@@ -215,6 +215,9 @@ struct StringLiteral(
         """
         return hash(self.unsafe_ptr(), len(self))
 
+    fn __hash_with__[H: Hasher](self, inout hasher: H):
+        pass
+
     fn __str__(self) -> String:
         """Convert the string literal to a string.
 

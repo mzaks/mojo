@@ -134,6 +134,7 @@ struct SIMD[type: DType, size: Int = simdwidthof[type]()](
     CollectionElement,
     Floorable,
     Hashable,
+    NewHashable,
     Intable,
     Roundable,
     Sized,
@@ -1872,6 +1873,10 @@ struct SIMD[type: DType, size: Int = simdwidthof[type]()](
             builtin documentation for more details.
         """
         return _hash_simd(self)
+
+    fn __hash_with__[H: Hasher](self, inout hasher: H):
+        pass
+        # hasher._update_with_simd(self)
 
     @always_inline("nodebug")
     fn slice[

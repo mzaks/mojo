@@ -102,6 +102,76 @@ trait Hashable:
         ...
 
 
+trait Hasher:
+    fn __init__(inout self):
+        """Expects a no argument instantiation."""
+        ...
+
+    fn _update_with_bytes(
+        inout self, data: DTypePointer[DType.uint8], length: Int
+    ):
+        """Conribute to the hash value based on a sequence of bytes. Use only for complex types which are not just a composition of Hashable types.
+        """
+        ...
+
+    fn _update_with_simd[
+        dt: DType, size: Int
+    ](inout self, value: SIMD[dt, size]):
+        """Contribute to the hash value with a compile time know fix size value. Used inside of std lib to avoid runtime branching.
+        """
+        ...
+
+    # fn update[T: NewHashable](inout self, value: T):
+    #      """Contribute to the hash value with a Hashable value. Should be used by implementors of Hashable types which are a composition of Hashable types.
+    #      """
+    #      ...
+
+    fn _finish[dt: DType = DType.uint64](owned self) -> Scalar[dt]:
+        """Used internally to generate the final hash value, should be simplified to `_finish(owned self) -> Scalar[hash_value_dt]`
+        once trait declarations support parameters and we can switch to `trait Hasher[hash_value_dt: DType]`.
+        This is beneficial as hash functions could have different implementations based on the type.
+        """
+        ...
+
+
+trait NewHashable:
+    fn __hash_with__[H: Hasher](self, inout hasher: H):
+        pass
+
+
+struct DummyHasher(Hasher):
+    var value: UInt64
+
+    fn __init__(inout self):
+        self.value = 13
+
+    fn _update_with_bytes(
+        inout self, data: DTypePointer[DType.uint8], length: Int
+    ):
+        """Conribute to the hash value based on a sequence of bytes. Use only for complex types which are not just a composition of Hashable types.
+        """
+        ...
+
+    fn _update_with_simd[
+        dt: DType, size: Int
+    ](inout self, value: SIMD[dt, size]):
+        """Contribute to the hash value with a compile time know fix size value. Used inside of std lib to avoid runtime branching.
+        """
+        ...
+
+    # fn update[T: NewHashable](inout self, value: T):
+    #      """Contribute to the hash value with a Hashable value. Should be used by implementors of Hashable types which are a composition of Hashable types.
+    #      """
+    #      ...
+
+    fn _finish[dt: DType = DType.uint64](owned self) -> Scalar[dt]:
+        """Used internally to generate the final hash value, should be simplified to `_finish(owned self) -> Scalar[hash_value_dt]`
+        once trait declarations support parameters and we can switch to `trait Hasher[hash_value_dt: DType]`.
+        This is beneficial as hash functions could have different implementations based on the type.
+        """
+        return self.value.cast[dt]()
+
+
 fn hash[T: Hashable](hashable: T) -> Int:
     """Hash a Hashable type using its underlying hash implementation.
 

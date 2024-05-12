@@ -190,6 +190,9 @@ struct Path(Stringable, CollectionElement, PathLike, KeyElement):
 
         return hash(self.path)
 
+    fn __hash_with__[H: Hasher](self, inout hasher: H):
+        pass
+
     fn stat(self) raises -> stat_result:
         """Returns the stat information on the path.
 

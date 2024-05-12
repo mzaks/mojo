@@ -194,6 +194,9 @@ struct DType(Stringable, Representable, KeyElement):
     fn __hash__(self) -> Int:
         return hash(UInt8(self._as_i8()))
 
+    fn __hash_with__[H: Hasher](self, inout hasher: H):
+        pass
+
     @always_inline("nodebug")
     fn isa[other: DType](self) -> Bool:
         """Checks if this DType matches the other one, specified as a

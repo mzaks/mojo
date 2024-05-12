@@ -138,7 +138,19 @@ fn test_issue_31111():
     _ = hash(Int(1))
 
 
+def test_hasher():
+    var hasher = DummyHasher()
+    var s: String = "Hello 🔥"
+    s.__hash_with__(hasher)
+    assert_equal(hasher^._finish(), 13)
+
+    # hasher = DummyHasher()
+    # hasher.update(Int64(13))
+    # assert_equal(hasher^._finish(), 13)
+
+
 def main():
     test_hash_byte_array()
     test_hash_simd()
     test_issue_31111()
+    test_hasher()

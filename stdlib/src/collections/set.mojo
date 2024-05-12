@@ -150,6 +150,9 @@ struct Set[T: KeyElement](Sized, Comparable, Hashable, Boolable):
             hash_value ^= hash(e[])
         return hash_value
 
+    fn __hash_with__[H: Hasher](self, inout hasher: H):
+        pass
+
     fn __and__(self, other: Self) -> Self:
         """The set intersection operator.
 

@@ -435,6 +435,9 @@ struct PythonObject(
         debug_assert(result != -1, "object is not hashable")
         return result
 
+    fn __hash_with__[H: Hasher](self, inout hasher: H):
+        pass
+
     fn __getitem__(self, *args: PythonObject) raises -> PythonObject:
         """Return the value for the given key or keys.
 

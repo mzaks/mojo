@@ -621,6 +621,7 @@ struct String(
     Boolable,
     Formattable,
     ToFormatter,
+    NewHashable,
 ):
     """Represents a mutable string."""
 
@@ -1548,6 +1549,10 @@ struct String(
             builtin documentation for more details.
         """
         return hash(self._strref_dangerous())
+
+    fn __hash_with__[H: Hasher](self, inout hasher: H):
+        hasher._update_with_simd(Int64(len(self)))
+        hasher._update_with_bytes(self.unsafe_uint8_ptr(), len(self))
 
     fn _interleave(self, val: String) -> String:
         var res = List[UInt8]()

@@ -310,6 +310,9 @@ struct StringRef(
         """
         return hash(self.data, self.length)
 
+    fn __hash_with__[H: Hasher](self, inout hasher: H):
+        pass
+
     fn count(self, substr: StringRef) -> Int:
         """Return the number of non-overlapping occurrences of substring
         `substr` in the string.

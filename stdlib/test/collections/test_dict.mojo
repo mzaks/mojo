@@ -355,6 +355,9 @@ struct DummyKey(KeyElement):
     fn __hash__(self) -> Int:
         return self.value
 
+    fn __hash_with__[H: Hasher](self, inout hasher: H):
+        pass
+
     fn __eq__(self, other: DummyKey) -> Bool:
         return self.value == other.value
 
