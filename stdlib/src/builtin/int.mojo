@@ -252,7 +252,7 @@ struct Int(
     Stringable,
     Truncable,
     Indexer,
-    # NewHashable,
+    NewHashable,
 ):
     """This type represents an integer value."""
 
@@ -1088,5 +1088,5 @@ struct Int(
         return _hash_simd(Scalar[DType.int64](self))
 
     fn __hash_with__[H: Hasher](self, inout hasher: H):
-        pass
-        # hasher._update_with_simd(Int64(self))
+        # pass
+        hasher._update_with_simd(Int64(self))
