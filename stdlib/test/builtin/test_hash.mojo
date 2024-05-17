@@ -141,12 +141,12 @@ fn test_issue_31111():
 def test_hasher():
     var hasher = DummyHasher()
     var s: String = "Hello 🔥"
-    s.__hash_with__(hasher)
+    hasher.update(s)
     assert_equal(hasher^._finish(), 13)
 
-    # hasher = DummyHasher()
-    # hasher.update(Int64(13))
-    # assert_equal(hasher^._finish(), 13)
+    hasher = DummyHasher()
+    hasher.update(13)
+    assert_equal(hasher^._finish(), 13)
 
 
 def main():

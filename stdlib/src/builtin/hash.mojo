@@ -121,10 +121,10 @@ trait Hasher:
         """
         ...
 
-    # fn update[T: NewHashable](inout self, value: T):
-    #      """Contribute to the hash value with a Hashable value. Should be used by implementors of Hashable types which are a composition of Hashable types.
-    #      """
-    #      ...
+    fn update[T: NewHashable](inout self, value: T):
+         """Contribute to the hash value with a Hashable value. Should be used by implementors of Hashable types which are a composition of Hashable types.
+         """
+         ...
 
     fn _finish[dt: DType = DType.uint64](owned self) -> Scalar[dt]:
         """Used internally to generate the final hash value, should be simplified to `_finish(owned self) -> Scalar[hash_value_dt]`
@@ -159,10 +159,10 @@ struct DummyHasher(Hasher):
         """
         ...
 
-    # fn update[T: NewHashable](inout self, value: T):
-    #      """Contribute to the hash value with a Hashable value. Should be used by implementors of Hashable types which are a composition of Hashable types.
-    #      """
-    #      ...
+    fn update[T: NewHashable](inout self, value: T):
+         """Contribute to the hash value with a Hashable value. Should be used by implementors of Hashable types which are a composition of Hashable types.
+         """
+         ...
 
     fn _finish[dt: DType = DType.uint64](owned self) -> Scalar[dt]:
         """Used internally to generate the final hash value, should be simplified to `_finish(owned self) -> Scalar[hash_value_dt]`
