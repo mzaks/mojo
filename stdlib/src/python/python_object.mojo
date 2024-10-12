@@ -25,7 +25,7 @@ from memory import UnsafePointer
 from collections import Dict
 from utils import StringRef
 
-from hashlib._hasher import _HashableWithHasher, _Hasher
+from hashlib._hasher import _Hasher
 
 from ._cpython import CPython, PyObjectPtr
 from .python import Python, _get_global_python_itf
@@ -233,7 +233,6 @@ struct PythonObject(
     SizedRaising,
     Stringable,
     Formattable,
-    _HashableWithHasher,
 ):
     """A Python object."""
 

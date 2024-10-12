@@ -699,7 +699,6 @@ struct String(
     ToFormatter,
     CollectionElementNew,
     FloatableRaising,
-    _HashableWithHasher,
 ):
     """Represents a mutable string."""
 

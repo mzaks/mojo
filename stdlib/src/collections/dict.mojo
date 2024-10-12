@@ -38,13 +38,17 @@ from bit import is_power_of_two
 from sys.ffi import OpaquePointer
 from memory import memcpy, bitcast, UnsafePointer
 from sys.intrinsics import _type_is_eq
+from hashlib._ahash import AHasher
+from hashlib._hasher import _hash_with_hasher, _HashableWithHasher
 
 
-trait KeyElement(CollectionElement, Hashable, EqualityComparable):
+trait KeyElement(
+    CollectionElement, Hashable, _HashableWithHasher, EqualityComparable
+):
     """A trait composition for types which implement all requirements of
     dictionary keys. Dict keys must minimally be Movable, Hashable,
-    and EqualityComparable for a hash map. Until we have references
-    they must also be copyable."""
+    _HashableWithHasher and EqualityComparable for a hash map. Until we have
+    references they must also be copyable."""
 
     pass
 
@@ -87,11 +91,10 @@ fn _hash_key[K: KeyElement](key: K) -> Int:
         A 64-bit hash value. This value is _not_ suitable for cryptographic
         uses. Its intended usage is for data structures.
     """
-
-    @parameter
-    if _type_is_eq[K, String]() or _type_is_eq[K, StringLiteral]():
-        return _hash_str(rebind[String](key))
-    return hash(key)
+    alias hasher_type = AHasher[SIMD[DType.uint64, 4](0, 0, 0, 0)]
+    var hasher = hasher_type()
+    key.__hash__(hasher)
+    return int(hasher^.finish())
 
 
 @value

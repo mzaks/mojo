@@ -16,7 +16,7 @@ These are Mojo built-ins, so you don't need to import them.
 """
 
 from collections import KeyElement
-from hashlib._hasher import _HashableWithHasher, _Hasher
+from hashlib._hasher import _Hasher
 from sys import sizeof, bitwidthof, os_is_windows
 
 alias _mIsSigned = UInt8(1)
@@ -33,7 +33,6 @@ struct DType(
     Representable,
     KeyElement,
     CollectionElementNew,
-    _HashableWithHasher,
 ):
     """Represents DType and provides methods for working with it."""
 

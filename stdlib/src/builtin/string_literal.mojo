@@ -19,7 +19,7 @@ from sys.ffi import c_char
 
 from memory import memcpy, UnsafePointer
 from collections import List
-from hashlib._hasher import _HashableWithHasher, _Hasher
+from hashlib._hasher import _Hasher
 from utils import StringRef, Span, StringSlice, StaticString
 from utils import Formattable, Formatter
 from utils._visualizers import lldb_formatter_wrapping_type
@@ -44,7 +44,6 @@ struct StringLiteral(
     Sized,
     Stringable,
     FloatableRaising,
-    _HashableWithHasher,
 ):
     """This type represents a string literal.
 
