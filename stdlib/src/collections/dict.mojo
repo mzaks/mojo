@@ -61,26 +61,6 @@ trait RepresentableKeyElement(KeyElement, Representable):
 
 
 @always_inline("nodebug")
-fn _hash_str(s: String) -> UInt:
-    """Hash a string using the DJBX33A hash algorithm.
-
-    When the string is small, the default SIMD hash function is not as efficient
-    as the SIMD machinery has some overhead that is not worth it for small data.
-
-    Args:
-        s: The string to hash.
-
-    Returns:
-        A 64-bit hash value. This value is _not_ suitable for cryptographic
-        uses. Its intended usage is for data structures.
-    """
-    var hash = 5381  # typical starting value
-    for c in s.as_string_slice():
-        hash = ((hash << 5) + hash) + ord(c)  # hash * 33 + ord(char)
-    return hash
-
-
-@always_inline("nodebug")
 fn _hash_key[K: KeyElement](key: K) -> Int:
     """Hash a key using the underlying hash function.
 
