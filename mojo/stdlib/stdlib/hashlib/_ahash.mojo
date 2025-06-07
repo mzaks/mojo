@@ -199,30 +199,14 @@ struct AHasher[key: U256](_Hasher):
         else:
             # vector values will contribute to hash in multiple rounds
             @parameter
-            if new_data.size == 1:
-                # large scalar value
+            for i in range(new_data.size):
+                v = new_data[i]
+
                 @parameter
                 for r in range(0, rounds, 2):
-                    u64_1 = (new_data[0] >> (r * 64)).cast[DType.uint64]()
-                    u64_2 = (new_data[0] >> ((r + 1) * 64)).cast[DType.uint64]()
+                    u64_1 = (v >> (r * 64)).cast[DType.uint64]()
+                    u64_2 = (v >> ((r + 1) * 64)).cast[DType.uint64]()
                     self._large_update(U128(u64_1, u64_2))
-            else:
-                # vector with large values
-                @parameter
-                for i in range(new_data.size):
-                    v = new_data[i]
-
-                    @parameter
-                    for r in range(0, rounds, 2):
-
-                        @parameter
-                        if new_data.dtype.is_integral():
-                            u64_1 = (v >> (r * 64)).cast[DType.uint64]()
-                            u64_2 = (v >> ((r + 1) * 64)).cast[DType.uint64]()
-                        else:
-                            u64_1 = v.cast[DType.uint64]()
-                            u64_2 = v.cast[DType.uint64]()
-                        self._large_update(U128(u64_1, u64_2))
 
     fn update[T: _HashableWithHasher](mut self, value: T):
         """Update the buffer value with new hashable value.
