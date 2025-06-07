@@ -171,13 +171,17 @@ struct AHasher[key: U256](_Hasher):
             new_data: Value used for update.
         """
 
+        # number of rounds a single vector value will contribute to a hash
+        # values smaller than 8 bytes contribute only once
+        # values which are multiple of 8 bytes contribute multiple times
+        # e.g. int128 is 16 bytes long and evaluates to 2 rounds
         alias rounds = (new_data.dtype.sizeof() >> 3) + (
             (new_data.dtype.sizeof() & 7) > 0
         )
 
         @parameter
         if rounds == 1:
-
+            # vector values are not bigger than 8 bytes each
             @parameter
             if new_data.dtype.is_floating_point():
                 v64 = new_data.to_bits().cast[DType.uint64]()
@@ -193,31 +197,32 @@ struct AHasher[key: U256](_Hasher):
                 for i in range(0, v64.size, 2):
                     self._large_update(U128(v64[i], v64[i + 1]))
         else:
-
+            # vector values will contribute to hash in multiple rounds
             @parameter
             if new_data.size == 1:
-
+                # large scalar value
                 @parameter
                 for r in range(0, rounds, 2):
                     u64_1 = (new_data[0] >> (r * 64)).cast[DType.uint64]()
                     u64_2 = (new_data[0] >> ((r + 1) * 64)).cast[DType.uint64]()
                     self._large_update(U128(u64_1, u64_2))
-
-            @parameter
-            for i in range(new_data.size):
-                v = new_data[i]
-
+            else:
+                # vector with large values
                 @parameter
-                for r in range(0, rounds, 2):
+                for i in range(new_data.size):
+                    v = new_data[i]
 
                     @parameter
-                    if new_data.dtype.is_integral():
-                        u64_1 = (v >> (r * 64)).cast[DType.uint64]()
-                        u64_2 = (v >> ((r + 1) * 64)).cast[DType.uint64]()
-                    else:
-                        u64_1 = v.cast[DType.uint64]()
-                        u64_2 = v.cast[DType.uint64]()
-                    self._large_update(U128(u64_1, u64_2))
+                    for r in range(0, rounds, 2):
+
+                        @parameter
+                        if new_data.dtype.is_integral():
+                            u64_1 = (v >> (r * 64)).cast[DType.uint64]()
+                            u64_2 = (v >> ((r + 1) * 64)).cast[DType.uint64]()
+                        else:
+                            u64_1 = v.cast[DType.uint64]()
+                            u64_2 = v.cast[DType.uint64]()
+                        self._large_update(U128(u64_1, u64_2))
 
     fn update[T: _HashableWithHasher](mut self, value: T):
         """Update the buffer value with new hashable value.
