@@ -52,16 +52,26 @@ struct Fnv1a(_Hasher):
             value: Value used for update.
         """
 
-        @parameter
-        if value.dtype.is_floating_point():
-            v64 = value.to_bits().cast[DType.uint64]()
-        else:
-            v64 = value.cast[DType.uint64]()
+        alias rounds = (value.dtype.sizeof() >> 3) + (
+            (value.dtype.sizeof() & 7) > 0
+        )
 
         @parameter
-        for i in range(0, v64.size):
-            self._value ^= v64[i].cast[DType.uint64]()
-            self._value *= 0x100000001B3
+        for i in range(value.size):
+            v = value[i]
+
+            @parameter
+            for r in range(rounds):
+
+                @parameter
+                if value.dtype.is_floating_point():
+                    u64 = v.to_bits().cast[DType.uint64]()
+                elif value.dtype.is_integral():
+                    u64 = (v >> (r * 64)).cast[DType.uint64]()
+                else:
+                    u64 = v.cast[DType.uint64]()
+                self._value ^= u64.cast[DType.uint64]()
+                self._value *= 0x100000001B3
 
     fn update[T: _HashableWithHasher](mut self, value: T):
         """Update the buffer value with new hashable value.

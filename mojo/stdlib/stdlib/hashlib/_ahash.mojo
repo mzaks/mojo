@@ -171,20 +171,53 @@ struct AHasher[key: U256](_Hasher):
             new_data: Value used for update.
         """
 
-        @parameter
-        if new_data.dtype.is_floating_point():
-            v64 = new_data.to_bits().cast[DType.uint64]()
-        else:
-            v64 = new_data.cast[DType.uint64]()
+        alias rounds = (new_data.dtype.sizeof() >> 3) + (
+            (new_data.dtype.sizeof() & 7) > 0
+        )
 
         @parameter
-        if v64.size == 1:
-            self._update(v64[0])
+        if rounds == 1:
+
+            @parameter
+            if new_data.dtype.is_floating_point():
+                v64 = new_data.to_bits().cast[DType.uint64]()
+            else:
+                v64 = new_data.cast[DType.uint64]()
+
+            @parameter
+            if v64.size == 1:
+                self._update(v64[0])
+            else:
+
+                @parameter
+                for i in range(0, v64.size, 2):
+                    self._large_update(U128(v64[i], v64[i + 1]))
         else:
 
             @parameter
-            for i in range(0, v64.size, 2):
-                self._large_update(U128(v64[i], v64[i + 1]))
+            if new_data.size == 1:
+
+                @parameter
+                for r in range(0, rounds, 2):
+                    u64_1 = (new_data[0] >> (r * 64)).cast[DType.uint64]()
+                    u64_2 = (new_data[0] >> ((r + 1) * 64)).cast[DType.uint64]()
+                    self._large_update(U128(u64_1, u64_2))
+
+            @parameter
+            for i in range(new_data.size):
+                v = new_data[i]
+
+                @parameter
+                for r in range(0, rounds, 2):
+
+                    @parameter
+                    if new_data.dtype.is_integral():
+                        u64_1 = (v >> (r * 64)).cast[DType.uint64]()
+                        u64_2 = (v >> ((r + 1) * 64)).cast[DType.uint64]()
+                    else:
+                        u64_1 = v.cast[DType.uint64]()
+                        u64_2 = v.cast[DType.uint64]()
+                    self._large_update(U128(u64_1, u64_2))
 
     fn update[T: _HashableWithHasher](mut self, value: T):
         """Update the buffer value with new hashable value.
