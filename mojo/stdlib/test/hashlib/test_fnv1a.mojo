@@ -132,7 +132,7 @@ def assert_fill_factor[
     var fill_factor = 1 - unfilled / num_buckets
     assert_true(
         fill_factor >= lower_bound,
-        String("Fill factor for {} is {}, provided lower boound was {}").format(
+        String("Fill factor for {} is {}, provided lower bound was {}").format(
             label, fill_factor, lower_bound
         ),
         location=__call_location(),
