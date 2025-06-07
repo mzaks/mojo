@@ -22,7 +22,16 @@ from builtin._location import __call_location
 from memory import Span, memset_zero
 from testing import assert_equal, assert_not_equal, assert_true
 
-from words import *
+from test_utils import (
+    gen_word_pairs,
+    words_ar,
+    words_el,
+    words_en,
+    words_he,
+    words_lv,
+    words_pl,
+    words_ru,
+)
 
 
 def dif_bits(i1: UInt64, i2: UInt64) -> Int:

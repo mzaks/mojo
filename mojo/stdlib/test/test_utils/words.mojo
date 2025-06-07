@@ -12,8 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 # RUN: %mojo %s
 
-# This is a utility module which holds most common words in different languages
-# and the gen_words_pairs function
+# Most common words in different languages and the gen_words_pairs function
 
 # Source: https://www.101languages.net/arabic/most-common-arabic-words/
 alias words_ar = """
@@ -575,7 +574,3 @@ fn gen_word_pairs[words: String = words_en]() -> List[String]:
             var w2 = w.strip()
             result.append(w1 + " " + w2)
     return result
-
-
-def main():
-    pass

@@ -18,7 +18,16 @@ from hashlib._fnv1a import Fnv1a
 from hashlib._hasher import _Hasher, _HashableWithHasher
 from testing import assert_equal, assert_not_equal, assert_true
 from memory import memset_zero, stack_allocation, UnsafePointer
-from words import *
+from test_utils import (
+    gen_word_pairs,
+    words_ar,
+    words_el,
+    words_en,
+    words_he,
+    words_lv,
+    words_pl,
+    words_ru,
+)
 
 
 def dif_bits(i1: UInt64, i2: UInt64) -> Int:
