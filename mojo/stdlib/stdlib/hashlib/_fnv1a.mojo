@@ -56,8 +56,8 @@ struct Fnv1a(_Hasher):
         # values smaller than 8 bytes contribute only once
         # values which are multiple of 8 bytes contribute multiple times
         # e.g. int128 is 16 bytes long and evaluates to 2 rounds
-        alias rounds = (value.dtype.sizeof() >> 3) + (
-            (value.dtype.sizeof() & 7) > 0
+        alias rounds = value.dtype.sizeof() // 8 + (
+            value.dtype.sizeof() % 8 > 0
         )
 
         @parameter
