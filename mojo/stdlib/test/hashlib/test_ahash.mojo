@@ -270,6 +270,11 @@ def test_hash_simd_values():
         hash(SIMD[DType.int64, 8](1, 0, 0, 0, 1, 0, 0, 0)), 8329308917989271970
     )
 
+    assert_equal(hash(SIMD[DType.uint256, 2](1)), 8329308917989271970)
+    assert_equal(
+        hash(SIMD[DType.uint64, 8](1, 0, 0, 0, 1, 0, 0, 0)), 8329308917989271970
+    )
+
     assert_equal(hash(SIMD[DType.int8, 1](-1)), 3480139124131340807)
     assert_equal(hash(SIMD[DType.int16, 1](-1)), 3480139124131340807)
     assert_equal(hash(SIMD[DType.int32, 1](-1)), 3480139124131340807)
