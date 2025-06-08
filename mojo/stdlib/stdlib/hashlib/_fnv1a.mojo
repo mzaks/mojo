@@ -62,10 +62,11 @@ struct Fnv1a(_Hasher):
 
         @parameter
         for i in range(value.size):
-            v = value[i]
+            var v = value[i]
 
             @parameter
             for r in range(rounds):
+                var u64: UInt64
 
                 @parameter
                 if value.dtype.is_floating_point():
