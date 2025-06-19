@@ -161,7 +161,14 @@ fn _type_of_width[bitwidth: Int, unsigned: Bool]() -> DType:
 
 @register_passable("trivial")
 struct IndexList[size: Int, *, element_type: DType = DType.int64](
-    Comparable, Copyable, Defaultable, Movable, Sized, Stringable, Writable
+    Comparable,
+    Copyable,
+    Defaultable,
+    Hashable,
+    Movable,
+    Sized,
+    Stringable,
+    Writable,
 ):
     """A base struct that implements size agnostic index functions.
 
@@ -780,6 +787,18 @@ struct IndexList[size: Int, *, element_type: DType = DType.int64](
             result.data[i] = self.data.__getitem__[i]().cast[
                 result.element_type
             ]()
+
+    fn __hash__[H: Hasher](self, mut hasher: H):
+        """Updates hasher with the underlying bytes.
+        Parameters:
+            H: The hasher type.
+        Args:
+            hasher: The hasher instance.
+        """
+
+        @parameter
+        for i in range(size):
+            hasher.update(self.data[i])
 
 
 # ===-----------------------------------------------------------------------===#
