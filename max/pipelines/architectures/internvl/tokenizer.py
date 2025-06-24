@@ -23,13 +23,18 @@ from PIL import Image
 from transformers import (
     AutoConfig,
     AutoTokenizer,
+    BatchEncoding,
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
 
-# The token ID for "<IMG_CONTEXT>" in the InternVL tokenizer
-# This is used to identify where to insert image embeddings in the text
+# The token ID for "<IMG_CONTEXT>" in the InternVL tokenizer.
+# This is used to identify where to insert image embeddings in the text.
 IMAGE_CONTEXT_TOKEN_ID = 151667
+
+# ImageNet normalization constants.
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 def find_closest_aspect_ratio(
@@ -73,7 +78,7 @@ def calculate_num_patches_for_image(
             for n in range(min_num, max_num + 1)
             for i in range(1, n + 1)
             for j in range(1, n + 1)
-            if i * j <= max_num and i * j >= min_num
+            if min_num <= i * j <= max_num
         )
     )
     target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
@@ -91,6 +96,98 @@ def calculate_num_patches_for_image(
         blocks += 1
 
     return blocks
+
+
+def imagenet_normalize(img: Image.Image, input_size: int) -> np.ndarray:
+    """Normalize image using ImageNet normalization.
+
+    This converts PIL image to normalized numpy array with proper preprocessing.
+    """
+    # Convert to RGB if needed.
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    # Resize with BICUBIC interpolation.
+    img = img.resize((input_size, input_size), Image.Resampling.BICUBIC)
+
+    # Convert to numpy array and normalize to [0, 1].
+    img_array = np.array(img, dtype=np.float32) / 255.0
+
+    # Apply ImageNet normalization.
+    img_array = (img_array - IMAGENET_MEAN) / IMAGENET_STD
+
+    return img_array
+
+
+def crop_into_patches(
+    image: Image.Image,
+    *,
+    min_num: int = 1,
+    max_num: int = 12,
+    image_size: int = 448,
+    use_thumbnail: bool = False,
+) -> list[Image.Image]:
+    """Dynamically preprocess image with adaptive tiling."""
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    # Calculate the existing image aspect ratio.
+    target_ratios = list(
+        set(
+            (i, j)
+            for n in range(min_num, max_num + 1)
+            for i in range(1, n + 1)
+            for j in range(1, n + 1)
+            if min_num <= i * j <= max_num
+        )
+    )
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    # Find the closest aspect ratio to the target..
+    target_aspect_ratio = find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size
+    )
+
+    # Calculate the target width and height.
+    # Note: Each individual patch will be square (image_size x image_size),
+    # but the overall image is resized to maintain aspect ratio by using
+    # different numbers of patches horizontally and vertically.
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    # Resize and split the image into patches.
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for y_block in range(target_aspect_ratio[1]):
+        for x_block in range(target_aspect_ratio[0]):
+            box = (
+                x_block * image_size,
+                y_block * image_size,
+                (x_block + 1) * image_size,
+                (y_block + 1) * image_size,
+            )
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+    assert len(processed_images) == blocks
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+    return processed_images
+
+
+def preprocess_image_to_tensor(
+    pil_image: Image.Image,
+    *,
+    input_size: int = 448,
+    max_num: int = 12,
+) -> np.ndarray:
+    """Preprocess image to tensor with dynamic patching - must match InternVLProcessor."""
+    images = crop_into_patches(
+        pil_image, image_size=input_size, use_thumbnail=True, max_num=max_num
+    )
+    pixel_values = [imagenet_normalize(image, input_size) for image in images]
+    return np.stack(pixel_values)
 
 
 class InternVLProcessor:
@@ -124,6 +221,51 @@ class InternVLProcessor:
         downsample_ratio = getattr(config, "downsample_ratio", 0.5)
         self.num_image_token = int(
             (self.image_size // patch_size) ** 2 * (downsample_ratio**2)
+        )
+
+    def apply_chat_template(
+        self,
+        messages: list[dict],
+        tokenize: bool = False,
+        add_generation_prompt: bool = True,
+        **kwargs,
+    ) -> str | list[int] | list[str] | list[list[int]] | BatchEncoding:
+        """Converts a list of dictionaries with `"role"` and `"content"` keys to a formatted string.
+
+        This method handles multimodal messages by extracting text content before
+        forwarding to the HF tokenizer.
+        """
+        # Convert multimodal messages to text-only for the tokenizer
+        text_messages = []
+        for message in messages:
+            text_message = {"role": message.get("role")}
+            content = message.get("content")
+
+            if isinstance(content, str):
+                text_message["content"] = content
+            elif isinstance(content, list):
+                # Extract text from multimodal content
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        # Handle both "content" and "text" keys
+                        text_content = item.get("content") or item.get(
+                            "text", ""
+                        )
+                        if text_content:
+                            text_parts.append(text_content)
+                text_message["content"] = " ".join(text_parts)
+            else:
+                text_message["content"] = ""
+
+            text_messages.append(text_message)
+
+        # Forward to the HF tokenizer with text-only messages
+        return self.tokenizer.apply_chat_template(
+            text_messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
         )
 
     def __call__(
@@ -161,24 +303,25 @@ class InternVLProcessor:
                 + self.IMG_END_TOKEN
             )
 
-            # Replace <image> with InternVL's format
+            # Replace <image> or <|image|> with InternVL's format.
             if "<image>" in processed_text:
                 processed_text = processed_text.replace(
                     "<image>", image_tokens, 1
+                )
+            elif "<|image|>" in processed_text:
+                # Handle the test prompt format with pipes.
+                processed_text = processed_text.replace(
+                    "<|image|>", image_tokens, 1
                 )
             else:
                 # If no <image> placeholder, prepend to text
                 processed_text = image_tokens + "\n" + processed_text
 
-            # Convert PIL image to basic numpy array (no torch/torchvision preprocessing)
-            # Just convert to RGB and numpy array - full preprocessing happens later
-            if image.mode != "RGB":
-                image = image.convert("RGB")
-
-            # Convert PIL image to numpy array (H, W, C format)
-            # TODO(MODELS-565): correctly patchify the image here.
-            image = image.resize((448, 448))
-            image_array = np.array(image, dtype=np.float32)
+            image_array = preprocess_image_to_tensor(
+                image,
+                input_size=self.image_size,
+                max_num=self.max_dynamic_patch,
+            )
             raw_pixel_values.append(image_array)
 
         # Tokenize the processed text
@@ -190,6 +333,17 @@ class InternVLProcessor:
         # These are raw image arrays that will be preprocessed later in the model layer
         if raw_pixel_values:
             text_inputs["pixel_values"] = [raw_pixel_values]
+
+            # Compute image token indices for optimization
+            input_ids = text_inputs.get("input_ids", [])
+            # Handle various input formats (list, nested list, numpy array)
+            # by converting to numpy and flattening.
+            seq = np.asarray(input_ids).ravel()
+
+            image_token_indices = (
+                (seq == IMAGE_CONTEXT_TOKEN_ID).nonzero()[0].astype(np.int32)
+            )
+            text_inputs["image_token_indices"] = image_token_indices
 
         return text_inputs
 

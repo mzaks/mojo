@@ -674,6 +674,45 @@ fn _is_amd_rdna() -> Bool:
 
 
 @always_inline("nodebug")
+fn _is_amd_mi300x() -> Bool:
+    return is_amd_gpu["amdgpu:gfx942"]()
+
+
+@always_inline("nodebug")
+fn _is_amd_mi355x() -> Bool:
+    return is_amd_gpu["amdgpu:gfx950"]()
+
+
+@always_inline("nodebug")
+fn _cnda_version() -> Int:
+    constrained[
+        _is_amd_mi300x() or _is_amd_mi355x(),
+        "querying the cdna version is only supported on AMD hardware",
+    ]()
+
+    @parameter
+    if _is_amd_mi300x():
+        return 3
+    else:
+        return 4
+
+
+@always_inline("nodebug")
+fn _cnda_3_or_newer() -> Bool:
+    return _cnda_version() >= 3
+
+
+@always_inline("nodebug")
+fn _cnda_4_or_newer() -> Bool:
+    return _cnda_version() >= 4
+
+
+@always_inline("nodebug")
+fn _is_amd_cdna() -> Bool:
+    return _is_amd_mi300x() or _is_amd_mi355x()
+
+
+@always_inline("nodebug")
 fn is_amd_gpu() -> Bool:
     """Returns True if the target triple of the compiler is `amdgcn-amd-amdhsa`
     False otherwise.

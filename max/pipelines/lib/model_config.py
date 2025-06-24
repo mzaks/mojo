@@ -98,6 +98,13 @@ class MAXModelConfig(MAXModelConfigBase):
     use_subgraphs: bool = False
     """Whether to use subgraphs for the model."""
 
+    # TODO: This can be made more generic for arbitrary dtypes.
+    cast_safetensor_weights_from_float32_to_bfloat16: bool = False
+    """Whether to cast safetensor weights from float32 to bfloat16."""
+
+    applied_bfloat16_downcast: bool = False
+    """If safetensor weights were downcasted from float32 to bfloat16."""
+
     _huggingface_config: Optional[AutoConfig] = None
     """Hugging Face config. This should only be set by internal code."""
 
@@ -351,6 +358,7 @@ class MAXModelConfig(MAXModelConfigBase):
             _weights_format = weights_format(self.weight_path)
         except ValueError:
             _weights_format = None
+
         if (
             self.weight_path
             and self.quantization_encoding
@@ -408,7 +416,23 @@ class MAXModelConfig(MAXModelConfigBase):
             if len(supported_encodings) == 1:
                 msg = f"huggingface repo only has '{supported_encodings[0]}' weights, using '{supported_encodings[0]}'"
                 logger.debug(msg)
-                self.quantization_encoding = supported_encodings[0]
+
+                # Special case for when we allow for float32 safetensors weights
+                # to be downcasted to bfloat16.
+                if (
+                    self.cast_safetensor_weights_from_float32_to_bfloat16
+                    and supported_encodings[0] == SupportedEncoding.float32
+                ):
+                    # if no GPUs are available, we can't possibly downcast to bfloat16.
+                    if not any(
+                        d.device_type == "gpu" for d in self.device_specs
+                    ):
+                        msg = "No GPUs available, cannot downcast from float32 to bfloat16."
+                        raise ValueError(msg)
+                    self.applied_bfloat16_downcast = True
+                    self.quantization_encoding = SupportedEncoding.bfloat16
+                else:
+                    self.quantization_encoding = supported_encodings[0]
             elif not self.device_specs[0].device_type == "cpu":
                 # TODO(AITLIB-137): replace this with more full featured logic.
                 # If we are running on an accelerator and the quantiziation encoding is not set, override to bfloat16.
@@ -503,6 +527,14 @@ class MAXModelConfig(MAXModelConfigBase):
             weight_files = self.huggingface_weight_repo.files_for_encoding(
                 encoding=self.quantization_encoding
             )
+            if (
+                not weight_files
+                and self.cast_safetensor_weights_from_float32_to_bfloat16
+            ):
+                # We allow ourselves to load float32 safetensors weights as bfloat16.
+                weight_files = self.huggingface_weight_repo.files_for_encoding(
+                    encoding=SupportedEncoding.float32
+                )
 
             if default_weight_files := weight_files.get(
                 default_weights_format, []
