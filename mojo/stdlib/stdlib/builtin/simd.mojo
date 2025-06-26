@@ -1962,8 +1962,7 @@ struct SIMD[dtype: DType, size: Int](
     @staticmethod
     fn from_bytes[
         big_endian: Bool = is_big_endian(),
-        size: Int = 1,
-    ](bytes: InlineArray[Byte, dtype.sizeof() * size]) -> SIMD[dtype, size]:
+    ](bytes: InlineArray[Byte, sizeof[Self]()]) -> SIMD[dtype, size]:
         """Converts a byte array to a vector.
 
         Args:
@@ -1971,7 +1970,6 @@ struct SIMD[dtype: DType, size: Int](
 
         Parameters:
             big_endian: Whether the byte array is big-endian.
-            size: The size of the output vector.
 
         Returns:
             The integer value.
@@ -1987,7 +1985,7 @@ struct SIMD[dtype: DType, size: Int](
 
     fn as_bytes[
         big_endian: Bool = is_big_endian()
-    ](self) -> InlineArray[Byte, dtype.sizeof() * size]:
+    ](self) -> InlineArray[Byte, sizeof[Self]()]:
         """Convert the vector to a byte array.
 
         Parameters:
@@ -2003,8 +2001,8 @@ struct SIMD[dtype: DType, size: Int](
             value = byte_swap(value)
 
         var ptr = UnsafePointer(to=value)
-        var array = InlineArray[Byte, dtype.sizeof() * size](uninitialized=True)
-        memcpy(array.unsafe_ptr(), ptr.bitcast[Byte](), dtype.sizeof() * size)
+        var array = InlineArray[Byte, sizeof[Self]()](uninitialized=True)
+        memcpy(array.unsafe_ptr(), ptr.bitcast[Byte](), sizeof[Self]())
         return array^
 
     fn _floor_ceil_trunc_impl[intrinsic: StaticString](self) -> Self:
