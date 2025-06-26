@@ -1981,7 +1981,6 @@ struct SIMD[dtype: DType, size: Int](
 
         @parameter
         if is_big_endian() != big_endian:
-
             return byte_swap(value)
 
         return value

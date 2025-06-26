@@ -1972,13 +1972,85 @@ def test_from_bytes_as_bytes():
             )
 
     var v8_u8 = SIMD[DType.uint8, 8](1, 2, 3, 4, 5, 6, 7, 8)
-    assert_equal(v8_u8, SIMD[DType.uint8, 8].from_bytes[size=8](v8_u8.from_bytes()))
+    assert_equal(
+        v8_u8, SIMD[DType.uint8, 8].from_bytes[size=8](v8_u8.as_bytes())
+    )
+
+    var v8_u16 = SIMD[DType.uint16, 8](1, 2, 3, 4, 5, 6, 7, 8)
+    var expected_v8_u16_be_bytes = [
+        0,
+        1,
+        0,
+        2,
+        0,
+        3,
+        0,
+        4,
+        0,
+        5,
+        0,
+        6,
+        0,
+        7,
+        0,
+        8,
+    ]
+    var actual_v8_u16_be_bytes = v8_u16.as_bytes[big_endian=True]()
+    for i in range(len(expected_v8_u16_be_bytes)):
+        assert_equal(
+            Int(actual_v8_u16_be_bytes[i]), expected_v8_u16_be_bytes[i]
+        )
+    var expected_v8_u16_le_bytes = [
+        1,
+        0,
+        2,
+        0,
+        3,
+        0,
+        4,
+        0,
+        5,
+        0,
+        6,
+        0,
+        7,
+        0,
+        8,
+        0,
+    ]
+    var actual_v8_u16_le_bytes = v8_u16.as_bytes[big_endian=False]()
+    for i in range(len(expected_v8_u16_le_bytes)):
+        assert_equal(
+            Int(actual_v8_u16_le_bytes[i]), expected_v8_u16_le_bytes[i]
+        )
+
     var v8_i64 = SIMD[DType.int64, 8](1, -2, 3, -4, 5, -6, 7, -8)
-    assert_equal(v8_i64, SIMD[DType.int64, 8].from_bytes[size=8](v8_i64.as_bytes()))
-    var v8_f64 = SIMD[DType.float64, 8](1.1, -2.2, 3.3, -4.4, 5.5, -6.6, 7.7, -8.8)
-    assert_equal(v8_f64, SIMD[DType.float64, 8].from_bytes[size=8](v8_f64.as_bytes()))
-    var v8_bool = SIMD[DType.bool, 8](True, True, False, True, False, True, True, True)
-    assert_equal(v8_bool, SIMD[DType.bool, 8].from_bytes[size=8](v8_bool.as_bytes()))
+    assert_equal(
+        v8_i64,
+        SIMD[DType.int64, 8].from_bytes[big_endian=False, size=8](
+            v8_i64.as_bytes[big_endian=False]()
+        ),
+    )
+    assert_equal(
+        v8_i64,
+        SIMD[DType.int64, 8].from_bytes[big_endian=True, size=8](
+            v8_i64.as_bytes[big_endian=True]()
+        ),
+    )
+
+    var v8_f64 = SIMD[DType.float64, 8](
+        1.1, -2.2, 3.3, -4.4, 5.5, -6.6, 7.7, -8.8
+    )
+    assert_equal(
+        v8_f64, SIMD[DType.float64, 8].from_bytes[size=8](v8_f64.as_bytes())
+    )
+
+    var v8_bool = SIMD[DType.bool, 8](
+        True, True, False, True, False, True, True, True
+    )
+    assert_equal(
+        v8_bool, SIMD[DType.bool, 8].from_bytes[size=8](v8_bool.as_bytes())
+    )
 
 
 def test_reversed():
