@@ -1961,32 +1961,35 @@ struct SIMD[dtype: DType, size: Int](
 
     @staticmethod
     fn from_bytes[
-        big_endian: Bool = is_big_endian()
-    ](bytes: InlineArray[Byte, dtype.sizeof()]) -> Scalar[dtype]:
-        """Converts a byte array to an scalar integer.
+        big_endian: Bool = is_big_endian(),
+        size: Int = 1,
+    ](bytes: InlineArray[Byte, dtype.sizeof() * size]) -> SIMD[dtype, size]:
+        """Converts a byte array to a vector.
 
         Args:
             bytes: The byte array to convert.
 
         Parameters:
             big_endian: Whether the byte array is big-endian.
+            size: The size of the output vector.
 
         Returns:
             The integer value.
         """
-        var ptr = bytes.unsafe_ptr().bitcast[Scalar[dtype]]()
+        var ptr = bytes.unsafe_ptr().bitcast[SIMD[dtype, size]]()
         var value = ptr[]
 
         @parameter
         if is_big_endian() != big_endian:
+
             return byte_swap(value)
 
         return value
 
     fn as_bytes[
         big_endian: Bool = is_big_endian()
-    ](self) -> InlineArray[Byte, dtype.sizeof()]:
-        """Convert the scalar integer to a byte array.
+    ](self) -> InlineArray[Byte, dtype.sizeof() * size]:
+        """Convert the vector to a byte array.
 
         Parameters:
             big_endian: Whether the byte array should be big-endian.
@@ -2001,8 +2004,8 @@ struct SIMD[dtype: DType, size: Int](
             value = byte_swap(value)
 
         var ptr = UnsafePointer(to=value)
-        var array = InlineArray[Byte, dtype.sizeof()](uninitialized=True)
-        memcpy(array.unsafe_ptr(), ptr.bitcast[Byte](), dtype.sizeof())
+        var array = InlineArray[Byte, dtype.sizeof() * size](uninitialized=True)
+        memcpy(array.unsafe_ptr(), ptr.bitcast[Byte](), dtype.sizeof() * size)
         return array^
 
     fn _floor_ceil_trunc_impl[intrinsic: StaticString](self) -> Self:

@@ -1971,6 +1971,15 @@ def test_from_bytes_as_bytes():
                 x,
             )
 
+    var v8_u8 = SIMD[DType.uint8, 8](1, 2, 3, 4, 5, 6, 7, 8)
+    assert_equal(v8_u8, SIMD[DType.uint8, 8].from_bytes[size=8](v8_u8.from_bytes()))
+    var v8_i64 = SIMD[DType.int64, 8](1, -2, 3, -4, 5, -6, 7, -8)
+    assert_equal(v8_i64, SIMD[DType.int64, 8].from_bytes[size=8](v8_i64.as_bytes()))
+    var v8_f64 = SIMD[DType.float64, 8](1.1, -2.2, 3.3, -4.4, 5.5, -6.6, 7.7, -8.8)
+    assert_equal(v8_f64, SIMD[DType.float64, 8].from_bytes[size=8](v8_f64.as_bytes()))
+    var v8_bool = SIMD[DType.bool, 8](True, True, False, True, False, True, True, True)
+    assert_equal(v8_bool, SIMD[DType.bool, 8].from_bytes[size=8](v8_bool.as_bytes()))
+
 
 def test_reversed():
     fn test[D: DType]() raises:
