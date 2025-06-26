@@ -38,7 +38,7 @@ what we publish.
   declared.
 
 ### Standard library changes
-- The `Hashable` trait has been updated to use a new data flow / Hasher-based strategy.
+- The `Hashable` trait has been updated to use a new data flow strategy.
   - Users are now required to implement the method 
     `fn __hash__[H: Hasher](self, mut hasher: H):` 
     (see `Hashable` docstring for further details).
