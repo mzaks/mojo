@@ -1974,7 +1974,7 @@ struct SIMD[dtype: DType, size: Int](
         Returns:
             The integer value.
         """
-        var ptr = bytes.unsafe_ptr().bitcast[SIMD[dtype, size]]()
+        var ptr = bytes.unsafe_ptr().bitcast[Self]()
         var value = ptr[]
 
         @parameter
