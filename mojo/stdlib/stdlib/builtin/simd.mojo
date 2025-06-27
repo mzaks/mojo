@@ -1984,7 +1984,7 @@ struct SIMD[dtype: DType, size: Int](
         return value
 
     fn as_bytes[
-        big_endian: Bool = is_big_endian()
+        *, big_endian: Bool = is_big_endian(),
     ](self) -> InlineArray[Byte, sizeof[Self]()]:
         """Convert the vector to a byte array.
 
