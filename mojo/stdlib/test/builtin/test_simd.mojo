@@ -1976,47 +1976,21 @@ def test_from_bytes_as_bytes():
     assert_equal(v8_u8, SIMD[DType.uint8, 8].from_bytes(v8_u8.as_bytes()))
 
     var v8_u16 = SIMD[DType.uint16, 8](1, 2, 3, 4, 5, 6, 7, 8)
+    # fmt: off
     var expected_v8_u16_be_bytes = [
-        0,
-        1,
-        0,
-        2,
-        0,
-        3,
-        0,
-        4,
-        0,
-        5,
-        0,
-        6,
-        0,
-        7,
-        0,
-        8,
+        0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8,
     ]
+    # fmt: on
     var actual_v8_u16_be_bytes = v8_u16.as_bytes[big_endian=True]()
     for i in range(len(expected_v8_u16_be_bytes)):
         assert_equal(
             Int(actual_v8_u16_be_bytes[i]), expected_v8_u16_be_bytes[i]
         )
+    # fmt: off
     var expected_v8_u16_le_bytes = [
-        1,
-        0,
-        2,
-        0,
-        3,
-        0,
-        4,
-        0,
-        5,
-        0,
-        6,
-        0,
-        7,
-        0,
-        8,
-        0,
+        1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0,
     ]
+    # fmt: on
     var actual_v8_u16_le_bytes = v8_u16.as_bytes[big_endian=False]()
     for i in range(len(expected_v8_u16_le_bytes)):
         assert_equal(

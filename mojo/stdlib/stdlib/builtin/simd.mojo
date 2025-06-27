@@ -1961,7 +1961,8 @@ struct SIMD[dtype: DType, size: Int](
 
     @staticmethod
     fn from_bytes[
-        *, big_endian: Bool = is_big_endian(),
+        *,
+        big_endian: Bool = is_big_endian(),
     ](bytes: InlineArray[Byte, sizeof[Self]()]) -> SIMD[dtype, size]:
         """Converts a byte array to a vector.
 
@@ -1984,7 +1985,8 @@ struct SIMD[dtype: DType, size: Int](
         return value
 
     fn as_bytes[
-        *, big_endian: Bool = is_big_endian(),
+        *,
+        big_endian: Bool = is_big_endian(),
     ](self) -> InlineArray[Byte, sizeof[Self]()]:
         """Convert the vector to a byte array.
 
