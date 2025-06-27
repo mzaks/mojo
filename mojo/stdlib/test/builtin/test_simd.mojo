@@ -1972,6 +1972,8 @@ def test_from_bytes_as_bytes():
                 x,
             )
 
+
+def test_vector_from_bytes_as_bytes():
     var v8_u8 = SIMD[DType.uint8, 8](1, 2, 3, 4, 5, 6, 7, 8)
     assert_equal(v8_u8, SIMD[DType.uint8, 8].from_bytes(v8_u8.as_bytes()))
 
@@ -2133,6 +2135,7 @@ def main():
     test_floor()
     test_floordiv()
     test_from_bytes_as_bytes()
+    test_vector_from_bytes_as_bytes()
     test_iadd()
     test_indexing()
     test_init_from_index()
