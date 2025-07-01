@@ -24,7 +24,7 @@ import msgspec
 import torch
 from max import driver
 from max._core import nixl
-from max.driver import CPU
+from max.driver import CPU, Accelerator
 from max.driver.tensor import Tensor
 
 logger = logging.getLogger("max.pipelines")
@@ -110,7 +110,7 @@ class KVTransferEngine:
         total_num_pages: int,
         *,
         listen_port: int = 8040,
-    ):
+    ) -> None:
         if total_num_pages <= 0:
             raise ValueError(
                 f"Total number of pages {total_num_pages} must be greater than 0"
@@ -120,6 +120,18 @@ class KVTransferEngine:
             raise ValueError(
                 f"Tensor num elements {tensor.num_elements} must be divisible by total number of pages {total_num_pages}"
             )
+
+        # Regardless of whether the tensor is on CPU / GPU, we must ensure that
+        # CUDADriver.cpp is called which loads the libcuda.so.1 and libnvidia-ml.so.1
+        # symbols PRIOR to loading the UCX CUDA backend.
+        acc = Accelerator()
+        if acc.api != "cuda":
+            raise NotImplementedError(
+                "Currently UCX only supports CUDA devices."
+            )
+        # This device is unused. It is created for the sole purpose of loading
+        # the CUDA symbols.
+        del acc
 
         # Create agent
         self.name = name
@@ -429,9 +441,6 @@ class KVTransferEngine:
     def finalize_transfer(self, xfer_req_id: XferReqData) -> None:
         """Finalize a completed transfer by copying data from staging buffer and cleaning up.
 
-        Once called, the transfer data is no longer tracked in completed_xfers and thus,
-        is_complete(xfer_req_id) will return False for a recently completed transfer.
-
         Args:
             xfer_req_id: The transfer request data containing transfer metadata.
         """
@@ -442,15 +451,13 @@ class KVTransferEngine:
                 )
             self.cpu_staging_buffer.device.synchronize()
 
-        # Release from completed xfers
-        self.completed_xfers[xfer_req_id.src_name].remove(xfer_req_id.xfer_name)
-
     def recv_xfer_sync(self, xfer_req_id: XferReqData) -> None:
         """Wait for a transfer initiated by remote engine to complete."""
         while not self.is_complete(xfer_req_id):
             self.update_completed_xfers()
 
         self.finalize_transfer(xfer_req_id)
+        self.completed_xfers[xfer_req_id.src_name].remove(xfer_req_id.xfer_name)
 
     def cleanup(self) -> None:
         """Release all resources associated with the transfer engine.

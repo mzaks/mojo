@@ -62,7 +62,7 @@ from collections.string._utf8 import (
     _utf8_first_byte_sequence_length,
 )
 from collections.string.format import _CurlyEntryFormattable, _FormatCurlyEntry
-from hashlib._hasher import _HashableWithHasher, _Hasher
+from hashlib.hasher import Hasher
 from math import align_down
 from os import PathLike, abort
 from sys import bitwidthof, is_compile_time, simdwidthof
@@ -465,7 +465,6 @@ struct StringSlice[mut: Bool, //, origin: Origin[mut]](
     Stringable,
     Writable,
     _CurlyEntryFormattable,
-    _HashableWithHasher,
 ):
     """A non-owning view to encoded string data.
 
@@ -486,9 +485,9 @@ struct StringSlice[mut: Bool, //, origin: Origin[mut]](
     """
 
     # Aliases
-    alias Mutable = StringSlice[MutableOrigin.cast_from[origin].result]
+    alias Mutable = StringSlice[MutableOrigin.cast_from[origin]]
     """The mutable version of the `StringSlice`."""
-    alias Immutable = StringSlice[ImmutableOrigin.cast_from[origin].result]
+    alias Immutable = StringSlice[ImmutableOrigin.cast_from[origin]]
     """The immutable version of the `StringSlice`."""
     # Fields
     var _slice: Span[Byte, origin]
@@ -507,7 +506,7 @@ struct StringSlice[mut: Bool, //, origin: Origin[mut]](
     @always_inline("nodebug")
     fn __init__(
         other: StringSlice,
-        out self: StringSlice[ImmutableOrigin.cast_from[other.origin].result],
+        out self: StringSlice[ImmutableOrigin.cast_from[other.origin]],
     ):
         """Implicitly cast the mutable origin of self to an immutable one.
 
@@ -718,11 +717,7 @@ struct StringSlice[mut: Bool, //, origin: Origin[mut]](
         """
         var len = self.byte_length()
         var result = String(unsafe_uninit_length=len)
-        memcpy(
-            result.unsafe_ptr_mut[is_unique_mut_ref=True](),
-            self.unsafe_ptr(),
-            len,
-        )
+        memcpy(result.unsafe_ptr_mut(), self.unsafe_ptr(), len)
         return result^
 
     fn __repr__(self) -> String:
@@ -823,17 +818,7 @@ struct StringSlice[mut: Bool, //, origin: Origin[mut]](
         """
         return len(self._slice) > 0
 
-    fn __hash__(self) -> UInt:
-        """Hash the underlying buffer using builtin hash.
-
-        Returns:
-            A 64-bit hash value. This value is _not_ suitable for cryptographic
-            uses. Its intended usage is for data structures. See the `hash`
-            builtin documentation for more details.
-        """
-        return hash(self._slice._data, self._slice._len)
-
-    fn __hash__[H: _Hasher](self, mut hasher: H):
+    fn __hash__[H: Hasher](self, mut hasher: H):
         """Updates hasher with the underlying bytes.
 
         Parameters:
@@ -1090,13 +1075,13 @@ struct StringSlice[mut: Bool, //, origin: Origin[mut]](
         Returns:
             The string concatenated `n` times.
         """
-        var result = String()
-        if n <= 0:
-            return result
-        result.reserve(self.byte_length() * n)
+        var string = String()
+        var str_bytes = self.as_bytes()
+        var buffer = _WriteBufferStack(string)
         for _ in range(n):
-            result += self
-        return result
+            buffer.write_bytes(str_bytes)
+        buffer.flush()
+        return string
 
     @always_inline("nodebug")
     fn __merge_with__[
