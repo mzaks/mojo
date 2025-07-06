@@ -79,14 +79,24 @@ fn bench_layer_norm_gpu[
         return gamma.load[width=width](idx[0])
 
     @always_inline
+    @__copy_capture(beta)
+    @parameter
+    fn output_fn[
+        width: Int, rank_: Int, alignment: Int
+    ](idx: IndexList[rank_], val: SIMD[dtype, width]) -> None:
+        data_buf.store[width=width, alignment=alignment](
+            rebind[IndexList[rank]](idx), val
+        )
+
+    @always_inline
     @__copy_capture(shape, beta, epsilon, data_buf)
     @parameter
     fn bench_fn(mut b: Bencher) raises:
         @parameter
         @always_inline
         fn kernel_launch(ctx: DeviceContext) raises:
-            layer_norm_gpu[input_fn, gamma_fn](
-                shape, beta, epsilon, data_buf, ctx=ctx
+            layer_norm_gpu[input_fn, gamma_fn, output_fn](
+                shape, beta, epsilon, ctx=ctx
             )
 
         b.iter_custom[kernel_launch](ctx)
@@ -154,9 +164,11 @@ fn bench_rms_norm_gpu[
     @__copy_capture(data_buf)
     @parameter
     fn identity_output_fn[
-        width: Int
+        width: Int, alignment: Int
     ](idx: IndexList[rank], val: SIMD[dtype, width]) -> None:
-        data_buf.store(idx, val)
+        data_buf.store[width=width, alignment=alignment](
+            rebind[IndexList[rank]](idx), val
+        )
 
     @always_inline
     @__copy_capture(shape, gamma, epsilon, weight_offset)

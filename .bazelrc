@@ -14,7 +14,7 @@ common:linux --repo_env=BAZEL_NO_APPLE_CPP_TOOLCHAIN=1
 # Don't fail on unknown GPUs, add needed GPUs to common.MODULE.bazel
 common --repo_env=MOJO_IGNORE_UNKNOWN_GPUS=1
 
-common --cxxopt=-std=c++17 --host_cxxopt=-std=c++17
+common --cxxopt=-std=c++20 --host_cxxopt=-std=c++20
 
 # https://github.com/bazelbuild/bazel/issues/25145
 info --platforms=
@@ -30,6 +30,10 @@ common --build_runfile_links=false
 # Include full test log in failed tests
 build --test_output=errors
 build --test_summary=terse
+
+# Disable layering check for third parties since we don't care about their
+# layers, and we're not using this ourselves yet.
+build --features=-layering_check --host_features=-layering_check
 
 # Silence warnings in external dependencies used in tests
 build --per_file_copt=external/.*@-w --host_per_file_copt=external/.*@-w

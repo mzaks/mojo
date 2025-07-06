@@ -52,6 +52,7 @@ from layout.tensor_core_async import (
     TensorCoreAsync,
     tile_layout_k_major,
     tile_layout_mn_major,
+    tile_to_descriptor,
 )
 from layout.tma_async import PipelineState, SharedMemBarrier
 from nn.mha_mask import MHAMask, TileMaskStatus
@@ -707,6 +708,7 @@ fn _mha_sm90[
     alias frag_simdwidth = 2
 
     alias a_frag_size = MMA_M * MMA_K // WARP_SIZE
+    # MMA_N0 // MMA_K
     alias frag_ratio = p_frag_size // a_frag_size
 
     alias q_swizzle = TensorMapSwizzle.SWIZZLE_128B
@@ -1034,10 +1036,10 @@ fn _mha_sm90[
         ):
             kv_tile_start_row += BN
 
+        produce_k[False](write_pipeline_states, kv_tile_start_row, position)
+
         var kv_tile_start_row_prev: UInt32 = kv_tile_start_row
         var position_prev: position_t = position
-
-        produce_k[False](write_pipeline_states, kv_tile_start_row, position)
 
         # wait to flip phase, but only bother after producing
         # there isn't any memory we can throttle
@@ -1421,17 +1423,30 @@ fn _mha_sm90[
         var position_prev: position_t = position
         var q_idx_old: UInt32 = q_pipeline_state.index()
         var q_phase_old: UInt32 = q_pipeline_state.phase()
+
         # Consumption order:
         # Preheader: Q0, K0
         # Body: Q1, K1, V0, Q2, K2, V1, ..., Q{-1}, K{-1}, V{-2}
         # Exit: V{-1}
-        kv_tile_start_row += BN
+        @parameter
+        if persistent:
+            kv_tile_start_row += BN
         while True:
-            while kv_tile_start_row < end:
+            while True:
+
+                @parameter
+                if not persistent:
+                    kv_tile_start_row += BN
+                if kv_tile_start_row >= end:
+                    break
+
                 # this loops over num_keys
                 mask_status = position.mask_status(mask, kv_tile_start_row)
                 if mask_status == TileMaskStatus.FULL_MASK:
-                    kv_tile_start_row += BN
+
+                    @parameter
+                    if persistent:
+                        kv_tile_start_row += BN
                     continue
                 p_frag.vectorize[
                     1, a_frag_size
@@ -1558,7 +1573,10 @@ fn _mha_sm90[
 
                     wait_for_p_mul_v(read_idx_v)  # can rw output and pfrag
                     scale_output(score_frag_rowmax)  # scale output
-                kv_tile_start_row += BN
+
+                @parameter
+                if persistent:
+                    kv_tile_start_row += BN
 
             @parameter
             if persistent:

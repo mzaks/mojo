@@ -231,6 +231,7 @@ from tensor_internal import (
     _input_fusion_hook_impl,
     _mixed_precision_input_fusion_hook_impl,
     _mixed_precision_output_fusion_hook_impl,
+    _mixed_precision_compute_output_fusion_hook_impl,
     _output_fusion_hook_impl,
     foreach,
     simd_load_from_managed_tensor_slice,
@@ -772,6 +773,7 @@ fn export():
     alias __output_fusion_hook_impl = _output_fusion_hook_impl
     alias __mixed_precision_input_fusion_hook_impl = _mixed_precision_input_fusion_hook_impl
     alias __mixed_precision_output_fusion_hook_impl = _mixed_precision_output_fusion_hook_impl
+    alias __mixed_precision_compute_output_fusion_hook_impl = _mixed_precision_compute_output_fusion_hook_impl
 
 
 # ===-----------------------------------------------------------------------===#
@@ -3838,7 +3840,7 @@ struct PadConstant:
                 ctx.get_device_context(),
             )
         else:
-            constrained[False, String("Unknown target ") + target]()
+            constrained[False, "Unknown target " + target]()
 
     @staticmethod
     fn shape[
@@ -4088,13 +4090,16 @@ struct LayerNorm:
         rank: Int,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=rank],
+        output: FusedOutputTensor[dtype=dtype, rank=rank],
         input: FusedInputTensor[dtype=dtype, rank=rank],
         gamma: FusedInputTensor[dtype=dtype, rank=1],
         beta: InputTensor[dtype=dtype, rank=1],
         epsilon: Scalar[dtype=dtype],
         ctx: DeviceContextPtr,
     ) capturing raises:
+        if output.shape() != input.shape():
+            raise Error("Input and output buffers are not same shape")
+
         @parameter
         @always_inline
         fn input_fn[
@@ -4111,15 +4116,23 @@ struct LayerNorm:
         ](coords: IndexList[_rank]) -> SIMD[dtype, width]:
             return gamma._lambda_load[width=width](rebind[IndexList[1]](coords))
 
-        var beta_buf = managed_tensor_slice_to_ndbuffer(beta)
-        var output_buf = managed_tensor_slice_to_ndbuffer(output)
+        @parameter
+        @always_inline
+        fn output_fn[
+            width: Int, _rank: Int, alignment: Int
+        ](coords: IndexList[_rank], val: SIMD[dtype, width]):
+            output._lambda_store[width=width, element_alignment=alignment](
+                rebind[IndexList[output.rank]](coords),
+                rebind[SIMD[output.dtype, width]](val),
+            )
 
-        layer_norm[dtype, rank, input_fn, gamma_fn, target=target](
+        var beta_buf = managed_tensor_slice_to_ndbuffer(beta)
+
+        layer_norm[dtype, rank, input_fn, gamma_fn, output_fn, target=target](
             input.shape(),
             gamma.shape(),
             beta_buf,
             epsilon,
-            output_buf,
             ctx,
         )
 
@@ -4145,13 +4158,16 @@ struct RMSNorm:
         target: StaticString,
         multiply_before_cast: Bool = True,
     ](
-        output: OutputTensor[dtype=dtype, rank=rank],
+        output: FusedOutputTensor[dtype=dtype, rank=rank],
         input: FusedInputTensor[dtype=dtype, rank=rank],
         gamma: InputTensor[dtype=dtype, rank=1],
         epsilon: Scalar[dtype=dtype],
         weight_offset: Scalar[dtype=dtype],
         ctx: DeviceContextPtr,
     ) capturing raises:
+        if output.shape() != input.shape():
+            raise Error("Input and output buffers are not same shape")
+
         @parameter
         @always_inline
         fn input_fn[
@@ -4161,13 +4177,23 @@ struct RMSNorm:
                 rebind[IndexList[input.rank]](coords)
             )
 
+        @parameter
+        @always_inline
+        fn output_fn[
+            width: Int, _rank: Int, alignment: Int
+        ](coords: IndexList[_rank], val: SIMD[dtype, width]):
+            output._lambda_store[width=width, element_alignment=alignment](
+                rebind[IndexList[output.rank]](coords),
+                rebind[SIMD[output.dtype, width]](val),
+            )
+
         var gamma_buf = managed_tensor_slice_to_ndbuffer(gamma)
-        var output_buf = managed_tensor_slice_to_ndbuffer(output)
 
         rms_norm[
             dtype,
             rank,
             input_fn,
+            output_fn,
             target=target,
             multiply_before_cast=multiply_before_cast,
         ](
@@ -4175,7 +4201,6 @@ struct RMSNorm:
             gamma_buf,
             epsilon,
             weight_offset,
-            output_buf,
             ctx,
         )
 

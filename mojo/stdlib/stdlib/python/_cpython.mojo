@@ -34,10 +34,6 @@ from sys.ffi import (
     c_uint,
 )
 
-from python.bindings import (
-    Typed_initproc,
-    Typed_newfunc,
-)
 
 alias Py_ssize_t = c_ssize_t
 alias Py_hash_t = Py_ssize_t
@@ -399,13 +395,24 @@ alias Py_tp_methods = 64
 alias Py_tp_new = 65
 alias Py_tp_repr = 66
 
-# Slot Type typedefs
 # https://docs.python.org/3/c-api/typeobj.html#slot-type-typedefs
 
 alias destructor = fn (PyObjectPtr) -> None
 """`typedef void (*destructor)(PyObject*)`"""
 alias reprfunc = fn (PyObjectPtr) -> PyObjectPtr
 """`typedef PyObject *(*reprfunc)(PyObject*)`"""
+alias Typed_initproc = fn (
+    PyObjectPtr,
+    PyObjectPtr,
+    PyObjectPtr,  # NULL if no keyword arguments were passed
+) -> c_int
+"""`typedef int (*initproc)(PyObject*, PyObject*, PyObject*)`"""
+alias Typed_newfunc = fn (
+    PyTypeObjectPtr,
+    PyObjectPtr,
+    PyObjectPtr,
+) -> PyObjectPtr
+"""`typedef PyObject *(*newfunc)(PyTypeObject*, PyObject*, PyObject*)`"""
 
 
 @fieldwise_init
@@ -1310,7 +1317,7 @@ struct CPython(Copyable, Defaultable, Movable):
         self._inc_total_rc()
         return r
 
-    fn PyImport_AddModule(self, owned name: String) -> PyObjectPtr:
+    fn PyImport_AddModule(self, var name: String) -> PyObjectPtr:
         """[Reference](
         https://docs.python.org/3/c-api/import.html#c.PyImport_AddModule).
         """
@@ -1428,7 +1435,7 @@ struct CPython(Copyable, Defaultable, Movable):
     # Python Evaluation
     # ===-------------------------------------------------------------------===#
 
-    fn PyRun_SimpleString(self, owned str: String) -> Bool:
+    fn PyRun_SimpleString(self, var str: String) -> Bool:
         """Executes the given Python code.
 
         Args:

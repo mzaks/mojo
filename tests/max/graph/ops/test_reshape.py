@@ -1,7 +1,14 @@
 # ===----------------------------------------------------------------------=== #
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
-# This file is Modular Inc proprietary.
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
 #
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ===----------------------------------------------------------------------=== #
 """Test the max.graph Python bindings."""
 
@@ -11,6 +18,7 @@ import pytest
 from conftest import shapes, static_dims, symbolic_dims, tensor_types
 from hypothesis import assume, example, given
 from hypothesis import strategies as st
+from max.driver import CPU
 from max.dtype import DType
 from max.graph import DeviceRef, Dim, Graph, Shape, StaticDim, TensorType
 
@@ -209,3 +217,52 @@ def test_reshape__can_reshape_single_element_tensors(
         assert out.dtype == input_type.dtype
         assert out.shape == output_shape
         graph.output(out)
+
+
+def test_MAXPLAT_328():
+    input_type = TensorType(
+        DType.float32, ["n_patches", 2048], DeviceRef.from_device(CPU())
+    )
+    with Graph("test_MAXPLAT_328", input_types=[input_type]) as graph:
+        (x,) = graph.inputs
+        x = x.tensor.rebind([Dim("n_patches_over_4") * 4, 2048])
+        n_patches, _ = x.shape
+        graph.output(x.reshape([n_patches // 4, 4, 2048]))
+
+
+def test_MAXPLAT_328_no_new_parameter():
+    input_type = TensorType(
+        DType.float32, ["n_patches", 2048], DeviceRef.from_device(CPU())
+    )
+    with Graph("test_MAXPLAT_328", input_types=[input_type]) as graph:
+        (x,) = graph.inputs
+        n_patches, _ = x.tensor.shape
+        x = x.tensor.rebind([(n_patches // 4) * 4, 2048])
+        graph.output(x.reshape([n_patches // 4, 4, 2048]))
+
+
+@pytest.mark.skip("MAXPLAT-330: This is currently a compile-time error")
+def test_reshape_statically_known_impossible_shape():
+    input_type = TensorType(
+        DType.float32, [7, 4], device=DeviceRef.from_device(CPU())
+    )
+
+    with Graph("reshape", input_types=[input_type]) as graph:
+        (x,) = graph.inputs
+        x = x.tensor.rebind([Dim("n_patches_over_4") * 4, 4])
+        n_patches, _ = x.shape
+        with pytest.raises(Exception):
+            x.reshape([n_patches // 4, 4, 4])
+
+
+@pytest.mark.skip(
+    "MAXPLAT-329: Point users towards using a rebind before reshape"
+)
+def test_reshape_needs_rebind_error_message():
+    input_type = TensorType(
+        DType.float32, ["n_patches", 2048], DeviceRef.from_device(CPU())
+    )
+    with Graph("test_MAXPLAT_329", input_types=[input_type]) as graph:
+        (x,) = graph.inputs
+        n_patches, _ = x.tensor.shape
+        graph.output(x.tensor.reshape([n_patches // 4, 4, 2048]))

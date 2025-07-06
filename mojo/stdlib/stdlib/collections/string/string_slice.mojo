@@ -74,7 +74,7 @@ from memory import Span, memcmp, memcpy, pack_bits
 from memory.memory import _memcmp_impl_unconstrained
 from python import Python, PythonConvertible, PythonObject
 
-from utils.write import _WriteBufferStack
+from utils.write import _WriteBufferStack, _TotalWritableBytes
 
 alias StaticString = StringSlice[StaticConstantOrigin]
 """An immutable static string slice."""
@@ -857,7 +857,7 @@ struct StringSlice[mut: Bool, //, origin: Origin[mut]](
         debug_assert(span.step.or_else(1) == 1, "Slice step must be 1")
         return Self(unsafe_from_utf8=self._slice[span])
 
-    fn to_python_object(owned self) raises -> PythonObject:
+    fn to_python_object(var self) raises -> PythonObject:
         """Convert this value to a PythonObject.
 
         Returns:
@@ -907,6 +907,17 @@ struct StringSlice[mut: Bool, //, origin: Origin[mut]](
             If the `StringSlice` is equal to the input in length and contents.
         """
         return Self.__eq__(self, rhs=rhs_same)
+
+    fn __eq__(self, rhs: String) -> Bool:
+        """Verify if a `StringSlice` is equal to another `String`.
+
+        Args:
+            rhs: The `StringSlice` to compare against.
+
+        Returns:
+            If the `StringSlice` is equal to the input in length and contents.
+        """
+        return self == rhs.as_string_slice()
 
     # This decorator informs the compiler that indirect address spaces are not
     # dereferenced by the method.
@@ -2178,7 +2189,7 @@ struct StringSlice[mut: Bool, //, origin: Origin[mut]](
         return result
 
     fn join[
-        T: Copyable & Movable & Writable
+        T: Copyable & Movable & Writable, //,
     ](self, elems: List[T, *_]) -> String:
         """Joins string elements using the current string as a delimiter.
 
@@ -2191,15 +2202,32 @@ struct StringSlice[mut: Bool, //, origin: Origin[mut]](
 
         Returns:
             The joined string.
+
+        Notes:
+            - Defaults to writing directly to the string if the bytes
+            fit in an inline `String`, otherwise will process it by chunks.
         """
-        var string = String()
-        var buffer = _WriteBufferStack(string)
-        for i in range(len(elems)):
-            buffer.write(elems[i])
-            if i < len(elems) - 1:
-                buffer.write(self)
+        if len(elems) == 0:
+            return String()
+
+        var sep = StaticString(ptr=self.unsafe_ptr(), length=self.byte_length())
+        var total_bytes = _TotalWritableBytes(elems, sep=sep).size
+        var result = String(capacity=total_bytes)
+
+        if result._is_inline():
+            # Write directly to the stack address
+            result.write(elems[0])
+            for i in range(1, len(elems)):
+                result.write(self, elems[i])
+            return result^
+
+        var buffer = _WriteBufferStack(result)
+
+        buffer.write(elems[0])
+        for i in range(1, len(elems)):
+            buffer.write(self, elems[i])
         buffer.flush()
-        return string
+        return result^
 
     # TODO(MOCO-1791): The corresponding String.__init__ is limited to
     # StaticString. This is because default arguments and param inference aren't

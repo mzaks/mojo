@@ -53,6 +53,29 @@ what we publish.
   problem. If you run into this, rework the code to materialize the full object
   (e.g. the String) to runtime explicitly.
 
+- `StringLiteral` now automatically materializes to a `String` when used at
+  runtime:
+
+  ```mojo
+  alias param = "foo"        # type = StringLiteral
+  var runtime_value = "bar"  # type = String
+  var runtime_value2 = param # type = String
+  ```
+
+  This enables all the behavior users expect without having to convert
+  or annotate types, for example:
+
+  ```mojo
+  var string = "hello"
+  string += " world"
+
+  var if_result = "foo" if True else "bar"
+  ```
+
+Initializing a `String` from a `StringLiteral` initially points to static
+constant memory, and does not perform SSO or allocate until the first
+mutation.
+
 ### Language changes
 
 - The `@value` decorator has been formally deprecated with a warning, it will
@@ -61,6 +84,12 @@ what we publish.
 
 - Implicit trait conformance is removed. All conformances must be explicitly
   declared.
+
+- The `owned` argument convention is being renamed to `var`. This reflects that
+  `var` is used consistently for a "named, scoped, owning of a value" already
+  which is exactly what the `owned` convention does.  In this release, both
+  `var` and `owned` are allowed in an argument list, but `owned` will be removed
+  in a subsequent release, so please move your code over.
 
 ### Standard library changes
 
@@ -85,8 +114,11 @@ what we publish.
 
 - Python interop changes:
 
-  - The `PythonTypeBuilder` utility now allows registering bindings for Python
-    static methods, i.e. methods that don't require an instance of the class.
+  - The `PythonTypeBuilder` utility now allows:
+    - registering bindings for Python static methods, i.e. methods that don't
+      require an instance of the class.
+    - registering initializers that take arguments. Types no longer need to be
+      `Defaultable` to be exposed and created from Python.
 
 - Added `Iterator` trait for modeling types that produce a sequence of values.
 
@@ -101,6 +133,10 @@ what we publish.
 
   `Iterator` does not currently have a variant for supporting iteration over
   borrowed `ref` values.
+
+- `InlineArray` can now be constructed with a size of 0. This makes it easier to
+  use `InlineArray` in situations where the number of elements is generic and
+  could also be 0.
 
 ### Tooling changes
 
@@ -130,3 +166,9 @@ what we publish.
 
 - [#4499](https://github.com/modular/modular/issues/4499) - Traits with
   `ref self` cause issues when used as parameter.
+
+- [#4911](https://github.com/modular/modular/issues/4911) - `InlineArray`
+  now calls the move constructor for its elements when moved.
+
+- [#3927](https://github.com/modular/modular/issues/3927) - `InlineArray`
+  now can be constructed with a size of 0.

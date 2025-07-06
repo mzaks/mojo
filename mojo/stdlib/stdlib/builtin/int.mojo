@@ -86,7 +86,7 @@ fn index[T: Indexer](idx: T, /) -> __mlir_type.index:
 # ===----------------------------------------------------------------------=== #
 
 
-trait Intable(Copyable, Movable):
+trait Intable:
     """The `Intable` trait describes a type that can be converted to an Int.
 
     Any type that conforms to `Intable` or
@@ -1159,7 +1159,7 @@ struct Int(
     # Methods
     # ===-------------------------------------------------------------------===#
 
-    fn to_python_object(owned self) raises -> PythonObject:
+    fn to_python_object(var self) raises -> PythonObject:
         """Convert this value to a PythonObject.
 
         Returns:

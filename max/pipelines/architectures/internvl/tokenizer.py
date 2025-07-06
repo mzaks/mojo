@@ -37,6 +37,41 @@ IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
+class InternVLImageConfig:
+    """InternVL image-specific configuration values for processing and memory estimation."""
+
+    num_image_token: int
+    """Number of tokens per image patch."""
+
+    max_dynamic_patch: int
+    """Maximum number of dynamic patches."""
+
+    image_size: int
+    """Size of input images."""
+
+    patch_size: int
+    """Size of each patch."""
+
+    def __init__(self, config: AutoConfig) -> None:
+        """Initialize from HuggingFace model configuration.
+
+        Args:
+            config: HuggingFace model configuration
+        """
+        vision_config = config.vision_config
+
+        # Get configuration values with defaults.
+        self.image_size = getattr(vision_config, "image_size", 448)
+        self.patch_size = getattr(vision_config, "patch_size", 14)
+        self.max_dynamic_patch = getattr(config, "max_dynamic_patch", 12)
+        downsample_ratio = getattr(config, "downsample_ratio", 0.5)
+
+        # Calculate number of image tokens per patch.
+        self.num_image_token = int(
+            (self.image_size // self.patch_size) ** 2 * (downsample_ratio**2)
+        )
+
+
 def find_closest_aspect_ratio(
     aspect_ratio: float,
     target_ratios: list[tuple[int, int]],
@@ -264,21 +299,16 @@ class InternVLProcessor:
         self.tokenizer = tokenizer
         self.config = config
 
-        # InternVL configuration
-        self.image_size = getattr(config.vision_config, "image_size", 448)
-        self.max_dynamic_patch = getattr(config, "max_dynamic_patch", 12)
+        # Extract InternVL image configuration
+        image_config = InternVLImageConfig(config)
+        self.image_size = image_config.image_size
+        self.max_dynamic_patch = image_config.max_dynamic_patch
+        self.num_image_token = image_config.num_image_token
 
         # Image token configuration
         self.IMG_START_TOKEN = "<img>"
         self.IMG_END_TOKEN = "</img>"
         self.IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
-
-        # Calculate number of image tokens per patch
-        patch_size = getattr(config.vision_config, "patch_size", 14)
-        downsample_ratio = getattr(config, "downsample_ratio", 0.5)
-        self.num_image_token = int(
-            (self.image_size // patch_size) ** 2 * (downsample_ratio**2)
-        )
 
     def apply_chat_template(
         self,
@@ -371,8 +401,26 @@ class InternVLProcessor:
                     "<|image|>", image_tokens, 1
                 )
             else:
-                # If no <image> placeholder, prepend to text
-                processed_text = image_tokens + "\n" + processed_text
+                # If no <image> placeholder, find the last user prompt and
+                # insert the image tokens at the beginning of it.
+                user_prompt_start = "<|im_start|>user\n"
+                last_user_prompt_idx = processed_text.rfind(user_prompt_start)
+
+                if last_user_prompt_idx != -1:
+                    # Insert after "<|im_start|>user\n"
+                    insertion_point = last_user_prompt_idx + len(
+                        user_prompt_start
+                    )
+                    processed_text = (
+                        processed_text[:insertion_point]
+                        + image_tokens
+                        + "\n"
+                        + processed_text[insertion_point:]
+                    )
+                else:
+                    # Fallback for plain text prompts (no chat template)
+                    # or if no user turn is present.
+                    processed_text = image_tokens + "\n" + processed_text
 
             image_array = preprocess_image_to_tensor(
                 image,
