@@ -623,7 +623,7 @@ def main():
 
     var m = Bench(
         BenchConfig(
-            out_file=_dir_of_current_file() / "bench_dict_string.csv",
+            # out_file=_dir_of_current_file() / "bench_dict_string.csv",
             num_repetitions=5,
         )
     )
