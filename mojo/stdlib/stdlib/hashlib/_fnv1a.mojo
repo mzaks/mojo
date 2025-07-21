@@ -16,7 +16,7 @@
 from .hasher import Hasher
 
 
-struct Fnv1a(Defaultable, Hasher, Copyable):
+struct Fnv1a(Copyable, Defaultable, Hasher):
     """Fnv1a is a very simple algorithm with good quality, but sub optimal runtime for long inputs.
     It can be used for comp time hash value generation.
 

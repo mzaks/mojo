@@ -17,14 +17,17 @@ from sys import is_compile_time
 alias default_hasher = DefaultHasher
 alias default_comp_time_hasher = Fnv1a
 
+
 struct DefaultHasher(Hasher):
     """
     DefaultHasher is a workaround type that delegates to AHasher at runtime and Fnv1a at compile time.
     This is necessary because AHasher is not yet usable at compile time. Once AHasher supports compile-time
     usage, this struct can be removed in favor of using AHasher directly.
     """
+
     var _ahasher: AHasher[SIMD[DType.uint64, 4](0)]
     var _fnv1a: Fnv1a
+
     fn __init__(out self):
         self._ahasher = AHasher[SIMD[DType.uint64, 4](0)]()
         self._fnv1a = Fnv1a()
@@ -60,9 +63,9 @@ struct DefaultHasher(Hasher):
         @parameter
         if is_compile_time():
             var hasher = self._fnv1a
-            return hasher^.finish() 
+            return hasher^.finish()
         else:
-            var hasher = self._ahasher 
+            var hasher = self._ahasher
             return hasher^.finish()
 
 
