@@ -120,7 +120,7 @@ struct KeysContainer[KeyEndType: DType = DType.uint32](Sized):
         self.keys_end.free()
 
     @always_inline
-    fn add(mut self, key: String):
+    fn add(mut self, key: StringSlice):
         var prev_end = 0 if self.count == 0 else self.keys_end[self.count - 1]
         var key_length = len(key)
         var new_end = prev_end + key_length
@@ -288,10 +288,10 @@ struct StringDict[
         return self.count
 
     @always_inline
-    fn __contains__(self, key: String) -> Bool:
+    fn __contains__(self, key: StringSlice) -> Bool:
         return self._find_key_index(key) != 0
 
-    fn put(mut self, key: String, value: V):
+    fn put(mut self, key: StringSlice, value: V):
         if self.count / self.capacity >= 0.87:
             self._rehash()
 
@@ -428,7 +428,7 @@ struct StringDict[
             self.key_hashes = key_hashes
         old_slot_to_index.free()
 
-    fn get(self, key: String, default: V) -> V:
+    fn get(self, key: StringSlice, default: V) -> V:
         var key_index = self._find_key_index(key)
         if key_index == 0:
             return default
@@ -439,7 +439,7 @@ struct StringDict[
                 return default
         return self.values[key_index - 1]
 
-    fn delete(mut self, key: String):
+    fn delete(mut self, key: StringSlice):
         @parameter
         if not destructive:
             return
@@ -451,7 +451,7 @@ struct StringDict[
             self.count -= 1
         self._deleted(key_index - 1)
 
-    fn upsert(mut self, key: String, update: fn (value: Optional[V]) -> V):
+    fn upsert(mut self, key: StringSlice, update: fn (value: Optional[V]) -> V):
         var key_index = self._find_key_index(key)
         if key_index == 0:
             var value = update(None)
@@ -478,7 +478,7 @@ struct StringDict[
         self.count = 0
 
     @always_inline
-    fn _find_key_index(self, key: String) -> Int:
+    fn _find_key_index(self, key: StringSlice) -> Int:
         var key_hash = hash(key).cast[KeyCountType]()
         var modulo_mask = self.capacity - 1
 
