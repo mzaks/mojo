@@ -292,7 +292,7 @@ struct StringDict[
         return self._find_key_index(key) != 0
 
     fn put(mut self, key: StringSlice, value: V):
-        if self.count.cast[Float64]() / self.capacity >= 0.87:
+        if self.count >= self.capacity - (self.capacity >> 3):
             self._rehash()
 
         var key_hash = hash(key).cast[KeyCountType]()
@@ -518,8 +518,7 @@ fn bench_dict_init_with_short_keys[file_name: String](mut b: Bencher) raises:
         var d = Dict[String, Int]()
         for i in range(len(keys)):
             d[keys[i]] = i
-        keep(d._entries.data)
-        keep(d._index.data)
+        keep(d._entries.unsafe_ptr())
 
     b.iter[call_fn]()
 
@@ -534,8 +533,7 @@ fn bench_dict_init_with_long_keys[file_name: String](mut b: Bencher) raises:
         var d = Dict[String, Int, default_hasher]()
         for i in range(len(keys)):
             d[keys[i]] = i
-        keep(d._entries.data)
-        keep(d._index.data)
+        keep(d._entries.unsafe_ptr())
 
     b.iter[call_fn]()
 
@@ -556,7 +554,6 @@ fn bench_string_dict_init_with_short_keys[
         for i in range(len(keys)):
             d.put(keys[i], i)
         keep(d.keys.keys)
-        keep(d.values.data)
 
     b.iter[call_fn]()
 
@@ -574,7 +571,6 @@ fn bench_string_dict_init_with_long_keys[
         for i in range(len(keys)):
             d.put(keys[i], i)
         keep(d.keys.keys)
-        keep(d.values.data)
 
     b.iter[call_fn]()
 
