@@ -145,7 +145,7 @@ struct KeysContainer[KeyEndType: DType = DType.uint32](Sized):
         if count >= self.capacity:
             var new_capacity = self.capacity + (self.capacity >> 1)
             var keys_end = UnsafePointer[SIMD[KeyEndType, 1]].alloc(
-                self.allocated_bytes
+                new_capacity
             )
             memcpy(keys_end, self.keys_end, self.capacity)
             self.keys_end.free()
