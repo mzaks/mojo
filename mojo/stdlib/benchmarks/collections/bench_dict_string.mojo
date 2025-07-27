@@ -104,7 +104,7 @@ struct KeysContainer[KeyEndType: DType = DType.uint32](Sized):
         self.keys = UnsafePointer[UInt8].alloc(self.allocated_bytes)
         memcpy(self.keys, existing.keys, self.allocated_bytes)
         self.keys_end = UnsafePointer[Scalar[KeyEndType]].alloc(
-            self.allocated_bytes
+            self.capacity
         )
         memcpy(self.keys_end, existing.keys_end, self.capacity)
 
