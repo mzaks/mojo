@@ -292,7 +292,7 @@ struct StringDict[
         return self._find_key_index(key) != 0
 
     fn put(mut self, key: StringSlice, value: V):
-        if self.count / self.capacity >= 0.87:
+        if self.count.cast[Float64]() / self.capacity >= 0.87:
             self._rehash()
 
         var key_hash = hash(key).cast[KeyCountType]()
