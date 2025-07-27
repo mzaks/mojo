@@ -50,7 +50,7 @@ fn make_small_keys(filename: String = "UN_charter_EN.txt") -> List[String]:
 
 
 # ===-----------------------------------------------------------------------===#
-# Benchmark Data
+# Long Key Data
 # ===-----------------------------------------------------------------------===#
 fn make_long_keys(filename: String = "UN_charter_EN.txt") -> List[String]:
     """Make a `String` made of items in the `./data` directory.
