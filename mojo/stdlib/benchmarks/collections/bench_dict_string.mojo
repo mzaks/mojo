@@ -103,9 +103,7 @@ struct KeysContainer[KeyEndType: DType = DType.uint32](Sized):
         self.capacity = existing.capacity
         self.keys = UnsafePointer[UInt8].alloc(self.allocated_bytes)
         memcpy(self.keys, existing.keys, self.allocated_bytes)
-        self.keys_end = UnsafePointer[Scalar[KeyEndType]].alloc(
-            self.capacity
-        )
+        self.keys_end = UnsafePointer[Scalar[KeyEndType]].alloc(self.capacity)
         memcpy(self.keys_end, existing.keys_end, self.capacity)
 
     fn __moveinit__(out self, owned existing: Self):
