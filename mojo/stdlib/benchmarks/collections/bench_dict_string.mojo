@@ -186,7 +186,7 @@ struct KeysContainer[KeyEndType: DType = DType.uint32](Sized):
     fn print_keys(self):
         print("(" + String(self.count) + ")[", end="")
         for i in range(self.count):
-            var end = ", " if i < self.capacity - 1 else ""
+            var end = ", " if i < self.count - 1 else ""
             print(self[i], end=end)
         print("]")
 
