@@ -462,6 +462,8 @@ struct StringDict[
             @parameter
             if destructive:
                 if self._is_deleted(key_index):
+                    self.count += 1
+                    self._not_deleted(key_index)
                     self.values[key_index] = update(None)
                     return
 
