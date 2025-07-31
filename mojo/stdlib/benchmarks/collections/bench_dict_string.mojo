@@ -21,6 +21,7 @@ from benchmark import (
     keep,
     run,
 )
+from collections.string.string_slice import _to_string_list
 from hashlib import default_comp_time_hasher, default_hasher
 from memory import memcpy, memset_zero
 from os import abort
@@ -43,7 +44,7 @@ fn make_small_keys(filename: String = "UN_charter_EN.txt") -> List[String]:
         directory = _dir_of_current_file() / "data"
         var f = open(directory / filename, "r")
         var content = f.read()
-        return content.split()
+        return _to_string_list(content.split())
     except e:
         print(e, file=stderr)
     return abort[List[String]]()
@@ -63,7 +64,7 @@ fn make_long_keys(filename: String = "UN_charter_EN.txt") -> List[String]:
         directory = _dir_of_current_file() / "data"
         var f = open(directory / filename, "r")
         var content = f.read()
-        return content.split("\n")
+        return _to_string_list(content.split("\n"))
     except e:
         print(e, file=stderr)
     return abort[List[String]]()
