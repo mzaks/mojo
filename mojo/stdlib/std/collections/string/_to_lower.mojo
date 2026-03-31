@@ -527,6 +527,9 @@ def lower_utf8[ascii_optimized: Bool = True](s: String) -> String:
         A new `String` with all characters converted to lowercase.
     """
     comptime SIMD_WIDTH = 8
+    # The width is set to 8 bytes based on performance benchmark for pure ASCII examples
+    # and with examples where ASCII is mixed with non ASCII characters.
+    # It is imaginable to promote SIMD_WIDTH from constant to be a function parameter.
     var byte_len = s.byte_length()
     var result = String(capacity=byte_len // 2 * 3 + 1)
     var offset = 0
