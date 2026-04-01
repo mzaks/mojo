@@ -25,7 +25,7 @@ from std.sys import align_of, size_of
 from std.utils._nicheable import UnsafeSingleNicheable
 
 
-struct _Null[address_space: AddressSpace](
+struct _Null[address_space: AddressSpace = AddressSpace.GENERIC](
     Defaultable, Intable, TrivialRegisterPassable
 ):
     comptime _mlir_type = __mlir_type[
@@ -144,6 +144,9 @@ struct NonNullUnsafePointer[
         comptime assert (
             size_of[type_of(self)]() == size_of[Int]()
         ), "Pointer/Int size mismatch"
+        assert unsafe_from_address != Int(
+            _Null[Self.address_space]()
+        ), "cannot create a non-null pointer from the null address"
         self = NonNullUnsafePointer(to=unsafe_from_address).bitcast[
             type_of(self)
         ]()[]
@@ -1002,3 +1005,37 @@ def bitcast[
     return NonNullUnsafePointer(to=pointer).bitcast[
         Optional[NonNullUnsafePointer[To, origin]]
     ]()[]
+
+
+@always_inline
+def unsafe_origin_cast[
+    T: AnyType,
+    from_origin: Origin,
+    address_space: AddressSpace,
+    //,
+    to_origin: Origin,
+](
+    pointer: Optional[
+        NonNullUnsafePointer[T, from_origin, address_space=address_space]
+    ]
+) -> Optional[NonNullUnsafePointer[T, to_origin, address_space=address_space]]:
+    try:
+        return (
+            pointer[]
+            .unsafe_mut_cast[to_origin.mut]()
+            .unsafe_origin_cast[to_origin]()
+        )
+    except:
+        return {}
+
+
+@always_inline
+def address_of[
+    T: AnyType,
+    origin: Origin,
+    //,
+](pointer: Optional[NonNullUnsafePointer[T, origin]]) -> Int:
+    try:
+        return Int(pointer[])
+    except:
+        return Int(_Null())

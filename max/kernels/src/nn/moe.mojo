@@ -30,15 +30,17 @@ from std.gpu import (
     lane_id_uint as lane_id,
     thread_idx_uint as thread_idx,
 )
-from std.gpu.primitives.grid_controls import PDL, pdl_launch_attributes
+from std.gpu.primitives.grid_controls import (
+    PDL,
+    PDLLevel,
+    pdl_launch_attributes,
+)
 from std.gpu.host.info import is_gpu
 from layout import (
     Coord,
-    CoordLike,
     Idx,
     TensorLayout,
     TileTensor,
-    coord_to_index_list,
     row_major,
     stack_allocation as tensor_alloc,
 )
@@ -631,7 +633,7 @@ def moe_create_indices_bucket_group_kernel[
     expert_usage_stats: contains two values, the maximum number of tokens assigned to any expert and the
     number of active experts. For our example the stats would be [2, 5]
 
-    restore_token_order: a 1D tensor where each index represents a cooresponding token and holds the new index of the token
+    restore_token_order: a 1D tensor where each index represents a corresponding token and holds the new index of the token
     in the token_expert_order tensor. For our example the restore_token_order would be [0, 2, 1, 3, 4, 5]
     """
 
@@ -1128,5 +1130,5 @@ def router_group_limited[
             routed_scaling_factor,
             grid_dim=expert_scores.dim(0),
             block_dim=num_threads,
-            attributes=pdl_launch_attributes(),
+            attributes=pdl_launch_attributes(PDLLevel(1)),
         )

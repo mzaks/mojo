@@ -20,7 +20,6 @@ from std.gpu import global_idx_uint as global_idx
 from std.gpu.host import DeviceContext
 from std.testing import assert_equal
 
-from std.utils.index import Index
 from std.sys import has_apple_gpu_accelerator
 from layout import TileTensor, Idx, row_major
 
@@ -64,7 +63,7 @@ def mandelbrot(out_ptr: UnsafePointer[Scalar[int_type], MutAnyOrigin]):
     if row >= height:
         return
 
-    var out = TileTensor(out_ptr, row_major((Idx(height), Idx(width))))
+    var out = TileTensor(out_ptr, row_major(Idx(height), Idx(width)))
 
     comptime scale_x = (max_x - min_x) / width
     comptime scale_y = (max_y - min_y) / height

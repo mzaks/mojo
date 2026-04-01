@@ -12,60 +12,39 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.collections import OptionalReg
-from std.math import ceildiv, recip
+from std.math import ceildiv
 from std.math.constants import log2e
 
-from std.sys import size_of, simd_width_of
-from std.sys.info import _cdna_4_or_newer
+from std.sys import size_of
 from std.sys.intrinsics import _type_is_eq
 from std.sys._assembly import inlined_assembly
-from std.algorithm.functional import unswitch
 from std.gpu import (
-    barrier,
     block_idx_int as block_idx,
     lane_id_uint as lane_id,
     thread_idx_uint as thread_idx,
 )
-from std.gpu import warp_id as get_warp_id
 from layout import Layout, LayoutTensor, UNKNOWN_VALUE
-from layout.layout import blocked_product
-from layout._utils import idx2crd, make_amd_buffer_resource
-from layout.layout_tensor import (
-    ThreadScope,
-    copy_dram_to_local,
-    copy_local_to_dram,
-)
-from std.memory import bitcast
-from std.sys.intrinsics import readfirstlane
-from nn.mha_mask import CausalMask, MASK_VALUE, MaterializedMask
-from layout.swizzle import Swizzle
+from layout._utils import idx2crd
+from layout.layout_tensor import ThreadScope, copy_local_to_dram
+from nn.attention.mha_mask import CausalMask
 from layout.tensor_core import TiledTensorCore, num_matrix_reg
-from std.memory.pointer import AddressSpace as BaseAddressSpace
-from nn.mha_mask import MHAMask, TileMaskStatus
-from nn.mha_operand import MHAOperand
-from nn.mha_utils import (
-    MHAConfig,
-    _kernel_mask,
-    get_start_and_end_for_partitions,
-)
+from nn.attention.mha_mask import MHAMask, TileMaskStatus
+from nn.attention.mha_operand import MHAOperand
+from nn.attention.mha_utils import MHAConfig, _kernel_mask
 from .softmax import Softmax
 from std.sys import _RegisterPackType
 from std.utils import Index, IndexList
 from std.utils.numerics import get_accum_type, min_or_neg_inf
 
 from .buffers import (
-    KBuffer,
     KVBuffer,
     OutputRegisterBuffer,
     PRegisterBuffer,
     QRegisterBuffer,
-    VBuffer,
-    VBufferTransposeLoads,
 )
 from .mma import mma
 from .utils import (
     GlobalMemoryManager,
-    LocalLayoutTensor,
     SharedLayoutTensor,
     SharedMemoryManager,
     copy_local_to_dram2,
@@ -709,27 +688,7 @@ struct Attention[
 
         comptime is_causal_mask = _type_is_eq[Self.mask_t, CausalMask]()
 
-        comptime if not is_causal_mask or (
-            not Self.attention_config_t.double_buffer
-        ):
-            # using double buffer as proxy for the experimental kernel,
-            # using readfirstlane for the gfx942 kernel leads to incorrect results.
-            # This needs more investigation.
-            # Disable inline asm for all other masks except causal mask,
-            # Inline asm was generating bad code for the MaterializedMask,
-            # and for now we only care about the performance of the causal mask.
-            self.scale = scale_log2e
-        else:
-            self.scale = inlined_assembly[
-                "v_readfirstlane_b32 $0, $1",
-                Scalar[Self.accum_type],
-                constraints="=s,v",
-            ](scale_log2e)
-            # readfirstlane does not work without inline asm
-            # bitcast[Self.accum_type](
-            #     readfirstlane(bitcast[DType.int32](Float32(scale_log2e)))
-            # )
-
+        self.scale = scale_log2e
         self.seq_len = seq_len
         self.num_keys = num_keys
         self.start_pos = start_pos

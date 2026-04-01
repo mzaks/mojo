@@ -18,14 +18,8 @@ incoming neighbors were visited in the previous level. If so, the vertex
 marks itself as visited at the current level.
 """
 
-from std.gpu import (
-    block_dim_uint as block_dim,
-    block_idx_uint as block_idx,
-    grid_dim,
-    thread_idx_uint as thread_idx,
-)
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
 from std.os import Atomic
 from std.collections import List
 
@@ -49,7 +43,7 @@ def bfs_kernel(
     curr_level: UInt32,
 ):
     """BFS kernel: vertex-centric pull-based traversal using CSC graph."""
-    var vertex = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var vertex = block_idx.x * block_dim.x + thread_idx.x
 
     if vertex < num_vertices:
         if level[vertex] == UNVISITED:

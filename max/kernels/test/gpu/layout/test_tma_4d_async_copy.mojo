@@ -30,7 +30,6 @@ from layout.tma_async import (
     TMATensorTile,
     _idx_product,
     create_tensor_tile,
-    create_tma_tile,
 )
 from std.memory import stack_allocation
 from std.testing import assert_equal
@@ -85,8 +84,7 @@ def test_tma_4d_load_kernel[
         address_space=AddressSpace.SHARED,
         alignment=8,
     ]()
-    idx0 = Int(block_idx.z) // grid_dim1
-    idx1 = Int(block_idx.z) % grid_dim1
+    idx0, idx1 = divmod(Int(block_idx.z), grid_dim1)
     idx2 = Int(block_idx.y)
     idx3 = Int(block_idx.x)
 

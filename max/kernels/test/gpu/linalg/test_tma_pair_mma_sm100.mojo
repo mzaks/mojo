@@ -15,7 +15,7 @@ from std.math import align_up
 from std.sys import size_of
 
 import linalg.matmul.vendor.blas as vendor_blas
-from std.gpu import WARP_SIZE, barrier
+from std.gpu import barrier
 from std.gpu.primitives.cluster import (
     block_rank_in_cluster,
     cluster_sync,
@@ -26,8 +26,8 @@ from std.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.gpu import (
     block_id_in_cluster,
     block_idx_uint as block_idx,
-    lane_id,
-    warp_id,
+    lane_id_uint as lane_id,
+    warp_id_uint as warp_id,
 )
 from std.gpu.memory import external_memory
 from std.gpu.compute.arch.mma_nvidia_sm100 import *
@@ -45,7 +45,6 @@ from layout.tma_async import (
     TMATensorTile,
     _idx_product,
     create_tensor_tile,
-    create_tma_tile,
 )
 from std.testing import assert_almost_equal
 
@@ -330,8 +329,15 @@ def tma_umma_kernel_pair_cta[
     comptime num_ld_iters = total_repeat // ld_repeat
     comptime ld_width = c_frag_size // num_ld_iters
 
+    var cluster_idx_m = block_idx.x // UInt(CLUSTER_M)
+    var cluster_idx_n = block_idx.y // UInt(CLUSTER_N)
+    var global_mma_m = (
+        cluster_idx_m * UInt(CLUSTER_M // cta_group) + peer_cta_coord[1]
+    )
+    var global_mma_n = cluster_idx_n * UInt(CLUSTER_N) + peer_cta_coord[2]
+
     var c_gmem_block = c.tile[MMA_M, MMA_N](
-        Int(peer_cta_coord[1]), Int(peer_cta_coord[2])
+        Int(global_mma_m), Int(global_mma_n)
     )
     var c_gmem_slice = c_gmem_block.tile[BM, MMA_N](Int(peer_cta_coord[0]), 0)
 
@@ -586,7 +592,7 @@ def main() raises:
                 test_tma_umma_pair_cta[
                     ab_type=dtype,
                     c_type=DType.bfloat16,
-                    prob_shape=Index(256, 512, 2 * BK),
+                    prob_shape=Index(512, 1024, 2 * BK),
                     block_tile_shape=Index(64, 64, BK),
                     transpose_b=True,
                     cluster_shape=StaticTuple[Int32, 3](4, 4, 1),

@@ -10,10 +10,10 @@ guide](https://docs.modular.com/max/get-started).
 
 ## Set up your environment
 
-First, make sure your system meets the [MAX system
-requirements](https://docs.modular.com/max/packages/install#system-requirements).
-The same requirements that apply to the `modular` package apply to developing
-in this repo.
+First, make sure your system meets the
+[MAX system requirements](https://docs.modular.com/max/packages/install#system-requirements).
+The same requirements that apply to the `modular` package apply to developing in
+this repo.
 
 In particular, if you're on macOS, make sure you have Metal utilities (for GPU
 programming in recent versions of Xcode)—try `xcodebuild -downloadComponent
@@ -110,13 +110,13 @@ then expand to the full relevant suites before sending a PR. The following
 commands are good local starting points, not a substitute for broader test
 coverage:
 
-| Change type                                                      | Suggested command                                                                                                                       | Typical prerequisites                             |
-| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| Core Python logic and lightweight local regression               | `./bazelw test //max/tests/tests:cpu_local_tests`                                                                                       | No GPU; usually no `HF_TOKEN`                     |
-| Serve process-control unit tests                                 | `./bazelw test //max/tests/tests/serve/unit:tests`                                                                                      | CPU-only, but slower than the default local suite |
-| Pipeline library or architecture logic that should stay CPU-safe | `./bazelw test //max/tests/tests/pipelines/... //max/tests/integration/pipelines:tests`                                                 | Network may be needed for some pipeline tests     |
+| Change type                                                      | Suggested command                                                                                                                       | Typical prerequisites                                 |
+|------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------|
+| Core Python logic and lightweight local regression               | `./bazelw test //max/tests/tests:cpu_local_tests`                                                                                       | No GPU; usually no `HF_TOKEN`                         |
+| Serve process-control unit tests                                 | `./bazelw test //max/tests/tests/serve/unit:tests`                                                                                      | CPU-only, but slower than the default local suite     |
+| Pipeline library or architecture logic that should stay CPU-safe | `./bazelw test //max/tests/tests/pipelines/... //max/tests/integration/pipelines:tests`                                                 | Network may be needed for some pipeline tests         |
 | Tokenization or HF-backed pipeline integration                   | `./bazelw test //max/tests/integration/pipelines/tokenization:tests //max/tests/integration/architectures/internvl_network_tests:tests` | Hugging Face auth, network, and a GPU-capable machine |
-| GPU runtime, graph, or kernel-facing changes                     | `./bazelw test //max/tests/tests:test_interpreter_ops_gpu //max/tests/integration/pipelines:tests_gpu`                                  | GPU required; network often required              |
+| GPU runtime, graph, or kernel-facing changes                     | `./bazelw test //max/tests/tests:test_interpreter_ops_gpu //max/tests/integration/pipelines:tests_gpu`                                  | GPU required; network often required                  |
 
 If you are unsure whether a target needs network or GPUs, inspect its Bazel
 rule for tags such as `gpu` or `requires-network`, or for `env_inherit =
@@ -169,6 +169,6 @@ Here are some docs to help start developing in the MAX framework:
 - [Benchmarking a MAX endpoint](/max/docs/max-benchmarking.md)
 - [Benchmarking Mojo kernels with `kbench`](/max/docs/kernel-benchmarking.md)
 - [Kernel profiling with Nsight Compute](/max/docs/kernel-profiling.md)
-- [Contributing changes to the repo](../../CONTRIBUTING.md#contributing-changes)
+- [Contributing changes to the repo](../CONTRIBUTING.md)
 
 For more documentation, see [docs.modular.com](https://docs.modular.com).

@@ -18,7 +18,7 @@ from std.sys.info import simd_width_of, size_of
 
 import std.gpu.primitives.warp as warp
 from std.gpu import WARP_SIZE, lane_id_uint as lane_id, warp_id_uint as warp_id
-from std.gpu.host import DeviceContext, FuncAttribute, get_gpu_target
+from std.gpu.host import DeviceContext, get_gpu_target
 from std.gpu.host.nvidia.tma import TMADescriptor, create_tma_descriptor
 from std.gpu import (
     block_dim_uint as block_dim,
@@ -57,7 +57,7 @@ def block_reduce[
     ]()
 
     var tid = thread_idx.x
-    for i in range(tid, max_warps_per_block, block_dim.x):
+    for i in range(Int(tid), max_warps_per_block, Int(block_dim.x)):
         m2_shared[i] = 0
 
     if tid == 0:
@@ -220,7 +220,7 @@ def test_tma_block_reduce[
                 shared_mem_bytes=shared_mem_bytes,
             )
         else:
-            var data_buf = TileTensor(d_data, row_major((Idx(rows), Idx(cols))))
+            var data_buf = TileTensor(d_data, row_major(Idx(rows), Idx(cols)))
 
             # Change the input function to match RMS norm pattern
             @__copy_capture(data_buf)

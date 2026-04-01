@@ -18,8 +18,6 @@ from layout.tile_layout import row_major
 from linalg.packing import pack_b
 from std.memory import memset_zero, stack_allocation
 
-from std.utils.index import IndexList
-
 
 # CHECK-LABEL: test_prepack
 def test_prepack():
@@ -44,8 +42,8 @@ def test_prepack():
     for i in range(n * k):
         src_ptr[i] = Float32(i)
 
-    var src_tt = TileTensor(src_ptr, row_major((Idx(k), Idx(n))))
-    var dst_tt = TileTensor(dst_ptr, row_major((Idx(k_padded), Idx(n_padded))))
+    var src_tt = TileTensor(src_ptr, row_major(Idx(k), Idx(n)))
+    var dst_tt = TileTensor(dst_ptr, row_major(Idx(k_padded), Idx(n_padded)))
 
     pack_b[
         False,

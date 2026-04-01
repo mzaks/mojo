@@ -21,8 +21,7 @@ from linalg.gemv import gemv_kernel, gevm_kernel
 from linalg.matmul.gpu import matmul_kernel
 import linalg.matmul.vendor.blas as vendor_blas
 
-from std.utils import Index, IndexList
-from std.utils.numerics import isnan
+from std.utils import IndexList
 from internal_utils import assert_almost_equal
 
 from layout import TileTensor, Coord, Idx, row_major
@@ -139,9 +138,9 @@ def run_matvec[
     # Create tensors for vendor_blas
     # For GEMV (N=1): A is MxK, B is Kx1, C is Mx1
     # For GEVM (M=1): A is 1xK, B is KxN, C is 1xN
-    var a_nd = TileTensor(a_device, row_major((Idx(M), Idx(K))))
-    var b_nd = TileTensor(b_device, row_major((Idx(K), Idx(N))))
-    var c_ref_nd = TileTensor(c_device_naive, row_major((Idx(M), Idx(N))))
+    var a_nd = TileTensor(a_device, row_major(Idx(M), Idx(K)))
+    var b_nd = TileTensor(b_device, row_major(Idx(K), Idx(N)))
+    var c_ref_nd = TileTensor(c_device_naive, row_major(Idx(M), Idx(N)))
 
     vendor_blas.matmul(
         ctx,

@@ -20,10 +20,9 @@ from std.gpu import (
 )
 from layout import TensorLayout, TileTensor
 from std.utils.index import IndexList
-from std.memory import UnsafePointer
 from std.algorithm import sync_parallelize
 import std.math
-from std.math import ceildiv, exp2
+from std.math import exp2
 from state_space.causal_conv1d import silu
 from state_space.selective_scan import softplus
 
@@ -520,10 +519,8 @@ def varlen_selective_state_update_cpu[
 
     @parameter
     def worker(idx: Int):
-        var b = idx // (nheads * dim)
-        var remaining = idx % (nheads * dim)
-        var h = remaining // dim
-        var m = remaining % dim
+        var b, remaining = divmod(idx, nheads * dim)
+        var h, m = divmod(remaining, dim)
 
         # Determine state batch index
         var state_batch_idx = Int32(b)

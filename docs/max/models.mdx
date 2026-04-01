@@ -17,8 +17,8 @@ by following the [MAX quickstart guide](/max/get-started/). Or if you want to
 serve a custom model, see the tutorial to [serve custom model
 architectures](/max/develop/serve-custom-model-architectures/).
 
-You can also see the [model source code in
-GitHub](https://github.com/modular/modular/tree/main/max/python/max/pipelines/architectures).
+You can also see the
+[model source code in GitHub](https://github.com/modular/modular/tree/main/max/python/max/pipelines/architectures).
 
 {/*********** CAUTION *************
 
@@ -373,6 +373,16 @@ GitHub](https://github.com/modular/modular/tree/main/max/python/max/pipelines/ar
       <td className='modality'>text-to-text</td>
       <td className='encodings'>bfloat16, float4_e2m1fnx2, float8_e4m3fn</td>
       <td className='gpus'>Yes</td>
+    </tr>
+    <tr>
+      <td className='arch'><code>ZImagePipeline</code></td>
+      <td className='models'>
+        <a href="https://huggingface.co/Tongyi-MAI/Z-Image">Tongyi-MAI/Z-Image</a>,<br/>
+        <a href="https://huggingface.co/Zyphra/Z-Image">Zyphra/Z-Image</a>
+      </td>
+      <td className='modality'>text-to-image</td>
+      <td className='encodings'>bfloat16</td>
+      <td className='gpus'>No</td>
     </tr>
   </tbody>
 </table>

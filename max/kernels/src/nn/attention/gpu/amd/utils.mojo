@@ -23,16 +23,14 @@ from layout._utils import idx2crd, make_amd_buffer_resource
 from layout.element import Element
 from layout.layout_tensor import ThreadScope
 from layout.tensor_core import num_matrix_reg
-from std.memory import AddressSpace as BaseAddressSpace
 from std.memory import stack_allocation
 from std.math.uutils import umod, ufloordiv
 
 from std.utils import IndexList
 from std.utils.numerics import get_accum_type
 from layout.swizzle import Swizzle
-from std.gpu._utils import to_i32, to_llvm_shared_mem_ptr, to_i64
+from std.gpu._utils import to_i32, to_i64
 from std.itertools import product
-from std.sys._assembly import inlined_assembly
 
 
 @always_inline
@@ -60,8 +58,7 @@ def get_warp_layout[mma_shape: IndexList[3]]() -> Layout:
 @always_inline
 def get_warp_coords[BN: Int, WN: Int]() -> IndexList[2]:
     comptime num_warps_n = BN // WN
-    var warp_row = get_warp_id() // UInt(num_warps_n)
-    var warp_col = get_warp_id() % UInt(num_warps_n)
+    var warp_row, warp_col = divmod(get_warp_id(), UInt(num_warps_n))
     return IndexList[2](Int(warp_row), Int(warp_col))
 
 
@@ -643,15 +640,12 @@ def copy_dram_to_sram_lds[
 
         var shared_ptr3 = __mlir_op.`builtin.unrealized_conversion_cast`[
             _type=__mlir_type.`!llvm.ptr<3>`
-        ](type_of(dst_ptr)())
+        ](dst_ptr)
 
         comptime num_bytes_per_lane = size_of[dtype]() * simd_width_of[dtype]()
         var vector_offset_bytes = Int(src_dist.ptr) - Int(src_partitions.ptr)
         var scalar_offset_bytes = Int(src_partitions.ptr) - Int(src.ptr)
 
-        inlined_assembly[
-            "s_mov_b32 m0, $0", NoneType, has_side_effect=True, constraints="s"
-        ](lds_ptr)
         __mlir_op.`rocdl.raw.ptr.buffer.load.lds`[
             alias_scopes=_alias_scope_attr,
             _type=None,

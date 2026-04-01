@@ -26,15 +26,13 @@ from std.gpu import (
 )
 from std.gpu.primitives.grid_controls import PDL, pdl_launch_attributes
 from std.gpu.host import DeviceContext, get_gpu_target
-from std.gpu.host.info import B200, H100, _is_sm10x_gpu
+from std.gpu.host.info import B200, _is_sm10x_gpu
 from layout import (
     Coord,
     Idx,
-    IntTuple,
     Layout,
     LayoutTensor,
     TileTensor,
-    coord_to_index_list,
     lt_to_tt,
     row_major,
 )
@@ -42,10 +40,9 @@ from layout.tile_layout import TensorLayout
 from std.logger import Logger
 from std.memory import bitcast
 from std.runtime.tracing import Trace, TraceLevel, trace_arg
-from std.bit import log2_floor
 from std.algorithm import elementwise
 from std.utils.index import Index, IndexList, StaticTuple
-from std.utils.numerics import get_accum_type, max_finite, min_finite
+from std.utils.numerics import get_accum_type
 
 from .matmul import matmul
 from .matmul.gpu.sm100_structured.blockwise_fp8.blockwise_fp8_matmul import (
@@ -133,7 +130,7 @@ def quantize_dynamic_scaled_fp8[
     ) capturing -> SIMD[in_dtype, width],
     group_size_or_per_token: Int,
     num_cols: Int,
-    pdl_level: PDLLevel = PDLLevel(),
+    pdl_level: PDLLevel = PDLLevel(1),
 ](
     scaled_output: TileTensor[mut=True, dtype=out_dtype, ...],
     scales: TileTensor[mut=True, dtype=scales_dtype, ...],
@@ -237,7 +234,7 @@ def quantize_fp8_kernel[
     var group_idx = block_idx.y
 
     with PDL():
-        for i in range(tid, group_size // simd_width, num_threads):
+        for i in range(Int(tid), group_size // simd_width, num_threads):
             var idx: Int = i * simd_width + group_idx * group_size
             input_vec = input_fn[simd_width, simd_width](row, idx).cast[
                 accum_type
@@ -268,7 +265,7 @@ def quantize_fp8_kernel[
         if tid == 0:
             scales.store_linear(Index(group_idx, row), scale_factor)
 
-        for i in range(tid, group_size // simd_width, num_threads):
+        for i in range(Int(tid), group_size // simd_width, num_threads):
             var idx: Int = i * simd_width + group_idx * group_size
 
             comptime if use_warp_tiling:
@@ -295,7 +292,7 @@ def batched_quantize_dynamic_scaled_fp8[
     ) capturing -> SIMD[in_dtype, width],
     group_size_or_per_token: Int,
     num_cols: Int,
-    pdl_level: PDLLevel = PDLLevel(),
+    pdl_level: PDLLevel = PDLLevel(1),
 ](
     scaled_output: TileTensor[mut=True, dtype=out_dtype, ...],
     scales: TileTensor[mut=True, dtype=scales_dtype, ...],
@@ -388,7 +385,7 @@ def batched_quantize_fp8_kernel[
     var batch_idx = block_idx.z
 
     with PDL():
-        for i in range(tid, group_size // simd_width, num_threads):
+        for i in range(Int(tid), group_size // simd_width, num_threads):
             var idx: Int = i * simd_width + group_idx * group_size
             input_vec = input_fn[simd_width, simd_width](
                 batch_idx, row, idx
@@ -406,7 +403,7 @@ def batched_quantize_fp8_kernel[
         if tid == 0:
             scales.store_linear(Index(batch_idx, group_idx, row), scale_factor)
 
-        for i in range(tid, group_size // simd_width, num_threads):
+        for i in range(Int(tid), group_size // simd_width, num_threads):
             var idx: Int = i * simd_width + group_idx * group_size
 
             comptime if use_warp_tiling:

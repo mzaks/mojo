@@ -35,19 +35,24 @@ from std.sys import align_of
 from std.testing import assert_false
 
 import linalg.matmul.vendor.blas as vendor_blas
-from layout import Coord, Idx, Layout, LayoutTensor, TileTensor, row_major
+from layout import (
+    Coord,
+    Idx,
+    TileTensor,
+    row_major,
+)
 from std.gpu.host import DeviceContext
 from internal_utils import assert_almost_equal
-from nn.conv import conv_gpu
-from nn.conv_utils import elementwise_simd_epilogue_type
+from nn.conv.conv import conv_gpu
+from nn.conv.conv_utils import elementwise_simd_epilogue_type
 from std.random import rand
 from std.utils.index import IndexList
-from nn.conv_sm100.conv2d import (
+from nn.conv.gpu.nvidia.sm100.conv2d import (
     conv2d_fprop,
     conv2d_fprop_with_residual,
     im2col,
 )
-from nn.conv_sm100.conv_config import (
+from nn.conv.gpu.nvidia.sm100.conv_config import (
     Conv2dConfig,
     Conv2dProblemShape,
 )
@@ -194,13 +199,13 @@ def test_conv2d_implicit_im2col[
     ctx.enqueue_copy(im2col_device, im2col_host_ptr)
 
     var im2col_device_nd = TileTensor(
-        im2col_device.unsafe_ptr(), row_major((Idx(M), Idx(K)))
+        im2col_device.unsafe_ptr(), row_major(Idx(M), Idx(K))
     )
     var filter_2d_device_nd = TileTensor(
-        filter_device.unsafe_ptr(), row_major((Idx(N), Idx(K)))
+        filter_device.unsafe_ptr(), row_major(Idx(N), Idx(K))
     )
     var out_2d_ref_nd = TileTensor(
-        out_device_ref.unsafe_ptr(), row_major((Idx(M), Idx(N)))
+        out_device_ref.unsafe_ptr(), row_major(Idx(M), Idx(N))
     )
 
     # Reference: cuBLAS GEMM (transpose_b=True for NK layout)
@@ -385,13 +390,13 @@ def test_conv2d_1sm[
     var dynamic_b_ref_shape = IndexList[2](N, K)
     var dynamic_c_ref_shape = IndexList[2](M, N)
     var im2col_device_nd = TileTensor(
-        im2col_device.unsafe_ptr(), row_major((Idx(M), Idx(K)))
+        im2col_device.unsafe_ptr(), row_major(Idx(M), Idx(K))
     )
     var filter_2d_device_nd = TileTensor(
-        filter_device.unsafe_ptr(), row_major((Idx(N), Idx(K)))
+        filter_device.unsafe_ptr(), row_major(Idx(N), Idx(K))
     )
     var out_2d_ref_nd = TileTensor(
-        out_device_ref.unsafe_ptr(), row_major((Idx(M), Idx(N)))
+        out_device_ref.unsafe_ptr(), row_major(Idx(M), Idx(N))
     )
 
     # Reference: cuBLAS GEMM
@@ -613,13 +618,13 @@ def test_conv2d_epilogue_lambda[
     ctx.enqueue_copy(im2col_device, im2col_host_ptr)
 
     var im2col_device_nd = TileTensor(
-        im2col_device.unsafe_ptr(), row_major((Idx(M), Idx(K)))
+        im2col_device.unsafe_ptr(), row_major(Idx(M), Idx(K))
     )
     var filter_2d_device_nd = TileTensor(
-        filter_device.unsafe_ptr(), row_major((Idx(N), Idx(K)))
+        filter_device.unsafe_ptr(), row_major(Idx(N), Idx(K))
     )
     var out_2d_ref_nd = TileTensor(
-        out_device_ref.unsafe_ptr(), row_major((Idx(M), Idx(N)))
+        out_device_ref.unsafe_ptr(), row_major(Idx(M), Idx(N))
     )
 
     # Reference: cuBLAS GEMM
@@ -833,13 +838,13 @@ def test_conv2d_bias_fusion[
     ctx.enqueue_copy(im2col_dev, im2col_host)
 
     var im2col_nd = TileTensor(
-        im2col_dev.unsafe_ptr(), row_major((Idx(M), Idx(K)))
+        im2col_dev.unsafe_ptr(), row_major(Idx(M), Idx(K))
     )
     var filter_2d_nd = TileTensor(
-        filter_dev.unsafe_ptr(), row_major((Idx(N), Idx(K)))
+        filter_dev.unsafe_ptr(), row_major(Idx(N), Idx(K))
     )
     var out_ref_nd = TileTensor(
-        out_ref_dev.unsafe_ptr(), row_major((Idx(M), Idx(N)))
+        out_ref_dev.unsafe_ptr(), row_major(Idx(M), Idx(N))
     )
 
     vendor_blas.matmul(
@@ -1056,13 +1061,13 @@ def test_conv2d_residual_api[
     ctx.enqueue_copy(im2col_device, im2col_host_ptr)
 
     var im2col_device_nd = TileTensor(
-        im2col_device.unsafe_ptr(), row_major((Idx(M), Idx(K)))
+        im2col_device.unsafe_ptr(), row_major(Idx(M), Idx(K))
     )
     var filter_2d_device_nd = TileTensor(
-        filter_device.unsafe_ptr(), row_major((Idx(N), Idx(K)))
+        filter_device.unsafe_ptr(), row_major(Idx(N), Idx(K))
     )
     var out_2d_ref_nd = TileTensor(
-        out_device_ref.unsafe_ptr(), row_major((Idx(M), Idx(N)))
+        out_device_ref.unsafe_ptr(), row_major(Idx(M), Idx(N))
     )
 
     # Reference: cuBLAS GEMM (conv2d only)
@@ -1213,9 +1218,6 @@ def test_conv_gpu_scale_epilogue[
     comptime Hout = H + 2 * pad - R + 1
     comptime Wout = W + 2 * pad - S + 1
     comptime dtype = DType.bfloat16
-    comptime input_layout = Layout.row_major(N, H, W, C_in)
-    comptime filter_layout = Layout.row_major(R, S, C_in, C_out)
-    comptime output_layout = Layout.row_major(N, Hout, Wout, C_out)
     comptime in_size = N * H * W * C_in
     comptime filter_size = R * S * C_in * C_out
     comptime out_size = N * Hout * Wout * C_out
@@ -1237,17 +1239,13 @@ def test_conv_gpu_scale_epilogue[
     ctx.enqueue_copy(input_dev, input_host)
     ctx.enqueue_copy(filter_dev, filter_host)
 
-    var input_lt = LayoutTensor[dtype, input_layout](input_dev.unsafe_ptr())
-    var filter_lt = LayoutTensor[dtype, filter_layout](filter_dev.unsafe_ptr())
-    var out_epilogue_lt = LayoutTensor[dtype, output_layout](
-        out_epilogue_dev.unsafe_ptr()
-    )
-    var out_ref_lt = LayoutTensor[dtype, output_layout](
-        out_ref_dev.unsafe_ptr()
-    )
-    var out_epilogue_tt = TileTensor(
-        out_epilogue_dev.unsafe_ptr(), row_major[N, Hout, Wout, C_out]()
-    )
+    comptime input_tt_layout = row_major[N, H, W, C_in]()
+    comptime filter_tt_layout = row_major[R, S, C_in, C_out]()
+    comptime output_tt_layout = row_major[N, Hout, Wout, C_out]()
+    var input_tt = TileTensor(input_dev, input_tt_layout)
+    var filter_tt = TileTensor(filter_dev, filter_tt_layout)
+    var out_epilogue_tt = TileTensor(out_epilogue_dev, output_tt_layout)
+    var out_ref_tt = TileTensor(out_ref_dev, output_tt_layout)
 
     @parameter
     @always_inline
@@ -1264,17 +1262,14 @@ def test_conv_gpu_scale_epilogue[
         )
 
     conv_gpu[
-        input_layout,
-        filter_layout,
-        output_layout,
         dtype,
         dtype,
         dtype,
         Optional[elementwise_simd_epilogue_type](scale_epilogue),
     ](
-        input_lt.as_any_origin(),
-        filter_lt.as_any_origin(),
-        out_epilogue_lt.as_any_origin(),
+        input_tt,
+        filter_tt,
+        out_epilogue_tt,
         IndexList[2](1, 1),
         IndexList[2](1, 1),
         IndexList[4](pad, pad, pad, pad),
@@ -1283,16 +1278,13 @@ def test_conv_gpu_scale_epilogue[
     )
 
     conv_gpu[
-        input_layout,
-        filter_layout,
-        output_layout,
         dtype,
         dtype,
         dtype,
     ](
-        input_lt.as_any_origin(),
-        filter_lt.as_any_origin(),
-        out_ref_lt.as_any_origin(),
+        input_tt,
+        filter_tt,
+        out_ref_tt,
         IndexList[2](1, 1),
         IndexList[2](1, 1),
         IndexList[4](pad, pad, pad, pad),
@@ -1351,9 +1343,6 @@ def test_conv_gpu_additive_epilogue[
     comptime Hout = H + 2 * pad - R + 1
     comptime Wout = W + 2 * pad - S + 1
     comptime dtype = DType.bfloat16
-    comptime input_layout = Layout.row_major(N, H, W, C_in)
-    comptime filter_layout = Layout.row_major(R, S, C_in, C_out)
-    comptime output_layout = Layout.row_major(N, Hout, Wout, C_out)
     comptime in_size = N * H * W * C_in
     comptime filter_size = R * S * C_in * C_out
     comptime out_size = N * Hout * Wout * C_out
@@ -1379,17 +1368,13 @@ def test_conv_gpu_additive_epilogue[
     ctx.enqueue_copy(filter_dev, filter_host)
     ctx.enqueue_copy(out_epilogue_dev, bias_host)
 
-    var input_lt = LayoutTensor[dtype, input_layout](input_dev.unsafe_ptr())
-    var filter_lt = LayoutTensor[dtype, filter_layout](filter_dev.unsafe_ptr())
-    var out_epilogue_lt = LayoutTensor[dtype, output_layout](
-        out_epilogue_dev.unsafe_ptr()
-    )
-    var out_ref_lt = LayoutTensor[dtype, output_layout](
-        out_ref_dev.unsafe_ptr()
-    )
-    var out_epilogue_tt = TileTensor(
-        out_epilogue_dev.unsafe_ptr(), row_major[N, Hout, Wout, C_out]()
-    )
+    comptime input_tt_layout = row_major[N, H, W, C_in]()
+    comptime filter_tt_layout = row_major[R, S, C_in, C_out]()
+    comptime output_tt_layout = row_major[N, Hout, Wout, C_out]()
+    var input_tt = TileTensor(input_dev, input_tt_layout)
+    var filter_tt = TileTensor(filter_dev, filter_tt_layout)
+    var out_epilogue_tt = TileTensor(out_epilogue_dev, output_tt_layout)
+    var out_ref_tt = TileTensor(out_ref_dev, output_tt_layout)
 
     @parameter
     @always_inline
@@ -1407,17 +1392,14 @@ def test_conv_gpu_additive_epilogue[
         out_epilogue_tt.store[width=_width](coord, result)
 
     conv_gpu[
-        input_layout,
-        filter_layout,
-        output_layout,
         dtype,
         dtype,
         dtype,
         Optional[elementwise_simd_epilogue_type](add_bias_epilogue),
     ](
-        input_lt.as_any_origin(),
-        filter_lt.as_any_origin(),
-        out_epilogue_lt.as_any_origin(),
+        input_tt,
+        filter_tt,
+        out_epilogue_tt,
         IndexList[2](1, 1),
         IndexList[2](1, 1),
         IndexList[4](pad, pad, pad, pad),
@@ -1426,16 +1408,13 @@ def test_conv_gpu_additive_epilogue[
     )
 
     conv_gpu[
-        input_layout,
-        filter_layout,
-        output_layout,
         dtype,
         dtype,
         dtype,
     ](
-        input_lt.as_any_origin(),
-        filter_lt.as_any_origin(),
-        out_ref_lt.as_any_origin(),
+        input_tt,
+        filter_tt,
+        out_ref_tt,
         IndexList[2](1, 1),
         IndexList[2](1, 1),
         IndexList[4](pad, pad, pad, pad),
@@ -1497,9 +1476,6 @@ def test_conv_gpu_residual[
     comptime Hout = H + 2 * pad - R + 1
     comptime Wout = W + 2 * pad - S + 1
     comptime dtype = DType.bfloat16
-    comptime input_layout = Layout.row_major(N, H, W, C_in)
-    comptime filter_layout = Layout.row_major(R, S, C_in, C_out)
-    comptime output_layout = Layout.row_major(N, Hout, Wout, C_out)
     comptime in_size = N * H * W * C_in
     comptime filter_size = R * S * C_in * C_out
     comptime out_size = N * Hout * Wout * C_out
@@ -1525,27 +1501,23 @@ def test_conv_gpu_residual[
     ctx.enqueue_copy(filter_dev, filter_host)
     ctx.enqueue_copy(source_dev, source_host)
 
-    var input_lt = LayoutTensor[dtype, input_layout](input_dev.unsafe_ptr())
-    var filter_lt = LayoutTensor[dtype, filter_layout](filter_dev.unsafe_ptr())
-    var out_residual_lt = LayoutTensor[dtype, output_layout](
-        out_residual_dev.unsafe_ptr()
-    )
-    var out_ref_lt = LayoutTensor[dtype, output_layout](
-        out_ref_dev.unsafe_ptr()
-    )
+    comptime input_tt_layout = row_major[N, H, W, C_in]()
+    comptime filter_tt_layout = row_major[R, S, C_in, C_out]()
+    comptime output_tt_layout = row_major[N, Hout, Wout, C_out]()
+    var input_tt = TileTensor(input_dev, input_tt_layout)
+    var filter_tt = TileTensor(filter_dev, filter_tt_layout)
+    var out_residual_tt = TileTensor(out_residual_dev, output_tt_layout)
+    var out_ref_tt = TileTensor(out_ref_dev, output_tt_layout)
 
     conv_gpu[
-        input_layout,
-        filter_layout,
-        output_layout,
         dtype,
         dtype,
         dtype,
         has_residual=True,
     ](
-        input_lt.as_any_origin(),
-        filter_lt.as_any_origin(),
-        out_residual_lt.as_any_origin(),
+        input_tt,
+        filter_tt,
+        out_residual_tt,
         IndexList[2](1, 1),
         IndexList[2](1, 1),
         IndexList[4](pad, pad, pad, pad),
@@ -1556,16 +1528,13 @@ def test_conv_gpu_residual[
     )
 
     conv_gpu[
-        input_layout,
-        filter_layout,
-        output_layout,
         dtype,
         dtype,
         dtype,
     ](
-        input_lt.as_any_origin(),
-        filter_lt.as_any_origin(),
-        out_ref_lt.as_any_origin(),
+        input_tt,
+        filter_tt,
+        out_ref_tt,
         IndexList[2](1, 1),
         IndexList[2](1, 1),
         IndexList[4](pad, pad, pad, pad),

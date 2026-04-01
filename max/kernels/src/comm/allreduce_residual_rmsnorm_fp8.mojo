@@ -59,7 +59,6 @@ from std.sys import (
     simd_width_of,
     size_of,
 )
-from std.sys.info import _accelerator_arch
 
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
@@ -80,15 +79,19 @@ from layout import (
     row_major,
 )
 from std.utils import IndexList, StaticTuple
-from std.utils.numerics import get_accum_type, max_finite
+from std.utils.numerics import get_accum_type
 
 from std.runtime.asyncrt import DeviceContextPtr
 from .fp8_utils import compute_dynamic_fp8_scale, fp8_quantize
 
 from .rms_norm_fp8 import rms_norm_fused_fp8
 
-from .allreduce import allreduce, elementwise_epilogue_type
-from .device_query import get_sm_version, _dispatch_max_num_blocks
+from .allreduce import (
+    allreduce,
+    elementwise_epilogue_type,
+    allreduce_tuning_table,
+)
+from .device_query import get_sm_version, dispatch_max_num_blocks
 from .reducescatter import _target_address_space
 from .sync import (
     MAX_GPUS,
@@ -621,7 +624,9 @@ def _allreduce_rmsnorm_fp8_launch[
     """Launch the fused allreduce + RMSNorm + FP8 kernel."""
     comptime sm_version = get_sm_version()
     var payload_bytes = rows * cols * size_of[in_dtype]()
-    var max_blocks = _dispatch_max_num_blocks[ngpus, sm_version](payload_bytes)
+    var max_blocks = dispatch_max_num_blocks[
+        ngpus, sm_version, allreduce_tuning_table
+    ](payload_bytes)
     var grid_dim = min(rows, max_blocks)
     var block_dim = threads_per_block
 
@@ -722,7 +727,9 @@ def _allreduce_rmsnorm_fp8_launch_2stage[
     # ensures 100% block utilization in both stages.
     comptime sm_version = get_sm_version()
     var payload_bytes = rows * cols * size_of[in_dtype]()
-    var max_blocks = _dispatch_max_num_blocks[ngpus, sm_version](payload_bytes)
+    var max_blocks = dispatch_max_num_blocks[
+        ngpus, sm_version, allreduce_tuning_table
+    ](payload_bytes)
     var grid_dim = min(ceildiv(rows, ngpus), max_blocks)
     var block_dim = threads_per_block
 

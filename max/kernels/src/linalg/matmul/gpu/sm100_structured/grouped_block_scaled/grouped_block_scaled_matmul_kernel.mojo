@@ -48,7 +48,7 @@ from std.gpu.primitives.cluster import cluster_sync, elect_one_sync
 from std.gpu.sync import syncwarp
 from std.gpu.host.nvidia.tma import TMADescriptor, TensorMapSwizzle
 from std.sys import inlined_assembly
-from layout import ComptimeInt, RowMajorLayout, TensorLayout, TileTensor
+from layout import ComptimeInt, RowMajorLayout, TileTensor
 from layout.tile_layout import _IntToComptimeInt
 from structured_kernels.tile_types import (
     TmaOpType,
@@ -60,8 +60,8 @@ from layout.tma_async import (
     TMATensorTileArray,
 )
 from layout.tensor_core_async import (
-    tile_layout_k_major,
-    tile_layout_mn_major,
+    tile_layout_k_major_typed,
+    tile_layout_mn_major_typed,
     tile_sf_layout_k_major,
 )
 
@@ -71,12 +71,10 @@ from std.utils.static_tuple import StaticTuple
 from linalg.arch.sm100 import MmaOpSM100_BlockScaled_SS
 from linalg.fp4_utils import SF_MN_GROUP_SIZE, SF_ATOM_M, SF_ATOM_K
 from linalg.utils import elementwise_compute_lambda_type
-from linalg.structuring import SMemPtr
 from ..structured_kernels.config import (
     BlockScaledMatmulConfig,
     OutputPipelineConfig,
 )
-from structured_kernels.tile_types import internal_k_major_128B
 from structured_kernels.kernel_common import (
     WarpRole,
     KernelContext,
@@ -104,14 +102,10 @@ from ..structured_kernels.warp_context import (
     EpilogueWarpContext,
 )
 from ..structured_kernels.output_writer import TileWriter
-from ..structured_kernels.tile_scheduler import (
-    TileScheduler as WorkingTileScheduler,
-)
 from .grouped_block_scaled_smem import GroupedBlockScaledSmem
 from .grouped_tile_scheduler import (
     GroupedTileScheduler,
     GroupedWorkInfo,
-    GroupedWorkIterator,
     GroupedCLCWorkIterator,
     GroupedCLCSchedulerIterator,
 )
@@ -731,15 +725,15 @@ struct GroupedBlockScaledMatmulKernel[
 
     # ========== Shared Memory Layout Types ==========
 
-    comptime a_smem_layout = tile_layout_k_major[
+    comptime a_smem_layout = tile_layout_k_major_typed[
         Self.a_type, Self.BM, Self.BK, swizzle_mode=Self.config.a_swizzle
-    ]()
+    ].to_layout()
 
-    comptime b_smem_layout = tile_layout_k_major[
+    comptime b_smem_layout = tile_layout_k_major_typed[
         Self.b_type, Self.BN, Self.BK, swizzle_mode=Self.config.b_swizzle
-    ]() if Self.transpose_b else tile_layout_mn_major[
+    ].to_layout() if Self.transpose_b else tile_layout_mn_major_typed[
         Self.b_type, Self.BN, Self.BK, swizzle_mode=Self.config.b_swizzle
-    ]()
+    ].to_layout()
 
     comptime c_smem_layout = Layout.row_major(Self.OutputM, Self.OutputN)
 

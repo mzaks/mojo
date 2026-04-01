@@ -12,7 +12,6 @@
 # ===----------------------------------------------------------------------=== #
 from std.math import ceildiv
 from std.sys import (
-    align_of,
     get_defined_bool,
     get_defined_int,
     simd_width_of,
@@ -25,7 +24,7 @@ from std.gpu.primitives.grid_controls import PDLLevel
 from std.gpu.host import DeviceContext, get_gpu_target
 from std.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.gpu.host.info import B200
-from layout import Coord, Idx, TileTensor, row_major
+from layout import Coord, Idx, TileTensor
 from std.logger import Logger
 
 from std.utils.index import Index, IndexList
@@ -48,7 +47,6 @@ from ...tile_scheduler import RasterOrder
 from .matmul import (
     blackwell_matmul_tma_umma_warp_specialized,
     blackwell_batched_matmul_tma_umma_warp_specialized,
-    matmul_sm100_fallback,
 )
 from internal_utils import Table
 from .tuning_configs import (
@@ -137,13 +135,13 @@ def matmul_dispatch_sm100[
             gemv_gpu[
                 transpose_b=transpose_b,
                 elementwise_lambda_fn=elementwise_lambda_wrapper,
-                pdl_level=pdl_level,
+                pdl_level=PDLLevel(1),
             ](c, a, b, ctx)
             return
 
     comptime if _vendor_blas_fallback_disabled():
         comptime if (
-            c_type == DType.bfloat16
+            c_type in (DType.bfloat16, DType.float8_e4m3fn)
             and static_N * size_of[c_type]() % 16 == 0
             and static_K * size_of[a_type]() % 16 == 0
             and transpose_b
@@ -156,9 +154,10 @@ def matmul_dispatch_sm100[
             ](c, a, b, ctx)
             if status:
                 return
-            # Heuristic had no config for this (N,K) or m; fall through to normal
-        # When vendor fallback is disabled but shape is not the benchmarking path,
-        # fall through to normal SM100 dispatch.
+            else:
+                raise Error(
+                    "Heuristic failed to find a config for this (N,K) or m"
+                )
 
     var epilogue_type = String("None")
 
@@ -447,8 +446,9 @@ def heuristic_and_outliers_dispatch[
     comptime configs = build_configs[
         a_type, b_type, c_type, static_N, static_K, transpose_b
     ]()
+    var aligned_m = align_up(m, 64) if m >= 256 else m
     var config_runtime = choose_config[a_type, b_type, c_type, transpose_b](
-        m, static_N, static_K
+        aligned_m, static_N, static_K
     )
 
     comptime for config in configs:
@@ -640,7 +640,7 @@ def matmul_dispatch_sm100_bf16[
     return DISPATCH_MISS
 
 
-# NOTE: vendor blas, naive matmul, and multistage gemm dosen't support compute lambdas so we need to wrap them in a lambda function.
+# NOTE: vendor blas, naive matmul, and multistage gemm doesn't support compute lambdas so we need to wrap them in a lambda function.
 # if there is no compute lambda, then this wrapper will be a simple element wise lambda.
 @always_inline
 def _vendor_blas_matmul_sm100[
@@ -938,8 +938,9 @@ def sm100_heuristic_and_outliers_dispatch[
     comptime configs = build_configs[
         a_type, b_type, c_type, static_N, static_K, transpose_b
     ]()
+    var aligned_m = align_up(m, 64) if m >= 256 else m
     var config_runtime = choose_config[a_type, b_type, c_type, transpose_b](
-        m, static_N, static_K
+        aligned_m, static_N, static_K
     )
 
     comptime for config in configs:

@@ -39,11 +39,7 @@ from std.gpu import MAX_THREADS_PER_BLOCK_METADATA
 from layout import TileTensor
 from layout.coord import Coord, Idx
 from layout.tile_layout import TensorLayout
-from .fp4_utils import (
-    cast_uint_to_fp4e2m1,
-    MXFP4_SF_VECTOR_SIZE,
-    MXFP4_SF_DTYPE,
-)
+from .fp4_utils import cast_uint_to_fp4e2m1, MXFP4_SF_VECTOR_SIZE
 
 
 @__llvm_metadata(
@@ -77,11 +73,13 @@ def _dequant_mxfp4_to_fp8_kernel[
     comptime BYTES_PER_THREAD = ELEMENTS_PER_THREAD // 2
 
     with PDL():
-        for global_row_idx in range(block_idx.x, num_rows, grid_dim.x):
+        for global_row_idx in range(
+            Int(block_idx.x), num_rows, Int(grid_dim.x)
+        ):
             for col_thread_idx in range(
-                thread_idx.x,
+                Int(thread_idx.x),
                 ceildiv(num_cols, ELEMENTS_PER_THREAD),
-                block_dim.x,
+                Int(block_dim.x),
             ):
                 var global_col_idx = col_thread_idx * ELEMENTS_PER_THREAD
 

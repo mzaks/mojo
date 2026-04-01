@@ -15,14 +15,16 @@ from std.math import fma
 from std.ffi import external_call
 from std.sys import size_of, align_of
 
-from buffer.dimlist import Dim, DimList
 from compiler_internal import StaticTensorSpec
 from std.collections import InlineArray
 from std.gpu.host import DeviceBuffer
+from std.gpu.host.device_context import _DeviceContextPtr
 from std.gpu.host.info import is_cpu, is_gpu
 from layout import (
     Coord,
     Idx,
+    IntTuple,
+    TensorLayout,
     TileTensor,
     row_major,
 )
@@ -152,10 +154,10 @@ def unpack_device_ctx(
 ) -> DeviceContextPtr:
     var ptr = external_call[
         "MGP_RT_UnpackDeviceContext",
-        OpaquePointer[MutAnyOrigin],
+        _DeviceContextPtr[mut=True],
     ](async_ptr)
 
-    return DeviceContextPtr(ptr.unsafe_origin_cast[MutExternalOrigin]())
+    return DeviceContextPtr(ptr)
 
 
 @no_inline
@@ -282,6 +284,48 @@ def mgp_tensor_extract_buffer[
     return MutByteBuffer(
         buffer.unsafe_ptr[DType.int8](), IndexList[1](buffer.spec().bytecount())
     )
+
+
+@register_internal("mgp.tensor.slice")
+@no_inline
+def mgp_tensor_slice[
+    rank: Int,
+    dtype: DType,
+](
+    input: DynamicTensor[dtype, rank],
+    output_spec: IndexList[rank],
+    start: DynamicTensor[DType.int64, 1],
+) -> DynamicTensor[dtype, rank]:
+    var input_shape = input.shape()
+
+    # Find k: the first non-size-1 input dimension (the sliced dimension).
+    var k = rank
+    for i in range(rank):
+        if input_shape[i] != 1:
+            k = i
+            break
+
+    # Compute stride_k = product of input dims strictly after k.
+    var stride_k = 1
+    for i in range(k + 1, rank):
+        stride_k *= input_shape[i]
+
+    # start is a 1-element vector holding the scalar start value for
+    # dimension k.  (mogg.slice scalars are rank-0 in MO but are lowered to
+    # rank-1 DynamicTensors of size 1 by TensorCreateOp::emitMojo.)
+    var start_k = Int(start.unsafe_ptr()[0]) if k < rank else 0
+
+    # Compute the offset, normalizing negative start values.
+    if start_k >= 0:
+        return DynamicTensor[dtype, rank](
+            input.unsafe_ptr() + start_k * stride_k, output_spec
+        )
+    else:
+        var dim_k = input_shape[k]
+        var normalized = max(0, dim_k + start_k)
+        return DynamicTensor[dtype, rank](
+            input.unsafe_ptr() + normalized * stride_k, output_spec
+        )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -537,16 +581,16 @@ def mgp_buffer_get_size(
 @register_internal("mgp.tensor_spec.create")
 @no_inline
 def mgp_tensor_spec_create[
-    aRawDims: DimList,
+    aRawDims: IntTuple,
     aRawDimsRank: Int,
 ](*runtimeDims: Int) -> IndexList[aRawDimsRank]:
     var shape = IndexList[aRawDimsRank]()
     var runtimeIndex = 0
     # Update Shape with runtime elements.
+    # Negative values in aRawDims indicate dynamic dimensions.
     comptime for i in range(aRawDimsRank):
-        var dim = aRawDims.at[i]()
-        if dim.get() > -1:
-            shape[i] = dim.get()
+        if Int(aRawDims[i]) >= 0:
+            shape[i] = Int(aRawDims[i])
         else:
             shape[i] = runtimeDims[runtimeIndex]
             runtimeIndex += 1
@@ -965,15 +1009,18 @@ def mogg_tensor_init[
     rank: Int,
     mut: Bool,
     input: IO,
-    static_shape: DimList,
-    static_stride: DimList,
+    static_layout: TensorLayout,
     alignment: Int,
     exclusive: Bool,
 ](
     ptr: OpaquePointer[MutAnyOrigin], shape: IndexList[rank]
 ) -> ManagedTensorSlice[
     io_spec=IOSpec[mut, input](),
-    static_spec=StaticTensorSpec[dtype, rank, static_shape, static_stride](
+    static_spec=StaticTensorSpec[
+        dtype,
+        rank,
+        static_layout=static_layout,
+    ](
         alignment,
         AddressSpace.GENERIC,
         exclusive,
@@ -1044,7 +1091,7 @@ def mogg_format_kernel_error(
     and eventually caught by the outer MGP region's except handler.
     """
     var msg = (
-        String('An error occured in kernel named "')
+        String('An error occurred in kernel named "')
         + kernel_name
         + '":\n'
         + String(error)
@@ -1067,7 +1114,7 @@ def mogg_format_region_error(
     Called from MGP ABI stub except handlers after catching a kernel error.
     """
     return Error(
-        String('An error occured in kernel entry point named "')
+        String('An error occurred in kernel entry point named "')
         + region_name
         + '":\n'
         + String(error)
@@ -1077,14 +1124,16 @@ def mogg_format_region_error(
 @register_internal("mogg.tensor.reshape")
 @always_inline
 def reshape_contiguous_buffer[
-    static_shape: DimList, static_stride: DimList, new_rank: Int
+    static_layout: TensorLayout, new_rank: Int
 ](
     buffer: ManagedTensorSlice,
     shape: IndexList[new_rank],
 ) -> ManagedTensorSlice[
     io_spec=buffer.io_spec,
     static_spec=StaticTensorSpec[
-        buffer.dtype, new_rank, static_shape, static_stride
+        buffer.dtype,
+        new_rank,
+        static_layout=static_layout,
     ](
         1,
         AddressSpace.GENERIC,

@@ -14,9 +14,8 @@ from std.sys._assembly import inlined_assembly
 from std.sys import is_nvidia_gpu, bit_width_of
 from std.sys.info import _is_sm_100x_or_newer, align_of
 from std.utils.index import IndexList
-from std.utils.numerics import FPUtils
 from std.memory import bitcast
-from layout import Coord, CoordLike, Idx, Layout, LayoutTensor, TileTensor
+from layout import CoordLike, Idx, Layout, LayoutTensor, TileTensor
 from std.builtin.simd import _convert_f32_to_float8_ue8m0
 from std.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
 
@@ -316,6 +315,34 @@ def set_batched_scale_factor[
     ] = rebind[Scalar[scales_dtype]](scale_value)
 
 
+def set_batched_scale_factor[
+    scales_dtype: DType,
+    //,
+    SF_VECTOR_SIZE: Int,
+](
+    scales_tensor: TileTensor[mut=True, scales_dtype, ...],
+    batch_idx: Int,
+    row_idx: Int,
+    col_idx: Int,
+    scale_value: Scalar[scales_dtype],
+):
+    comptime assert (
+        scales_tensor.flat_rank >= 6
+    ), "scales_tensor must be 6D for batched scales tensor"
+
+    scales_tensor.store(
+        (
+            Idx(batch_idx),
+            Idx(row_idx // SF_MN_GROUP_SIZE),
+            Idx(col_idx // (SF_VECTOR_SIZE * SF_ATOM_K)),
+            Idx(row_idx % SF_ATOM_M[0]),
+            Idx((row_idx % SF_MN_GROUP_SIZE) // SF_ATOM_M[0]),
+            Idx((col_idx // SF_VECTOR_SIZE) % SF_ATOM_K),
+        ),
+        scale_value,
+    )
+
+
 def get_batched_scale_factor[
     scales_dtype: DType,
     scales_layout: Layout,
@@ -422,7 +449,10 @@ def get_scaling_kind[
         return UMMAKind.KIND_MXF4NVF4
     elif a_type == DType.uint8 and scales_dtype == MXFP4_SF_DTYPE and SF_VECTOR_SIZE == MXFP4_SF_VECTOR_SIZE:
         return UMMAKind.KIND_MXF4
-    elif a_type == DType.float8_e4m3fn and scales_dtype == MXFP8_SF_DTYPE and SF_VECTOR_SIZE == MXFP8_SF_VECTOR_SIZE:
-        return UMMAKind.KIND_MXF8F6F4
     else:
-        comptime assert False, "Unsupported scaling kind"
+        comptime assert (
+            a_type == DType.float8_e4m3fn
+            and scales_dtype == MXFP8_SF_DTYPE
+            and SF_VECTOR_SIZE == MXFP8_SF_VECTOR_SIZE
+        ), "unsupported a_type/scales_dtype for block-scaled matmul"
+        return UMMAKind.KIND_MXF8F6F4

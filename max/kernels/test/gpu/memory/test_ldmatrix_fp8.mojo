@@ -20,11 +20,7 @@ from std.gpu.compute.mma_util import store_matrix_d
 from layout import (
     Coord,
     Idx,
-    Layout,
-    LayoutTensor,
-    RuntimeLayout,
     TileTensor,
-    UNKNOWN_VALUE,
     row_major,
 )
 from layout.tensor_core import get_fragment_size, get_mma_shape
@@ -61,10 +57,10 @@ def test_ldmatrix_fp8[
         N * K, input_type, alignment=32, address_space=AddressSpace.SHARED
     ]()
 
-    for i in range(lane_id(), M * K, WARP_SIZE):
+    for i in range(Int(lane_id()), M * K, WARP_SIZE):
         a_shared[i] = a_ptr[i]
 
-    for i in range(lane_id(), N * K, WARP_SIZE):
+    for i in range(Int(lane_id()), N * K, WARP_SIZE):
         b_shared[i] = b_ptr[i]
 
     barrier()
