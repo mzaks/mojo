@@ -39,8 +39,10 @@ unknown values its condition depends on, for example:
       depends on unknown argument #1 of hlcf.loop at test_list.mojo:179:5
 ```
 
-An unproven obligation without unknowns has a condition that is false in some
-execution the analysis considers, rather than one it cannot see into.
+Each unknown shows the value it takes in a counterexample. An unproven
+obligation without unknowns has a condition that is false in some execution
+the analysis considers, rather than one it cannot see into. Uninitialized
+reads, typically from arms that cannot be taken, are listed last.
 
 ## Expected results
 

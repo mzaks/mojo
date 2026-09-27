@@ -334,8 +334,10 @@ public:
   /// The unknowns (with their IR descriptions) a term transitively depends
   /// on, e.g. the loads or call results an obligation's condition could not
   /// see through. Requires `annotate`.
-  SmallVector<std::string> unknownInputs(StringRef expr) const {
-    SmallVector<std::string> result;
+  /// Returns (SMT name, description) pairs sorted by description.
+  SmallVector<std::pair<std::string, std::string>>
+  unknownInputs(StringRef expr) const {
+    SmallVector<std::pair<std::string, std::string>> result;
     llvm::StringSet<> seen;
     SmallVector<std::string> worklist = namesIn(expr);
     while (!worklist.empty()) {
@@ -343,12 +345,17 @@ public:
       if (!seen.insert(name).second)
         continue;
       if (auto it = unknowns.find(name); it != unknowns.end())
-        result.push_back(it->second);
+        result.push_back({name, it->second});
       if (auto it = deps.find(name); it != deps.end())
         worklist.append(it->second.begin(), it->second.end());
     }
-    llvm::sort(result);
-    result.erase(std::unique(result.begin(), result.end()), result.end());
+    // Uninitialized reads are usually from arms that cannot be taken; list
+    // them last so the cap on shown unknowns keeps the informative ones.
+    llvm::sort(result, [](auto &a, auto &b) {
+      bool ua = StringRef(a.second).contains("uninitialized read");
+      bool ub = StringRef(b.second).contains("uninitialized read");
+      return std::tie(ua, a.second, a.first) < std::tie(ub, b.second, b.first);
+    });
     return result;
   }
 
@@ -1063,8 +1070,13 @@ private:
     Operation *op =
         from ? from->getPrevNode() : (block.empty() ? nullptr : &block.back());
     for (; op; op = op->getPrevNode()) {
-      if (op == place.slotDef)
-        return {Search::Fail, std::nullopt}; // Nothing stored yet.
+      if (op == place.slotDef) {
+        // Nothing stored yet: an uninitialized read, whose value is simply
+        // arbitrary (e.g. a union member for a tag that never occurs).
+        std::string name = declare(place.sort);
+        noteUnknown(name, "uninitialized read of " + describe(place.loc.slot));
+        return {Search::Found, name};
+      }
       if (auto store = dyn_cast<POP::StoreOp>(op)) {
         std::optional<MemLoc> target = memLocation(store.getPtr());
         if (!target) {
@@ -1962,6 +1974,8 @@ enum class Answer { Unsat, Sat, Unknown };
 struct Reply {
   Answer answer = Answer::Unknown;
   DenseMap<unsigned, bool> values;
+  /// The raw output for the query (e.g. model values from `get-value`).
+  std::string text;
 };
 
 /// Each query is preceded by `(echo "@@")`, so the output splits into one
@@ -2001,6 +2015,7 @@ std::optional<std::vector<Reply>> parseReplies(StringRef output,
       else if (rest.starts_with("false"))
         reply.values[index] = false;
     }
+    reply.text = segment.str();
     replies.push_back(std::move(reply));
   }
   return replies;
@@ -2048,8 +2063,9 @@ struct QueryBatch {
   /// Check `assumptions && goalNegation`. `named` terms are defined as
   /// `q0, q1, ...` inside the query (usable in `goalNegation`) and their
   /// values are requested when the query is satisfiable.
+  /// `show` lists existing terms whose values are requested as well.
   void add(ArrayRef<std::string> assumptions, StringRef goalNegation,
-           ArrayRef<std::string> named = {}) {
+           ArrayRef<std::string> named = {}, ArrayRef<std::string> show = {}) {
     text += "(echo \"@@\")\n(push 1)\n";
     for (const std::string &a : assumptions)
       if (a != "true")
@@ -2063,10 +2079,34 @@ struct QueryBatch {
         text += " q" + std::to_string(i);
       text += "))\n";
     }
+    if (!show.empty()) {
+      text += "(get-value (";
+      for (const std::string &name : show)
+        text += " " + name;
+      text += "))\n";
+    }
     text += "(pop 1)\n";
     ++count;
   }
 };
+
+/// The model value z3 printed for `name` (from `get-value`), as a signed
+/// decimal for bitvectors, or nullopt.
+std::optional<std::string> modelValue(StringRef text, StringRef name) {
+  std::string key = ("(" + name + " ").str();
+  size_t pos = text.find(key);
+  if (pos == StringRef::npos)
+    return std::nullopt;
+  StringRef value = text.drop_front(pos + key.size()).ltrim();
+  value = value.take_until([](char c) { return c == ')' || c == '\n'; });
+  value = value.trim();
+  APInt bits;
+  if (value.consume_front("#x") && !value.getAsInteger(16, bits))
+    return llvm::toString(bits.zextOrTrunc(value.size() * 4), 10, true);
+  if (value.consume_front("#b") && !value.getAsInteger(2, bits))
+    return llvm::toString(bits.zextOrTrunc(value.size()), 10, true);
+  return value.str();
+}
 
 /// Named invariant of each loop, defined once per script.
 std::string invariantDefinitions(const std::deque<LoopInfo> &loops) {
@@ -2263,13 +2303,25 @@ struct BoundsCheckReportPass
 
     // Three queries per obligation: is it reachable at all (guards against
     // vacuous proofs), is it provable on its own, and with earlier ones.
+    // With `explain`, the second query also asks for a counterexample: the
+    // values of the unknowns the condition depends on.
+    constexpr size_t kMaxShown = 8;
+    std::vector<SmallVector<std::pair<std::string, std::string>>> inputs;
     QueryBatch batch;
     for (ObligationInfo &ob : enc.obligations) {
       SmallVector<std::string> assume = invariantsOf(ob.enclosing);
       assume.push_back(ob.reach);
       assume.push_back(ob.assumed);
       batch.add(assume, "true");
-      batch.add(assume, mkNot(ob.cond));
+      SmallVector<std::string> show;
+      inputs.emplace_back();
+      if (explain) {
+        inputs.back() = enc.unknownInputs(ob.cond);
+        for (auto &[name, description] : inputs.back())
+          if (show.size() < kMaxShown)
+            show.push_back(name);
+      }
+      batch.add(assume, mkNot(ob.cond), {}, show);
       for (auto &[reach, cond] : ob.earlier)
         assume.push_back("(=> " + reach + " " + cond + ")");
       batch.add(assume, mkNot(ob.cond));
@@ -2298,7 +2350,13 @@ struct BoundsCheckReportPass
       }
       SmallVector<std::string> unknowns;
       if (explain && status == Status::Unproven)
-        unknowns = enc.unknownInputs(ob.cond);
+        for (auto &[name, description] : inputs[i]) {
+          std::string line = description;
+          if (std::optional<std::string> value =
+                  modelValue((*replies)[3 * i + 1].text, name))
+            line += "  (= " + *value + " in a counterexample)";
+          unknowns.push_back(line);
+        }
       report.results.push_back({ob.kind, ob.location, status, unknowns});
     }
     return report;
