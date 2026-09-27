@@ -427,6 +427,12 @@ private:
   struct CallContext {
     /// The callee's name (for descriptions).
     std::string callee;
+    /// The context the call itself is evaluated in (null: the function being
+    /// analyzed); the callee's arguments are values there.
+    CallContext *parent = nullptr;
+    unsigned depth = 0;
+    /// Results of calls inside this callee, backed by nested contexts.
+    DenseMap<Value, std::pair<CallContext *, Value>> results;
     DenseMap<Value, Value> args;
     DenseMap<Value, std::string> terms;
     DenseMap<std::pair<Value, unsigned>, std::string> extracts;
@@ -437,6 +443,70 @@ private:
   CallContext *ctx = nullptr;
   /// Call results backed by a callee's returned value in a context.
   DenseMap<Value, std::pair<CallContext *, Value>> callResults;
+
+  /// If `value` is the result of a call whose callee has a single return,
+  /// the context evaluating that callee and the returned value backing it.
+  /// Calls met while evaluating a callee get nested contexts on demand.
+  std::optional<std::pair<CallContext *, Value>> callResult(Value value) {
+    auto &results = ctx ? ctx->results : callResults;
+    if (auto it = results.find(value); it != results.end())
+      return it->second;
+    if (!ctx || ctx->depth >= kMaxNesting)
+      return std::nullopt;
+    auto call = value.getDefiningOp<CallOp>();
+    std::optional<std::pair<FuncOp, HLCF::ReturnOp>> callee =
+        call ? singleReturnCallee(call) : std::nullopt;
+    if (!callee)
+      return std::nullopt;
+    CallContext &nested = contexts.emplace_back();
+    nested.callee = calleeName(call);
+    nested.parent = ctx;
+    nested.depth = ctx->depth + 1;
+    Block &entry = callee->first->getRegion(0).front();
+    for (auto [arg, operand] :
+         llvm::zip(entry.getArguments(), call->getOperands()))
+      nested.args[arg] = operand;
+    for (auto [result, returned] :
+         llvm::zip(call->getResults(), callee->second->getOperands()))
+      results[result] = {&nested, returned};
+    return results.lookup(value);
+  }
+
+  static constexpr unsigned kMaxNesting = 4;
+
+  static std::string calleeName(CallOp call) {
+    if (auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee()))
+      return callee.getSymbol()
+          .getRootReference()
+          .getValue()
+          .split('(')
+          .first.str();
+    return "<callee>";
+  }
+
+  /// The callee of `call` if it has a body with exactly one return, at the end
+  /// of its entry block, matching the call's operands and results.
+  std::optional<std::pair<FuncOp, HLCF::ReturnOp>>
+  singleReturnCallee(CallOp call) const {
+    auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!callee || !symbols)
+      return std::nullopt;
+    auto fn = symbols->lookup<FuncOp>(callee.getSymbol().getRootReference());
+    if (!fn || fn == self || fn->getRegion(0).empty())
+      return std::nullopt;
+    Block &entry = fn->getRegion(0).front();
+    auto ret = dyn_cast<HLCF::ReturnOp>(entry.getTerminator());
+    if (!ret || entry.getNumArguments() != call->getNumOperands() ||
+        ret->getNumOperands() != call->getNumResults())
+      return std::nullopt;
+    bool otherReturn =
+        fn->walk([&](HLCF::ReturnOp r) {
+            return r == ret ? WalkResult::advance() : WalkResult::interrupt();
+          }).wasInterrupted();
+    if (otherReturn)
+      return std::nullopt;
+    return std::make_pair(fn, ret);
+  }
 
   DenseMap<Value, std::string> &termMap() { return ctx ? ctx->terms : terms; }
   std::map<std::pair<void *, std::string>, std::string> &pathMap() {
@@ -518,18 +588,17 @@ private:
       // A callee argument is the caller's operand.
       auto arg = ctx->args.find(value);
       if (arg != ctx->args.end())
-        return inContext(nullptr, [&] { return term(arg->second); });
-    } else {
-      // A call result backed by the callee's returned value.
-      auto res = callResults.find(value);
-      if (res != callResults.end() && !terms.count(value)) {
-        auto [context, returned] = res->second;
+        return inContext(ctx->parent, [&] { return term(arg->second); });
+    }
+    // A call result backed by the callee's returned value.
+    if (!termMap().count(value))
+      if (auto res = callResult(value)) {
+        auto [context, returned] = *res;
         MaybeTerm t = inContext(context, [&] { return term(returned); });
         if (t)
-          terms[value] = *t;
+          termMap()[value] = *t;
         return t;
       }
-    }
     auto &map = termMap();
     auto it = map.find(value);
     if (it != map.end())
@@ -921,17 +990,15 @@ private:
     if (ctx) {
       auto arg = ctx->args.find(aggregate);
       if (arg != ctx->args.end())
-        return inContext(nullptr, [&] {
+        return inContext(ctx->parent, [&] {
           return resolveAccess(arg->second, path, sort, depth + 1);
         });
-    } else {
-      auto res = callResults.find(aggregate);
-      if (res != callResults.end()) {
-        auto [context, returned] = res->second;
-        return inContext(context, [&] {
-          return resolveAccess(returned, path, sort, depth + 1);
-        });
-      }
+    }
+    if (auto res = callResult(aggregate)) {
+      auto [context, returned] = *res;
+      return inContext(context, [&] {
+        return resolveAccess(returned, path, sort, depth + 1);
+      });
     }
     Operation *def = aggregate.getDefiningOp();
     if (!def)
