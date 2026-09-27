@@ -127,21 +127,6 @@ def bad_nested_overwritten_through_pointer() -> Int:
     return list[0][1]
 
 
-# Known limit: in bounds, but the second append reallocates and moves the
-# first child with a copy loop, which the heap search does not follow.
-@inline(.never)
-def limit_nested_after_realloc() -> Int:
-    var list = List[List[Int]](capacity=1)
-    var a = List[Int](capacity=2)
-    a.append(1)
-    a.append(2)
-    var b = List[Int](capacity=1)
-    b.append(1)
-    list.append(a^)
-    list.append(b^)
-    return list[0][1]
-
-
 @inline(.never)
 def bad_nested_string_field_after_asserts() raises -> Int:
     var list = List[List[Named]](capacity=1)
@@ -226,6 +211,21 @@ def ok_nested_other_list_written() -> Int:
     return list[0][1] + other[0]
 
 
+# The second append reallocates and moves the first child with a byte copy,
+# which the stdlib marks as an element copy for the analysis.
+@inline(.never)
+def ok_nested_after_realloc() -> Int:
+    var list = List[List[Int]](capacity=1)
+    var a = List[Int](capacity=2)
+    a.append(1)
+    a.append(2)
+    var b = List[Int](capacity=1)
+    b.append(1)
+    list.append(a^)
+    list.append(b^)
+    return list[0][1]
+
+
 # `assert_equal` raises through an arm that formats the message; reads after
 # a passed assert do not search it.
 @inline(.never)
@@ -266,7 +266,7 @@ def main() raises:
         bad_nested_wrong_child(),
         bad_nested_cleared(),
         bad_nested_overwritten_through_pointer(),
-        limit_nested_after_realloc(),
+        ok_nested_after_realloc(),
         ok_nested_straight(),
         ok_nested_two_children(),
         ok_nested_other_list_written(),

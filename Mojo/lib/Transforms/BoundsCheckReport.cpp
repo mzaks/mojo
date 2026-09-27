@@ -2135,11 +2135,24 @@ private:
            MaybeTerm &found) {
     if (auto store = dyn_cast<POP::StoreOp>(op))
       return heapStore(r, store, store.getPtr(), store.getArg(), guards, found);
+    if (auto marker = dyn_cast<CopyMarkerOp>(op);
+        marker && copyMarkerKind(marker) == "end") {
+      found = heapAfterCopy(r, marker, depth + 1);
+      return found ? HeapStep::Found : HeapStep::Fail;
+    }
     if (op->getName().getStringRef() == "pop.atomic.rmw")
       return heapStore(r, op, op->getOperand(0), Value(), guards, found);
     if (auto call = dyn_cast<CallOp>(op)) {
       if (isAllocation(call)) {
         noteAllocation(call);
+        // The read's memory did not exist before its allocation.
+        if (call->getNumResults())
+          if (MaybeTerm ptr = resolveAccess(call->getResult(0), {0},
+                                            {Sort::Ptr, 64, false});
+              ptr && *ptr == r.addr.root) {
+            found = heapUnknown(r, "uninitialized, allocated by", call);
+            return HeapStep::Found;
+          }
         return HeapStep::Skip; // Fresh memory: writes no existing place.
       }
       auto callee = singleReturnCallee(call);
@@ -2275,6 +2288,68 @@ private:
     if (!expr)
       return std::nullopt;
     return expr->front() == '(' ? define(r.sort, *expr) : *expr;
+  }
+
+  static StringRef copyMarkerKind(CopyMarkerOp marker) {
+    if (auto str = dyn_cast<StringAttr>(marker.getKind()))
+      return str.getValue();
+    return "";
+  }
+
+  /// The value of the read after a copy bracketed by `kgen.copy_marker`s
+  /// ending at `end`: in the copied elements, the source element before the
+  /// copy; elsewhere, the value before the copy (the code in between writes
+  /// only the copied elements, which the markers vouch for).
+  MaybeTerm heapAfterCopy(const HeapRead &r, CopyMarkerOp end, unsigned depth) {
+    CopyMarkerOp begin;
+    for (Operation *op = end->getPrevNode(); op && !begin;
+         op = op->getPrevNode())
+      if (auto marker = dyn_cast<CopyMarkerOp>(op);
+          marker && copyMarkerKind(marker) == "begin" &&
+          marker->getOperands() == end->getOperands())
+        begin = marker;
+    if (!begin)
+      return std::nullopt;
+    std::optional<HeapAddr> dest = heapAddress(end.getDest());
+    std::optional<HeapAddr> src = heapAddress(end.getSrc());
+    MaybeTerm count = term(end.getCount());
+    if (!dest || !src || !count)
+      return std::nullopt;
+    MaybeTerm before = heapValueBefore(r, begin, depth);
+    if (!before)
+      before = heapUnknown(r, "before the copy at", begin);
+    std::string sameRegion =
+        dest->root == r.addr.root
+            ? "true"
+            : "(= " + region(dest->root) + " " + region(r.addr.root) + ")";
+    if (sameRegion == "true" && dest->base != r.addr.base &&
+        dest->element != r.addr.element)
+      return heapUnknown(r, "possibly overwritten by", end);
+    if (dest->element != r.addr.element || !dest->path.empty() ||
+        !src->path.empty())
+      return define(r.sort, "(ite " + sameRegion + " " +
+                                heapUnknown(r, "possibly overwritten by", end) +
+                                " " + *before + ")");
+    // Element `i` of the destination is element `i` of the source.
+    std::string offset = "(bvsub " + r.addr.index + " " + dest->index + ")";
+    HeapRead fromSrc = r;
+    fromSrc.addr.base = src->base;
+    fromSrc.addr.root = src->root;
+    fromSrc.addr.index = "(bvadd " + src->index + " " + offset + ")";
+    MaybeTerm copied = heapValueBefore(fromSrc, begin, depth);
+    if (!copied)
+      copied = heapUnknown(r, "copied from unknown memory by", end);
+    std::string baseEq = dest->base == r.addr.base
+                             ? "true"
+                             : "(= " + dest->base + " " + r.addr.base + ")";
+    std::string inCopy = mkAnd(baseEq, "(bvult " + offset + " " + *count + ")");
+    // Another base pointer into the destination's allocation may overlap
+    // the copied elements at another offset.
+    std::string clobbered = mkAnd(mkNot(baseEq), sameRegion);
+    return define(r.sort, "(ite " + inCopy + " " + *copied + " (ite " +
+                              clobbered + " " +
+                              heapUnknown(r, "possibly overwritten by", end) +
+                              " " + *before + "))");
   }
 
   /// The value of the read after an `hlcf.if` that may write heap memory.

@@ -108,10 +108,12 @@ and memory from different allocations never overlaps
 (`ok_nested_other_list_written`). Clearing the inner list
 (`bad_nested_cleared`) or overwriting it through an unsafe pointer
 (`bad_nested_overwritten_through_pointer`) still counts as a write.
-`limit_nested_after_realloc` is in bounds but stays unproven: when `append`
-reallocates, it moves the elements with a copy loop, and the search gives up at
-loops that write memory. The same limit keeps lists of lists that are filled in
-a loop unproven (`test_2d_dynamic_list` in `test_list.mojo`).
+When `append` reallocates, it moves the elements with a byte-wise `memcpy`
+(`ok_nested_after_realloc`): the stdlib brackets it with `kgen.copy_marker
+"begin"` / `"end"` (typed pointers and element count, erased when lowering to
+LLVM), and the analysis reads a copied element from the source as it was
+before the copy instead of following the bytes. The markers are trusted, like
+`_assume`.
 
 Heap values also have to get past the code between the write and the read.
 `ok_nested_int_after_asserts` and `ok_nested_string_field_after_asserts` read
