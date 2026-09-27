@@ -70,6 +70,69 @@ def bad_escaped_pointer() -> Int:
     return vs[2]
 
 
+# Lists of lists: the inner list's length is read from the outer list's heap
+# buffer.
+@inline(.never)
+def bad_nested_short_child() -> Int:
+    var list = List[List[Int]](capacity=1)
+    var child = List[Int](capacity=2)
+    child.append(10)
+    list.append(child^)
+    return list[0][1]
+
+
+@inline(.never)
+def bad_nested_wrong_child() -> Int:
+    var list = List[List[Int]](capacity=2)
+    var a = List[Int](capacity=3)
+    a.append(1)
+    a.append(2)
+    a.append(3)
+    var b = List[Int](capacity=1)
+    b.append(1)
+    list.append(a^)
+    list.append(b^)
+    return list[1][2]
+
+
+@inline(.never)
+def bad_nested_cleared() -> Int:
+    var list = List[List[Int]](capacity=1)
+    var child = List[Int](capacity=2)
+    child.append(10)
+    child.append(20)
+    list.append(child^)
+    list[0].clear()
+    return list[0][1]
+
+
+@inline(.never)
+def bad_nested_overwritten_through_pointer() -> Int:
+    var list = List[List[Int]](capacity=1)
+    var child = List[Int](capacity=2)
+    child.append(10)
+    child.append(20)
+    list.append(child^)
+    var p = list.unsafe_ptr()
+    p[0] = List[Int]()
+    return list[0][1]
+
+
+# Known limit: in bounds, but the second append reallocates and moves the
+# first child with a copy loop, which the heap search does not follow.
+@inline(.never)
+def limit_nested_after_realloc() -> Int:
+    var list = List[List[Int]](capacity=1)
+    var a = List[Int](capacity=2)
+    a.append(1)
+    a.append(2)
+    var b = List[Int](capacity=1)
+    b.append(1)
+    list.append(a^)
+    list.append(b^)
+    return list[0][1]
+
+
 # --- must be PROVEN ---
 @inline(.never)
 def ok_strided_twice() -> Int:
@@ -87,6 +150,44 @@ def ok_read_calls_keep_length() -> Int:
     return vs[2]
 
 
+@inline(.never)
+def ok_nested_straight() -> Int:
+    var list = List[List[Int]](capacity=1)
+    var child = List[Int](capacity=2)
+    child.append(10)
+    child.append(20)
+    list.append(child^)
+    return list[0][1]
+
+
+@inline(.never)
+def ok_nested_two_children() -> Int:
+    var list = List[List[Int]](capacity=2)
+    var a = List[Int](capacity=1)
+    a.append(1)
+    var b = List[Int](capacity=3)
+    b.append(1)
+    b.append(2)
+    b.append(3)
+    list.append(a^)
+    list.append(b^)
+    return list[0][0] + list[1][2]
+
+
+@inline(.never)
+def ok_nested_other_list_written() -> Int:
+    # Writes to another allocation, even of another element type, do not
+    # touch the outer list's buffer.
+    var list = List[List[Int]](capacity=1)
+    var child = List[Int](capacity=2)
+    child.append(10)
+    child.append(20)
+    list.append(child^)
+    var other = List[Int](capacity=1)
+    other.append(5)
+    return list[0][1] + other[0]
+
+
 def main():
     var bag = Bag()
     print(
@@ -96,5 +197,13 @@ def main():
         ok_strided_twice(),
         ok_read_calls_keep_length(),
         bag.ok_get(1),
+        bad_nested_short_child(),
+        bad_nested_wrong_child(),
+        bad_nested_cleared(),
+        bad_nested_overwritten_through_pointer(),
+        limit_nested_after_realloc(),
+        ok_nested_straight(),
+        ok_nested_two_children(),
+        ok_nested_other_list_written(),
         bag.bad_get_after_clear(1),
     )

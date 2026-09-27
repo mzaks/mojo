@@ -59,7 +59,7 @@ the first, so each access counts once.
 | `contracts.mojo`   | all `bad_*` (see below)                     | all `ok_*`                   |
 | `slicing.mojo`     | all `bad_*`                                 | all `ok_*`                   |
 | `loops.mojo`       | all `bad_*`                                 | all `ok_*`                   |
-| `memory.mojo`      | all `bad_*`                                 | all `ok_*`, `Bag.ok_get`     |
+| `memory.mojo`      | all `bad_*`, `limit_nested_after_realloc`   | all `ok_*`, `Bag.ok_get`     |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -98,3 +98,17 @@ trusted language guarantee: unsafe code that casts the origin away breaks it.
 `mut` calls (`bad_after_mut_call`, `bad_read_then_mut_call`,
 `Bag.bad_get_after_clear`) and a mutable `Pointer` taken to the list before a
 read-only call (`bad_escaped_pointer`) still count as writes.
+
+The `*_nested_*` examples in `memory.mojo` index lists of lists, where the inner
+list's length is a load from the outer list's heap buffer. The analysis finds
+the value by searching back from the load for the stores that may have written
+it, including the ones inside the non-inlined `List.append` that put the inner
+list there. Each store contributes "if it wrote this address, the stored value",
+and memory from different allocations never overlaps
+(`ok_nested_other_list_written`). Clearing the inner list
+(`bad_nested_cleared`) or overwriting it through an unsafe pointer
+(`bad_nested_overwritten_through_pointer`) still counts as a write.
+`limit_nested_after_realloc` is in bounds but stays unproven: when `append`
+reallocates, it moves the elements with a copy loop, and the search gives up at
+loops that write memory. The same limit keeps lists of lists that are filled in
+a loop unproven (`test_2d_dynamic_list` in `test_list.mojo`).
