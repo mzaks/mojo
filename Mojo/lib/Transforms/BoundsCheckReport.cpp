@@ -51,6 +51,7 @@
 #include "mlir/Dialect/Index/IR/IndexOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Threading.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/FileSystem.h"
@@ -1261,7 +1262,7 @@ struct BoundsCheckReportPass
   };
 
   /// Encode one function, infer its loop invariants and check its
-  /// obligations.
+  /// obligations. Only reads the IR, so functions can run in parallel.
   FunctionReport analyzeFunction(FuncOp func, unsigned index) const {
     FunctionReport report;
     report.name = func.getSymName();
@@ -1327,9 +1328,12 @@ struct BoundsCheckReportPass
         funcs.push_back(func);
     });
 
-    std::vector<FunctionReport> reports;
-    for (auto [i, func] : llvm::enumerate(funcs))
-      reports.push_back(analyzeFunction(func, i));
+    // Each function spends its time in external solver processes; run them
+    // concurrently and print the reports in module order afterwards.
+    std::vector<FunctionReport> reports(funcs.size());
+    mlir::parallelFor(&getContext(), 0, funcs.size(), [&](size_t i) {
+      reports[i] = analyzeFunction(funcs[i], i);
+    });
 
     unsigned total = 0, proven = 0, failed = 0, unreachable = 0;
     llvm::raw_ostream &os = llvm::errs();
