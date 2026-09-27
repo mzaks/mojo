@@ -832,11 +832,11 @@ private:
            prefix == path.take_front(prefix.size());
   }
 
-  /// Whether the address of a stack slot never leaves plain loads, stores (as
-  /// the address), views and field addresses of it and lifetime markers. Then
-  /// nothing but a direct store to the slot can change it: no call and no
-  /// other pointer can.
-  static bool isNonEscapingSlot(Value slot) {
+  /// The uses through which the address of a stack slot escapes: anything
+  /// but plain loads, stores (as the address), views and field addresses of
+  /// it and lifetime markers.
+  static SmallVector<Operation *> escapingUses(Value slot) {
+    SmallVector<Operation *> escapes;
     SmallVector<Value> worklist = {slot};
     while (!worklist.empty()) {
       Value ptr = worklist.pop_back_val();
@@ -845,9 +845,9 @@ private:
         if (isa<POP::LoadOp>(user))
           continue;
         if (auto store = dyn_cast<POP::StoreOp>(user)) {
-          if (&use == &store.getPtrMutable())
-            continue;
-          return false; // The address itself is stored somewhere.
+          if (&use != &store.getPtrMutable())
+            escapes.push_back(user); // The address itself is stored.
+          continue;
         }
         if (isa<POP::PointerBitcastOp, POP::UnionBitcastOp, StructGEPOp>(
                 user)) {
@@ -858,10 +858,46 @@ private:
         if (name == "pop.stack_alloc.lifetime.start" ||
             name == "pop.stack_alloc.lifetime.end")
           continue;
-        return false;
+        escapes.push_back(user);
       }
     }
-    return true;
+    return escapes;
+  }
+
+  /// Whether `later` certainly executes after `point` whenever both execute:
+  /// their ancestors in a common block are ordered that way and no loop
+  /// encloses that block (an iteration's `later` could precede the next
+  /// iteration's `point`).
+  static bool happensAfter(Operation *later, Operation *point) {
+    DenseMap<Block *, Operation *> pointAncestors;
+    for (Operation *op = point; op && !isa<FuncOp>(op); op = op->getParentOp())
+      pointAncestors[op->getBlock()] = op;
+    for (Operation *op = later; op && !isa<FuncOp>(op);
+         op = op->getParentOp()) {
+      auto it = pointAncestors.find(op->getBlock());
+      if (it == pointAncestors.end())
+        continue;
+      if (it->second == op || !it->second->isBeforeInBlock(op))
+        return false;
+      for (Operation *anc = op->getParentOp(); anc && !isa<FuncOp>(anc);
+           anc = anc->getParentOp())
+        if (isa<HLCF::LoopOp>(anc))
+          return false;
+      return true;
+    }
+    return false;
+  }
+
+  /// Whether nothing but direct stores can have changed the slot before
+  /// `point`: its address does not escape, or only escapes after `point`
+  /// (e.g. into a closure created later), so no call or other pointer can
+  /// write it before then.
+  static bool isNonEscapingBefore(Value slot, Operation *point) {
+    // The escape at `point` itself (e.g. the call whose operand the value
+    // is read for) has not happened yet either.
+    return llvm::all_of(escapingUses(slot), [&](Operation *escape) {
+      return escape == point || happensAfter(escape, point);
+    });
   }
 
   /// Whether `op` (including nested ops) may write the place `loc`.
@@ -931,8 +967,9 @@ private:
     std::optional<MemLoc> loc = memLocation(loadOp.getPtr());
     if (!loc)
       return std::nullopt;
-    Place place{*loc, loadOp.getResult().getType(), SmallVector<int>(access),
-                sort, isNonEscapingSlot(loc->slot), loc->slot.getDefiningOp()};
+    Place place{
+        *loc, loadOp.getResult().getType(),         SmallVector<int>(access),
+        sort, isNonEscapingBefore(loc->slot, load), loc->slot.getDefiningOp()};
     return valueBefore(place, load, 0);
   }
 
