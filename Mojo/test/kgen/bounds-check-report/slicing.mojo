@@ -72,11 +72,8 @@ def ok_strided_step() -> Int:
     return es[1]
 
 
-# Known limit: with an explicit start and end, the `Optional` payloads are
-# copied by `Variant`'s copy constructor through `unsafe_ptr[T]()[]`, which
-# the analysis cannot follow yet.
 @inline(.never)
-def limit_strided_backwards_range() -> Int:
+def ok_strided_backwards_range() -> Int:
     var vs: List[Int] = [1, 2, 3]
     var es = vs[1:0:-1]
     return es[0]
@@ -112,7 +109,7 @@ def main():
         bad_strided_backwards_range(),
         ok_strided_reverse(),
         ok_strided_step(),
-        limit_strided_backwards_range(),
+        ok_strided_backwards_range(),
         ok_copy(),
         ok_contiguous(),
         ok_slice_bounds(),

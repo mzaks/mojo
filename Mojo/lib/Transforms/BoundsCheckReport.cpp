@@ -805,6 +805,8 @@ private:
   }
 
   static constexpr int kUnwrap = -1;
+  /// Access resolution may cross several call contexts, merges and views.
+  static constexpr unsigned kMaxAccessDepth = 64;
 
   /// A place in a stack allocation: the allocation and the constant
   /// `kgen.struct.gep` field indices leading to it. Pointer and union views
@@ -1197,8 +1199,13 @@ private:
         return std::nullopt;
       return term(aggregate);
     }
-    if (depth > 16)
-      return std::nullopt;
+    if (depth > kMaxAccessDepth) {
+      // Say so, rather than blaming whatever value an outer fallback picks.
+      std::string name = declare(sort);
+      noteUnknown(name, "access depth limit reached resolving " +
+                            describe(aggregate));
+      return name;
+    }
     if (ctx) {
       auto arg = ctx->args.find(aggregate);
       if (arg != ctx->args.end())
