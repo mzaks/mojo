@@ -40,6 +40,7 @@ from std.sys import (
 )
 
 from std.algorithm import vectorize
+from std.collections.string.string_span import _get_kgen_string
 
 # ===-----------------------------------------------------------------------===#
 # memcmp
@@ -560,6 +561,28 @@ def is_trivially_deletable[T: AnyType]() -> Bool:
 # ===-----------------------------------------------------------------------===#
 
 
+@inline(.nodebug)
+def _copy_marker[
+    T: AnyType, //, kind: StaticString
+](dest: MutPointer[T, _], src: Pointer[T, _], count: Int):
+    """Marks the start ("begin") or end ("end") of a copy of `count` elements
+    from `src` to `dest` for static verification (`kgen.copy_marker`). It has
+    no runtime effect.
+
+    Parameters:
+        T: The element type.
+        kind: "begin" or "end".
+
+    Args:
+        dest: The destination of the copy.
+        src: The source of the copy.
+        count: The number of elements copied.
+    """
+    __mlir_op.`kgen.copy_marker`[kind=_get_kgen_string[kind](), _type=None](
+        dest._mlir_value, src._mlir_value, count.__mlir_index__()
+    )
+
+
 @inline(.always)
 def unsafe_uninit_move_n[
     T: Movable,
@@ -613,7 +636,11 @@ def unsafe_uninit_move_n[
         comptime if overlapping:
             unsafe_memmove(dest=dest, src=src, count=count)
         else:
+            # Tells static verification that the byte copy copies `count`
+            # elements, so it need not follow the bytes.
+            _copy_marker["begin"](dest, src, count)
             unsafe_memcpy(dest=dest, src=src, count=count)
+            _copy_marker["end"](dest, src, count)
     else:
         if overlapping and Int(dest) > Int(src):
             for i in reversed(range(count)):
@@ -679,7 +706,11 @@ def unsafe_uninit_copy_n[
         comptime if overlapping:
             unsafe_memmove(dest=dest, src=src, count=count)
         else:
+            # Tells static verification that the byte copy copies `count`
+            # elements, so it need not follow the bytes.
+            _copy_marker["begin"](dest, src, count)
             unsafe_memcpy(dest=dest, src=src, count=count)
+            _copy_marker["end"](dest, src, count)
     else:
         if overlapping and Int(dest) > Int(src):
             for i in reversed(range(count)):
