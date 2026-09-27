@@ -51,16 +51,16 @@ that should be proven. Every `List` access produces two obligations, one from
 `__getitem__` and one from `unsafe_get`. The second is reported as "implied" by
 the first, so each access counts once.
 
-| File               | Must stay unproven                          | Should be proven             |
-|--------------------|---------------------------------------------|------------------------------|
-| `basic.mojo`       | `get`                                       | `sum_all`, `get_or_zero`     |
-| `cases.mojo`       | all `bad_*`, `maybe_mutating` (known limit) | all `ok_*`, `maybe_reversed` |
-| `adversarial.mojo` | all `bad_*`                                 | all `ok_*`                   |
-| `contracts.mojo`   | all `bad_*` (see below)                     | all `ok_*`                   |
-| `slicing.mojo`     | all `bad_*`                                 | all `ok_*`                   |
-| `loops.mojo`       | all `bad_*`                                 | all `ok_*`                   |
-| `memory.mojo`      | all `bad_*` and `limit_*`                   | all `ok_*`, `Bag.ok_get`     |
-| `unrolling.mojo`   | all `bad_*` and `limit_*`                   | all `ok_*`                   |
+| File               | Must stay unproven        | Should be proven                               |
+|--------------------|---------------------------|------------------------------------------------|
+| `basic.mojo`       | `get`                     | `sum_all`, `get_or_zero`                       |
+| `cases.mojo`       | all `bad_*`               | all `ok_*`, `maybe_reversed`, `maybe_mutating` |
+| `adversarial.mojo` | all `bad_*`               | all `ok_*`                                     |
+| `contracts.mojo`   | all `bad_*` (see below)   | all `ok_*`                                     |
+| `slicing.mojo`     | all `bad_*`               | all `ok_*`                                     |
+| `loops.mojo`       | all `bad_*`               | all `ok_*`                                     |
+| `memory.mojo`      | all `bad_*` and `limit_*` | all `ok_*`, `Bag.ok_get`                       |
+| `unrolling.mojo`   | all `bad_*` and `limit_*` | all `ok_*`                                     |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
