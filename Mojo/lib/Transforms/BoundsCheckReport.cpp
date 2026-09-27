@@ -81,7 +81,9 @@ namespace {
 
 /// The SMT sort of an SSA value. `None` values are not encoded at all.
 struct Sort {
-  enum Kind { None, Bool, BV } kind = None;
+  /// `Ptr` is a 64-bit address, kept apart from `BV` so that no arithmetic
+  /// or loop invariant template mixes pointers with integers.
+  enum Kind { None, Bool, BV, Ptr } kind = None;
   unsigned width = 0;
   /// Default interpretation for ops whose semantics depend on signedness
   /// (comparisons, max/min, extension, division).
@@ -96,6 +98,8 @@ struct Sort {
 };
 
 Sort sortOf(Type type) {
+  if (isa<PointerType>(type))
+    return {Sort::Ptr, 64, false};
   if (isa<IndexType>(type))
     return {Sort::BV, 64, true};
   if (auto intTy = dyn_cast<IntegerType>(type)) {
@@ -454,6 +458,8 @@ private:
     Operation *call = nullptr;
     /// Results of calls inside this callee, backed by nested contexts.
     DenseMap<Value, std::pair<CallContext *, Value>> results;
+    /// Contexts of calls inside this callee (see `contextFor`).
+    DenseMap<Operation *, CallContext *> calls;
     DenseMap<Value, Value> args;
     DenseMap<Value, std::string> terms;
     DenseMap<std::pair<Value, unsigned>, std::string> extracts;
@@ -464,6 +470,8 @@ private:
   CallContext *ctx = nullptr;
   /// Call results backed by a callee's returned value in a context.
   DenseMap<Value, std::pair<CallContext *, Value>> callResults;
+  /// Contexts of calls in the function itself (see `contextFor`).
+  DenseMap<Operation *, CallContext *> callContexts;
 
   /// If `value` is the result of a call whose callee has a single return,
   /// the context evaluating that callee and the returned value backing it.
@@ -495,6 +503,34 @@ private:
   }
 
   static constexpr unsigned kMaxNesting = 4;
+
+  /// The context evaluating the callee of `call` (which must have a single
+  /// return), created on demand like the ones backing call results; null if
+  /// there is none or the nesting limit is reached.
+  CallContext *contextFor(CallOp call) {
+    auto &map = ctx ? ctx->calls : callContexts;
+    if (auto it = map.find(call); it != map.end())
+      return it->second;
+    CallContext *result = nullptr;
+    if (call->getNumResults())
+      if (auto res = callResult(call->getResult(0)))
+        result = res->first;
+    if (!result && ctx && ctx->depth < kMaxNesting)
+      if (auto callee = singleReturnCallee(call)) {
+        CallContext &nested = contexts.emplace_back();
+        nested.callee = calleeName(call);
+        nested.call = call;
+        nested.parent = ctx;
+        nested.depth = ctx->depth + 1;
+        Block &entry = callee->first->getRegion(0).front();
+        for (auto [arg, operand] :
+             llvm::zip(entry.getArguments(), call->getOperands()))
+          nested.args[arg] = operand;
+        result = &nested;
+      }
+    map[call] = result;
+    return result;
+  }
 
   static std::string calleeName(CallOp call) {
     if (auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee()))
@@ -1480,6 +1516,11 @@ private:
     }
 
     StringRef name = op->getName().getStringRef();
+    if (isa<POP::PointerBitcastOp>(op)) {
+      if (MaybeTerm t = term(op->getOperand(0)))
+        termMap()[result] = *t; // The same address.
+      return;
+    }
     if (isa<POP::LoadOp>(op)) {
       MaybeTerm t = loadTerm(op, {}, sort);
       if (t) {
@@ -1862,6 +1903,7 @@ private:
       return;
 
     CallContext &context = contexts.emplace_back();
+    callContexts[call] = &context;
     context.call = call;
     context.callee =
         callee.getSymbol().getRootReference().getValue().split('(').first.str();
