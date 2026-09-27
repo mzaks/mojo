@@ -16,6 +16,7 @@
 from . import OptionalReg
 from std.builtin.builtin_slice import ContiguousSlice
 from std.builtin.debug_assert import _assert_enabled
+from std.collections.string.string_span import _get_kgen_string
 from std.reflection import SourceLocation
 from std.sys.info import is_gpu
 from std.reflection import call_location
@@ -59,6 +60,20 @@ def check_bounds[
             inside a `__getitem__` method, it will show the source location where
             the incorrect index was provided.
     """
+    # Record the condition for static verification (e.g. the
+    # `bounds-check-report` pass), independent of the assert mode. The location
+    # is the caller of `__getitem__`: one inline level above this function.
+    var line, col, file_name = __mlir_op.`kgen.source_loc`[
+        inlineCount=Int(1).__mlir_index__(),
+        _type=Tuple[
+            __mlir_type.index,
+            __mlir_type.index,
+            __mlir_type.`!kgen.string`,
+        ],
+    ]()
+    __mlir_op.`kgen.obligation`[kind=_get_kgen_string["bounds"](), _type=None](
+        (UInt(index(idx)) < UInt(size))._mlir_value, line, col, file_name
+    )
     debug_assert[assert_mode=_AssertMode[cpu_default]](
         UInt(index(idx)) < UInt(size),
         "index ",
