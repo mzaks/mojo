@@ -51,9 +51,13 @@ the first, so each access counts once.
 model with unbounded integers would miss.
 
 `contracts.mojo` exercises the `_ensures` contracts of `List.append`,
-`List.pop` and `List._realloc`, and the `_assume(0 <= len)` type invariant.
+`List.pop` and `List._realloc`, the `_requires(len(self) > 0)` precondition of
+`List.pop()`, and the `_assume(0 <= len)` type invariant.
 `bad_pop_first_unguarded` guards against using an assumption made after a check
-to justify that check. `bad_pop_unguarded` calls `pop()` without inlining it,
-so its failing bounds check is inside `List.pop` and only shows with
-`include-stdlib=true`; checking it at the call site needs `requires`
-contracts.
+to justify that check. `bad_pop_unguarded` is not inlined, so the precondition
+of `pop()` is checked at its call and reported as an unproven `requires` there;
+`ok_pop_guarded` establishes it. `ok_first_requires` has its own `_requires`
+and proves its body from it; `bad_call_without_precondition` and
+`ok_call_with_precondition` call it without and with the guard, and
+`bad_check_before_pop` checks that a later precondition does not justify an
+earlier access. `main` calls the examples on one shared list.
