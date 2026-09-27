@@ -231,8 +231,62 @@ struct TryInfo {
   SmallVector<Edge> raises;
 };
 
+struct ObligationLocation {
+  StringRef file;
+  int64_t line = 0, col = 0;
+};
+
+std::optional<ObligationLocation> getObligationLocation(ObligationOp op) {
+  IntegerAttr line, col;
+  StringAttr file;
+  if (!mlir::matchPattern(op.getLine(), mlir::m_Constant(&line)) ||
+      !mlir::matchPattern(op.getCol(), mlir::m_Constant(&col)) ||
+      !mlir::matchPattern(op.getFileName(), mlir::m_Constant(&file)))
+    return std::nullopt;
+  return ObligationLocation{file.getValue(), line.getInt(), col.getInt()};
+}
+
+StringRef getObligationKind(ObligationOp op) {
+  if (auto kind = dyn_cast<StringAttr>(op.getKind()))
+    return kind.getValue();
+  return "<unknown>";
+}
+
+/// The source location of an op itself (e.g. a call), preferring the
+/// innermost frame: the code as written at that point.
+std::optional<ObligationLocation> locationOf(Location loc) {
+  while (true) {
+    if (auto callSite = dyn_cast<mlir::CallSiteLoc>(loc))
+      loc = callSite.getCallee();
+    else if (auto name = dyn_cast<mlir::NameLoc>(loc))
+      loc = name.getChildLoc();
+    else if (auto fused = dyn_cast<mlir::FusedLoc>(loc);
+             fused && !fused.getLocations().empty())
+      loc = fused.getLocations().front();
+    else
+      break;
+  }
+  if (auto file = dyn_cast<FileLineColLoc>(loc))
+    return ObligationLocation{file.getFilename().getValue(), file.getLine(),
+                              file.getColumn()};
+  return std::nullopt;
+}
+
+/// A `requires` records the location of the call to the annotated function,
+/// which only resolves once that function is inlined into a caller. Still
+/// unresolved, it is the precondition of the function being analyzed itself:
+/// assumed there, and checked at its call sites.
+bool isOwnPrecondition(ObligationOp op) {
+  return getObligationKind(op) == "requires" &&
+         op.getLine().getDefiningOp<SourceLocOp>();
+}
+
 struct ObligationInfo {
   ObligationOp op;
+  /// What to report: usually taken from `op`, but a callee's precondition
+  /// checked at a call site is reported at the call.
+  StringRef kind;
+  std::optional<ObligationLocation> location;
   std::string reach, cond;
   SmallVector<LoopInfo *> enclosing;
   /// (reach, cond) of obligations preceding this one on the same path.
@@ -926,8 +980,13 @@ private:
     if (auto obligation = dyn_cast<ObligationOp>(op)) {
       std::string r = reachName(reach);
       std::string cond = boolTerm(obligation.getCond());
+      if (isOwnPrecondition(obligation)) {
+        addAssumption(r, cond);
+        return reach;
+      }
       obligations.push_back(
-          {obligation, r, cond, assumedLoops(),
+          {obligation, getObligationKind(obligation),
+           getObligationLocation(obligation), r, cond, assumedLoops(),
            SmallVector<std::pair<std::string, std::string>>(activeObligations),
            assumed});
       activeObligations.push_back({r, cond});
@@ -964,10 +1023,11 @@ private:
     return reach;
   }
 
-  /// Assume the `ensures` of a (non-inlined) callee at a call to it. The
-  /// callee's entry arguments are bound to the call's operands and its
-  /// returned values back the call's results, so conditions over "self at
-  /// exit" talk about the call's results.
+  /// Apply the contract of a (non-inlined) callee at a call to it: its
+  /// `requires` become obligations of the caller, reported at the call, and
+  /// its `ensures` are assumed after them. The callee's entry arguments are
+  /// bound to the call's operands and its returned values back the call's
+  /// results, so conditions over "self at exit" talk about the call's results.
   void instantiateContracts(CallOp call, StringRef reach) {
     if (ctx || !symbols)
       return;
@@ -977,39 +1037,53 @@ private:
     auto fn = symbols->lookup<FuncOp>(callee.getSymbol().getRootReference());
     if (!fn || fn == self || fn->getRegion(0).empty())
       return;
-    // The contract must hold on every normal exit: require exactly one
-    // return, at the end of the entry block, preceded by the `ensures`.
     Block &entry = fn->getRegion(0).front();
-    auto ret = dyn_cast<HLCF::ReturnOp>(entry.getTerminator());
-    if (!ret || entry.getNumArguments() != call->getNumOperands() ||
-        ret->getNumOperands() != call->getNumResults())
+    if (entry.getNumArguments() != call->getNumOperands())
       return;
-    bool otherReturn =
-        fn->walk([&](HLCF::ReturnOp r) {
-            return r == ret ? WalkResult::advance() : WalkResult::interrupt();
-          }).wasInterrupted();
-    if (otherReturn)
-      return;
-    SmallVector<ObligationOp> ensures;
+    SmallVector<ObligationOp> preconditions, postconditions;
     for (Operation &op : entry)
-      if (auto ob = dyn_cast<ObligationOp>(&op))
-        if (auto kind = dyn_cast<StringAttr>(ob.getKind()))
-          if (kind.getValue() == "ensures")
-            ensures.push_back(ob);
-    if (ensures.empty())
+      if (auto ob = dyn_cast<ObligationOp>(&op)) {
+        if (isOwnPrecondition(ob))
+          preconditions.push_back(ob);
+        else if (getObligationKind(ob) == "ensures")
+          postconditions.push_back(ob);
+      }
+    // A postcondition must hold on every normal exit: require exactly one
+    // return, at the end of the entry block, preceded by the `ensures`.
+    auto ret = dyn_cast<HLCF::ReturnOp>(entry.getTerminator());
+    bool singleReturn =
+        ret && ret->getNumOperands() == call->getNumResults() &&
+        !fn->walk([&](HLCF::ReturnOp r) {
+             return r == ret ? WalkResult::advance() : WalkResult::interrupt();
+           }).wasInterrupted();
+    if (!singleReturn)
+      postconditions.clear();
+    if (preconditions.empty() && postconditions.empty())
       return;
 
     CallContext &context = contexts.emplace_back();
     for (auto [arg, operand] :
          llvm::zip(entry.getArguments(), call->getOperands()))
       context.args[arg] = operand;
+    std::string r = reachName(reach);
+    for (ObligationOp pre : preconditions) {
+      std::string cond =
+          inContext(&context, [&] { return boolTerm(pre.getCond()); });
+      obligations.push_back(
+          {pre, "requires", locationOf(call.getLoc()), r, cond, assumedLoops(),
+           SmallVector<std::pair<std::string, std::string>>(activeObligations),
+           assumed});
+      activeObligations.push_back({r, cond});
+      ++contractsUsed;
+    }
+    if (postconditions.empty())
+      return;
     for (auto [result, returned] :
          llvm::zip(call->getResults(), ret->getOperands()))
       callResults[result] = {&context, returned};
-    std::string r = reachName(reach);
-    for (ObligationOp e : ensures) {
+    for (ObligationOp post : postconditions) {
       std::string cond =
-          inContext(&context, [&] { return boolTerm(e.getCond()); });
+          inContext(&context, [&] { return boolTerm(post.getCond()); });
       addAssumption(r, cond);
       ++contractsUsed;
     }
@@ -1337,27 +1411,6 @@ void generateCandidates(LoopInfo &loop) {
 // Reporting
 //===----------------------------------------------------------------------===//
 
-struct ObligationLocation {
-  StringRef file;
-  int64_t line = 0, col = 0;
-};
-
-std::optional<ObligationLocation> getObligationLocation(ObligationOp op) {
-  IntegerAttr line, col;
-  StringAttr file;
-  if (!mlir::matchPattern(op.getLine(), mlir::m_Constant(&line)) ||
-      !mlir::matchPattern(op.getCol(), mlir::m_Constant(&col)) ||
-      !mlir::matchPattern(op.getFileName(), mlir::m_Constant(&file)))
-    return std::nullopt;
-  return ObligationLocation{file.getValue(), line.getInt(), col.getInt()};
-}
-
-StringRef getObligationKind(ObligationOp op) {
-  if (auto kind = dyn_cast<StringAttr>(op.getKind()))
-    return kind.getValue();
-  return "<unknown>";
-}
-
 enum class Status { Proven, Implied, Unproven, Unreachable, SolverFailed };
 
 struct BoundsCheckReportPass
@@ -1453,7 +1506,12 @@ struct BoundsCheckReportPass
 
   struct FunctionReport {
     StringRef name;
-    SmallVector<std::pair<ObligationOp, Status>> results;
+    struct Result {
+      StringRef kind;
+      std::optional<ObligationLocation> location;
+      Status status;
+    };
+    SmallVector<Result> results;
     bool solverFailed = false;
     unsigned contractsUsed = 0;
   };
@@ -1504,7 +1562,7 @@ struct BoundsCheckReportPass
         else
           status = Status::Unproven;
       }
-      report.results.push_back({ob.op, status});
+      report.results.push_back({ob.kind, ob.location, status});
     }
     return report;
   }
@@ -1519,19 +1577,43 @@ struct BoundsCheckReportPass
       return signalPassFailure();
     }
 
+    // Callee contracts are looked up by symbol; lookups only read the table.
+    mlir::SymbolTable symbols(getOperation());
+
+    // Functions with preconditions: calls to them are checked at the caller.
+    DenseSet<Operation *> withPreconditions;
+    getOperation().walk([&](FuncOp func) {
+      if (!func->getRegion(0).empty() &&
+          llvm::any_of(func->getRegion(0).front(), [](Operation &op) {
+            auto ob = dyn_cast<ObligationOp>(&op);
+            return ob && isOwnPrecondition(ob);
+          }))
+        withPreconditions.insert(func);
+    });
+    auto hasWork = [&](Operation *op) {
+      if (isa<ObligationOp>(op))
+        return true;
+      auto call = dyn_cast<CallOp>(op);
+      auto callee =
+          call ? dyn_cast<SymbolConstantAttr>(call.getCallee()) : nullptr;
+      return callee && withPreconditions.contains(symbols.lookup(
+                           callee.getSymbol().getRootReference()));
+    };
+
     SmallVector<FuncOp> funcs;
     getOperation().walk([&](FuncOp func) {
       if (!includeStdlib && func.getSymName().starts_with("std::"))
         return;
-      if (func.walk([](ObligationOp) { return WalkResult::interrupt(); })
+      if (func.walk([&](Operation *op) {
+                return hasWork(op) ? WalkResult::interrupt()
+                                   : WalkResult::advance();
+              })
               .wasInterrupted())
         funcs.push_back(func);
     });
 
     // Each function spends its time in external solver processes; run them
     // concurrently and print the reports in module order afterwards.
-    // Callee contracts are looked up by symbol; lookups only read the table.
-    mlir::SymbolTable symbols(getOperation());
     std::vector<FunctionReport> reports(funcs.size());
     mlir::parallelFor(&getContext(), 0, funcs.size(), [&](size_t i) {
       reports[i] = analyzeFunction(funcs[i], i, symbols);
@@ -1543,7 +1625,7 @@ struct BoundsCheckReportPass
     for (FunctionReport &report : reports) {
       unsigned funcProven = 0, funcImplied = 0, funcTotal = 0,
                funcUnreachable = 0;
-      for (auto &[op, status] : report.results) {
+      for (auto &[kind, location, status] : report.results) {
         if (status == Status::Implied) {
           ++funcImplied;
           continue;
@@ -1567,11 +1649,11 @@ struct BoundsCheckReportPass
       if (funcUnreachable)
         os << " (+" << funcUnreachable << " unreachable)";
       if (report.contractsUsed)
-        os << " (" << report.contractsUsed << " callee ensures assumed)";
+        os << " (" << report.contractsUsed << " callee contracts applied)";
       if (report.solverFailed)
         os << "  [solver failed]";
       os << "\n";
-      for (auto &[op, status] : report.results) {
+      for (auto &[kind, location, status] : report.results) {
         if (!verbose && (status == Status::Proven || status == Status::Implied))
           continue;
         os << "  "
@@ -1579,9 +1661,9 @@ struct BoundsCheckReportPass
                : status == Status::Implied     ? "implied "
                : status == Status::Unreachable ? "unreach "
                                                : "UNPROVEN")
-           << "  " << getObligationKind(op) << "  ";
-        if (auto loc = getObligationLocation(op))
-          os << loc->file << ":" << loc->line << ":" << loc->col;
+           << "  " << kind << "  ";
+        if (location)
+          os << location->file << ":" << location->line << ":" << location->col;
         else
           os << "<unresolved location>";
         os << "\n";
