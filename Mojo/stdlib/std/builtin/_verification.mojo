@@ -21,6 +21,34 @@ from std.collections.string.string_span import _get_kgen_string
 
 
 @inline(.nodebug)
+def _requires(cond: Bool):
+    """Declares a precondition, to be placed at the start of a function.
+
+    Callers must establish `cond`: static verification checks it at every call
+    site (the call's arguments bound to the parameters), and assumes it inside
+    the function itself.
+
+    Args:
+        cond: The condition that must hold when the function is called.
+    """
+    # The location of the call to the annotated function. It only resolves once
+    # that function is inlined into a caller, which is how verification tells a
+    # function's own precondition (unresolved: assumed) from the precondition
+    # of an inlined callee (resolved: checked and reported at the call).
+    var line, col, file_name = __mlir_op.`kgen.source_loc`[
+        inlineCount=Int(1).__mlir_index__(),
+        _type=Tuple[
+            __mlir_type.index,
+            __mlir_type.index,
+            __mlir_type.`!kgen.string`,
+        ],
+    ]()
+    __mlir_op.`kgen.obligation`[
+        kind=_get_kgen_string["requires"](), _type=None
+    ](cond._mlir_value, line, col, file_name)
+
+
+@inline(.nodebug)
 def _ensures(cond: Bool):
     """Declares a postcondition, to be placed right before a function returns.
 

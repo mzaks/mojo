@@ -41,7 +41,7 @@ from std.memory import (
     unsafe_uninit_move_n,
 )
 from std.builtin.builtin_slice import ContiguousSlice, StridedSlice
-from std.builtin._verification import _assume, _ensures
+from std.builtin._verification import _assume, _ensures, _requires
 from .optional import Optional
 
 # ===-----------------------------------------------------------------------===#
@@ -1145,6 +1145,7 @@ struct List[T: AnyType, /](
         print("length", len(numbers))             # length 4
         ```
         """
+        _requires(len(self) > 0)
         var old_len = len(self)
         var ret_val = self.pop(old_len - 1)
         _ensures(len(self) == old_len - 1)
