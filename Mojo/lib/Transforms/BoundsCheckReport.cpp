@@ -814,9 +814,13 @@ private:
     if (op->getNumRegions()) {
       // Unknown region op: its regions may run any number of times under the
       // current condition; block arguments and results stay unconstrained.
+      // Each block gets its own free guard: blocks are not known to be
+      // exclusive, so value definitions from different blocks must not be
+      // able to contradict each other.
       for (Region &region : op->getRegions())
         for (Block &block : region)
-          encodeBlock(block, reach);
+          encodeBlock(block,
+                      reachName(mkAnd(reach, declare({Sort::Bool, 1, false}))));
       return reach;
     }
     encodeOp(op);
