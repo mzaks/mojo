@@ -462,6 +462,15 @@ private:
     /// Contexts of calls inside this callee (see `contextFor`).
     DenseMap<Operation *, CallContext *> calls;
     DenseMap<Value, Value> args;
+    /// For an iteration of a loop (see `iterationContext`): the loop, the
+    /// context it is evaluated in, and the iteration's number. `parent` is
+    /// then the previous iteration (or `owner` for the first one), whose
+    /// `hlcf.continue` operands are this iteration's block arguments.
+    Operation *loop = nullptr;
+    CallContext *owner = nullptr;
+    unsigned iteration = 0;
+    /// Iterations of loops in this context (see `iterationContext`).
+    DenseMap<std::pair<Operation *, unsigned>, CallContext *> iterations;
     DenseMap<Value, std::string> terms;
     DenseMap<std::pair<Value, unsigned>, std::string> extracts;
     std::map<std::pair<void *, std::string>, std::string> paths;
@@ -473,11 +482,32 @@ private:
   DenseMap<Value, std::pair<CallContext *, Value>> callResults;
   /// Contexts of calls in the function itself (see `contextFor`).
   DenseMap<Operation *, CallContext *> callContexts;
+  /// Iterations of loops in the function itself (see `iterationContext`).
+  DenseMap<std::pair<Operation *, unsigned>, CallContext *> loopIterations;
+
+  /// The context `value` is evaluated in: an iteration context only
+  /// evaluates the values of its loop's body, the others belong to the
+  /// context the loop is in.
+  CallContext *contextOf(Value value) {
+    CallContext *c = ctx;
+    while (c && c->loop &&
+           !c->loop->getRegion(0).isAncestor(value.getParentRegion()))
+      c = c->owner;
+    return c;
+  }
 
   /// If `value` is the result of a call whose callee has a single return,
   /// the context evaluating that callee and the returned value backing it.
   /// Calls met while evaluating a callee get nested contexts on demand.
   std::optional<std::pair<CallContext *, Value>> callResult(Value value) {
+    if (ctx && ctx->loop)
+      if (CallContext *owner = contextOf(value); owner != ctx) {
+        CallContext *saved = ctx;
+        ctx = owner;
+        auto result = callResult(value);
+        ctx = saved;
+        return result;
+      }
     auto &results = ctx ? ctx->results : callResults;
     if (auto it = results.find(value); it != results.end())
       return it->second;
@@ -599,6 +629,196 @@ private:
     return (prefix + Twine(counter++)).str();
   }
 
+  /// The expression of every defined name, for `evalConst`.
+  llvm::StringMap<std::string> definitions;
+  llvm::StringMap<std::optional<APInt>> constants;
+
+  /// The value of a term that is a constant (e.g. a loop counter in an
+  /// unrolled iteration), through definitions: bit-vector literals and
+  /// arithmetic, comparisons, Boolean connectives and `ite`. Booleans are
+  /// 1-bit values. Nullopt if it is not constant or not understood.
+  std::optional<APInt> evalConst(StringRef term) {
+    size_t pos = 0;
+    return evalAt(term, pos, 0);
+  }
+
+  static StringRef token(StringRef s, size_t &pos) {
+    while (pos < s.size() && s[pos] == ' ')
+      ++pos;
+    size_t start = pos;
+    while (pos < s.size() && s[pos] != ' ' && s[pos] != '(' && s[pos] != ')')
+      ++pos;
+    return s.slice(start, pos);
+  }
+
+  /// Skips one term starting at `pos`.
+  static void skipTerm(StringRef s, size_t &pos) {
+    while (pos < s.size() && s[pos] == ' ')
+      ++pos;
+    if (pos >= s.size())
+      return;
+    if (s[pos] != '(') {
+      token(s, pos);
+      return;
+    }
+    unsigned open = 0;
+    do {
+      if (s[pos] == '(')
+        ++open;
+      else if (s[pos] == ')')
+        --open;
+      ++pos;
+    } while (pos < s.size() && open);
+  }
+
+  std::optional<APInt> evalAt(StringRef s, size_t &pos, unsigned depth) {
+    while (pos < s.size() && s[pos] == ' ')
+      ++pos;
+    if (pos >= s.size() || depth > 256)
+      return std::nullopt;
+    if (s[pos] != '(') {
+      StringRef name = token(s, pos);
+      if (name == "true" || name == "false")
+        return APInt(1, name == "true");
+      if (auto it = constants.find(name); it != constants.end())
+        return it->second;
+      auto def = definitions.find(name);
+      if (def == definitions.end())
+        return std::nullopt;
+      std::string expr = def->second;
+      size_t inner = 0;
+      std::optional<APInt> value = evalAt(expr, inner, depth + 1);
+      constants[name] = value;
+      return value;
+    }
+    ++pos; // '('
+    auto close = [&](std::optional<APInt> v) -> std::optional<APInt> {
+      while (pos < s.size() && s[pos] != ')')
+        skipTerm(s, pos);
+      ++pos;
+      return v;
+    };
+    while (pos < s.size() && s[pos] == ' ')
+      ++pos;
+    // Indexed operators: `((_ extract hi lo) x)` and the extensions.
+    if (s[pos] == '(') {
+      ++pos;
+      token(s, pos); // "_"
+      StringRef op = token(s, pos);
+      unsigned a = 0, b = 0;
+      token(s, pos).getAsInteger(10, a);
+      if (op == "extract")
+        token(s, pos).getAsInteger(10, b);
+      while (pos < s.size() && s[pos] != ')')
+        ++pos;
+      ++pos;
+      std::optional<APInt> x = evalAt(s, pos, depth + 1);
+      if (!x)
+        return close(std::nullopt);
+      if (op == "extract")
+        return close(x->extractBits(a - b + 1, b));
+      if (op == "zero_extend")
+        return close(x->zext(x->getBitWidth() + a));
+      if (op == "sign_extend")
+        return close(x->sext(x->getBitWidth() + a));
+      return close(std::nullopt);
+    }
+    StringRef op = token(s, pos);
+    if (op == "_") {
+      // `(_ bvN W)`.
+      StringRef digits = token(s, pos).drop_front(2);
+      unsigned width = 0;
+      token(s, pos).getAsInteger(10, width);
+      if (!width)
+        return close(std::nullopt);
+      return close(APInt(width, digits, 10));
+    }
+    if (op == "ite") {
+      std::optional<APInt> c = evalAt(s, pos, depth + 1);
+      if (!c)
+        return close(std::nullopt);
+      if (c->isOne()) {
+        std::optional<APInt> v = evalAt(s, pos, depth + 1);
+        return close(v);
+      }
+      skipTerm(s, pos);
+      return close(evalAt(s, pos, depth + 1));
+    }
+    SmallVector<std::optional<APInt>> args;
+    while (true) {
+      while (pos < s.size() && s[pos] == ' ')
+        ++pos;
+      if (pos >= s.size() || s[pos] == ')')
+        break;
+      args.push_back(evalAt(s, pos, depth + 1));
+    }
+    ++pos;
+    auto known = [&] {
+      return llvm::all_of(args, [](auto &a) { return a.has_value(); });
+    };
+    if (op == "and" || op == "or") {
+      bool isAnd = op == "and";
+      bool unknown = false;
+      for (auto &a : args) {
+        if (!a)
+          unknown = true;
+        else if (a->isOne() != isAnd)
+          return APInt(1, !isAnd);
+      }
+      if (unknown)
+        return std::nullopt;
+      return APInt(1, isAnd);
+    }
+    if (!known() || args.empty())
+      return std::nullopt;
+    const APInt &x = *args[0];
+    auto boolean = [](bool b) { return APInt(1, b); };
+    if (op == "not")
+      return boolean(x.isZero());
+    if (op == "bvneg")
+      return -x;
+    if (args.size() != 2 || x.getBitWidth() != args[1]->getBitWidth())
+      return std::nullopt;
+    const APInt &y = *args[1];
+    if (op == "=")
+      return boolean(x == y);
+    if (op == "distinct")
+      return boolean(x != y);
+    if (op == "=>")
+      return boolean(x.isZero() || y.isOne());
+    if (op == "xor")
+      return boolean(x != y);
+    if (op == "bvadd")
+      return x + y;
+    if (op == "bvsub")
+      return x - y;
+    if (op == "bvmul")
+      return x * y;
+    if (op == "bvand")
+      return x & y;
+    if (op == "bvor")
+      return x | y;
+    if (op == "bvxor")
+      return x ^ y;
+    if (op == "bvslt")
+      return boolean(x.slt(y));
+    if (op == "bvsle")
+      return boolean(x.sle(y));
+    if (op == "bvsgt")
+      return boolean(x.sgt(y));
+    if (op == "bvsge")
+      return boolean(x.sge(y));
+    if (op == "bvult")
+      return boolean(x.ult(y));
+    if (op == "bvule")
+      return boolean(x.ule(y));
+    if (op == "bvugt")
+      return boolean(x.ugt(y));
+    if (op == "bvuge")
+      return boolean(x.uge(y));
+    return std::nullopt;
+  }
+
   std::string declare(Sort sort, StringRef prefix = "h") {
     std::string name = fresh(prefix);
     prelude += "(declare-const " + name + " " + sort.str() + ")\n";
@@ -607,6 +827,7 @@ private:
 
   std::string define(Sort sort, StringRef expr, StringRef prefix = "v") {
     std::string name = fresh(prefix);
+    definitions[name] = expr.str();
     prelude +=
         ("(define-fun " + name + " () " + sort.str() + " " + expr + ")\n")
             .str();
@@ -646,6 +867,9 @@ private:
     Sort sort = sortOf(value.getType());
     if (sort.kind == Sort::None)
       return std::nullopt;
+    if (ctx && ctx->loop)
+      if (CallContext *owner = contextOf(value); owner != ctx)
+        return inContext(owner, [&] { return term(value); });
     if (ctx) {
       // A callee argument is the caller's operand.
       auto arg = ctx->args.find(value);
@@ -671,7 +895,10 @@ private:
       if (Operation *def = value.getDefiningOp()) {
         if (auto ifOp = dyn_cast<HLCF::IfOp>(def))
           encodeIfResultOnDemand(ifOp, cast<OpResult>(value));
-        else
+        else if (auto loop = dyn_cast<HLCF::LoopOp>(def)) {
+          if (MaybeTerm t = loopResultTerm(loop, cast<OpResult>(value)))
+            map[value] = *t;
+        } else
           encodeOp(def);
         auto it = map.find(value);
         if (it != map.end())
@@ -1363,6 +1590,184 @@ private:
     return resolveAccess(stored, path, place.sort);
   }
 
+  // Loop unrolling: the first iterations of a loop, evaluated like callees.
+  // Values after a loop that exits within `kMaxUnroll` iterations are exact;
+  // later exits leave them unknown.
+
+  static constexpr unsigned kMaxUnroll = 8;
+
+  /// A loop the unrolling handles: its body is one block ending in the only
+  /// `hlcf.continue` for it, with one `hlcf.break` for it, reached through
+  /// `hlcf.if` arms only (`exitPath`: their conditions and arms).
+  struct LoopShape {
+    HLCF::BreakOp exit;
+    SmallVector<std::pair<Value, bool>> exitPath;
+  };
+
+  /// The loop a `hlcf.break` / `hlcf.continue` leaves or repeats.
+  static Operation *targetLoop(Operation *jump, StringAttr label) {
+    for (Operation *op = jump->getParentOp(); op; op = op->getParentOp())
+      if (auto loop = dyn_cast<HLCF::LoopOp>(op))
+        if (!label || loop.getLabelAttr() == label)
+          return loop;
+    return nullptr;
+  }
+
+  std::optional<LoopShape> loopShape(HLCF::LoopOp loop) {
+    if (auto it = loopShapes.find(loop); it != loopShapes.end())
+      return it->second;
+    std::optional<LoopShape> &shape = loopShapes[loop];
+    Region &body = loop->getRegion(0);
+    if (!body.hasOneBlock() ||
+        !isa<HLCF::ContinueOp>(body.front().getTerminator()))
+      return std::nullopt;
+    SmallVector<HLCF::BreakOp> breaks;
+    unsigned continues = 0;
+    body.walk([&](Operation *op) {
+      if (auto jump = dyn_cast<HLCF::BreakOp>(op)) {
+        if (targetLoop(op, jump.getLabelAttr()) == loop)
+          breaks.push_back(jump);
+      } else if (auto jump = dyn_cast<HLCF::ContinueOp>(op)) {
+        if (targetLoop(op, jump.getLabelAttr()) == loop)
+          ++continues;
+      }
+    });
+    if (breaks.size() != 1 || continues != 1)
+      return std::nullopt;
+    LoopShape result{breaks.front(), {}};
+    for (Operation *op = breaks.front(); op->getParentOp() != loop;) {
+      Block *block = op->getBlock();
+      auto ifOp = dyn_cast<HLCF::IfOp>(op->getParentOp());
+      if (!ifOp || !ifOp.getElifRegions().empty())
+        return std::nullopt;
+      result.exitPath.push_back(
+          {ifOp.getCond(), block == &ifOp.getThenBlock()});
+      op = ifOp;
+    }
+    shape = result;
+    return shape;
+  }
+  DenseMap<Operation *, std::optional<LoopShape>> loopShapes;
+
+  /// The context evaluating iteration `k` of `loop` (in the current
+  /// context), created on demand after the ones before it.
+  CallContext *iterationContext(HLCF::LoopOp loop, unsigned k) {
+    auto &map = ctx ? ctx->iterations : loopIterations;
+    if (auto it = map.find({loop, k}); it != map.end())
+      return it->second;
+    CallContext *previous = k ? iterationContext(loop, k - 1) : nullptr;
+    CallContext &iteration = contexts.emplace_back();
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    os << "iteration " << k << " of hlcf.loop";
+    if (std::optional<ObligationLocation> where = locationOf(loop.getLoc()))
+      os << " at " << where->file << ":" << where->line;
+    iteration.callee = text;
+    iteration.loop = loop;
+    iteration.owner = ctx;
+    iteration.iteration = k;
+    iteration.parent = previous ? previous : ctx;
+    iteration.depth = ctx ? ctx->depth : 0;
+    Block &body = loop->getRegion(0).front();
+    ValueRange carried =
+        previous ? body.getTerminator()->getOperands() : loop->getOperands();
+    for (auto [arg, value] : llvm::zip(body.getArguments(), carried))
+      iteration.args[arg] = value;
+    map[{loop, k}] = &iteration;
+    return &iteration;
+  }
+
+  /// Whether iteration `k` leaves through the loop's `hlcf.break` (evaluated
+  /// in the current context, which runs the loop).
+  std::string exitsIn(HLCF::LoopOp loop, const LoopShape &shape, unsigned k) {
+    CallContext *iteration = iterationContext(loop, k);
+    return inContext(iteration, [&] {
+      std::string cond = "true";
+      for (auto &[value, arm] : shape.exitPath) {
+        std::string c = boolTerm(value);
+        cond = mkAnd(cond, arm ? c : mkNot(c));
+      }
+      return cond;
+    });
+  }
+
+  /// The iterations that may be the one leaving the loop, in order, with
+  /// their exit conditions: iterations whose exit condition is constant
+  /// false are left out, and the list ends at one whose exit is certain
+  /// (`certain` is then set; else later exits are possible).
+  SmallVector<std::pair<unsigned, std::string>>
+  exitingIterations(HLCF::LoopOp loop, const LoopShape &shape, bool &certain) {
+    SmallVector<std::pair<unsigned, std::string>> result;
+    certain = false;
+    for (unsigned k = 0; k < kMaxUnroll; ++k) {
+      std::string exits = exitsIn(loop, shape, k);
+      std::optional<APInt> known = evalConst(exits);
+      if (known && known->isZero())
+        continue;
+      result.push_back({k, exits});
+      if (known) {
+        certain = true;
+        break;
+      }
+    }
+    return result;
+  }
+
+  /// A loop result in a callee or iteration context: the `hlcf.break`
+  /// operand of the iteration that exits.
+  MaybeTerm loopResultTerm(HLCF::LoopOp loop, OpResult result) {
+    std::optional<LoopShape> shape = loopShape(loop);
+    Sort sort = sortOf(result.getType());
+    if (!shape || sort.kind == Sort::None)
+      return std::nullopt;
+    bool certain;
+    auto exits = exitingIterations(loop, *shape, certain);
+    std::optional<std::string> expr;
+    if (!certain) {
+      expr = declare(sort);
+      noteUnknown(*expr, "loop result after more than " +
+                             std::to_string(kMaxUnroll) + " iterations of " +
+                             describe(result));
+    }
+    for (auto &[k, cond] : llvm::reverse(exits)) {
+      MaybeTerm value = inContext(iterationContext(loop, k), [&] {
+        return term(shape->exit->getOperand(result.getResultNumber()));
+      });
+      if (!value)
+        return std::nullopt;
+      expr = expr ? "(ite " + cond + " " + *value + " " + *expr + ")" : *value;
+    }
+    if (!expr)
+      return std::nullopt;
+    return expr->front() == '(' ? define(sort, *expr) : *expr;
+  }
+
+  /// The loop's results in the function itself already have terms (bounded
+  /// by the loop's invariants): tie them to the iteration that exits.
+  void linkLoopResults(HLCF::LoopOp loop, const LoopShape &shape) {
+    if (ctx || !linkedLoops.insert(loop).second)
+      return;
+    for (OpResult result : loop->getResults()) {
+      MaybeTerm whole = term(result);
+      if (!whole)
+        continue;
+      // Iterations after the exiting one never run: only the first exit
+      // decides the results.
+      std::string notYet = "true";
+      bool certain;
+      for (auto &[k, exits] : exitingIterations(loop, shape, certain)) {
+        MaybeTerm value = inContext(iterationContext(loop, k), [&] {
+          return term(shape.exit->getOperand(result.getResultNumber()));
+        });
+        if (value)
+          assertGlobal("(=> " + mkAnd(notYet, exits) + " (= " + *whole + " " +
+                       *value + "))");
+        notYet = mkAnd(notYet, mkNot(exits));
+      }
+    }
+  }
+  DenseSet<Operation *> linkedLoops;
+
   // Heap memory: loads from anything but a local stack slot or an argument
   // place, e.g. the element of a list that holds lists. The value is built
   // lazily from the stores before the load, most recent first, each guarded
@@ -1704,6 +2109,19 @@ private:
           known.facts.push_back({ifOp.getCond(), false});
         return heapValueBefore(known, ifOp, depth + 1);
       }
+      // The start of an iteration's body: what the previous iteration left,
+      // or what the loop started with.
+      if (ctx && ctx->loop == parent) {
+        CallContext *iteration = ctx;
+        if (iteration->iteration == 0)
+          return inContext(iteration->owner, [&] {
+            return heapValueBefore(r.withoutFacts(), parent, depth + 1);
+          });
+        Operation *next = parent->getRegion(0).front().getTerminator();
+        return inContext(iteration->parent, [&] {
+          return heapValueBefore(r.withoutFacts(), next, depth + 1);
+        });
+      }
       // A loop body could see a value an earlier iteration stored.
       if (heapMayWrite(parent))
         return std::nullopt;
@@ -1738,6 +2156,12 @@ private:
       if (!heapMayWrite(ifOp))
         return HeapStep::Skip;
       found = heapMergeIf(r, ifOp, depth + 1);
+      return found ? HeapStep::Found : HeapStep::Fail;
+    }
+    if (auto loop = dyn_cast<HLCF::LoopOp>(op)) {
+      if (!heapMayWrite(loop))
+        return HeapStep::Skip;
+      found = heapAfterLoop(r, loop, depth + 1);
       return found ? HeapStep::Found : HeapStep::Fail;
     }
     if (op->getNumRegions())
@@ -1824,6 +2248,35 @@ private:
     return HeapStep::Skip;
   }
 
+  /// The value of the read after a loop that may write heap memory: what
+  /// the exiting iteration left at its `hlcf.break`.
+  MaybeTerm heapAfterLoop(const HeapRead &r, HLCF::LoopOp loop,
+                          unsigned depth) {
+    std::optional<LoopShape> shape = loopShape(loop);
+    if (!shape)
+      return std::nullopt;
+    linkLoopResults(loop, *shape);
+    bool certain;
+    auto exits = exitingIterations(loop, *shape, certain);
+    std::optional<std::string> expr;
+    if (!certain)
+      expr = heapUnknown(
+          r, "after more than " + std::to_string(kMaxUnroll) + " iterations of",
+          loop);
+    for (auto &[k, cond] : llvm::reverse(exits)) {
+      MaybeTerm value = inContext(iterationContext(loop, k), [&] {
+        return heapValueBefore(r.withoutFacts(), shape->exit, depth + 1);
+      });
+      if (!value)
+        value = heapUnknown(
+            r, "at the exit of iteration " + std::to_string(k) + " of", loop);
+      expr = expr ? "(ite " + cond + " " + *value + " " + *expr + ")" : *value;
+    }
+    if (!expr)
+      return std::nullopt;
+    return expr->front() == '(' ? define(r.sort, *expr) : *expr;
+  }
+
   /// The value of the read after an `hlcf.if` that may write heap memory.
   MaybeTerm heapMergeIf(const HeapRead &r, HLCF::IfOp ifOp, unsigned depth) {
     auto armValue = [&](Block &block) -> std::string {
@@ -1865,6 +2318,10 @@ private:
   /// values visible through e.g. the `Optional` returned by iterators.
   MaybeTerm resolveAccess(Value aggregate, ArrayRef<int> path, Sort sort,
                           unsigned depth = 0) {
+    if (ctx && ctx->loop)
+      if (CallContext *owner = contextOf(aggregate); owner != ctx)
+        return inContext(
+            owner, [&] { return resolveAccess(aggregate, path, sort, depth); });
     if (path.empty()) {
       if (!(sortOf(aggregate.getType()) == sort))
         return std::nullopt;
