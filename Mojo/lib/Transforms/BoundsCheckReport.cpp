@@ -53,6 +53,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/Threading.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -582,6 +583,189 @@ private:
 
   static constexpr int kUnwrap = -1;
 
+  /// A place in a stack allocation: the allocation and the constant
+  /// `kgen.struct.gep` field indices leading to it. Pointer and union views
+  /// do not change the place.
+  struct MemLoc {
+    Value slot;
+    SmallVector<int> path;
+  };
+
+  static std::optional<MemLoc> memLocation(Value ptr) {
+    SmallVector<int> reversed;
+    while (Operation *def = ptr.getDefiningOp()) {
+      if (auto cast = dyn_cast<POP::PointerBitcastOp>(def)) {
+        ptr = cast.getInput();
+      } else if (auto view = dyn_cast<POP::UnionBitcastOp>(def)) {
+        ptr = view.getValue();
+      } else if (auto gep = dyn_cast<StructGEPOp>(def)) {
+        auto index = dyn_cast<IntegerAttr>(gep.getIndexAttr());
+        if (!index)
+          return std::nullopt;
+        reversed.push_back(index.getInt());
+        ptr = gep.getContainer();
+      } else {
+        break;
+      }
+    }
+    if (!ptr.getDefiningOp<POP::StackAllocationOp>())
+      return std::nullopt;
+    return MemLoc{ptr, SmallVector<int>(llvm::reverse(reversed))};
+  }
+
+  static Value stackSlot(Value ptr) {
+    std::optional<MemLoc> loc = memLocation(ptr);
+    return loc ? loc->slot : Value();
+  }
+
+  /// Whether `prefix` is a prefix of `path`.
+  static bool isPrefix(ArrayRef<int> prefix, ArrayRef<int> path) {
+    return prefix.size() <= path.size() &&
+           prefix == path.take_front(prefix.size());
+  }
+
+  enum class Forward { Same, Wrap, Unwrap };
+
+  /// The result of forwarding a load: the loaded value is `stored` (wrapped
+  /// or unwrapped per `kind`) followed by the field accesses `fields`.
+  struct Forwarded {
+    Value stored;
+    Forward kind;
+    SmallVector<int> fields;
+  };
+
+  /// Whether the address of a stack slot never leaves plain loads, stores (as
+  /// the address), views and field addresses of it and lifetime markers. Then
+  /// nothing but a direct store to the slot can change it: no call and no
+  /// other pointer can.
+  static bool isNonEscapingSlot(Value slot) {
+    SmallVector<Value> worklist = {slot};
+    while (!worklist.empty()) {
+      Value ptr = worklist.pop_back_val();
+      for (OpOperand &use : ptr.getUses()) {
+        Operation *user = use.getOwner();
+        if (isa<POP::LoadOp>(user))
+          continue;
+        if (auto store = dyn_cast<POP::StoreOp>(user)) {
+          if (&use == &store.getPtrMutable())
+            continue;
+          return false; // The address itself is stored somewhere.
+        }
+        if (isa<POP::PointerBitcastOp, POP::UnionBitcastOp, StructGEPOp>(
+                user)) {
+          worklist.push_back(user->getResult(0));
+          continue;
+        }
+        StringRef name = user->getName().getStringRef();
+        if (name == "pop.stack_alloc.lifetime.start" ||
+            name == "pop.stack_alloc.lifetime.end")
+          continue;
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// Whether `op` (including nested ops) may write the place `loc`.
+  static bool mayWrite(Operation *op, const MemLoc &loc, bool nonEscaping) {
+    return op
+        ->walk([&](Operation *nested) {
+          if (auto store = dyn_cast<POP::StoreOp>(nested)) {
+            std::optional<MemLoc> target = memLocation(store.getPtr());
+            if (!target)
+              return nonEscaping ? WalkResult::advance()
+                                 : WalkResult::interrupt();
+            if (target->slot == loc.slot && (isPrefix(target->path, loc.path) ||
+                                             isPrefix(loc.path, target->path)))
+              return WalkResult::interrupt();
+            return WalkResult::advance();
+          }
+          // Lifetime markers write nothing: reading a place outside its
+          // lifetime is undefined behavior, which the analysis excludes.
+          StringRef name = nested->getName().getStringRef();
+          if (name == "pop.stack_alloc.lifetime.start" ||
+              name == "pop.stack_alloc.lifetime.end")
+            return WalkResult::advance();
+          if (nonEscaping || nested->getNumRegions() ||
+              isa<POP::LoadOp, POP::StackAllocationOp, ObligationOp, AssumeOp>(
+                  nested) ||
+              mlir::isMemoryEffectFree(nested))
+            return WalkResult::advance();
+          return WalkResult::interrupt();
+        })
+        .wasInterrupted();
+  }
+
+  /// Store-to-load forwarding for stack slots: the value of the last store to
+  /// the loaded place before the load, if nothing in between can write it.
+  /// Places are compared by field path: a store of an enclosing struct
+  /// forwards the loaded field of it, a store to a disjoint field does not
+  /// interfere, and a store to a field inside the loaded place (a partial
+  /// write) stops the search. The search walks backwards through the load's
+  /// block and out through enclosing `if`s; it leaves a loop only if the loop
+  /// never writes the place (a later iteration could have). For a slot whose
+  /// address escapes, any op that may write memory through an unknown pointer
+  /// stops the search; for a non-escaping slot only stores to it do.
+  /// Stored and loaded types may differ by a union view: storing a member and
+  /// loading the union wraps it, the reverse unwraps it.
+  static std::optional<Forwarded> forwardLoad(Operation *load) {
+    auto loadOp = dyn_cast<POP::LoadOp>(load);
+    if (!loadOp)
+      return std::nullopt;
+    std::optional<MemLoc> loc = memLocation(loadOp.getPtr());
+    if (!loc)
+      return std::nullopt;
+    bool nonEscaping = isNonEscapingSlot(loc->slot);
+    Operation *slotDef = loc->slot.getDefiningOp();
+    Operation *cur = load;
+    while (cur) {
+      for (Operation *op = cur->getPrevNode(); op; op = op->getPrevNode()) {
+        if (op == slotDef)
+          return std::nullopt; // Nothing stored yet.
+        if (auto store = dyn_cast<POP::StoreOp>(op)) {
+          std::optional<MemLoc> target = memLocation(store.getPtr());
+          if (!target) {
+            if (nonEscaping)
+              continue;
+            return std::nullopt; // May alias the place.
+          }
+          if (target->slot != loc->slot)
+            continue;
+          if (!isPrefix(target->path, loc->path)) {
+            if (isPrefix(loc->path, target->path))
+              return std::nullopt; // Partial write of the loaded place.
+            continue;              // A disjoint field.
+          }
+          Value stored = store.getArg();
+          SmallVector<int> fields(
+              ArrayRef<int>(loc->path).drop_front(target->path.size()));
+          if (!fields.empty())
+            return Forwarded{stored, Forward::Same, fields};
+          Type loaded = loadOp.getResult().getType(), type = stored.getType();
+          if (loaded == type)
+            return Forwarded{stored, Forward::Same, {}};
+          if (auto u = dyn_cast<POP::UnionType>(loaded);
+              u && llvm::is_contained(u.getTypes(), type))
+            return Forwarded{stored, Forward::Wrap, {}};
+          if (auto u = dyn_cast<POP::UnionType>(type);
+              u && llvm::is_contained(u.getTypes(), loaded))
+            return Forwarded{stored, Forward::Unwrap, {}};
+          return std::nullopt;
+        }
+        if (mayWrite(op, *loc, nonEscaping))
+          return std::nullopt;
+      }
+      // Continue in the enclosing block, before the op containing `cur`.
+      Operation *parent = cur->getParentOp();
+      if (!parent || isa<FuncOp>(parent))
+        return std::nullopt;
+      if (!isa<HLCF::IfOp>(parent) && mayWrite(parent, *loc, nonEscaping))
+        return std::nullopt;
+      cur = parent;
+    }
+    return std::nullopt;
+  }
+
   /// The scalar reached from `aggregate` by the accesses in `path` (struct
   /// field indices or `kUnwrap`), following the ops that built the aggregate:
   /// `kgen.struct.create`, `pop.union.wrap` and `pop.select`. This keeps
@@ -613,6 +797,18 @@ private:
     Operation *def = aggregate.getDefiningOp();
     if (!def)
       return opaqueField(aggregate, path, sort);
+    if (std::optional<Forwarded> forward = forwardLoad(def)) {
+      SmallVector<int> full(forward->fields);
+      if (forward->kind == Forward::Unwrap)
+        full.insert(full.begin(), kUnwrap);
+      full.append(path.begin(), path.end());
+      if (forward->kind == Forward::Wrap) {
+        if (path.front() != kUnwrap)
+          return opaqueField(aggregate, path, sort);
+        full.erase(full.begin() + forward->fields.size());
+      }
+      return resolveAccess(forward->stored, full, sort, depth + 1);
+    }
     Attribute constant;
     if (mlir::matchPattern(aggregate, mlir::m_Constant(&constant))) {
       // Walk into constant structs, e.g. the tag of a constant `None`.
@@ -704,6 +900,24 @@ private:
     }
 
     StringRef name = op->getName().getStringRef();
+    if (std::optional<Forwarded> forward = forwardLoad(op)) {
+      MaybeTerm t;
+      SmallVector<int> full(forward->fields);
+      if (forward->kind == Forward::Unwrap)
+        full.insert(full.begin(), kUnwrap);
+      if (forward->kind != Forward::Wrap)
+        t = full.empty() ? (sortOf(forward->stored.getType()) == sort
+                                ? term(forward->stored)
+                                : std::nullopt)
+                         : resolveAccess(forward->stored, full, sort);
+      if (t) {
+        if (t->front() == '(')
+          setTerm(result, *t);
+        else
+          termMap()[result] = *t;
+        return;
+      }
+    }
     auto operandTerms = [&]() {
       SmallVector<std::string> ts;
       for (Value operand : op->getOperands()) {
