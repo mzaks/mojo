@@ -56,6 +56,7 @@ the first, so each access counts once.
 | `adversarial.mojo` | all `bad_*`                                 | all `ok_*`                   |
 | `contracts.mojo`   | all `bad_*` (see below)                     | all `ok_*`                   |
 | `slicing.mojo`     | all `bad_*`, `limit_*` (known limit)        | all `ok_*`                   |
+| `loops.mojo`       | all `bad_*`                                 | all `ok_*`                   |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -81,3 +82,8 @@ Strided slices without explicit bounds (`vs[::-1]`, `vs[::2]`) are proven.
 With explicit bounds (`vs[1:0:-1]`), the `Optional` payloads are copied through
 `Variant`'s copy constructor, which the analysis cannot follow yet, so
 `limit_strided_backwards_range` stays unproven.
+
+`loops.mojo` needs loop invariants that relate two loop-carried values: the
+index and the length of a list that shrinks by one per iteration keep their
+sum (`i + len == i0 + len0`), and one that grows keeps their difference. The
+analysis tries both templates for every pair of values of the same type.
