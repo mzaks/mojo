@@ -1246,6 +1246,44 @@ private:
     return false;
   }
 
+  /// Whether control leaves through the end of an `if` arm: by a jump, or by
+  /// a call that never returns (e.g. a failed `debug_assert`).
+  bool armLeaves(Block &block) {
+    if (isa<HLCF::BreakOp, HLCF::ContinueOp, HLCF::ReturnOp,
+            HLCF::UnreachableOp, LIT::TryRaiseOp>(block.getTerminator()))
+      return true;
+    return llvm::any_of(block, [&](Operation &op) {
+      auto call = dyn_cast<CallOp>(&op);
+      return call && neverReturns(call);
+    });
+  }
+
+  /// Whether a call never returns: its callee has no `hlcf.return` (it
+  /// traps, loops forever or ends in `hlcf.unreachable`), or its entry block
+  /// unconditionally makes such a call. Decided on the elaborated body, so it
+  /// follows compile-time choices (a `debug_assert` in "warn" mode returns).
+  bool neverReturns(CallOp call, unsigned depth = 0) {
+    auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!callee || !symbols || depth > kMaxNesting)
+      return false;
+    auto fn = symbols->lookup<FuncOp>(callee.getSymbol().getRootReference());
+    if (!fn || fn->getRegion(0).empty())
+      return false;
+    if (auto it = noReturn.find(fn); it != noReturn.end())
+      return it->second;
+    noReturn[fn] = false; // Assumed while deciding (recursion).
+    bool result = !fn->walk([](HLCF::ReturnOp) {
+                       return WalkResult::interrupt();
+                     }).wasInterrupted() ||
+                  llvm::any_of(fn->getRegion(0).front(), [&](Operation &op) {
+                    auto inner = dyn_cast<CallOp>(&op);
+                    return inner && neverReturns(inner, depth + 1);
+                  });
+    noReturn[fn] = result;
+    return result;
+  }
+  DenseMap<Operation *, bool> noReturn;
+
   /// The value of the place after an `hlcf.if` that writes it.
   MaybeTerm mergeIf(const Place &place, HLCF::IfOp ifOp, unsigned depth) {
     if (elifConditionsMayWrite(place, ifOp))
@@ -1264,8 +1302,7 @@ private:
     auto armValue = [&](Block &block) -> std::string {
       Operation *terminator = block.getTerminator();
       // Control does not reach the load along an arm that leaves.
-      if (isa<HLCF::BreakOp, HLCF::ContinueOp, HLCF::ReturnOp,
-              HLCF::UnreachableOp, LIT::TryRaiseOp>(terminator))
+      if (armLeaves(block))
         return declare(place.sort);
       auto [kind, found] = searchBlock(place, block, terminator, depth);
       if (kind == Search::Found && found)
@@ -1742,8 +1779,7 @@ private:
     auto armValue = [&](Block &block) -> std::string {
       Operation *terminator = block.getTerminator();
       // Control does not reach the read along an arm that leaves.
-      if (isa<HLCF::BreakOp, HLCF::ContinueOp, HLCF::ReturnOp,
-              HLCF::UnreachableOp, LIT::TryRaiseOp>(terminator))
+      if (armLeaves(block))
         return declare(r.sort);
       if (MaybeTerm t = heapValueBefore(r, terminator, depth))
         return *t;
