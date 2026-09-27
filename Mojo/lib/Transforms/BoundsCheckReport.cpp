@@ -832,16 +832,6 @@ private:
            prefix == path.take_front(prefix.size());
   }
 
-  enum class Forward { Same, Wrap, Unwrap };
-
-  /// The result of forwarding a load: the loaded value is `stored` (wrapped
-  /// or unwrapped per `kind`) followed by the field accesses `fields`.
-  struct Forwarded {
-    Value stored;
-    Forward kind;
-    SmallVector<int> fields;
-  };
-
   /// Whether the address of a stack slot never leaves plain loads, stores (as
   /// the address), views and field addresses of it and lifetime markers. Then
   /// nothing but a direct store to the slot can change it: no call and no
@@ -904,74 +894,198 @@ private:
         .wasInterrupted();
   }
 
-  /// Store-to-load forwarding for stack slots: the value of the last store to
-  /// the loaded place before the load, if nothing in between can write it.
-  /// Places are compared by field path: a store of an enclosing struct
-  /// forwards the loaded field of it, a store to a disjoint field does not
-  /// interfere, and a store to a field inside the loaded place (a partial
-  /// write) stops the search. The search walks backwards through the load's
-  /// block and out through enclosing `if`s; it leaves a loop only if the loop
-  /// never writes the place (a later iteration could have). For a slot whose
-  /// address escapes, any op that may write memory through an unknown pointer
-  /// stops the search; for a non-escaping slot only stores to it do.
+  /// A load being forwarded: the place it reads, the type it loads and the
+  /// access applied to the loaded value.
+  struct Place {
+    MemLoc loc;
+    Type loaded;
+    SmallVector<int> access;
+    Sort sort;
+    bool nonEscaping;
+    Operation *slotDef;
+  };
+
+  enum class Search { Found, NotWritten, Fail };
+  static constexpr unsigned kMaxMergeDepth = 32;
+
+  /// Store-to-load forwarding for stack slots: the term for the value a load
+  /// reads (with `access` applied), built from the stores before it, or
+  /// nullopt. Places are compared by field path: a store of an enclosing
+  /// struct forwards the loaded field of it, a store to a disjoint field does
+  /// not interfere, and a partial write of the loaded place stops the search.
   /// Stored and loaded types may differ by a union view: storing a member and
   /// loading the union wraps it, the reverse unwraps it.
-  static std::optional<Forwarded> forwardLoad(Operation *load) {
+  ///
+  /// The search walks backwards through the load's block and out through
+  /// enclosing `if`s; it leaves a loop only if the loop never writes the place
+  /// (a later iteration could have). An `if` that writes the place merges its
+  /// arms: the value after it is an `ite` over the arms' conditions of each
+  /// arm's value at its end (its last store, or the value before the `if` if
+  /// the arm does not write the place). For a slot whose address escapes, any
+  /// op that may write memory through an unknown pointer stops the search; for
+  /// a non-escaping slot only stores to it do.
+  MaybeTerm loadTerm(Operation *load, ArrayRef<int> access, Sort sort) {
     auto loadOp = dyn_cast<POP::LoadOp>(load);
     if (!loadOp)
       return std::nullopt;
     std::optional<MemLoc> loc = memLocation(loadOp.getPtr());
     if (!loc)
       return std::nullopt;
-    bool nonEscaping = isNonEscapingSlot(loc->slot);
-    Operation *slotDef = loc->slot.getDefiningOp();
-    Operation *cur = load;
-    while (cur) {
-      for (Operation *op = cur->getPrevNode(); op; op = op->getPrevNode()) {
-        if (op == slotDef)
-          return std::nullopt; // Nothing stored yet.
-        if (auto store = dyn_cast<POP::StoreOp>(op)) {
-          std::optional<MemLoc> target = memLocation(store.getPtr());
-          if (!target) {
-            if (nonEscaping)
-              continue;
-            return std::nullopt; // May alias the place.
-          }
-          if (target->slot != loc->slot)
-            continue;
-          if (!isPrefix(target->path, loc->path)) {
-            if (isPrefix(loc->path, target->path))
-              return std::nullopt; // Partial write of the loaded place.
-            continue;              // A disjoint field.
-          }
-          Value stored = store.getArg();
-          SmallVector<int> fields(
-              ArrayRef<int>(loc->path).drop_front(target->path.size()));
-          if (!fields.empty())
-            return Forwarded{stored, Forward::Same, fields};
-          Type loaded = loadOp.getResult().getType(), type = stored.getType();
-          if (loaded == type)
-            return Forwarded{stored, Forward::Same, {}};
-          if (auto u = dyn_cast<POP::UnionType>(loaded);
-              u && llvm::is_contained(u.getTypes(), type))
-            return Forwarded{stored, Forward::Wrap, {}};
-          if (auto u = dyn_cast<POP::UnionType>(type);
-              u && llvm::is_contained(u.getTypes(), loaded))
-            return Forwarded{stored, Forward::Unwrap, {}};
-          return std::nullopt;
-        }
-        if (mayWrite(op, *loc, nonEscaping))
-          return std::nullopt;
-      }
+    Place place{*loc, loadOp.getResult().getType(), SmallVector<int>(access),
+                sort, isNonEscapingSlot(loc->slot), loc->slot.getDefiningOp()};
+    return valueBefore(place, load, 0);
+  }
+
+  /// The value of the place just before `op`.
+  MaybeTerm valueBefore(const Place &place, Operation *op, unsigned depth) {
+    Operation *cur = op;
+    while (true) {
+      auto [kind, found] = searchBlock(place, *cur->getBlock(), cur, depth);
+      if (kind == Search::Found)
+        return found;
+      if (kind == Search::Fail)
+        return std::nullopt;
       // Continue in the enclosing block, before the op containing `cur`.
       Operation *parent = cur->getParentOp();
       if (!parent || isa<FuncOp>(parent))
         return std::nullopt;
-      if (!isa<HLCF::IfOp>(parent) && mayWrite(parent, *loc, nonEscaping))
+      if (auto ifOp = dyn_cast<HLCF::IfOp>(parent)) {
+        if (elifConditionsMayWrite(place, ifOp))
+          return std::nullopt;
+      } else if (mayWrite(parent, place.loc, place.nonEscaping)) {
         return std::nullopt;
+      }
       cur = parent;
     }
-    return std::nullopt;
+  }
+
+  /// Search `block` backwards from just before `from` (from its end if null)
+  /// for the value of the place.
+  std::pair<Search, MaybeTerm> searchBlock(const Place &place, Block &block,
+                                           Operation *from, unsigned depth) {
+    Operation *op =
+        from ? from->getPrevNode() : (block.empty() ? nullptr : &block.back());
+    for (; op; op = op->getPrevNode()) {
+      if (op == place.slotDef)
+        return {Search::Fail, std::nullopt}; // Nothing stored yet.
+      if (auto store = dyn_cast<POP::StoreOp>(op)) {
+        std::optional<MemLoc> target = memLocation(store.getPtr());
+        if (!target) {
+          if (place.nonEscaping)
+            continue;
+          return {Search::Fail, std::nullopt}; // May alias the place.
+        }
+        if (target->slot != place.loc.slot)
+          continue;
+        if (isPrefix(target->path, place.loc.path)) {
+          MaybeTerm t = fromStore(place, store, *target);
+          return {t ? Search::Found : Search::Fail, t};
+        }
+        if (isPrefix(place.loc.path, target->path))
+          return {Search::Fail, std::nullopt}; // Partial write.
+        continue;                              // A disjoint field.
+      }
+      if (!mayWrite(op, place.loc, place.nonEscaping))
+        continue;
+      if (auto ifOp = dyn_cast<HLCF::IfOp>(op);
+          ifOp && depth < kMaxMergeDepth) {
+        MaybeTerm t = mergeIf(place, ifOp, depth + 1);
+        return {t ? Search::Found : Search::Fail, t};
+      }
+      return {Search::Fail, std::nullopt};
+    }
+    return {Search::NotWritten, std::nullopt};
+  }
+
+  /// Whether the condition regions of an `hlcf.if`'s elif arms may write the
+  /// place (they run before the arms).
+  bool elifConditionsMayWrite(const Place &place, HLCF::IfOp ifOp) {
+    auto elifs = ifOp.getElifRegions();
+    for (unsigned i = 0; i < elifs.size(); i += 2)
+      for (Operation &op : elifs[i].front())
+        if (mayWrite(&op, place.loc, place.nonEscaping))
+          return true;
+    return false;
+  }
+
+  /// The value of the place after an `hlcf.if` that writes it.
+  MaybeTerm mergeIf(const Place &place, HLCF::IfOp ifOp, unsigned depth) {
+    if (elifConditionsMayWrite(place, ifOp))
+      return std::nullopt;
+    std::optional<MaybeTerm> before; // Computed on first use.
+    auto unknownIn = [&](StringRef why) {
+      std::string name = declare(place.sort);
+      std::string text;
+      llvm::raw_string_ostream os(text);
+      os << "stack slot value " << why << " of hlcf.if";
+      if (std::optional<ObligationLocation> where = locationOf(ifOp.getLoc()))
+        os << " at " << where->file << ":" << where->line << ":" << where->col;
+      noteUnknown(name, text);
+      return name;
+    };
+    auto armValue = [&](Block &block) -> std::string {
+      Operation *terminator = block.getTerminator();
+      // Control does not reach the load along an arm that leaves.
+      if (isa<HLCF::BreakOp, HLCF::ContinueOp, HLCF::ReturnOp,
+              HLCF::UnreachableOp, LIT::TryRaiseOp>(terminator))
+        return declare(place.sort);
+      auto [kind, found] = searchBlock(place, block, terminator, depth);
+      if (kind == Search::Found && found)
+        return *found;
+      if (kind == Search::NotWritten) {
+        if (!before)
+          before = valueBefore(place, ifOp, depth);
+        if (*before)
+          return **before;
+        return unknownIn("before");
+      }
+      return unknownIn("in an arm");
+    };
+    SmallVector<std::pair<std::string, std::string>> arms;
+    arms.push_back({boolTerm(ifOp.getCond()), armValue(ifOp.getThenBlock())});
+    auto elifs = ifOp.getElifRegions();
+    for (unsigned i = 0; i + 1 < elifs.size(); i += 2) {
+      Operation *condYield = elifs[i].front().getTerminator();
+      if (!isa<HLCF::IfElifCondYieldOp>(condYield) ||
+          !condYield->getNumOperands())
+        return std::nullopt;
+      arms.push_back(
+          {boolTerm(condYield->getOperand(0)), armValue(elifs[i + 1].front())});
+    }
+    std::string expr = armValue(ifOp.getElseBlock());
+    for (auto &[cond, value] : llvm::reverse(arms))
+      expr = "(ite " + cond + " " + value + " " + expr + ")";
+    return expr;
+  }
+
+  /// The loaded value (with the place's access) given the store that last
+  /// wrote the place or a place enclosing it.
+  MaybeTerm fromStore(const Place &place, POP::StoreOp store,
+                      const MemLoc &target) {
+    Value stored = store.getArg();
+    SmallVector<int> path(
+        ArrayRef<int>(place.loc.path).drop_front(target.path.size()));
+    ArrayRef<int> access = place.access;
+    if (path.empty() && place.loaded != stored.getType()) {
+      Type type = stored.getType();
+      if (auto u = dyn_cast<POP::UnionType>(place.loaded);
+          u && llvm::is_contained(u.getTypes(), type)) {
+        // The load wraps the stored member; unwrapping it gives the member.
+        if (access.empty() || access.front() != kUnwrap)
+          return std::nullopt;
+        access = access.drop_front();
+      } else if (auto u = dyn_cast<POP::UnionType>(type);
+                 u && llvm::is_contained(u.getTypes(), place.loaded)) {
+        path.push_back(kUnwrap);
+      } else {
+        return std::nullopt;
+      }
+    }
+    path.append(access.begin(), access.end());
+    if (path.empty())
+      return sortOf(stored.getType()) == place.sort ? term(stored)
+                                                    : std::nullopt;
+    return resolveAccess(stored, path, place.sort);
   }
 
   /// The scalar reached from `aggregate` by the accesses in `path` (struct
@@ -1003,18 +1117,9 @@ private:
     Operation *def = aggregate.getDefiningOp();
     if (!def)
       return opaqueField(aggregate, path, sort);
-    if (std::optional<Forwarded> forward = forwardLoad(def)) {
-      SmallVector<int> full(forward->fields);
-      if (forward->kind == Forward::Unwrap)
-        full.insert(full.begin(), kUnwrap);
-      full.append(path.begin(), path.end());
-      if (forward->kind == Forward::Wrap) {
-        if (path.front() != kUnwrap)
-          return opaqueField(aggregate, path, sort);
-        full.erase(full.begin() + forward->fields.size());
-      }
-      return resolveAccess(forward->stored, full, sort, depth + 1);
-    }
+    if (isa<POP::LoadOp>(def))
+      if (MaybeTerm t = loadTerm(def, path, sort))
+        return t;
     Attribute constant;
     if (mlir::matchPattern(aggregate, mlir::m_Constant(&constant))) {
       // Walk into constant structs, e.g. the tag of a constant `None`.
@@ -1177,16 +1282,8 @@ private:
     }
 
     StringRef name = op->getName().getStringRef();
-    if (std::optional<Forwarded> forward = forwardLoad(op)) {
-      MaybeTerm t;
-      SmallVector<int> full(forward->fields);
-      if (forward->kind == Forward::Unwrap)
-        full.insert(full.begin(), kUnwrap);
-      if (forward->kind != Forward::Wrap)
-        t = full.empty() ? (sortOf(forward->stored.getType()) == sort
-                                ? term(forward->stored)
-                                : std::nullopt)
-                         : resolveAccess(forward->stored, full, sort);
+    if (isa<POP::LoadOp>(op)) {
+      MaybeTerm t = loadTerm(op, {}, sort);
       if (t) {
         if (t->front() == '(')
           setTerm(result, *t);
