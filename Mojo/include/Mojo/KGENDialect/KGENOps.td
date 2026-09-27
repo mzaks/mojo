@@ -1354,6 +1354,41 @@ def KGEN_ObligationOp : KGENOp<"obligation", [
 }
 
 //===----------------------------------------------------------------------===//
+// AssumeOp
+//===----------------------------------------------------------------------===//
+
+def KGEN_AssumeOp : KGENOp<"assume", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
+  let summary = "a trusted condition a static verifier may assume";
+  let description = [{
+    The `kgen.assume` operation states a condition that static analyses may
+    take as true whenever execution reaches it, without proving it. It is the
+    trusted counterpart of `kgen.obligation`, e.g. for a type invariant such as
+    `0 <= len(list)`. Like `kgen.obligation` it has no runtime semantics and is
+    erased when lowering to LLVM.
+
+    `kind` classifies the assumption (e.g. "invariant"); `line`, `col` and
+    `fileName` locate it, typically via `kgen.source_loc`.
+
+    Example:
+    ```mlir
+    %line, %col, %file = kgen.source_loc[0]
+    kgen.assume "invariant"(%nonneg) at(%line, %col, %file)
+        : !kgen.scalar<bool>, !kgen.string
+    ```
+  }];
+
+  let arguments = (ins AttrOfType<KGEN_StringType>:$kind, BoolScalar:$cond,
+                       Index:$line, Index:$col, KGEN_StringType:$fileName);
+  let assemblyFormat = [{
+    custom<StringParam>($kind) `(` $cond `)`
+    `at` `(` $line `,` $col `,` $fileName `)` attr-dict
+    `:` type($cond) `,` type($fileName)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // StructCreateOp
 //===----------------------------------------------------------------------===//
 

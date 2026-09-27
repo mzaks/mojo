@@ -731,6 +731,22 @@ ObligationOp::parametric_interpret(ArrayRef<Attribute> operands,
 }
 
 //===----------------------------------------------------------------------===//
+// AssumeOp
+//===----------------------------------------------------------------------===//
+
+// Assumptions have no runtime semantics either.
+ErrorTreeOrSuccess AssumeOp::interpret(ArrayRef<Attribute> operands,
+                                       InterpreterState &state) {
+  return state.mapResults({});
+}
+
+ErrorTreeOrSuccess
+AssumeOp::parametric_interpret(ArrayRef<Attribute> operands,
+                               ParametricInterpreterState &state) {
+  return state.mapResults({});
+}
+
+//===----------------------------------------------------------------------===//
 // VariantCreateOp
 //===----------------------------------------------------------------------===//
 

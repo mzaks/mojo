@@ -1052,6 +1052,18 @@ struct ConvertKGENObligation : ConvertPOPToLLVMPattern<ObligationOp> {
   }
 };
 
+/// Like obligations, assumptions only feed static analyses.
+struct ConvertKGENAssume : ConvertPOPToLLVMPattern<AssumeOp> {
+  using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(AssumeOp op, AssumeOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct ConvertKGENSourceLoc : ConvertPOPToLLVMPattern<SourceLocOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
@@ -1205,6 +1217,7 @@ static void populateKGENToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
                                        const AttributeIdentifiers &ids) {
   patterns.insert<
       // clang-format off
+      ConvertKGENAssume,
       ConvertKGENCall,
       ConvertKGENObligation,
       ConvertKGENSourceLoc,

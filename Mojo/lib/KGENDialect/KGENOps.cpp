@@ -142,6 +142,17 @@ void ObligationOp::getEffects(
 }
 
 //===----------------------------------------------------------------------===//
+// AssumeOp
+//===----------------------------------------------------------------------===//
+
+// Same effects as `kgen.obligation`: kept alive, but no memory ordering.
+void AssumeOp::getEffects(
+    SmallVectorImpl<mlir::MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                       ObligationResource::get());
+}
+
+//===----------------------------------------------------------------------===//
 // ParamMaterializeOp
 //===----------------------------------------------------------------------===//
 
