@@ -172,8 +172,8 @@ struct LoopInfo;
 struct Edge {
   std::string reach;
   SmallVector<MaybeTerm> values;
-  /// Loops whose invariants hold at the source of the edge (the enclosing
-  /// loops).
+  /// Loops whose invariants hold at the source of the edge (enclosing loops
+  /// and loops completed before it).
   SmallVector<LoopInfo *> enclosing;
   /// Assumptions made before the source of the edge.
   std::string assumed = "true";
@@ -272,6 +272,10 @@ private:
   DenseMap<Value, std::string> terms;
   DenseMap<std::pair<Value, unsigned>, std::string> extracts;
   SmallVector<LoopInfo *> loopStack;
+  /// Loops that have run to completion before the current point, in the
+  /// current block and its ancestors. Their invariants held on their last
+  /// iteration, so later code may assume them.
+  SmallVector<LoopInfo *> completedLoops;
   SmallVector<TryInfo *> tryStack;
   SmallVector<std::pair<std::string, std::string>> activeObligations;
 
@@ -303,9 +307,12 @@ private:
     return result;
   }
 
-  /// Loops whose invariants hold at the current point: the enclosing ones.
+  /// Loops whose invariants hold at the current point: the enclosing ones and
+  /// the ones that completed before it.
   SmallVector<LoopInfo *> assumedLoops() const {
-    return SmallVector<LoopInfo *>(loopStack.begin(), loopStack.end());
+    SmallVector<LoopInfo *> result(loopStack.begin(), loopStack.end());
+    result.append(completedLoops.begin(), completedLoops.end());
+    return result;
   }
 
   std::string fresh(StringRef prefix) {
@@ -850,6 +857,7 @@ private:
 
   BlockResult encodeBlock(Block &block, std::string reach) {
     size_t activeSize = activeObligations.size();
+    size_t completedSize = completedLoops.size();
     BlockResult result{reach, nullptr};
     for (Operation &op : block) {
       if (op.hasTrait<OpTrait::IsTerminator>()) {
@@ -860,6 +868,7 @@ private:
       result.fall = reach;
     }
     activeObligations.resize(activeSize);
+    completedLoops.resize(completedSize);
     return result;
   }
 
@@ -1091,6 +1100,7 @@ private:
           assertGlobal("(=> " + brk.reach + " (= " + *r + " " + *brk.values[i] +
                        "))");
     }
+    completedLoops.push_back(&loop);
     return reachName(mkOr(exits));
   }
 
