@@ -119,8 +119,11 @@ def check_slice_bounds[
     var start = slice.start.or_else(0)
     var end = slice.end.or_else(len)
 
+    # Takes the bounds as arguments rather than capturing them: captured
+    # locals would have their addresses escape into the call, which hides
+    # their values from static verification after it.
     @inline(.never)
-    def do_asserts(location: SourceLocation) {imm}:
+    def do_asserts(location: SourceLocation, start: Int, end: Int, len: Int):
         debug_assert[assert_mode=mode](
             UInt(start) <= UInt(len),
             "slice start index ",
@@ -152,6 +155,29 @@ def check_slice_bounds[
         # Combine the failure conditions here so valid slices avoid the
         # no-inline assertion helper, while invalid slices still bounds check.
         if UInt(start) > UInt(len) or UInt(end) > UInt(len) or start > end:
-            do_asserts(location.or_else(call_location[inline_count=2]()))
+            do_asserts(
+                location.or_else(call_location[inline_count=2]()),
+                start,
+                end,
+                len,
+            )
 
+    # Record the condition for static verification, independent of the assert
+    # mode, at the caller of the slicing `__getitem__`.
+    var line, col, file_name = __mlir_op.`kgen.source_loc`[
+        inlineCount=Int(1).__mlir_index__(),
+        _type=Tuple[
+            __mlir_type.index,
+            __mlir_type.index,
+            __mlir_type.`!kgen.string`,
+        ],
+    ]()
+    __mlir_op.`kgen.obligation`[kind=_get_kgen_string["bounds"](), _type=None](
+        (
+            UInt(start) <= UInt(len) and UInt(end) <= UInt(len) and start <= end
+        )._mlir_value,
+        line,
+        col,
+        file_name,
+    )
     return start, end
