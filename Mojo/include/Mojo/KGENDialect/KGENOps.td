@@ -1389,6 +1389,42 @@ def KGEN_AssumeOp : KGENOp<"assume", [
 }
 
 //===----------------------------------------------------------------------===//
+// CopyMarkerOp
+//===----------------------------------------------------------------------===//
+
+def KGEN_CopyMarkerOp : KGENOp<"copy_marker", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
+  let summary = "marks a copy of elements for static verifiers";
+  let description = [{
+    A `kgen.copy_marker "begin"` and the matching `kgen.copy_marker "end"`
+    with the same operands, in the same block, bracket code that copies
+    `count` elements from `src` to `dest` (typed pointers) and writes no other
+    memory. Static analyses may take the elements at `dest` after the "end"
+    marker to be those at `src` before the "begin" marker, without examining
+    the code in between (e.g. a byte-wise `memcpy`). It is a trusted
+    annotation, like `kgen.assume`: it has no runtime semantics and is erased
+    when lowering to LLVM.
+
+    Example:
+    ```mlir
+    kgen.copy_marker "begin"(%dest, %src, %count)
+        : !kgen.pointer<scalar<index>>, !kgen.pointer<scalar<index>>
+    // ... the copy ...
+    kgen.copy_marker "end"(%dest, %src, %count)
+        : !kgen.pointer<scalar<index>>, !kgen.pointer<scalar<index>>
+    ```
+  }];
+
+  let arguments = (ins AttrOfType<KGEN_StringType>:$kind, AnyType:$dest,
+                       AnyType:$src, Index:$count);
+  let assemblyFormat = [{
+    custom<StringParam>($kind) `(` $dest `,` $src `,` $count `)` attr-dict
+    `:` type($dest) `,` type($src)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // StructCreateOp
 //===----------------------------------------------------------------------===//
 

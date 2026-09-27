@@ -1064,6 +1064,18 @@ struct ConvertKGENAssume : ConvertPOPToLLVMPattern<AssumeOp> {
   }
 };
 
+/// Copy markers only feed static analyses too.
+struct ConvertKGENCopyMarker : ConvertPOPToLLVMPattern<CopyMarkerOp> {
+  using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(CopyMarkerOp op, CopyMarkerOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct ConvertKGENSourceLoc : ConvertPOPToLLVMPattern<SourceLocOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
@@ -1219,6 +1231,7 @@ static void populateKGENToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
       // clang-format off
       ConvertKGENAssume,
       ConvertKGENCall,
+      ConvertKGENCopyMarker,
       ConvertKGENObligation,
       ConvertKGENSourceLoc,
       ConvertKGENStructCreate,

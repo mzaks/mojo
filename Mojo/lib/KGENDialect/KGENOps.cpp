@@ -153,6 +153,17 @@ void AssumeOp::getEffects(
 }
 
 //===----------------------------------------------------------------------===//
+// CopyMarkerOp
+//===----------------------------------------------------------------------===//
+
+// Same effects as `kgen.obligation`: kept alive, but no memory ordering.
+void CopyMarkerOp::getEffects(
+    SmallVectorImpl<mlir::MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                       ObligationResource::get());
+}
+
+//===----------------------------------------------------------------------===//
 // ParamMaterializeOp
 //===----------------------------------------------------------------------===//
 
