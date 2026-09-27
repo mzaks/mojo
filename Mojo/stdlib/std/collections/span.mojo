@@ -31,6 +31,7 @@ from std.memory import (
 )
 from std.collections import check_bounds, check_slice_bounds
 from std.builtin.rebind import downcast
+from std.builtin._verification import _assume
 from std.sys import align_of
 from std.sys.info import simd_width_of
 from std.traits import (
@@ -146,6 +147,9 @@ struct _SpanIter[
         Returns:
             The number of elements remaining in this iterator.
         """
+        # Type invariant of `Span`, stated here because `Span.__len__` is
+        # `@always_inline("builtin")` and cannot call `_assume`.
+        _assume(len(self.src) >= 0)
         comptime if Self.forward:
             return len(self.src) - self.index
         else:

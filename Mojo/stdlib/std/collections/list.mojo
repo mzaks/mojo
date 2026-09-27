@@ -528,10 +528,13 @@ struct List[T: AnyType, /](
         Args:
             iterable: The iterable of values to populate the list with.
         """
-        var lower, _ = iter(iterable).bounds()
+        var lower, upper = iter(iterable).bounds()
         self = type_of(self)(capacity=lower)
         for var value in iterable:
             self.append(rebind_var[type_of(self).T](value^))
+        # Only as strong as the iterator's bounds: when they are exact, the
+        # list has exactly that many elements.
+        _ensures(not upper or upper.value() != lower or len(self) == lower)
 
     @inline(.always)
     def __init__(out self, *, unsafe_uninit_length: Int):
@@ -1047,6 +1050,7 @@ struct List[T: AnyType, /](
         print(numbers)   # [1, 2, 3, 4, 5, 6]
         ```
         """
+        var old_len = len(self)
         var elements_len = len(elements)
         var new_num_elts = self._len + elements_len
         self._grow_amortized(new_num_elts)
@@ -1060,6 +1064,7 @@ struct List[T: AnyType, /](
             src=elements.unsafe_ptr(),
             count=elements_len,
         )
+        _ensures(len(self) == old_len + elements_len)
 
     @__allow_legacy_custom_self_type
     def extend[
@@ -1490,15 +1495,19 @@ struct List[T: AnyType, /](
         var start, end, step = slice.indices(len(self))
         var r = range(start, end, step)
 
+        # A single return, so the postcondition covers every exit.
+        var result: Self
         if not len(r):
-            return Self()
-
-        return Self(
-            length=len(r),
-            fill_with=lambda (idx: Int) -> Self.T: self[
-                start + idx * step
-            ].copy(),
-        )
+            result = Self()
+        else:
+            result = Self(
+                length=len(r),
+                fill_with=lambda (idx: Int) -> Self.T: self[
+                    start + idx * step
+                ].copy(),
+            )
+        _ensures(len(result) == len(r))
+        return result^
 
     @__unsafe_nested_origins_read_only
     @stable(since="1.0")
