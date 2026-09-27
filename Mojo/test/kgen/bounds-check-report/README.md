@@ -29,8 +29,18 @@ Prefer this over dumping the IR and running `kgen-opt --bounds-check-report`
 on it: the textual form of some ops (e.g. `pop.call_llvm_intrinsic
 side_effecting`) does not parse back.
 
-Options: `verbose`, `include-stdlib`, `z3-path`, `timeout-ms`, and `dump-dir`
-(keeps the generated SMT-LIB scripts).
+Options: `verbose`, `include-stdlib`, `z3-path`, `timeout-ms`, `dump-dir`
+(keeps the generated SMT-LIB scripts, annotated with the IR value each term
+stands for), and `explain`, which lists under each unproven obligation the
+unknown values its condition depends on, for example:
+
+```text
+  UNPROVEN  bounds  test_list.mojo:180:33
+      depends on unknown argument #1 of hlcf.loop at test_list.mojo:179:5
+```
+
+An unproven obligation without unknowns has a condition that is false in some
+execution the analysis considers, rather than one it cannot see into.
 
 ## Expected results
 

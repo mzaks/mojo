@@ -55,6 +55,8 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -311,6 +313,32 @@ public:
 
   explicit Encoder(const mlir::SymbolTable *symbols) : symbols(symbols) {}
 
+  /// Record which IR value each unknown stands for and which names each
+  /// defined term uses, and comment the script with it (for `dump-dir` and
+  /// `explain`).
+  bool annotate = false;
+
+  /// The unknowns (with their IR descriptions) a term transitively depends
+  /// on, e.g. the loads or call results an obligation's condition could not
+  /// see through. Requires `annotate`.
+  SmallVector<std::string> unknownInputs(StringRef expr) const {
+    SmallVector<std::string> result;
+    llvm::StringSet<> seen;
+    SmallVector<std::string> worklist = namesIn(expr);
+    while (!worklist.empty()) {
+      std::string name = worklist.pop_back_val();
+      if (!seen.insert(name).second)
+        continue;
+      if (auto it = unknowns.find(name); it != unknowns.end())
+        result.push_back(it->second);
+      if (auto it = deps.find(name); it != deps.end())
+        worklist.append(it->second.begin(), it->second.end());
+    }
+    llvm::sort(result);
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+  }
+
   void encodeFunction(FuncOp func) {
     self = func;
     // Name the function in the script, for `dump-dir` debugging.
@@ -323,6 +351,62 @@ public:
 private:
   const mlir::SymbolTable *symbols;
   FuncOp self;
+  llvm::StringMap<std::string> unknowns;
+  llvm::StringMap<SmallVector<std::string>> deps;
+
+  /// The names of terms (`h12`, `v3`, `r7`, `a9`) used in an SMT expression.
+  static SmallVector<std::string> namesIn(StringRef expr) {
+    SmallVector<std::string> names;
+    SmallVector<StringRef> tokens;
+    expr.split(tokens, ' ', -1, /*KeepEmpty=*/false);
+    for (StringRef token : tokens) {
+      token = token.trim("()");
+      if (token.size() < 2 || !StringRef("hvra").contains(token.front()))
+        continue;
+      if (llvm::all_of(token.drop_front(), llvm::isDigit))
+        names.push_back(token.str());
+    }
+    return names;
+  }
+
+  /// A short description of an IR value: what defines it and where.
+  std::string describe(Value value) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    if (ctx)
+      os << "in " << ctx->callee << ": ";
+    Location loc = value.getLoc();
+    if (Operation *def = value.getDefiningOp()) {
+      os << def->getName().getStringRef();
+      if (auto call = dyn_cast<CallOp>(def))
+        if (auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee()))
+          os << " "
+             << callee.getSymbol()
+                    .getRootReference()
+                    .getValue()
+                    .split('(')
+                    .first;
+      if (def->getNumResults() > 1)
+        os << " result #" << cast<OpResult>(value).getResultNumber();
+      loc = def->getLoc();
+    } else {
+      auto arg = cast<BlockArgument>(value);
+      os << "argument #" << arg.getArgNumber() << " of "
+         << arg.getOwner()->getParentOp()->getName().getStringRef();
+      loc = arg.getOwner()->getParentOp()->getLoc();
+    }
+    if (std::optional<ObligationLocation> where = locationOf(loc))
+      os << " at " << where->file << ":" << where->line << ":" << where->col;
+    return text;
+  }
+
+  /// Record that `name` is an unknown standing for `description`.
+  void noteUnknown(StringRef name, std::string description) {
+    if (!annotate)
+      return;
+    prelude += ("; " + name + ": " + description + "\n").str();
+    unknowns[name] = std::move(description);
+  }
   unsigned counter = 0;
   DenseMap<Value, std::string> terms;
   DenseMap<std::pair<Value, unsigned>, std::string> extracts;
@@ -338,6 +422,8 @@ private:
   /// call's operands, and its other values are computed on demand from their
   /// definitions (anything not modeled stays unconstrained).
   struct CallContext {
+    /// The callee's name (for descriptions).
+    std::string callee;
     DenseMap<Value, Value> args;
     DenseMap<Value, std::string> terms;
     DenseMap<std::pair<Value, unsigned>, std::string> extracts;
@@ -385,6 +471,8 @@ private:
     prelude +=
         ("(define-fun " + name + " () " + sort.str() + " " + expr + ")\n")
             .str();
+    if (annotate)
+      deps[name] = namesIn(expr);
     return name;
   }
 
@@ -453,6 +541,7 @@ private:
       }
     std::string name = declare(sort);
     map[value] = name;
+    noteUnknown(name, describe(value));
     return name;
   }
 
@@ -501,7 +590,10 @@ private:
   }
 
   void setTerm(Value value, StringRef expr) {
-    termMap()[value] = define(sortOf(value.getType()), expr);
+    std::string name = define(sortOf(value.getType()), expr);
+    termMap()[value] = name;
+    if (annotate)
+      prelude += "; " + name + ": " + describe(value) + "\n";
   }
 
   //===--------------------------------------------------------------------===//
@@ -897,8 +989,11 @@ private:
     auto &memo = extractMap();
     auto key = std::make_pair(aggregate, unsigned(path.front()));
     auto it = memo.find(key);
-    if (it == memo.end())
+    if (it == memo.end()) {
       it = memo.try_emplace(key, declare(sort)).first;
+      noteUnknown(it->second, "field " + std::to_string(path.front()) + " of " +
+                                  describe(aggregate));
+    }
     return it->second;
   }
 
@@ -1159,8 +1254,11 @@ private:
       auto key = std::make_pair(container, idx);
       auto &memo = extractMap();
       auto it = memo.find(key);
-      if (it == memo.end())
+      if (it == memo.end()) {
         it = memo.try_emplace(key, declare(sort)).first;
+        noteUnknown(it->second, "field " + std::to_string(idx) + " of " +
+                                    describe(container));
+      }
       termMap()[result] = it->second;
       return;
     }
@@ -1326,6 +1424,8 @@ private:
       return;
 
     CallContext &context = contexts.emplace_back();
+    context.callee =
+        callee.getSymbol().getRootReference().getValue().split('(').first.str();
     for (auto [arg, operand] :
          llvm::zip(entry.getArguments(), call->getOperands()))
       context.args[arg] = operand;
@@ -1774,6 +1874,8 @@ struct BoundsCheckReportPass
       StringRef kind;
       std::optional<ObligationLocation> location;
       Status status;
+      /// With `explain`: the unknowns an unproven condition depends on.
+      SmallVector<std::string> unknowns;
     };
     SmallVector<Result> results;
     bool solverFailed = false;
@@ -1787,6 +1889,7 @@ struct BoundsCheckReportPass
     FunctionReport report;
     report.name = func.getSymName();
     Encoder enc(&symbols);
+    enc.annotate = explain || !dumpDir.empty();
     enc.encodeFunction(func);
     std::string dumpName = "f" + std::to_string(index);
     bool solverOk = inferInvariants(enc, dumpName);
@@ -1826,7 +1929,10 @@ struct BoundsCheckReportPass
         else
           status = Status::Unproven;
       }
-      report.results.push_back({ob.kind, ob.location, status});
+      SmallVector<std::string> unknowns;
+      if (explain && status == Status::Unproven)
+        unknowns = enc.unknownInputs(ob.cond);
+      report.results.push_back({ob.kind, ob.location, status, unknowns});
     }
     return report;
   }
@@ -1889,7 +1995,7 @@ struct BoundsCheckReportPass
     for (FunctionReport &report : reports) {
       unsigned funcProven = 0, funcImplied = 0, funcTotal = 0,
                funcUnreachable = 0;
-      for (auto &[kind, location, status] : report.results) {
+      for (auto &[kind, location, status, unknowns] : report.results) {
         if (status == Status::Implied) {
           ++funcImplied;
           continue;
@@ -1917,7 +2023,7 @@ struct BoundsCheckReportPass
       if (report.solverFailed)
         os << "  [solver failed]";
       os << "\n";
-      for (auto &[kind, location, status] : report.results) {
+      for (auto &[kind, location, status, unknowns] : report.results) {
         if (!verbose && (status == Status::Proven || status == Status::Implied))
           continue;
         os << "  "
@@ -1931,6 +2037,14 @@ struct BoundsCheckReportPass
         else
           os << "<unresolved location>";
         os << "\n";
+        constexpr size_t kMaxUnknowns = 8;
+        for (auto [n, unknown] : llvm::enumerate(unknowns)) {
+          if (n == kMaxUnknowns) {
+            os << "      ... and " << unknowns.size() - n << " more\n";
+            break;
+          }
+          os << "      depends on unknown " << unknown << "\n";
+        }
       }
     }
 
