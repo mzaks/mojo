@@ -47,6 +47,11 @@ struct Bag(Movable):
         return 0
 
 
+@inline(.never)
+def keep(p: Pointer[List[Int], _]):
+    pass
+
+
 struct Named(Movable):
     var name: String
 
@@ -77,6 +82,30 @@ def bad_escaped_pointer() -> Int:
     _ = vs[1:-1:1]
     clear_through(p)
     return vs[2]
+
+
+# Two loads of a list whose address escaped: equal only without a write in
+# between.
+@inline(.never)
+def bad_len_then_write_through_pointer() -> Int:
+    var xs: List[Int] = [1, 2, 3]
+    var p = Pointer(to=xs)
+    var n = len(xs)
+    clear_through(p)
+    if 2 < n:
+        return xs[2]
+    return 0
+
+
+@inline(.never)
+def bad_len_twice_write_between() -> Int:
+    var xs: List[Int] = [1, 2, 3]
+    var p = Pointer(to=xs)
+    keep(p)
+    if len(xs) > 2:
+        clear_through(p)
+        return xs[2]
+    return 0
 
 
 # Lists of lists: the inner list's length is read from the outer list's heap
@@ -211,6 +240,21 @@ def ok_nested_other_list_written() -> Int:
     return list[0][1] + other[0]
 
 
+# `List.__eq__` checks the lengths, then indexes `other` while iterating
+# `self`: two separate loads of `seen`'s length, after `deinit_with` called a
+# closure that may have changed it.
+@inline(.never)
+def ok_eq_after_closure() -> Bool:
+    var list: List[Int] = [0, 1]
+    var seen = List[Int]()
+
+    def record(var e: Int) {mut}:
+        seen.append(e)
+
+    list^.deinit_with(record)
+    return seen == [0, 1]
+
+
 # The second append reallocates and moves the first child with a byte copy,
 # which the stdlib marks as an element copy for the analysis.
 @inline(.never)
@@ -262,6 +306,9 @@ def main() raises:
         ok_strided_twice(),
         ok_read_calls_keep_length(),
         bag.ok_get(1),
+        bad_len_then_write_through_pointer(),
+        bad_len_twice_write_between(),
+        ok_eq_after_closure(),
         bad_nested_short_child(),
         bad_nested_wrong_child(),
         bad_nested_cleared(),

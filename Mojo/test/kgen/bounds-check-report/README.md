@@ -100,6 +100,14 @@ trusted language guarantee: unsafe code that casts the origin away breaks it.
 `Bag.bad_get_after_clear`) and a mutable `Pointer` taken to the list before a
 read-only call (`bad_escaped_pointer`) still count as writes.
 
+Once a list's address has escaped, a call may change it, so its fields are no
+longer known after one. Two loads of the same field with nothing that may write
+it in between still read the same value, even if that value is unknown
+(`ok_eq_after_closure`, after a closure appended to the list): `List.__eq__`
+checks the lengths and then indexes the other list while iterating, which needs
+its two loads of the length to agree. A write in between breaks the link
+(`bad_len_then_write_through_pointer`, `bad_len_twice_write_between`).
+
 The `*_nested_*` examples in `memory.mojo` index lists of lists, where the inner
 list's length is a load from the outer list's heap buffer. The analysis finds
 the value by searching back from the load for the stores that may have written
