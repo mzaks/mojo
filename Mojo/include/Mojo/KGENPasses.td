@@ -26,6 +26,38 @@ def FunctionStats : Pass<"function-stats", "ModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// BoundsCheckReport
+//===----------------------------------------------------------------------===//
+
+def BoundsCheckReport : Pass<"bounds-check-report", "ModuleOp"> {
+  let summary = "Report which `kgen.obligation`s are statically provable.";
+  let description = [{
+    The `bounds-check-report` pass tries to prove every `kgen.obligation`
+    (e.g. the ones `check_bounds` emits for `List.__getitem__`).
+
+    Each function is encoded into SMT-LIB: integer values as bitvectors with
+    exact wrap-around semantics, structured control flow (`hlcf.if`,
+    `hlcf.loop`, `lit.try`) as reachability conditions, and anything not
+    modeled as unconstrained values. Queries are answered by an external `z3`
+    process. The IR is not modified.
+
+    Designed to run right after elaboration.
+  }];
+  let options = [
+    Option<"includeStdlib", "include-stdlib", "bool", /*default=*/"false",
+           "Also report obligations in functions from the `std` package">,
+    Option<"verbose", "verbose", "bool", /*default=*/"false",
+           "Print every obligation, not only unproven ones">,
+    Option<"z3Path", "z3-path", "std::string", /*default=*/"\"\"",
+           "Path to the z3 executable (default: search PATH)">,
+    Option<"timeoutMs", "timeout-ms", "unsigned", /*default=*/"2000",
+           "Solver timeout per query in milliseconds">,
+    Option<"dumpDir", "dump-dir", "std::string", /*default=*/"\"\"",
+           "If set, keep the generated SMT-LIB scripts in this directory">,
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // Canonicalizer
 //===----------------------------------------------------------------------===//
 

@@ -33,6 +33,7 @@ void KGEN::registerDefaultKGENPasses(const std::string &cacheBaseExtra) {
   // Register opt passes.
   KGEN::registerApplyInliner();
   KGEN::registerArgPromotion();
+  KGEN::registerBoundsCheckReport();
   KGEN::registerCanonicalizer();
   KGEN::registerCheckLifetimes();
   KGEN::registerEliminateDeadSymbols();

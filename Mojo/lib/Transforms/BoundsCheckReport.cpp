@@ -1,0 +1,1080 @@
+//===----------------------------------------------------------------------===//
+// Copyright (c) 2026, Modular Inc. All rights reserved.
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions:
+// https://llvm.org/LICENSE.txt
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//===----------------------------------------------------------------------===//
+//
+// Report-only prototype: try to prove every `kgen.obligation` with an SMT
+// solver.
+//
+// Encoding (per function, into SMT-LIB text):
+//   - Integer-like SSA values (index, uindex, fixed-width ints, bool) become
+//     bitvector / Bool terms with exact (wrapping) semantics. Ops that are not
+//     modeled, loads, calls, and non-integer values produce unconstrained
+//     constants. Over-approximating is always sound: it can only make fewer
+//     obligations provable.
+//   - Structured control flow becomes reachability conditions: every block is
+//     encoded under the condition under which it executes. Values that arrive
+//     from several places (if/loop/try results, try handler arguments) are
+//     fresh constants constrained by one implication per source
+//     ("source reached => value = what the source sends").
+//   - A loop's block arguments are fresh, unconstrained constants standing for
+//     "the state of some iteration". This is sound but knows nothing about loop
+//     counters yet; the `continue` edges are recorded for invariant inference.
+//
+// An obligation is proven if "reached and condition false" is unsatisfiable.
+// It is "implied" if that only
+// holds when additionally assuming the obligations that precede it on the
+// same path.
+//
+//===----------------------------------------------------------------------===//
+
+#include "Mojo/ToolCommon/KGENPasses.h"
+
+#include "Mojo/HLCFDialect/HLCFOps.h"
+#include "Mojo/KGENDialect/KGENAttrs.h"
+#include "Mojo/KGENDialect/KGENOps.h"
+#include "Mojo/KGENDialect/KGENTypes.h"
+#include "Mojo/LITDialect/LITOps.h"
+#include "Mojo/POPDialect/POPOps.h"
+#include "mlir/Dialect/Index/IR/IndexOps.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/Program.h"
+
+#include <deque>
+
+using namespace M;
+using namespace KGEN;
+
+namespace M::KGEN {
+#define GEN_PASS_DEF_BOUNDSCHECKREPORT
+#include "Mojo/KGENPasses.h.inc"
+} // namespace M::KGEN
+
+namespace {
+
+//===----------------------------------------------------------------------===//
+// Sorts
+//===----------------------------------------------------------------------===//
+
+/// The SMT sort of an SSA value. `None` values are not encoded at all.
+struct Sort {
+  enum Kind { None, Bool, BV } kind = None;
+  unsigned width = 0;
+  /// Default interpretation for ops whose semantics depend on signedness
+  /// (comparisons, max/min, extension, division).
+  bool isSigned = true;
+
+  bool operator==(const Sort &o) const {
+    return kind == o.kind && width == o.width;
+  }
+  std::string str() const {
+    return kind == Bool ? "Bool" : "(_ BitVec " + std::to_string(width) + ")";
+  }
+};
+
+Sort sortOf(Type type) {
+  if (isa<IndexType>(type))
+    return {Sort::BV, 64, true};
+  if (auto intTy = dyn_cast<IntegerType>(type)) {
+    if (intTy.getWidth() == 1)
+      return {Sort::Bool, 1, false};
+    return {Sort::BV, intTy.getWidth(), !intTy.isUnsigned()};
+  }
+  if (auto simd = dyn_cast<SIMDType>(type)) {
+    auto size = dyn_cast_or_null<IntegerAttr>(simd.getSize());
+    if (!size || size.getInt() != 1)
+      return {};
+    std::optional<KGENDType> dtype = simd.getResolvedDType();
+    if (!dtype)
+      return {};
+    if (dtype->isBool())
+      return {Sort::Bool, 1, false};
+    if (dtype->isIndex() || dtype->isUIndex())
+      return {Sort::BV, 64, dtype->isIndex()};
+    if (dtype->isSInt() || dtype->isUInt()) {
+      ssize_t width = dtype->getWidthInBits(TargetInfoAttr());
+      if (width <= 0)
+        return {};
+      return {Sort::BV, static_cast<unsigned>(width), dtype->isSInt()};
+    }
+  }
+  return {};
+}
+
+std::string bvConst(const APInt &value) {
+  return "(_ bv" + llvm::toString(value, 10, /*Signed=*/false) + " " +
+         std::to_string(value.getBitWidth()) + ")";
+}
+
+std::string mkNot(StringRef a) {
+  if (a == "true")
+    return "false";
+  if (a == "false")
+    return "true";
+  return ("(not " + a + ")").str();
+}
+
+std::string mkAnd(StringRef a, StringRef b) {
+  if (a == "false" || b == "false")
+    return "false";
+  if (a == "true")
+    return b.str();
+  if (b == "true")
+    return a.str();
+  return ("(and " + a + " " + b + ")").str();
+}
+
+std::string mkOr(ArrayRef<std::string> terms) {
+  SmallVector<StringRef> live;
+  for (const std::string &t : terms) {
+    if (t == "true")
+      return "true";
+    if (t != "false")
+      live.push_back(t);
+  }
+  if (live.empty())
+    return "false";
+  if (live.size() == 1)
+    return live.front().str();
+  std::string result = "(or";
+  for (StringRef t : live)
+    result += (" " + t).str();
+  return result + ")";
+}
+
+//===----------------------------------------------------------------------===//
+// Loop, try and obligation bookkeeping
+//===----------------------------------------------------------------------===//
+
+using MaybeTerm = std::optional<std::string>;
+struct LoopInfo;
+
+/// A control transfer into a loop head, a loop exit or a try handler.
+struct Edge {
+  std::string reach;
+  SmallVector<MaybeTerm> values;
+  /// Loops enclosing the source of the edge, outermost first.
+  SmallVector<LoopInfo *> enclosing;
+};
+
+struct LoopInfo {
+  std::string reachIn;
+  SmallVector<MaybeTerm> args, inits;
+  SmallVector<Sort> argSorts;
+  SmallVector<LoopInfo *> enclosing;
+  SmallVector<Edge> continues, breaks;
+};
+
+struct TryInfo {
+  LIT::TryOp op;
+  SmallVector<Edge> raises;
+};
+
+struct ObligationInfo {
+  ObligationOp op;
+  std::string reach, cond;
+  SmallVector<LoopInfo *> enclosing;
+  /// (reach, cond) of obligations preceding this one on the same path.
+  SmallVector<std::pair<std::string, std::string>> earlier;
+};
+
+//===----------------------------------------------------------------------===//
+// Encoder
+//===----------------------------------------------------------------------===//
+
+class Encoder {
+public:
+  /// Declarations and global assertions, in dependency order.
+  std::string prelude;
+  std::deque<LoopInfo> loops;
+  std::vector<ObligationInfo> obligations;
+
+  void encodeFunction(FuncOp func) {
+    Region &body = func->getRegion(0);
+    if (!body.empty())
+      encodeBlock(body.front(), "true");
+  }
+
+private:
+  unsigned counter = 0;
+  DenseMap<Value, std::string> terms;
+  DenseMap<std::pair<Value, unsigned>, std::string> extracts;
+  SmallVector<LoopInfo *> loopStack;
+  SmallVector<TryInfo *> tryStack;
+  SmallVector<std::pair<std::string, std::string>> activeObligations;
+
+  std::string fresh(StringRef prefix) {
+    return (prefix + Twine(counter++)).str();
+  }
+
+  std::string declare(Sort sort, StringRef prefix = "h") {
+    std::string name = fresh(prefix);
+    prelude += "(declare-const " + name + " " + sort.str() + ")\n";
+    return name;
+  }
+
+  std::string define(Sort sort, StringRef expr, StringRef prefix = "v") {
+    std::string name = fresh(prefix);
+    prelude +=
+        ("(define-fun " + name + " () " + sort.str() + " " + expr + ")\n")
+            .str();
+    return name;
+  }
+
+  /// Name a Bool reachability condition (keeps formulas small).
+  std::string reachName(StringRef expr) {
+    if (expr == "true" || expr == "false" || expr.starts_with("r"))
+      return expr.str();
+    return define({Sort::Bool, 1, false}, expr, "r");
+  }
+
+  void assertGlobal(StringRef expr) {
+    prelude += ("(assert " + expr + ")\n").str();
+  }
+
+  /// The term of an encodable value. Values without a definition (block
+  /// arguments, loads, calls, unmodeled ops) become unconstrained constants.
+  MaybeTerm term(Value value) {
+    Sort sort = sortOf(value.getType());
+    if (sort.kind == Sort::None)
+      return std::nullopt;
+    auto it = terms.find(value);
+    if (it != terms.end())
+      return it->second;
+    std::string name = declare(sort);
+    terms[value] = name;
+    return name;
+  }
+
+  std::string boolTerm(Value value) {
+    MaybeTerm t = term(value);
+    if (t && sortOf(value.getType()).kind == Sort::Bool)
+      return *t;
+    return declare({Sort::Bool, 1, false});
+  }
+
+  void setTerm(Value value, StringRef expr) {
+    terms[value] = define(sortOf(value.getType()), expr);
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Straight-line ops
+  //===--------------------------------------------------------------------===//
+
+  /// The value of a scalar integer or boolean constant, as `width` bits.
+  static std::optional<APInt> constantInt(Value value, unsigned width) {
+    Attribute attr;
+    if (!mlir::matchPattern(value, mlir::m_Constant(&attr)))
+      return std::nullopt;
+    if (auto simd = dyn_cast<KGEN::SIMDAttr>(attr)) {
+      if (simd.getValues().size() != 1)
+        return std::nullopt;
+      const DTypeValue &v = simd.getValues().front();
+      KGENDType dtype = v.getDType();
+      if (dtype.isBool())
+        return APInt(width, v.getBoolVal() ? 1 : 0);
+      if (dtype.isIndex() || dtype.isUIndex())
+        return APInt(64, v.getIndexVal(), /*isSigned=*/true).sextOrTrunc(width);
+      if (dtype.isSInt() || dtype.isUInt())
+        return APInt(v.getIntVal().extOrTrunc(width));
+      return std::nullopt;
+    }
+    if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+      return intAttr.getValue().sextOrTrunc(width);
+    if (auto boolAttr = dyn_cast<BoolAttr>(attr))
+      return APInt(width, boolAttr.getValue() ? 1 : 0);
+    return std::nullopt;
+  }
+
+  MaybeTerm constantTerm(Value value, Sort sort) {
+    std::optional<APInt> c = constantInt(value, std::max(sort.width, 1u));
+    if (!c)
+      return std::nullopt;
+    if (sort.kind == Sort::Bool)
+      return std::string(c->isZero() ? "false" : "true");
+    return bvConst(*c);
+  }
+
+  /// Bits of `input` reinterpreted/converted to `to` (int<->int, int<->bool).
+  MaybeTerm convert(Value input, Sort to) {
+    Sort from = sortOf(input.getType());
+    MaybeTerm in = term(input);
+    if (!in || from.kind == Sort::None || to.kind == Sort::None)
+      return std::nullopt;
+    if (from.kind == Sort::Bool && to.kind == Sort::Bool)
+      return in;
+    if (from.kind == Sort::Bool)
+      return "(ite " + *in + " " + bvConst(APInt(to.width, 1)) + " " +
+             bvConst(APInt(to.width, 0)) + ")";
+    if (to.kind == Sort::Bool)
+      return "(distinct " + *in + " " + bvConst(APInt(from.width, 0)) + ")";
+    if (from.width == to.width)
+      return in;
+    if (from.width < to.width)
+      return std::string(from.isSigned ? "((_ sign_extend "
+                                       : "((_ zero_extend ") +
+             std::to_string(to.width - from.width) + ") " + *in + ")";
+    return "((_ extract " + std::to_string(to.width - 1) + " 0) " + *in + ")";
+  }
+
+  static std::optional<std::string> cmpOp(KGEN::CmpPredicate pred,
+                                          bool isSigned) {
+    switch (pred) {
+    case CmpPredicate::EQ:
+      return "=";
+    case CmpPredicate::NE:
+      return "distinct";
+    case CmpPredicate::LT:
+      return isSigned ? "bvslt" : "bvult";
+    case CmpPredicate::LE:
+      return isSigned ? "bvsle" : "bvule";
+    case CmpPredicate::GT:
+      return isSigned ? "bvsgt" : "bvugt";
+    case CmpPredicate::GE:
+      return isSigned ? "bvsge" : "bvuge";
+    }
+    return std::nullopt;
+  }
+
+  static std::string indexCmpOp(mlir::index::IndexCmpPredicate pred) {
+    using P = mlir::index::IndexCmpPredicate;
+    switch (pred) {
+    case P::EQ:
+      return "=";
+    case P::NE:
+      return "distinct";
+    case P::SLT:
+      return "bvslt";
+    case P::SLE:
+      return "bvsle";
+    case P::SGT:
+      return "bvsgt";
+    case P::SGE:
+      return "bvsge";
+    case P::ULT:
+      return "bvult";
+    case P::ULE:
+      return "bvule";
+    case P::UGT:
+      return "bvugt";
+    case P::UGE:
+      return "bvuge";
+    }
+    llvm_unreachable("unknown index predicate");
+  }
+
+  /// Encode a single-result op if its semantics are modeled; otherwise its
+  /// result stays unconstrained (created lazily by `term`).
+  void encodeOp(Operation *op) {
+    if (op->getNumResults() != 1)
+      return;
+    Value result = op->getResult(0);
+    Sort sort = sortOf(result.getType());
+    if (sort.kind == Sort::None)
+      return;
+
+    if (op->hasTrait<OpTrait::ConstantLike>()) {
+      if (MaybeTerm c = constantTerm(result, sort))
+        setTerm(result, *c);
+      return;
+    }
+
+    StringRef name = op->getName().getStringRef();
+    auto operandTerms = [&]() {
+      SmallVector<std::string> ts;
+      for (Value operand : op->getOperands()) {
+        MaybeTerm t = term(operand);
+        if (!t || !(sortOf(operand.getType()) == sort))
+          return SmallVector<std::string>();
+        ts.push_back(*t);
+      }
+      return ts;
+    };
+
+    // Bit-preserving and converting casts.
+    if (name == "pop.cast" || name == "pop.cast_to_builtin" ||
+        name == "pop.cast_from_builtin" || name == "index.casts" ||
+        name == "index.castu") {
+      Value input = op->getOperand(0);
+      Sort from = sortOf(input.getType());
+      if (name == "index.casts")
+        from.isSigned = true;
+      if (name == "index.castu")
+        from.isSigned = false;
+      if (from.kind == Sort::None)
+        return;
+      // Honor the op-specific signedness for extension.
+      Sort to = sort;
+      MaybeTerm in = term(input);
+      if (!in)
+        return;
+      if (from.kind == Sort::BV && to.kind == Sort::BV &&
+          from.width < to.width) {
+        setTerm(result, std::string(from.isSigned ? "((_ sign_extend "
+                                                  : "((_ zero_extend ") +
+                            std::to_string(to.width - from.width) + ") " + *in +
+                            ")");
+        return;
+      }
+      if (MaybeTerm t = convert(input, to)) {
+        if (*t == *in)
+          terms[result] = *in; // Pure aliasing, no new name needed.
+        else
+          setTerm(result, *t);
+      }
+      return;
+    }
+
+    if (sort.kind == Sort::BV) {
+      static const llvm::StringMap<StringRef> binary = {
+          {"pop.add", "bvadd"},      {"pop.sub", "bvsub"},
+          {"pop.mul", "bvmul"},      {"index.add", "bvadd"},
+          {"index.sub", "bvsub"},    {"index.mul", "bvmul"},
+          {"pop.simd.and", "bvand"}, {"pop.simd.or", "bvor"},
+          {"pop.simd.xor", "bvxor"}, {"index.and", "bvand"},
+          {"index.or", "bvor"},      {"index.xor", "bvxor"}};
+      auto it = binary.find(name);
+      if (it != binary.end()) {
+        SmallVector<std::string> ts = operandTerms();
+        if (ts.size() == 2)
+          setTerm(result,
+                  ("(" + it->second + " " + ts[0] + " " + ts[1] + ")").str());
+        return;
+      }
+      if (name == "pop.neg" || name == "pop.abs") {
+        SmallVector<std::string> ts = operandTerms();
+        if (ts.size() != 1)
+          return;
+        std::string neg = "(bvneg " + ts[0] + ")";
+        if (name == "pop.neg")
+          setTerm(result, neg);
+        else
+          setTerm(result, "(ite (bvslt " + ts[0] + " " +
+                              bvConst(APInt(sort.width, 0)) + ") " + neg + " " +
+                              ts[0] + ")");
+        return;
+      }
+      if (name == "pop.max" || name == "pop.min" || name == "index.maxs" ||
+          name == "index.mins" || name == "index.maxu" ||
+          name == "index.minu") {
+        SmallVector<std::string> ts = operandTerms();
+        if (ts.size() != 2)
+          return;
+        bool isSigned =
+            name.starts_with("pop.") ? sort.isSigned : name.ends_with("s");
+        bool isMax = name.contains("max");
+        std::string lt = std::string(isSigned ? "(bvslt " : "(bvult ") + ts[0] +
+                         " " + ts[1] + ")";
+        setTerm(result, "(ite " + lt + " " + (isMax ? ts[1] : ts[0]) + " " +
+                            (isMax ? ts[0] : ts[1]) + ")");
+        return;
+      }
+      // Shifts and divisions only by constants that avoid undefined cases.
+      if (name == "pop.shl" || name == "pop.shr" || name == "pop.floordiv") {
+        SmallVector<std::string> ts = operandTerms();
+        std::optional<APInt> rhs = constantInt(op->getOperand(1), sort.width);
+        if (ts.size() != 2 || !rhs)
+          return;
+        APInt amount = *rhs;
+        if (name == "pop.floordiv") {
+          if (amount.isZero() || (sort.isSigned && amount.isAllOnes()))
+            return;
+          if (!sort.isSigned) {
+            setTerm(result, "(bvudiv " + ts[0] + " " + ts[1] + ")");
+            return;
+          }
+          std::string zero = bvConst(APInt(sort.width, 0));
+          std::string q = "(bvsdiv " + ts[0] + " " + ts[1] + ")";
+          std::string r = "(bvsrem " + ts[0] + " " + ts[1] + ")";
+          setTerm(result, "(ite (and (distinct " + r + " " + zero +
+                              ") (xor (bvslt " + ts[0] + " " + zero +
+                              ") (bvslt " + ts[1] + " " + zero + "))) (bvsub " +
+                              q + " " + bvConst(APInt(sort.width, 1)) + ") " +
+                              q + ")");
+          return;
+        }
+        if (amount.uge(sort.width))
+          return;
+        StringRef shift =
+            name == "pop.shl" ? "bvshl" : (sort.isSigned ? "bvashr" : "bvlshr");
+        setTerm(result, ("(" + shift + " " + ts[0] + " " + ts[1] + ")").str());
+        return;
+      }
+    }
+
+    if (sort.kind == Sort::Bool) {
+      if (auto cmp = dyn_cast<POP::CmpOp>(op)) {
+        Sort operandSort = sortOf(cmp.getLhs().getType());
+        MaybeTerm l = term(cmp.getLhs()), r = term(cmp.getRhs());
+        if (!l || !r)
+          return;
+        if (operandSort.kind == Sort::Bool) {
+          if (cmp.getPred() == CmpPredicate::EQ)
+            setTerm(result, "(= " + *l + " " + *r + ")");
+          else if (cmp.getPred() == CmpPredicate::NE)
+            setTerm(result, "(distinct " + *l + " " + *r + ")");
+          return;
+        }
+        if (std::optional<std::string> fn =
+                cmpOp(cmp.getPred(), operandSort.isSigned))
+          setTerm(result, "(" + *fn + " " + *l + " " + *r + ")");
+        return;
+      }
+      if (auto cmp = dyn_cast<mlir::index::CmpOp>(op)) {
+        MaybeTerm l = term(cmp.getLhs()), r = term(cmp.getRhs());
+        if (l && r)
+          setTerm(result,
+                  "(" + indexCmpOp(cmp.getPred()) + " " + *l + " " + *r + ")");
+        return;
+      }
+      static const llvm::StringMap<StringRef> logical = {
+          {"pop.simd.and", "and"},
+          {"pop.simd.or", "or"},
+          {"pop.simd.xor", "xor"}};
+      auto it = logical.find(name);
+      if (it != logical.end()) {
+        SmallVector<std::string> ts = operandTerms();
+        if (ts.size() == 2)
+          setTerm(result,
+                  ("(" + it->second + " " + ts[0] + " " + ts[1] + ")").str());
+        return;
+      }
+    }
+
+    if (auto select = dyn_cast<POP::SelectOp>(op)) {
+      if (sortOf(select.getCondition().getType()).kind != Sort::Bool)
+        return;
+      MaybeTerm c = term(select.getCondition());
+      MaybeTerm t = term(select.getTrueValue());
+      MaybeTerm f = term(select.getFalseValue());
+      if (c && t && f && sortOf(select.getTrueValue().getType()) == sort)
+        setTerm(result, "(ite " + *c + " " + *t + " " + *f + ")");
+      return;
+    }
+
+    if (auto extract = dyn_cast<StructExtractOp>(op)) {
+      auto index = dyn_cast<IntegerAttr>(extract.getIndexAttr());
+      if (!index)
+        return;
+      Value container = extract.getContainer();
+      unsigned idx = index.getInt();
+      if (auto create = container.getDefiningOp<StructCreateOp>()) {
+        if (idx < create->getNumOperands())
+          if (MaybeTerm t = term(create->getOperand(idx)))
+            if (sortOf(create->getOperand(idx).getType()) == sort) {
+              terms[result] = *t;
+              return;
+            }
+      }
+      // The same field of the same struct value is the same value.
+      auto key = std::make_pair(container, idx);
+      auto it = extracts.find(key);
+      if (it == extracts.end())
+        it = extracts.try_emplace(key, declare(sort)).first;
+      terms[result] = it->second;
+      return;
+    }
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Control flow
+  //===--------------------------------------------------------------------===//
+
+  struct BlockResult {
+    /// Condition under which control falls through the block's terminator.
+    std::string fall;
+    Operation *terminator = nullptr;
+  };
+
+  BlockResult encodeBlock(Block &block, std::string reach) {
+    size_t activeSize = activeObligations.size();
+    BlockResult result{reach, nullptr};
+    for (Operation &op : block) {
+      if (op.hasTrait<OpTrait::IsTerminator>()) {
+        result = {handleTerminator(&op, reach), &op};
+        break;
+      }
+      reach = encodeOperation(&op, reach);
+      result.fall = reach;
+    }
+    activeObligations.resize(activeSize);
+    return result;
+  }
+
+  SmallVector<MaybeTerm> termsOf(ValueRange values) {
+    SmallVector<MaybeTerm> result;
+    for (Value v : values)
+      result.push_back(term(v));
+    return result;
+  }
+
+  LoopInfo *findLoop(StringAttr label) {
+    for (LoopInfo *loop : llvm::reverse(loopStack)) {
+      auto op = loopOps.lookup(loop);
+      if (!label || (op.getLabelAttr() && op.getLabelAttr() == label))
+        return loop;
+    }
+    return nullptr;
+  }
+
+  std::string handleTerminator(Operation *op, StringRef reach) {
+    std::string r = reachName(reach);
+    if (auto cont = dyn_cast<HLCF::ContinueOp>(op)) {
+      if (LoopInfo *loop = findLoop(cont.getLabelAttr()))
+        loop->continues.push_back({r, termsOf(cont.getOperands()),
+                                   SmallVector<LoopInfo *>(loopStack)});
+      return "false";
+    }
+    if (auto brk = dyn_cast<HLCF::BreakOp>(op)) {
+      if (LoopInfo *loop = findLoop(brk.getLabelAttr()))
+        loop->breaks.push_back({r, termsOf(brk.getOperands()),
+                                SmallVector<LoopInfo *>(loopStack)});
+      return "false";
+    }
+    if (auto raise = dyn_cast<LIT::TryRaiseOp>(op)) {
+      for (TryInfo *t : llvm::reverse(tryStack))
+        if (t->op.getLabelAttr() == raise.getLabelAttr()) {
+          t->raises.push_back({r, termsOf(raise.getOperands()),
+                               SmallVector<LoopInfo *>(loopStack)});
+          break;
+        }
+      return "false"; // An unmatched raise leaves the function.
+    }
+    if (isa<HLCF::ReturnOp, HLCF::UnreachableOp>(op))
+      return "false";
+    // yield, try.yield, elifcond.yield and unknown terminators fall through.
+    return r;
+  }
+
+  std::string encodeOperation(Operation *op, std::string reach) {
+    if (auto obligation = dyn_cast<ObligationOp>(op)) {
+      std::string r = reachName(reach);
+      std::string cond = boolTerm(obligation.getCond());
+      obligations.push_back({obligation, r, cond,
+                             SmallVector<LoopInfo *>(loopStack),
+                             SmallVector<std::pair<std::string, std::string>>(
+                                 activeObligations)});
+      activeObligations.push_back({r, cond});
+      return reach;
+    }
+    if (auto ifOp = dyn_cast<HLCF::IfOp>(op))
+      return encodeIf(ifOp, reach);
+    if (auto loop = dyn_cast<HLCF::LoopOp>(op))
+      return encodeLoop(loop, reach);
+    if (auto tryOp = dyn_cast<LIT::TryOp>(op))
+      return encodeTry(tryOp, reach);
+    if (isa<mlir::FunctionOpInterface>(op))
+      return reach; // Nested functions are encoded on their own.
+    if (op->getNumRegions()) {
+      // Unknown region op: its regions may run any number of times under the
+      // current condition; block arguments and results stay unconstrained.
+      for (Region &region : op->getRegions())
+        for (Block &block : region)
+          encodeBlock(block, reach);
+      return reach;
+    }
+    encodeOp(op);
+    return reach;
+  }
+
+  /// Bind `results` to the values yielded by the arms that fall through.
+  void bindResults(ValueRange results, ArrayRef<BlockResult> arms) {
+    for (auto [i, res] : llvm::enumerate(results)) {
+      MaybeTerm r = term(res);
+      if (!r)
+        continue;
+      for (const BlockResult &arm : arms) {
+        if (arm.fall == "false" || !arm.terminator ||
+            i >= arm.terminator->getNumOperands())
+          continue;
+        if (MaybeTerm v = term(arm.terminator->getOperand(i)))
+          assertGlobal("(=> " + arm.fall + " (= " + *r + " " + *v + "))");
+      }
+    }
+  }
+
+  std::string encodeIf(HLCF::IfOp ifOp, StringRef reach) {
+    std::string c = boolTerm(ifOp.getCond());
+    SmallVector<BlockResult> arms;
+    arms.push_back(
+        encodeBlock(ifOp.getThenBlock(), reachName(mkAnd(reach, c))));
+    std::string rest = reachName(mkAnd(reach, mkNot(c)));
+    auto elifs = ifOp.getElifRegions();
+    for (unsigned i = 0; i + 1 < elifs.size(); i += 2) {
+      BlockResult condArm = encodeBlock(elifs[i].front(), rest);
+      std::string ck = "false";
+      if (condArm.terminator && condArm.terminator->getNumOperands())
+        ck = boolTerm(condArm.terminator->getOperand(0));
+      arms.push_back(encodeBlock(elifs[i + 1].front(),
+                                 reachName(mkAnd(condArm.fall, ck))));
+      rest = reachName(mkAnd(condArm.fall, mkNot(ck)));
+    }
+    arms.push_back(encodeBlock(ifOp.getElseBlock(), rest));
+    bindResults(ifOp.getResults(), arms);
+    SmallVector<std::string> falls;
+    for (const BlockResult &arm : arms)
+      falls.push_back(arm.fall);
+    return reachName(mkOr(falls));
+  }
+
+  DenseMap<LoopInfo *, HLCF::LoopOp> loopOps;
+
+  std::string encodeLoop(HLCF::LoopOp loopOp, StringRef reach) {
+    LoopInfo &loop = loops.emplace_back();
+    loopOps[&loop] = loopOp;
+    loop.reachIn = reachName(reach);
+    loop.enclosing.assign(loopStack.begin(), loopStack.end());
+    loop.inits = termsOf(loopOp.getOperands());
+    Block &body = loopOp.getBody().front();
+    for (BlockArgument arg : body.getArguments()) {
+      loop.args.push_back(term(arg));
+      loop.argSorts.push_back(sortOf(arg.getType()));
+    }
+
+    loopStack.push_back(&loop);
+    BlockResult bodyResult = encodeBlock(body, loop.reachIn);
+    loopStack.pop_back();
+
+    SmallVector<std::string> exits;
+    SmallVector<BlockResult> exitArms;
+    for (Edge &brk : loop.breaks)
+      exits.push_back(brk.reach);
+    if (bodyResult.fall != "false")
+      exits.push_back(loop.reachIn); // Unexpected fallthrough: be safe.
+    for (auto [i, res] : llvm::enumerate(loopOp.getResults())) {
+      MaybeTerm r = term(res);
+      if (!r)
+        continue;
+      for (Edge &brk : loop.breaks)
+        if (i < brk.values.size() && brk.values[i])
+          assertGlobal("(=> " + brk.reach + " (= " + *r + " " + *brk.values[i] +
+                       "))");
+    }
+    return reachName(mkOr(exits));
+  }
+
+  std::string encodeTry(LIT::TryOp tryOp, StringRef reach) {
+    std::string r = reachName(reach);
+    if (!tryOp.getFinallyRegions().empty()) {
+      for (Region &region : tryOp->getRegions())
+        for (Block &block : region)
+          encodeBlock(block, r);
+      return r;
+    }
+    // Calls in the try region might raise without an explicit `try.raise`.
+    bool mayRaiseImplicitly = tryOp.getTryRegion()
+                                  .walk([](Operation *op) {
+                                    return isa<CallOp, CallIndirectOp>(op)
+                                               ? WalkResult::interrupt()
+                                               : WalkResult::advance();
+                                  })
+                                  .wasInterrupted();
+
+    TryInfo info{tryOp, {}};
+    tryStack.push_back(&info);
+    BlockResult tryResult = encodeBlock(tryOp.getTryRegion().front(), r);
+    tryStack.pop_back();
+
+    // Except region: arguments come from the raises.
+    Block &exceptBlock = tryOp.getExceptRegion().front();
+    SmallVector<std::string> exceptReaches;
+    for (Edge &raise : info.raises)
+      exceptReaches.push_back(raise.reach);
+    if (mayRaiseImplicitly)
+      exceptReaches.push_back(r);
+    for (auto [i, arg] : llvm::enumerate(exceptBlock.getArguments())) {
+      MaybeTerm a = term(arg);
+      if (!a)
+        continue;
+      for (Edge &raise : info.raises)
+        if (i < raise.values.size() && raise.values[i])
+          assertGlobal("(=> " + raise.reach + " (= " + *a + " " +
+                       *raise.values[i] + "))");
+    }
+
+    // Else region: arguments come from the try region's normal completion.
+    Block &elseBlock = tryOp.getElseRegion().front();
+    for (auto [i, arg] : llvm::enumerate(elseBlock.getArguments())) {
+      MaybeTerm a = term(arg);
+      if (!a || tryResult.fall == "false" || !tryResult.terminator ||
+          i >= tryResult.terminator->getNumOperands())
+        continue;
+      if (MaybeTerm v = term(tryResult.terminator->getOperand(i)))
+        assertGlobal("(=> " + tryResult.fall + " (= " + *a + " " + *v + "))");
+    }
+
+    SmallVector<BlockResult> arms;
+    arms.push_back(encodeBlock(exceptBlock, reachName(mkOr(exceptReaches))));
+    arms.push_back(encodeBlock(elseBlock, tryResult.fall));
+    bindResults(tryOp.getResults(), arms);
+    return reachName(mkOr({arms[0].fall, arms[1].fall}));
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Solver
+//===----------------------------------------------------------------------===//
+
+enum class Answer { Unsat, Sat, Unknown };
+
+/// The solver's reply to one query.
+struct Reply {
+  Answer answer = Answer::Unknown;
+};
+
+/// Each query is preceded by `(echo "@@")`, so the output splits into one
+/// segment per query regardless of error messages.
+std::optional<std::vector<Reply>> parseReplies(StringRef output,
+                                               size_t expected) {
+  SmallVector<StringRef> segments;
+  output.split(segments, "@@\n");
+  if (segments.empty() || segments.size() - 1 != expected)
+    return std::nullopt;
+  std::vector<Reply> replies;
+  for (StringRef segment : ArrayRef(segments).drop_front()) {
+    Reply reply;
+    StringRef answer = segment.split('\n').first.trim();
+    if (answer == "unsat")
+      reply.answer = Answer::Unsat;
+    else if (answer == "sat")
+      reply.answer = Answer::Sat;
+    else if (answer == "unknown" || answer == "timeout")
+      reply.answer = Answer::Unknown;
+    else
+      return std::nullopt; // Malformed script.
+    replies.push_back(std::move(reply));
+  }
+  return replies;
+}
+
+/// Runs z3 on `script` and returns one reply per query, or nullopt if the
+/// solver could not be run or its output does not match.
+std::optional<std::vector<Reply>> runZ3(StringRef z3, StringRef script,
+                                        size_t expected, StringRef dumpDir,
+                                        StringRef dumpName) {
+  SmallString<128> scriptPath, outPath;
+  if (!dumpDir.empty()) {
+    scriptPath = dumpDir;
+    llvm::sys::path::append(scriptPath, dumpName + ".smt2");
+  } else if (llvm::sys::fs::createTemporaryFile("bounds", "smt2", scriptPath)) {
+    return std::nullopt;
+  }
+  if (llvm::sys::fs::createTemporaryFile("bounds", "out", outPath))
+    return std::nullopt;
+  {
+    std::error_code ec;
+    llvm::raw_fd_ostream os(scriptPath, ec);
+    if (ec)
+      return std::nullopt;
+    os << script;
+  }
+  std::optional<StringRef> redirects[] = {StringRef(""), StringRef(outPath),
+                                          StringRef("")};
+  int rc = llvm::sys::ExecuteAndWait(z3, {z3, "-smt2", scriptPath},
+                                     std::nullopt, redirects);
+  auto buffer = llvm::MemoryBuffer::getFile(outPath);
+  llvm::sys::fs::remove(outPath);
+  if (dumpDir.empty())
+    llvm::sys::fs::remove(scriptPath);
+  if (rc < 0 || !buffer)
+    return std::nullopt;
+  return parseReplies((*buffer)->getBuffer(), expected);
+}
+
+/// Builds one script out of independent `(push) ... (check-sat) (pop)` blocks.
+struct QueryBatch {
+  std::string text;
+  size_t count = 0;
+
+  /// Check `assumptions && goalNegation`.
+  void add(ArrayRef<std::string> assumptions, StringRef goalNegation) {
+    text += "(echo \"@@\")\n(push 1)\n";
+    for (const std::string &a : assumptions)
+      if (a != "true")
+        text += "(assert " + a + ")\n";
+    text += ("(assert " + goalNegation + ")\n(check-sat)\n(pop 1)\n").str();
+    ++count;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Reporting
+//===----------------------------------------------------------------------===//
+
+struct ObligationLocation {
+  StringRef file;
+  int64_t line = 0, col = 0;
+};
+
+std::optional<ObligationLocation> getObligationLocation(ObligationOp op) {
+  IntegerAttr line, col;
+  StringAttr file;
+  if (!mlir::matchPattern(op.getLine(), mlir::m_Constant(&line)) ||
+      !mlir::matchPattern(op.getCol(), mlir::m_Constant(&col)) ||
+      !mlir::matchPattern(op.getFileName(), mlir::m_Constant(&file)))
+    return std::nullopt;
+  return ObligationLocation{file.getValue(), line.getInt(), col.getInt()};
+}
+
+StringRef getObligationKind(ObligationOp op) {
+  if (auto kind = dyn_cast<StringAttr>(op.getKind()))
+    return kind.getValue();
+  return "<unknown>";
+}
+
+enum class Status { Proven, Implied, Unproven, Unreachable, SolverFailed };
+
+struct BoundsCheckReportPass
+    : impl::BoundsCheckReportBase<BoundsCheckReportPass> {
+  using BoundsCheckReportBase::BoundsCheckReportBase;
+
+  std::string z3;
+
+  std::string header() const {
+    return "(set-option :timeout " + std::to_string(timeoutMs) + ")\n";
+  }
+
+  struct FunctionReport {
+    StringRef name;
+    SmallVector<std::pair<ObligationOp, Status>> results;
+    bool solverFailed = false;
+  };
+
+  /// Encode one function and check its obligations.
+  FunctionReport analyzeFunction(FuncOp func, unsigned index) const {
+    FunctionReport report;
+    report.name = func.getSymName();
+    Encoder enc;
+    enc.encodeFunction(func);
+    std::string dumpName = "f" + std::to_string(index);
+
+    // Three queries per obligation: is it reachable at all (guards against
+    // vacuous proofs), is it provable on its own, and with earlier ones.
+    QueryBatch batch;
+    for (ObligationInfo &ob : enc.obligations) {
+      SmallVector<std::string> assume = {ob.reach};
+      batch.add(assume, "true");
+      batch.add(assume, mkNot(ob.cond));
+      for (auto &[reach, cond] : ob.earlier)
+        assume.push_back("(=> " + reach + " " + cond + ")");
+      batch.add(assume, mkNot(ob.cond));
+    }
+    std::optional<std::vector<Reply>> replies =
+        runZ3(z3, header() + enc.prelude + batch.text, batch.count, dumpDir,
+              dumpName + ".obligations");
+    report.solverFailed = !replies;
+
+    for (auto [i, ob] : llvm::enumerate(enc.obligations)) {
+      Status status = Status::SolverFailed;
+      if (replies) {
+        if ((*replies)[3 * i].answer == Answer::Unsat)
+          status = Status::Unreachable;
+        else if ((*replies)[3 * i + 1].answer == Answer::Unsat)
+          status = Status::Proven;
+        else if (!ob.earlier.empty() &&
+                 (*replies)[3 * i + 2].answer == Answer::Unsat)
+          status = Status::Implied;
+        else
+          status = Status::Unproven;
+      }
+      report.results.push_back({ob.op, status});
+    }
+    return report;
+  }
+
+  void runOnOperation() override {
+    if (!z3Path.empty()) {
+      z3 = z3Path;
+    } else if (auto found = llvm::sys::findProgramByName("z3")) {
+      z3 = *found;
+    } else {
+      getOperation().emitError("bounds-check-report: z3 not found in PATH");
+      return signalPassFailure();
+    }
+
+    SmallVector<FuncOp> funcs;
+    getOperation().walk([&](FuncOp func) {
+      if (!includeStdlib && func.getSymName().starts_with("std::"))
+        return;
+      if (func.walk([](ObligationOp) { return WalkResult::interrupt(); })
+              .wasInterrupted())
+        funcs.push_back(func);
+    });
+
+    std::vector<FunctionReport> reports;
+    for (auto [i, func] : llvm::enumerate(funcs))
+      reports.push_back(analyzeFunction(func, i));
+
+    unsigned total = 0, proven = 0, failed = 0, unreachable = 0;
+    llvm::raw_ostream &os = llvm::errs();
+    os << "\n=== bounds-check-report ===\n";
+    for (FunctionReport &report : reports) {
+      unsigned funcProven = 0, funcImplied = 0, funcTotal = 0,
+               funcUnreachable = 0;
+      for (auto &[op, status] : report.results) {
+        if (status == Status::Implied) {
+          ++funcImplied;
+          continue;
+        }
+        if (status == Status::Unreachable) {
+          ++funcUnreachable;
+          continue;
+        }
+        ++funcTotal;
+        funcProven += status == Status::Proven;
+        failed += status == Status::SolverFailed;
+      }
+      total += funcTotal;
+      proven += funcProven;
+      unreachable += funcUnreachable;
+
+      os << "@" << report.name << ": " << funcProven << "/" << funcTotal
+         << " obligations proven";
+      if (funcImplied)
+        os << " (+" << funcImplied << " implied by earlier obligations)";
+      if (funcUnreachable)
+        os << " (+" << funcUnreachable << " unreachable)";
+      if (report.solverFailed)
+        os << "  [solver failed]";
+      os << "\n";
+      for (auto &[op, status] : report.results) {
+        if (!verbose && (status == Status::Proven || status == Status::Implied))
+          continue;
+        os << "  "
+           << (status == Status::Proven        ? "proven  "
+               : status == Status::Implied     ? "implied "
+               : status == Status::Unreachable ? "unreach "
+                                               : "UNPROVEN")
+           << "  " << getObligationKind(op) << "  ";
+        if (auto loc = getObligationLocation(op))
+          os << loc->file << ":" << loc->line << ":" << loc->col;
+        else
+          os << "<unresolved location>";
+        os << "\n";
+      }
+    }
+
+    os << "total: " << proven << "/" << total << " obligations proven";
+    if (failed)
+      os << " (" << failed << " not checked: solver failed)";
+    if (unreachable)
+      os << " (" << unreachable << " unreachable, not counted)";
+    os << "\n\n";
+    markAllAnalysesPreserved();
+  }
+};
+
+} // namespace
