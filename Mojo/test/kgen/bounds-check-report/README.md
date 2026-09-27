@@ -60,6 +60,7 @@ the first, so each access counts once.
 | `slicing.mojo`     | all `bad_*`                                 | all `ok_*`                   |
 | `loops.mojo`       | all `bad_*`                                 | all `ok_*`                   |
 | `memory.mojo`      | all `bad_*` and `limit_*`                   | all `ok_*`, `Bag.ok_get`     |
+| `unrolling.mojo`   | all `bad_*` and `limit_*`                   | all `ok_*`                   |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -125,3 +126,14 @@ live outside every allocation, so writes through them never touch a list's
 buffer. `limit_nested_after_string_dropped` stays unproven: `s += "def"` takes
 the String `mut`, which hides its buffer pointer from the analysis, so the
 reference count update when the String is dropped might hit the list's buffer.
+
+`unrolling.mojo` fills lists of lists in loops, like `test_2d_dynamic_list` in
+`test_list.mojo`. When the heap search meets a loop that writes memory, it
+unrolls it: iteration `k` is evaluated like a callee whose arguments are the
+previous iteration's loop-carried values, and the value after the loop is the
+one the exiting iteration leaves. It unrolls at most 8 iterations and skips
+iterations whose exit condition is a known constant, so `range(2)` costs two
+iterations; a loop that may run longer (`limit_loop_many_iterations`) or an
+unknown number of times (`bad_loop_unknown_count`) leaves the value unknown.
+Lists that start empty reallocate on the way (`ok_2d_realloc`), which the copy
+markers described above cover.
