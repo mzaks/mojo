@@ -172,8 +172,11 @@ struct LoopInfo;
 struct Edge {
   std::string reach;
   SmallVector<MaybeTerm> values;
-  /// Loops enclosing the source of the edge, outermost first.
+  /// Loops whose invariants hold at the source of the edge (the enclosing
+  /// loops).
   SmallVector<LoopInfo *> enclosing;
+  /// Assumptions made before the source of the edge.
+  std::string assumed = "true";
 };
 
 /// A Houdini candidate `arg <rel> other` for a loop head.
@@ -189,6 +192,8 @@ struct Candidate {
 struct LoopInfo {
   unsigned id = 0;
   std::string reachIn;
+  /// Assumptions made before the loop is entered.
+  std::string assumedAtEntry = "true";
   SmallVector<MaybeTerm> args, inits;
   SmallVector<Sort> argSorts;
   SmallVector<LoopInfo *> enclosing;
@@ -232,6 +237,8 @@ struct ObligationInfo {
   SmallVector<LoopInfo *> enclosing;
   /// (reach, cond) of obligations preceding this one on the same path.
   SmallVector<std::pair<std::string, std::string>> earlier;
+  /// Assumptions made before this obligation.
+  std::string assumed;
 };
 
 //===----------------------------------------------------------------------===//
@@ -244,8 +251,13 @@ public:
   std::string prelude;
   std::deque<LoopInfo> loops;
   std::vector<ObligationInfo> obligations;
+  /// Number of callee `ensures` assumed at call sites.
+  unsigned contractsUsed = 0;
+
+  explicit Encoder(const mlir::SymbolTable *symbols) : symbols(symbols) {}
 
   void encodeFunction(FuncOp func) {
+    self = func;
     // Name the function in the script, for `dump-dir` debugging.
     prelude += ("; " + func.getSymName() + "\n").str();
     Region &body = func->getRegion(0);
@@ -254,12 +266,47 @@ public:
   }
 
 private:
+  const mlir::SymbolTable *symbols;
+  FuncOp self;
   unsigned counter = 0;
   DenseMap<Value, std::string> terms;
   DenseMap<std::pair<Value, unsigned>, std::string> extracts;
   SmallVector<LoopInfo *> loopStack;
   SmallVector<TryInfo *> tryStack;
   SmallVector<std::pair<std::string, std::string>> activeObligations;
+
+  /// A callee evaluated for one call site: its entry arguments stand for the
+  /// call's operands, and its other values are computed on demand from their
+  /// definitions (anything not modeled stays unconstrained).
+  struct CallContext {
+    DenseMap<Value, Value> args;
+    DenseMap<Value, std::string> terms;
+    DenseMap<std::pair<Value, unsigned>, std::string> extracts;
+  };
+  std::deque<CallContext> contexts;
+  /// The callee context being evaluated, or null for the function itself.
+  CallContext *ctx = nullptr;
+  /// Call results backed by a callee's returned value in a context.
+  DenseMap<Value, std::pair<CallContext *, Value>> callResults;
+
+  DenseMap<Value, std::string> &termMap() { return ctx ? ctx->terms : terms; }
+  DenseMap<std::pair<Value, unsigned>, std::string> &extractMap() {
+    return ctx ? ctx->extracts : extracts;
+  }
+
+  template <typename F>
+  auto inContext(CallContext *context, F &&fn) {
+    CallContext *saved = ctx;
+    ctx = context;
+    auto result = fn();
+    ctx = saved;
+    return result;
+  }
+
+  /// Loops whose invariants hold at the current point: the enclosing ones.
+  SmallVector<LoopInfo *> assumedLoops() const {
+    return SmallVector<LoopInfo *>(loopStack.begin(), loopStack.end());
+  }
 
   std::string fresh(StringRef prefix) {
     return (prefix + Twine(counter++)).str();
@@ -286,8 +333,22 @@ private:
     return define({Sort::Bool, 1, false}, expr, "r");
   }
 
+  /// Only for definitions: constraints on fresh values that every other
+  /// assignment can satisfy. Facts go through `addAssumption`.
   void assertGlobal(StringRef expr) {
     prelude += ("(assert " + expr + ")\n").str();
+  }
+
+  /// The conjunction of assumptions (`kgen.assume`, callee `ensures`) made so
+  /// far, in program order. A check may only use the assumptions made before
+  /// it: a fact that holds later (e.g. an invariant restored after a check)
+  /// must not justify an earlier obligation.
+  std::string assumed = "true";
+
+  void addAssumption(StringRef reach, StringRef cond) {
+    assumed =
+        define({Sort::Bool, 1, false},
+               mkAnd(assumed, ("(=> " + reach + " " + cond + ")").str()), "a");
   }
 
   /// The term of an encodable value. Values without a definition (block
@@ -296,11 +357,37 @@ private:
     Sort sort = sortOf(value.getType());
     if (sort.kind == Sort::None)
       return std::nullopt;
-    auto it = terms.find(value);
-    if (it != terms.end())
+    if (ctx) {
+      // A callee argument is the caller's operand.
+      auto arg = ctx->args.find(value);
+      if (arg != ctx->args.end())
+        return inContext(nullptr, [&] { return term(arg->second); });
+    } else {
+      // A call result backed by the callee's returned value.
+      auto res = callResults.find(value);
+      if (res != callResults.end() && !terms.count(value)) {
+        auto [context, returned] = res->second;
+        MaybeTerm t = inContext(context, [&] { return term(returned); });
+        if (t)
+          terms[value] = *t;
+        return t;
+      }
+    }
+    auto &map = termMap();
+    auto it = map.find(value);
+    if (it != map.end())
       return it->second;
+    // Callee values are computed on demand; the function's own values are
+    // encoded in program order.
+    if (ctx)
+      if (Operation *def = value.getDefiningOp()) {
+        encodeOp(def);
+        auto it = map.find(value);
+        if (it != map.end())
+          return it->second;
+      }
     std::string name = declare(sort);
-    terms[value] = name;
+    map[value] = name;
     return name;
   }
 
@@ -312,7 +399,7 @@ private:
   }
 
   void setTerm(Value value, StringRef expr) {
-    terms[value] = define(sortOf(value.getType()), expr);
+    termMap()[value] = define(sortOf(value.getType()), expr);
   }
 
   //===--------------------------------------------------------------------===//
@@ -447,9 +534,35 @@ private:
     }
     if (depth > 16)
       return std::nullopt;
+    if (ctx) {
+      auto arg = ctx->args.find(aggregate);
+      if (arg != ctx->args.end())
+        return inContext(nullptr, [&] {
+          return resolveAccess(arg->second, path, sort, depth + 1);
+        });
+    } else {
+      auto res = callResults.find(aggregate);
+      if (res != callResults.end()) {
+        auto [context, returned] = res->second;
+        return inContext(context, [&] {
+          return resolveAccess(returned, path, sort, depth + 1);
+        });
+      }
+    }
     Operation *def = aggregate.getDefiningOp();
-    if (!def)
-      return std::nullopt;
+    if (!def) {
+      // A field of a block argument: the same term `kgen.struct.extract`
+      // gets for it, so e.g. a callee's view of its argument agrees with the
+      // caller's.
+      if (path.size() != 1 || path.front() < 0)
+        return std::nullopt;
+      auto &memo = extractMap();
+      auto key = std::make_pair(aggregate, unsigned(path.front()));
+      auto it = memo.find(key);
+      if (it == memo.end())
+        it = memo.try_emplace(key, declare(sort)).first;
+      return it->second;
+    }
     Attribute constant;
     if (mlir::matchPattern(aggregate, mlir::m_Constant(&constant))) {
       // Walk into constant structs, e.g. the tag of a constant `None`.
@@ -563,7 +676,7 @@ private:
       }
       if (MaybeTerm t = convert(input, to)) {
         if (*t == *in)
-          terms[result] = *in; // Pure aliasing, no new name needed.
+          termMap()[result] = *in; // Pure aliasing, no new name needed.
         else
           setTerm(result, *t);
       }
@@ -704,7 +817,7 @@ private:
           if (t->front() == '(')
             setTerm(result, *t);
           else
-            terms[result] = *t;
+            termMap()[result] = *t;
           return;
         }
     }
@@ -716,10 +829,11 @@ private:
       unsigned idx = index.getInt();
       // The same field of the same struct value is the same value.
       auto key = std::make_pair(container, idx);
-      auto it = extracts.find(key);
-      if (it == extracts.end())
-        it = extracts.try_emplace(key, declare(sort)).first;
-      terms[result] = it->second;
+      auto &memo = extractMap();
+      auto it = memo.find(key);
+      if (it == memo.end())
+        it = memo.try_emplace(key, declare(sort)).first;
+      termMap()[result] = it->second;
       return;
     }
   }
@@ -769,21 +883,21 @@ private:
     std::string r = reachName(reach);
     if (auto cont = dyn_cast<HLCF::ContinueOp>(op)) {
       if (LoopInfo *loop = findLoop(cont.getLabelAttr()))
-        loop->continues.push_back({r, termsOf(cont.getOperands()),
-                                   SmallVector<LoopInfo *>(loopStack)});
+        loop->continues.push_back(
+            {r, termsOf(cont.getOperands()), assumedLoops(), assumed});
       return "false";
     }
     if (auto brk = dyn_cast<HLCF::BreakOp>(op)) {
       if (LoopInfo *loop = findLoop(brk.getLabelAttr()))
-        loop->breaks.push_back({r, termsOf(brk.getOperands()),
-                                SmallVector<LoopInfo *>(loopStack)});
+        loop->breaks.push_back(
+            {r, termsOf(brk.getOperands()), assumedLoops(), assumed});
       return "false";
     }
     if (auto raise = dyn_cast<LIT::TryRaiseOp>(op)) {
       for (TryInfo *t : llvm::reverse(tryStack))
         if (t->op.getLabelAttr() == raise.getLabelAttr()) {
-          t->raises.push_back({r, termsOf(raise.getOperands()),
-                               SmallVector<LoopInfo *>(loopStack)});
+          t->raises.push_back(
+              {r, termsOf(raise.getOperands()), assumedLoops(), assumed});
           break;
         }
       return "false"; // An unmatched raise leaves the function.
@@ -798,13 +912,20 @@ private:
     if (auto obligation = dyn_cast<ObligationOp>(op)) {
       std::string r = reachName(reach);
       std::string cond = boolTerm(obligation.getCond());
-      obligations.push_back({obligation, r, cond,
-                             SmallVector<LoopInfo *>(loopStack),
-                             SmallVector<std::pair<std::string, std::string>>(
-                                 activeObligations)});
+      obligations.push_back(
+          {obligation, r, cond, assumedLoops(),
+           SmallVector<std::pair<std::string, std::string>>(activeObligations),
+           assumed});
       activeObligations.push_back({r, cond});
       return reach;
     }
+    if (auto assume = dyn_cast<AssumeOp>(op)) {
+      std::string cond = boolTerm(assume.getCond());
+      addAssumption(reachName(reach), cond);
+      return reach;
+    }
+    if (auto call = dyn_cast<CallOp>(op))
+      instantiateContracts(call, reach);
     if (auto ifOp = dyn_cast<HLCF::IfOp>(op))
       return encodeIf(ifOp, reach);
     if (auto loop = dyn_cast<HLCF::LoopOp>(op))
@@ -827,6 +948,57 @@ private:
     }
     encodeOp(op);
     return reach;
+  }
+
+  /// Assume the `ensures` of a (non-inlined) callee at a call to it. The
+  /// callee's entry arguments are bound to the call's operands and its
+  /// returned values back the call's results, so conditions over "self at
+  /// exit" talk about the call's results.
+  void instantiateContracts(CallOp call, StringRef reach) {
+    if (ctx || !symbols)
+      return;
+    auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!callee)
+      return;
+    auto fn = symbols->lookup<FuncOp>(callee.getSymbol().getRootReference());
+    if (!fn || fn == self || fn->getRegion(0).empty())
+      return;
+    // The contract must hold on every normal exit: require exactly one
+    // return, at the end of the entry block, preceded by the `ensures`.
+    Block &entry = fn->getRegion(0).front();
+    auto ret = dyn_cast<HLCF::ReturnOp>(entry.getTerminator());
+    if (!ret || entry.getNumArguments() != call->getNumOperands() ||
+        ret->getNumOperands() != call->getNumResults())
+      return;
+    bool otherReturn =
+        fn->walk([&](HLCF::ReturnOp r) {
+            return r == ret ? WalkResult::advance() : WalkResult::interrupt();
+          }).wasInterrupted();
+    if (otherReturn)
+      return;
+    SmallVector<ObligationOp> ensures;
+    for (Operation &op : entry)
+      if (auto ob = dyn_cast<ObligationOp>(&op))
+        if (auto kind = dyn_cast<StringAttr>(ob.getKind()))
+          if (kind.getValue() == "ensures")
+            ensures.push_back(ob);
+    if (ensures.empty())
+      return;
+
+    CallContext &context = contexts.emplace_back();
+    for (auto [arg, operand] :
+         llvm::zip(entry.getArguments(), call->getOperands()))
+      context.args[arg] = operand;
+    for (auto [result, returned] :
+         llvm::zip(call->getResults(), ret->getOperands()))
+      callResults[result] = {&context, returned};
+    std::string r = reachName(reach);
+    for (ObligationOp e : ensures) {
+      std::string cond =
+          inContext(&context, [&] { return boolTerm(e.getCond()); });
+      addAssumption(r, cond);
+      ++contractsUsed;
+    }
   }
 
   /// Bind `results` to the values yielded by the arms that fall through.
@@ -876,7 +1048,8 @@ private:
     loop.id = loops.size() - 1;
     loopOps[&loop] = loopOp;
     loop.reachIn = reachName(reach);
-    loop.enclosing.assign(loopStack.begin(), loopStack.end());
+    loop.assumedAtEntry = assumed;
+    loop.enclosing = assumedLoops();
     loop.inits = termsOf(loopOp.getOperands());
     Block &body = loopOp.getBody().front();
     for (BlockArgument arg : body.getArguments()) {
@@ -1218,10 +1391,12 @@ struct BoundsCheckReportPass
       for (LoopInfo &loop : enc.loops) {
         SmallVector<std::string> assume = invariantsOf(loop.enclosing);
         assume.push_back(loop.reachIn);
+        assume.push_back(loop.assumedAtEntry);
         addEdge(loop, loop.inits, assume);
         for (Edge &cont : loop.continues) {
           SmallVector<std::string> assume = invariantsOf(cont.enclosing);
           assume.push_back(cont.reach);
+          assume.push_back(cont.assumed);
           addEdge(loop, cont.values, assume);
         }
       }
@@ -1265,14 +1440,16 @@ struct BoundsCheckReportPass
     StringRef name;
     SmallVector<std::pair<ObligationOp, Status>> results;
     bool solverFailed = false;
+    unsigned contractsUsed = 0;
   };
 
   /// Encode one function, infer its loop invariants and check its
   /// obligations. Only reads the IR, so functions can run in parallel.
-  FunctionReport analyzeFunction(FuncOp func, unsigned index) const {
+  FunctionReport analyzeFunction(FuncOp func, unsigned index,
+                                 const mlir::SymbolTable &symbols) const {
     FunctionReport report;
     report.name = func.getSymName();
-    Encoder enc;
+    Encoder enc(&symbols);
     enc.encodeFunction(func);
     std::string dumpName = "f" + std::to_string(index);
     bool solverOk = inferInvariants(enc, dumpName);
@@ -1283,6 +1460,7 @@ struct BoundsCheckReportPass
     for (ObligationInfo &ob : enc.obligations) {
       SmallVector<std::string> assume = invariantsOf(ob.enclosing);
       assume.push_back(ob.reach);
+      assume.push_back(ob.assumed);
       batch.add(assume, "true");
       batch.add(assume, mkNot(ob.cond));
       for (auto &[reach, cond] : ob.earlier)
@@ -1296,6 +1474,7 @@ struct BoundsCheckReportPass
                           batch.text,
                       batch.count, dumpDir, dumpName + ".obligations");
     report.solverFailed = !replies;
+    report.contractsUsed = enc.contractsUsed;
 
     for (auto [i, ob] : llvm::enumerate(enc.obligations)) {
       Status status = Status::SolverFailed;
@@ -1336,9 +1515,11 @@ struct BoundsCheckReportPass
 
     // Each function spends its time in external solver processes; run them
     // concurrently and print the reports in module order afterwards.
+    // Callee contracts are looked up by symbol; lookups only read the table.
+    mlir::SymbolTable symbols(getOperation());
     std::vector<FunctionReport> reports(funcs.size());
     mlir::parallelFor(&getContext(), 0, funcs.size(), [&](size_t i) {
-      reports[i] = analyzeFunction(funcs[i], i);
+      reports[i] = analyzeFunction(funcs[i], i, symbols);
     });
 
     unsigned total = 0, proven = 0, failed = 0, unreachable = 0;
@@ -1370,6 +1551,8 @@ struct BoundsCheckReportPass
         os << " (+" << funcImplied << " implied by earlier obligations)";
       if (funcUnreachable)
         os << " (+" << funcUnreachable << " unreachable)";
+      if (report.contractsUsed)
+        os << " (" << report.contractsUsed << " callee ensures assumed)";
       if (report.solverFailed)
         os << "  [solver failed]";
       os << "\n";
