@@ -557,19 +557,8 @@ private:
       }
     }
     Operation *def = aggregate.getDefiningOp();
-    if (!def) {
-      // A field of a block argument: the same term `kgen.struct.extract`
-      // gets for it, so e.g. a callee's view of its argument agrees with the
-      // caller's.
-      if (path.size() != 1 || path.front() < 0)
-        return std::nullopt;
-      auto &memo = extractMap();
-      auto key = std::make_pair(aggregate, unsigned(path.front()));
-      auto it = memo.find(key);
-      if (it == memo.end())
-        it = memo.try_emplace(key, declare(sort)).first;
-      return it->second;
-    }
+    if (!def)
+      return opaqueField(aggregate, path, sort);
     Attribute constant;
     if (mlir::matchPattern(aggregate, mlir::m_Constant(&constant))) {
       // Walk into constant structs, e.g. the tag of a constant `None`.
@@ -604,7 +593,23 @@ private:
       return "(ite " + boolTerm(select.getCondition()) + " " +
              (t ? *t : declare(sort)) + " " + (f ? *f : declare(sort)) + ")";
     }
-    return std::nullopt;
+    return opaqueField(aggregate, path, sort);
+  }
+
+  /// A field of an aggregate whose construction is not visible (a block
+  /// argument, a call result, a load, ...): the same term every access to that
+  /// field of that SSA value gets, so e.g. a callee's view of its argument
+  /// agrees with the caller's view of the operand.
+  std::optional<std::string> opaqueField(Value aggregate, ArrayRef<int> path,
+                                         Sort sort) {
+    if (path.size() != 1 || path.front() < 0)
+      return std::nullopt;
+    auto &memo = extractMap();
+    auto key = std::make_pair(aggregate, unsigned(path.front()));
+    auto it = memo.find(key);
+    if (it == memo.end())
+      it = memo.try_emplace(key, declare(sort)).first;
+    return it->second;
   }
 
   /// For a chain of `kgen.struct.extract` / `pop.union.unwrap` ending in
