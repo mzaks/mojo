@@ -246,6 +246,8 @@ public:
   std::vector<ObligationInfo> obligations;
 
   void encodeFunction(FuncOp func) {
+    // Name the function in the script, for `dump-dir` debugging.
+    prelude += ("; " + func.getSymName() + "\n").str();
     Region &body = func->getRegion(0);
     if (!body.empty())
       encodeBlock(body.front(), "true");
