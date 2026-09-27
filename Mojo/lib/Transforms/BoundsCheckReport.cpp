@@ -443,7 +443,10 @@ private:
     // encoded in program order.
     if (ctx)
       if (Operation *def = value.getDefiningOp()) {
-        encodeOp(def);
+        if (auto ifOp = dyn_cast<HLCF::IfOp>(def))
+          encodeIfResultOnDemand(ifOp, cast<OpResult>(value));
+        else
+          encodeOp(def);
         auto it = map.find(value);
         if (it != map.end())
           return it->second;
@@ -458,6 +461,43 @@ private:
     if (t && sortOf(value.getType()).kind == Sort::Bool)
       return *t;
     return declare({Sort::Bool, 1, false});
+  }
+
+  /// On demand (in a callee context), an if/elif/else whose arms all yield is
+  /// a chain of `ite`s over the arms' conditions; conditions and yielded
+  /// values are themselves computed on demand. Anything else inside the arms
+  /// is ignored, which only loses information.
+  void encodeIfResultOnDemand(HLCF::IfOp ifOp, OpResult result) {
+    unsigned idx = result.getResultNumber();
+    auto yielded = [&](Block &block) -> MaybeTerm {
+      auto yield = dyn_cast<HLCF::YieldOp>(block.getTerminator());
+      if (!yield || idx >= yield->getNumOperands())
+        return std::nullopt;
+      return term(yield->getOperand(idx));
+    };
+    // Arms in order: (condition, value); the else value comes last.
+    SmallVector<std::pair<std::string, std::string>> arms;
+    MaybeTerm thenValue = yielded(ifOp.getThenBlock());
+    if (!thenValue)
+      return;
+    arms.push_back({boolTerm(ifOp.getCond()), *thenValue});
+    auto elifs = ifOp.getElifRegions();
+    for (unsigned i = 0; i + 1 < elifs.size(); i += 2) {
+      Operation *condYield = elifs[i].front().getTerminator();
+      if (!isa<HLCF::IfElifCondYieldOp>(condYield) ||
+          !condYield->getNumOperands())
+        return;
+      MaybeTerm value = yielded(elifs[i + 1].front());
+      if (!value)
+        return;
+      arms.push_back({boolTerm(condYield->getOperand(0)), *value});
+    }
+    MaybeTerm expr = yielded(ifOp.getElseBlock());
+    if (!expr)
+      return;
+    for (auto &[cond, value] : llvm::reverse(arms))
+      expr = "(ite " + cond + " " + value + " " + *expr + ")";
+    setTerm(result, *expr);
   }
 
   void setTerm(Value value, StringRef expr) {
