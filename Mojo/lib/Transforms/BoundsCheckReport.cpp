@@ -1077,7 +1077,7 @@ private:
       return std::nullopt;
     std::optional<MemLoc> loc = memLocation(loadOp.getPtr());
     if (!loc)
-      return std::nullopt;
+      return heapLoadTerm(loadOp, access, sort);
     // Loading a struct and taking a field of it reads the same as loading
     // that field: move leading field accesses into the place, so stores that
     // built the struct field by field are found.
@@ -1315,6 +1315,371 @@ private:
       return sortOf(stored.getType()) == place.sort ? term(stored)
                                                     : std::nullopt;
     return resolveAccess(stored, path, place.sort);
+  }
+
+  // Heap memory: loads from anything but a local stack slot or an argument
+  // place, e.g. the element of a list that holds lists. The value is built
+  // lazily from the stores before the load, most recent first, each guarded
+  // by "it wrote this address": `(ite (= addr store-addr) stored older)`.
+  // Callees with a single return are searched through (their stores happened
+  // before the call returned), `hlcf.if`s merge their arms, allocation and
+  // freeing write nothing, and anything else that may write memory gives up.
+
+  /// An address outside local stack slots: `index` elements of type
+  /// `element` past the pointer `base` (both terms), then the field `path`
+  /// inside that element.
+  struct HeapAddr {
+    std::string base, index;
+    Type element;
+    SmallVector<int> path;
+  };
+
+  /// A load from heap memory: its address, the type it loads, the access
+  /// applied to the loaded value and the result's sort.
+  struct HeapRead {
+    HeapAddr addr;
+    SmallVector<int> access;
+    Sort sort;
+  };
+
+  static constexpr unsigned kMaxHeapDepth = 32;
+
+  /// Whether `ptr` points into a stack slot, of the function itself or of a
+  /// caller of the callee being evaluated. Heap memory never overlaps one.
+  bool isStackAddress(Value ptr) {
+    CallContext *c = ctx;
+    while (true) {
+      while (Operation *def = ptr.getDefiningOp()) {
+        if (auto cast = dyn_cast<POP::PointerBitcastOp>(def))
+          ptr = cast.getInput();
+        else if (auto view = dyn_cast<POP::UnionBitcastOp>(def))
+          ptr = view.getValue();
+        else if (auto gep = dyn_cast<StructGEPOp>(def))
+          ptr = gep.getContainer();
+        else if (auto offset = dyn_cast<POP::OffsetOp>(def))
+          ptr = offset.getPtr();
+        else if (auto element = dyn_cast<POP::ArrayGEPOp>(def))
+          ptr = element.getArray();
+        else
+          break;
+      }
+      if (ptr.getDefiningOp<POP::StackAllocationOp>())
+        return true;
+      if (!c || !isEntryArgument(ptr))
+        return false;
+      auto arg = c->args.find(ptr);
+      if (arg == c->args.end())
+        return false;
+      ptr = arg->second;
+      c = c->parent;
+    }
+  }
+
+  /// The address `ptr` points to: constant field addresses inside an element,
+  /// then offsets in units of that element, then the base pointer (whose
+  /// bitcasts keep the address).
+  std::optional<HeapAddr> heapAddress(Value ptr) {
+    SmallVector<int> reversed;
+    while (auto gep = ptr.getDefiningOp<StructGEPOp>()) {
+      auto index = dyn_cast<IntegerAttr>(gep.getIndexAttr());
+      if (!index)
+        return std::nullopt;
+      reversed.push_back(index.getInt());
+      ptr = gep.getContainer();
+    }
+    Type element = cast<PointerType>(ptr.getType()).getElementType();
+    std::string index = bvConst(APInt(64, 0));
+    bool zero = true;
+    while (true) {
+      if (auto cast = ptr.getDefiningOp<POP::PointerBitcastOp>()) {
+        if (llvm::cast<PointerType>(cast.getInput().getType())
+                .getElementType() != element)
+          break;
+        ptr = cast.getInput();
+      } else if (auto offset = ptr.getDefiningOp<POP::OffsetOp>()) {
+        MaybeTerm i = term(offset.getIndex());
+        if (!i)
+          return std::nullopt;
+        index = zero ? *i : "(bvadd " + index + " " + *i + ")";
+        zero = false;
+        ptr = offset.getPtr();
+      } else {
+        break;
+      }
+    }
+    MaybeTerm base = term(ptr);
+    if (!base)
+      return std::nullopt;
+    return HeapAddr{*base, index, element,
+                    SmallVector<int>(llvm::reverse(reversed))};
+  }
+
+  /// An unknown for the read, described by why and where (`at`) it arises.
+  std::string heapUnknown(const HeapRead &r, const Twine &why, Operation *at) {
+    std::string name = declare(r.sort);
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    if (ctx)
+      os << "in " << ctx->callee << ": ";
+    os << "heap memory " << why;
+    if (at) {
+      os << " " << at->getName().getStringRef();
+      if (std::optional<ObligationLocation> where = locationOf(at->getLoc()))
+        os << " at " << where->file << ":" << where->line << ":" << where->col;
+    }
+    noteUnknown(name, text);
+    return name;
+  }
+
+  static bool isAllocation(CallOp call) {
+    return calleeName(call).starts_with("std::memory::alloc::alloc");
+  }
+
+  /// Ops that write no memory at all, heap or stack.
+  static bool writesNothing(Operation *op) {
+    StringRef name = op->getName().getStringRef();
+    return isa<POP::LoadOp, POP::StackAllocationOp, ObligationOp, AssumeOp>(
+               op) ||
+           name == "pop.stack_alloc.lifetime.start" ||
+           name == "pop.stack_alloc.lifetime.end" ||
+           // Reading freed memory is undefined behavior, which the analysis
+           // excludes.
+           name == "pop.aligned_free" ||
+           // Control flow (`hlcf.yield`, `hlcf.break`, ...) moves values only.
+           op->hasTrait<OpTrait::IsTerminator>() ||
+           (!op->getNumRegions() && mlir::isMemoryEffectFree(op));
+  }
+
+  /// Whether `op` (including nested ops) may write heap memory.
+  bool heapMayWrite(Operation *op) {
+    return op
+        ->walk([&](Operation *nested) {
+          if (auto store = dyn_cast<POP::StoreOp>(nested))
+            return isStackAddress(store.getPtr()) ? WalkResult::advance()
+                                                  : WalkResult::interrupt();
+          if (auto call = dyn_cast<CallOp>(nested))
+            return isAllocation(call) ? WalkResult::advance()
+                                      : WalkResult::interrupt();
+          if (nested->getNumRegions() || writesNothing(nested))
+            return WalkResult::advance();
+          return WalkResult::interrupt();
+        })
+        .wasInterrupted();
+  }
+
+  MaybeTerm heapLoadTerm(POP::LoadOp load, ArrayRef<int> access, Sort sort) {
+    if (isStackAddress(load.getPtr()))
+      return std::nullopt;
+    std::optional<HeapAddr> addr = heapAddress(load.getPtr());
+    if (!addr)
+      return std::nullopt;
+    // Leading field accesses of the loaded value are part of the address,
+    // like for stack slots.
+    Type loaded = load.getResult().getType();
+    size_t fields = 0;
+    for (; fields < access.size() && access[fields] >= 0; ++fields) {
+      auto structType = dyn_cast<StructType>(loaded);
+      std::optional<SmallVector<Type>> elements =
+          structType ? structType.getElementTypes() : std::nullopt;
+      if (!elements || size_t(access[fields]) >= elements->size())
+        break;
+      loaded = (*elements)[access[fields]];
+      addr->path.push_back(access[fields]);
+    }
+    HeapRead r{*addr, SmallVector<int>(access.drop_front(fields)), sort};
+    return heapValueBefore(r, load, 0);
+  }
+
+  /// The value of the read just before `op`.
+  MaybeTerm heapValueBefore(const HeapRead &r, Operation *op, unsigned depth) {
+    if (depth > kMaxHeapDepth)
+      return std::nullopt;
+    std::string key;
+    llvm::raw_string_ostream os(key);
+    os << r.addr.base << "|" << r.addr.index << "|"
+       << r.addr.element.getAsOpaquePointer() << "|" << r.sort.str();
+    for (int step : r.addr.path)
+      os << " " << step;
+    os << "|";
+    for (int step : r.access)
+      os << " " << step;
+    auto memoKey = std::make_tuple(op, ctx, key);
+    if (auto it = heapMemo.find(memoKey); it != heapMemo.end())
+      return it->second;
+    SmallVector<std::pair<std::string, std::string>> guards;
+    MaybeTerm rest = heapScan(r, op, depth, guards);
+    if (rest)
+      for (auto &[cond, value] : llvm::reverse(guards))
+        rest = "(ite " + cond + " " + value + " " + *rest + ")";
+    heapMemo[memoKey] = rest;
+    return rest;
+  }
+  std::map<std::tuple<Operation *, CallContext *, std::string>, MaybeTerm>
+      heapMemo;
+
+  enum class HeapStep { Skip, Found, Fail };
+
+  /// Scan backwards from just before `op` for stores that may have written
+  /// the read, appending their guarded values to `guards` (most recent
+  /// first); returns the value before the oldest one.
+  MaybeTerm
+  heapScan(const HeapRead &r, Operation *op, unsigned depth,
+           SmallVectorImpl<std::pair<std::string, std::string>> &guards) {
+    for (Operation *cur = op;;) {
+      for (Operation *prev = cur->getPrevNode(); prev;
+           prev = prev->getPrevNode()) {
+        MaybeTerm found;
+        HeapStep step = heapStep(r, prev, depth, guards, found);
+        if (step == HeapStep::Found)
+          return found;
+        if (step == HeapStep::Fail)
+          return std::nullopt;
+      }
+      Operation *parent = cur->getParentOp();
+      if (!parent)
+        return std::nullopt;
+      if (isa<FuncOp>(parent)) {
+        // A callee's entry: continue in the caller, before the call.
+        if (ctx && ctx->call) {
+          CallContext *callee = ctx;
+          return inContext(callee->parent, [&] {
+            return heapValueBefore(r, callee->call, depth + 1);
+          });
+        }
+        return heapUnknown(r, "at the entry of", parent);
+      }
+      if (auto ifOp = dyn_cast<HLCF::IfOp>(parent)) {
+        // Leaving an arm: the value before the `if`, unless an elif
+        // condition (which runs before the arm) may write it.
+        auto elifs = ifOp.getElifRegions();
+        for (unsigned i = 0; i < elifs.size(); i += 2)
+          for (Operation &condOp : elifs[i].front())
+            if (heapMayWrite(&condOp))
+              return std::nullopt;
+        return heapValueBefore(r, ifOp, depth + 1);
+      }
+      // A loop body could see a value an earlier iteration stored.
+      if (heapMayWrite(parent))
+        return std::nullopt;
+      cur = parent;
+    }
+  }
+
+  HeapStep
+  heapStep(const HeapRead &r, Operation *op, unsigned depth,
+           SmallVectorImpl<std::pair<std::string, std::string>> &guards,
+           MaybeTerm &found) {
+    if (auto store = dyn_cast<POP::StoreOp>(op))
+      return heapStore(r, store, store.getPtr(), store.getArg(), guards, found);
+    if (auto call = dyn_cast<CallOp>(op)) {
+      if (isAllocation(call))
+        return HeapStep::Skip; // Fresh memory: writes no existing place.
+      auto callee = singleReturnCallee(call);
+      CallContext *context = callee ? contextFor(call) : nullptr;
+      if (!context)
+        return HeapStep::Fail;
+      // What the callee left there when it returned.
+      found = inContext(context, [&] {
+        return heapValueBefore(r, callee->second, depth + 1);
+      });
+      return found ? HeapStep::Found : HeapStep::Fail;
+    }
+    if (auto ifOp = dyn_cast<HLCF::IfOp>(op)) {
+      if (!heapMayWrite(ifOp))
+        return HeapStep::Skip;
+      found = heapMergeIf(r, ifOp, depth + 1);
+      return found ? HeapStep::Found : HeapStep::Fail;
+    }
+    if (op->getNumRegions())
+      return heapMayWrite(op) ? HeapStep::Fail : HeapStep::Skip;
+    return writesNothing(op) ? HeapStep::Skip : HeapStep::Fail;
+  }
+
+  /// A write of `stored` to `ptr` by `op`, met while scanning back for the
+  /// read.
+  HeapStep
+  heapStore(const HeapRead &r, Operation *op, Value ptr, Value stored,
+            SmallVectorImpl<std::pair<std::string, std::string>> &guards,
+            MaybeTerm &found) {
+    if (isStackAddress(ptr))
+      return HeapStep::Skip;
+    std::optional<HeapAddr> target = heapAddress(ptr);
+    // Addresses counted in different element types are not compared.
+    if (!target || target->element != r.addr.element)
+      return HeapStep::Fail;
+    bool sameBase = target->base == r.addr.base;
+    std::string baseEq =
+        sameBase ? "true" : "(= " + target->base + " " + r.addr.base + ")";
+    std::string sameAddr =
+        mkAnd(baseEq, target->index == r.addr.index
+                          ? "true"
+                          : "(= " + target->index + " " + r.addr.index + ")");
+    // Different base pointers may still overlap (one may point into the
+    // other's memory at another offset): then the value is unknown.
+    auto clobbered = [&] {
+      if (!sameBase)
+        guards.push_back(
+            {"(not " + baseEq + ")",
+             heapUnknown(r, "possibly overwritten through another pointer by",
+                         op)});
+    };
+    if (isPrefix(target->path, r.addr.path)) {
+      // The write covers the read field or an enclosing struct.
+      SmallVector<int> path(r.addr.path.begin() + target->path.size(),
+                            r.addr.path.end());
+      path.append(r.access.begin(), r.access.end());
+      MaybeTerm value =
+          path.empty() ? (sortOf(stored.getType()) == r.sort ? term(stored)
+                                                             : std::nullopt)
+                       : resolveAccess(stored, path, r.sort);
+      if (!value)
+        return HeapStep::Fail;
+      if (sameAddr == "true") {
+        found = value;
+        return HeapStep::Found;
+      }
+      guards.push_back({sameAddr, *value});
+      clobbered();
+      return HeapStep::Skip;
+    }
+    if (isPrefix(r.addr.path, target->path)) {
+      // A partial write of the read place.
+      guards.push_back(
+          {sameAddr, heapUnknown(r, "partially overwritten by", op)});
+      clobbered();
+      return HeapStep::Skip;
+    }
+    clobbered(); // Disjoint fields of one element never overlap.
+    return HeapStep::Skip;
+  }
+
+  /// The value of the read after an `hlcf.if` that may write heap memory.
+  MaybeTerm heapMergeIf(const HeapRead &r, HLCF::IfOp ifOp, unsigned depth) {
+    auto armValue = [&](Block &block) -> std::string {
+      Operation *terminator = block.getTerminator();
+      // Control does not reach the read along an arm that leaves.
+      if (isa<HLCF::BreakOp, HLCF::ContinueOp, HLCF::ReturnOp,
+              HLCF::UnreachableOp, LIT::TryRaiseOp>(terminator))
+        return declare(r.sort);
+      if (MaybeTerm t = heapValueBefore(r, terminator, depth))
+        return *t;
+      return heapUnknown(r, "written in an arm of", ifOp);
+    };
+    SmallVector<std::pair<std::string, std::string>> arms;
+    arms.push_back({boolTerm(ifOp.getCond()), armValue(ifOp.getThenBlock())});
+    auto elifs = ifOp.getElifRegions();
+    for (unsigned i = 0; i + 1 < elifs.size(); i += 2) {
+      Operation *condYield = elifs[i].front().getTerminator();
+      if (!isa<HLCF::IfElifCondYieldOp>(condYield) ||
+          !condYield->getNumOperands())
+        return std::nullopt;
+      arms.push_back(
+          {boolTerm(condYield->getOperand(0)), armValue(elifs[i + 1].front())});
+    }
+    std::string expr = armValue(ifOp.getElseBlock());
+    for (auto &[cond, value] : llvm::reverse(arms))
+      expr = "(ite " + cond + " " + value + " " + expr + ")";
+    return expr;
   }
 
   /// The scalar reached from `aggregate` by the accesses in `path` (struct
