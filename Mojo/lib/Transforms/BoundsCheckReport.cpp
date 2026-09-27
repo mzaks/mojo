@@ -500,6 +500,9 @@ private:
     for (auto [result, returned] :
          llvm::zip(call->getResults(), callee->second->getOperands()))
       results[result] = {&nested, returned};
+    // Memory allocated in a callee is apart from all other allocations too.
+    if (isAllocation(call))
+      noteAllocation(call);
     return results.lookup(value);
   }
 
@@ -677,6 +680,11 @@ private:
     std::string name = declare(sort);
     map[value] = name;
     noteUnknown(name, describe(value));
+    // A string literal's address is static data, outside every allocation
+    // (whose regions count from 1).
+    if (Operation *def = value.getDefiningOp())
+      if (def->getName().getStringRef() == "pop.string.address")
+        assertGlobal("(= " + region(name) + " " + bvConst(APInt(64, 0)) + ")");
     return name;
   }
 
@@ -1328,11 +1336,14 @@ private:
 
   /// An address outside local stack slots: `index` elements of type
   /// `element` past the pointer `base` (both terms), then the field `path`
-  /// inside that element.
+  /// inside that element. `root` is the pointer the address is derived from
+  /// by offsets, views and field addresses of any type, which stay inside
+  /// one allocation: it decides the region.
   struct HeapAddr {
     std::string base, index;
     Type element;
     SmallVector<int> path;
+    std::string root;
   };
 
   /// A load from heap memory: its address, the type it loads, the access
@@ -1411,8 +1422,24 @@ private:
     MaybeTerm base = term(ptr);
     if (!base)
       return std::nullopt;
+    Value root = ptr;
+    while (Operation *def = root.getDefiningOp()) {
+      if (auto cast = dyn_cast<POP::PointerBitcastOp>(def))
+        root = cast.getInput();
+      else if (auto offset = dyn_cast<POP::OffsetOp>(def))
+        root = offset.getPtr();
+      else if (auto gep = dyn_cast<StructGEPOp>(def))
+        root = gep.getContainer();
+      else if (auto element = dyn_cast<POP::ArrayGEPOp>(def))
+        root = element.getArray();
+      else
+        break;
+    }
+    MaybeTerm rootTerm = term(root);
+    if (!rootTerm)
+      return std::nullopt;
     return HeapAddr{*base, index, element,
-                    SmallVector<int>(llvm::reverse(reversed))};
+                    SmallVector<int>(llvm::reverse(reversed)), *rootTerm};
   }
 
   /// An unknown for the read, described by why and where (`at`) it arises.
@@ -1449,7 +1476,9 @@ private:
   unsigned regions = 0;
   std::set<std::pair<Operation *, CallContext *>> allocationsNoted;
 
-  /// Give the memory returned by an allocation call its own region.
+  /// Give the memory returned by an allocation call its own region: done for
+  /// every allocation in the function itself, for every one whose result a
+  /// callee context resolves, and for every one the heap search passes.
   void noteAllocation(CallOp call) {
     if (!call->getNumResults() || !allocationsNoted.insert({call, ctx}).second)
       return;
@@ -1642,9 +1671,10 @@ private:
       return HeapStep::Fail;
     bool sameBase = target->base == r.addr.base;
     // Memory of different allocations never overlaps.
-    std::string sameRegion = sameBase ? "true"
-                                      : "(= " + region(target->base) + " " +
-                                            region(r.addr.base) + ")";
+    std::string sameRegion =
+        target->root == r.addr.root
+            ? "true"
+            : "(= " + region(target->root) + " " + region(r.addr.root) + ")";
     if (target->element != r.addr.element) {
       // Addresses counted in different element types are not compared: in
       // the same allocation, the write may overlap the read.
@@ -1883,6 +1913,7 @@ private:
       if (inserted) {
         it->second = declare(sort);
         noteUnknown(it->second, "access" + text + " of " + describe(aggregate));
+        noteStaticPointer(aggregate, it->second, sort);
       }
       return it->second;
     }
@@ -1893,8 +1924,18 @@ private:
       it = memo.try_emplace(key, declare(sort)).first;
       noteUnknown(it->second, "field " + std::to_string(path.front()) + " of " +
                                   describe(aggregate));
+      noteStaticPointer(aggregate, it->second, sort);
     }
     return it->second;
+  }
+
+  /// A pointer inside a compile-time constant (`kgen.param.materialize`)
+  /// points to static data, outside every allocation.
+  void noteStaticPointer(Value aggregate, StringRef name, Sort sort) {
+    Operation *def = aggregate.getDefiningOp();
+    if (sort.kind == Sort::Ptr && def &&
+        def->getName().getStringRef() == "kgen.param.materialize")
+      assertGlobal("(= " + region(name) + " " + bvConst(APInt(64, 0)) + ")");
   }
 
   /// For a chain of `kgen.struct.extract` / `pop.union.unwrap` ending in
@@ -2255,8 +2296,11 @@ private:
       addAssumption(reachName(reach), cond);
       return reach;
     }
-    if (auto call = dyn_cast<CallOp>(op))
+    if (auto call = dyn_cast<CallOp>(op)) {
       instantiateContracts(call, reach);
+      if (isAllocation(call))
+        noteAllocation(call);
+    }
     if (auto ifOp = dyn_cast<HLCF::IfOp>(op))
       return encodeIf(ifOp, reach);
     if (auto loop = dyn_cast<HLCF::LoopOp>(op))
