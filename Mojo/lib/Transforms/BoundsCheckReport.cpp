@@ -321,6 +321,10 @@ private:
     Attribute attr;
     if (!mlir::matchPattern(value, mlir::m_Constant(&attr)))
       return std::nullopt;
+    return constantInt(attr, width);
+  }
+
+  static std::optional<APInt> constantInt(Attribute attr, unsigned width) {
     if (auto simd = dyn_cast<KGEN::SIMDAttr>(attr)) {
       if (simd.getValues().size() != 1)
         return std::nullopt;
@@ -342,7 +346,14 @@ private:
   }
 
   MaybeTerm constantTerm(Value value, Sort sort) {
-    std::optional<APInt> c = constantInt(value, std::max(sort.width, 1u));
+    Attribute attr;
+    if (!mlir::matchPattern(value, mlir::m_Constant(&attr)))
+      return std::nullopt;
+    return constantTerm(attr, sort);
+  }
+
+  static MaybeTerm constantTerm(Attribute attr, Sort sort) {
+    std::optional<APInt> c = constantInt(attr, std::max(sort.width, 1u));
     if (!c)
       return std::nullopt;
     if (sort.kind == Sort::Bool)
@@ -416,6 +427,82 @@ private:
       return "bvuge";
     }
     llvm_unreachable("unknown index predicate");
+  }
+
+  static constexpr int kUnwrap = -1;
+
+  /// The scalar reached from `aggregate` by the accesses in `path` (struct
+  /// field indices or `kUnwrap`), following the ops that built the aggregate:
+  /// `kgen.struct.create`, `pop.union.wrap` and `pop.select`. This keeps
+  /// values visible through e.g. the `Optional` returned by iterators.
+  MaybeTerm resolveAccess(Value aggregate, ArrayRef<int> path, Sort sort,
+                          unsigned depth = 0) {
+    if (path.empty()) {
+      if (!(sortOf(aggregate.getType()) == sort))
+        return std::nullopt;
+      return term(aggregate);
+    }
+    if (depth > 16)
+      return std::nullopt;
+    Operation *def = aggregate.getDefiningOp();
+    if (!def)
+      return std::nullopt;
+    Attribute constant;
+    if (mlir::matchPattern(aggregate, mlir::m_Constant(&constant))) {
+      // Walk into constant structs, e.g. the tag of a constant `None`.
+      for (int step : path) {
+        auto structAttr = dyn_cast<StructAttr>(constant);
+        if (!structAttr || step < 0 ||
+            static_cast<size_t>(step) >= structAttr.getValues().size())
+          return std::nullopt;
+        constant = structAttr.getValues()[step];
+      }
+      return constantTerm(constant, sort);
+    }
+    if (auto create = dyn_cast<StructCreateOp>(def)) {
+      if (path.front() < 0 ||
+          static_cast<unsigned>(path.front()) >= create->getNumOperands())
+        return std::nullopt;
+      return resolveAccess(create->getOperand(path.front()), path.drop_front(),
+                           sort, depth + 1);
+    }
+    if (def->getName().getStringRef() == "pop.union.wrap" &&
+        path.front() == kUnwrap)
+      return resolveAccess(def->getOperand(0), path.drop_front(), sort,
+                           depth + 1);
+    if (auto select = dyn_cast<POP::SelectOp>(def)) {
+      if (sortOf(select.getCondition().getType()).kind != Sort::Bool)
+        return std::nullopt;
+      MaybeTerm t = resolveAccess(select.getTrueValue(), path, sort, depth + 1);
+      MaybeTerm f =
+          resolveAccess(select.getFalseValue(), path, sort, depth + 1);
+      if (!t && !f)
+        return std::nullopt;
+      return "(ite " + boolTerm(select.getCondition()) + " " +
+             (t ? *t : declare(sort)) + " " + (f ? *f : declare(sort)) + ")";
+    }
+    return std::nullopt;
+  }
+
+  /// For a chain of `kgen.struct.extract` / `pop.union.unwrap` ending in
+  /// `value`, the innermost aggregate and the accesses applied to it.
+  static std::pair<Value, SmallVector<int>> accessPath(Value value) {
+    SmallVector<int> reversed;
+    while (Operation *def = value.getDefiningOp()) {
+      if (auto extract = dyn_cast<StructExtractOp>(def)) {
+        auto index = dyn_cast<IntegerAttr>(extract.getIndexAttr());
+        if (!index)
+          break;
+        reversed.push_back(index.getInt());
+        value = extract.getContainer();
+      } else if (def->getName().getStringRef() == "pop.union.unwrap") {
+        reversed.push_back(kUnwrap);
+        value = def->getOperand(0);
+      } else {
+        break;
+      }
+    }
+    return {value, SmallVector<int>(llvm::reverse(reversed))};
   }
 
   /// Encode a single-result op if its semantics are modeled; otherwise its
@@ -607,20 +694,23 @@ private:
       return;
     }
 
+    if (isa<StructExtractOp>(op) || name == "pop.union.unwrap") {
+      auto [aggregate, path] = accessPath(result);
+      if (!path.empty())
+        if (MaybeTerm t = resolveAccess(aggregate, path, sort)) {
+          if (t->front() == '(')
+            setTerm(result, *t);
+          else
+            terms[result] = *t;
+          return;
+        }
+    }
     if (auto extract = dyn_cast<StructExtractOp>(op)) {
       auto index = dyn_cast<IntegerAttr>(extract.getIndexAttr());
       if (!index)
         return;
       Value container = extract.getContainer();
       unsigned idx = index.getInt();
-      if (auto create = container.getDefiningOp<StructCreateOp>()) {
-        if (idx < create->getNumOperands())
-          if (MaybeTerm t = term(create->getOperand(idx)))
-            if (sortOf(create->getOperand(idx).getType()) == sort) {
-              terms[result] = *t;
-              return;
-            }
-      }
       // The same field of the same struct value is the same value.
       auto key = std::make_pair(container, idx);
       auto it = extracts.find(key);
