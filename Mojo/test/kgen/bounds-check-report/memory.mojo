@@ -13,6 +13,8 @@
 # Lists in memory that calls may or may not write, for `bounds-check-report`;
 # see README.md.
 
+from std.testing import assert_equal
+
 
 @inline(.never)
 def clear_list(mut xs: List[Int]):
@@ -43,6 +45,13 @@ struct Bag(Movable):
             self.items.clear()
             return self.items[i]
         return 0
+
+
+struct Named(Movable):
+    var name: String
+
+    def __init__(out self, name: String):
+        self.name = name
 
 
 # --- must stay UNPROVEN ---
@@ -133,6 +142,35 @@ def limit_nested_after_realloc() -> Int:
     return list[0][1]
 
 
+@inline(.never)
+def bad_nested_string_field_after_asserts() raises -> Int:
+    var list = List[List[Named]](capacity=1)
+    var child = List[Named](capacity=2)
+    child.append(Named("a"))
+    child.append(Named("b"))
+    assert_equal(child[0].name, "a")
+    list.append(child^)
+    list[0][1].name = "c"
+    assert_equal(list[0][1].name, "c")
+    return list[0][2].name.byte_length()
+
+
+# Known limit: in bounds, but the String is built in place by `+=`, which
+# takes it `mut`; its buffer pointer is then unknown, and so is whether its
+# destructor's reference count update hits the outer list's buffer.
+@inline(.never)
+def limit_nested_after_string_dropped() -> Int:
+    var list = List[List[Int]](capacity=1)
+    var child = List[Int](capacity=2)
+    child.append(10)
+    child.append(20)
+    list.append(child^)
+    var s = String("abc")
+    s += "def"
+    _ = s^
+    return list[0][1]
+
+
 # --- must be PROVEN ---
 @inline(.never)
 def ok_strided_twice() -> Int:
@@ -188,7 +226,34 @@ def ok_nested_other_list_written() -> Int:
     return list[0][1] + other[0]
 
 
-def main():
+# `assert_equal` raises through an arm that formats the message; reads after
+# a passed assert do not search it.
+@inline(.never)
+def ok_nested_int_after_asserts() raises -> Int:
+    var list = List[List[Int]](capacity=1)
+    var child = List[Int](capacity=2)
+    child.append(10)
+    child.append(20)
+    list.append(child^)
+    assert_equal(list[0][0], 10)
+    assert_equal(list[0][1], 20)
+    return list[0][1]
+
+
+@inline(.never)
+def ok_nested_string_field_after_asserts() raises -> Int:
+    var list = List[List[Named]](capacity=1)
+    var child = List[Named](capacity=2)
+    child.append(Named("a"))
+    child.append(Named("b"))
+    assert_equal(child[0].name, "a")
+    list.append(child^)
+    list[0][1].name = "c"
+    assert_equal(list[0][1].name, "c")
+    return list[0][1].name.byte_length()
+
+
+def main() raises:
     var bag = Bag()
     print(
         bad_after_mut_call(),
@@ -205,5 +270,9 @@ def main():
         ok_nested_straight(),
         ok_nested_two_children(),
         ok_nested_other_list_written(),
+        bad_nested_string_field_after_asserts(),
+        limit_nested_after_string_dropped(),
+        ok_nested_int_after_asserts(),
+        ok_nested_string_field_after_asserts(),
         bag.bad_get_after_clear(1),
     )

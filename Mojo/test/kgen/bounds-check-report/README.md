@@ -59,7 +59,7 @@ the first, so each access counts once.
 | `contracts.mojo`   | all `bad_*` (see below)                     | all `ok_*`                   |
 | `slicing.mojo`     | all `bad_*`                                 | all `ok_*`                   |
 | `loops.mojo`       | all `bad_*`                                 | all `ok_*`                   |
-| `memory.mojo`      | all `bad_*`, `limit_nested_after_realloc`   | all `ok_*`, `Bag.ok_get`     |
+| `memory.mojo`      | all `bad_*` and `limit_*`                   | all `ok_*`, `Bag.ok_get`     |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -112,3 +112,14 @@ and memory from different allocations never overlaps
 reallocates, it moves the elements with a copy loop, and the search gives up at
 loops that write memory. The same limit keeps lists of lists that are filled in
 a loop unproven (`test_2d_dynamic_list` in `test_list.mojo`).
+
+Heap values also have to get past the code between the write and the read.
+`ok_nested_int_after_asserts` and `ok_nested_string_field_after_asserts` read
+after `assert_equal` calls: a failed assert raises through an arm that formats
+the message, and a read after the assert is only reached when it passed, so
+that arm is not searched. Failed `debug_assert`s in the same position abort and
+are skipped the same way. String literals and other compile-time constants
+live outside every allocation, so writes through them never touch a list's
+buffer. `limit_nested_after_string_dropped` stays unproven: `s += "def"` takes
+the String `mut`, which hides its buffer pointer from the analysis, so the
+reference count update when the String is dropped might hit the list's buffer.
