@@ -953,6 +953,59 @@ private:
       }
       return constantTerm(constant, sort);
     }
+    // An if/elif/else whose arms all yield: the access on the taken arm's
+    // value, as a chain of `ite`s over the arms' conditions.
+    if (auto ifOp = dyn_cast<HLCF::IfOp>(def)) {
+      unsigned idx = cast<OpResult>(aggregate).getResultNumber();
+      // An arm whose access does not resolve contributes an unknown, so the
+      // other arms still count.
+      auto yielded = [&](Block &block) -> MaybeTerm {
+        auto yield = dyn_cast<HLCF::YieldOp>(block.getTerminator());
+        if (!yield || idx >= yield->getNumOperands())
+          return std::nullopt;
+        if (MaybeTerm t =
+                resolveAccess(yield->getOperand(idx), path, sort, depth + 1))
+          return t;
+        return declare(sort);
+      };
+      SmallVector<std::pair<std::string, std::string>> arms;
+      bool complete = true;
+      if (MaybeTerm t = yielded(ifOp.getThenBlock()))
+        arms.push_back({boolTerm(ifOp.getCond()), *t});
+      else
+        complete = false;
+      auto elifs = ifOp.getElifRegions();
+      for (unsigned i = 0; complete && i + 1 < elifs.size(); i += 2) {
+        Operation *condYield = elifs[i].front().getTerminator();
+        MaybeTerm value = yielded(elifs[i + 1].front());
+        if (!isa<HLCF::IfElifCondYieldOp>(condYield) ||
+            !condYield->getNumOperands() || !value) {
+          complete = false;
+          break;
+        }
+        arms.push_back({boolTerm(condYield->getOperand(0)), *value});
+      }
+      MaybeTerm expr = complete ? yielded(ifOp.getElseBlock()) : std::nullopt;
+      if (expr) {
+        for (auto &[cond, value] : llvm::reverse(arms))
+          expr = "(ite " + cond + " " + value + " " + *expr + ")";
+        return expr;
+      }
+      return opaqueField(aggregate, path, sort);
+    }
+    // An aggregate that is itself a field or union member of another one.
+    if (auto extract = dyn_cast<StructExtractOp>(def)) {
+      if (auto index = dyn_cast<IntegerAttr>(extract.getIndexAttr())) {
+        SmallVector<int> outer = {int(index.getInt())};
+        outer.append(path.begin(), path.end());
+        return resolveAccess(extract.getContainer(), outer, sort, depth + 1);
+      }
+    }
+    if (def->getName().getStringRef() == "pop.union.unwrap") {
+      SmallVector<int> outer = {kUnwrap};
+      outer.append(path.begin(), path.end());
+      return resolveAccess(def->getOperand(0), outer, sort, depth + 1);
+    }
     if (auto create = dyn_cast<StructCreateOp>(def)) {
       if (path.front() < 0 ||
           static_cast<unsigned>(path.front()) >= create->getNumOperands())
@@ -964,16 +1017,16 @@ private:
         path.front() == kUnwrap)
       return resolveAccess(def->getOperand(0), path.drop_front(), sort,
                            depth + 1);
-    if (auto select = dyn_cast<POP::SelectOp>(def)) {
-      if (sortOf(select.getCondition().getType()).kind != Sort::Bool)
+    if (isa<POP::SelectOp, POP::SIMDSelectOp>(def)) {
+      Value cond = def->getOperand(0);
+      if (sortOf(cond.getType()).kind != Sort::Bool)
         return std::nullopt;
-      MaybeTerm t = resolveAccess(select.getTrueValue(), path, sort, depth + 1);
-      MaybeTerm f =
-          resolveAccess(select.getFalseValue(), path, sort, depth + 1);
+      MaybeTerm t = resolveAccess(def->getOperand(1), path, sort, depth + 1);
+      MaybeTerm f = resolveAccess(def->getOperand(2), path, sort, depth + 1);
       if (!t && !f)
         return std::nullopt;
-      return "(ite " + boolTerm(select.getCondition()) + " " +
-             (t ? *t : declare(sort)) + " " + (f ? *f : declare(sort)) + ")";
+      return "(ite " + boolTerm(cond) + " " + (t ? *t : declare(sort)) + " " +
+             (f ? *f : declare(sort)) + ")";
     }
     return opaqueField(aggregate, path, sort);
   }
@@ -1222,13 +1275,14 @@ private:
       }
     }
 
-    if (auto select = dyn_cast<POP::SelectOp>(op)) {
-      if (sortOf(select.getCondition().getType()).kind != Sort::Bool)
+    // `pop.select`, and `pop.simd.select` on scalars (same operand order).
+    if (isa<POP::SelectOp, POP::SIMDSelectOp>(op)) {
+      Value cond = op->getOperand(0), yes = op->getOperand(1),
+            no = op->getOperand(2);
+      if (sortOf(cond.getType()).kind != Sort::Bool)
         return;
-      MaybeTerm c = term(select.getCondition());
-      MaybeTerm t = term(select.getTrueValue());
-      MaybeTerm f = term(select.getFalseValue());
-      if (c && t && f && sortOf(select.getTrueValue().getType()) == sort)
+      MaybeTerm c = term(cond), t = term(yes), f = term(no);
+      if (c && t && f && sortOf(yes.getType()) == sort)
         setTerm(result, "(ite " + *c + " " + *t + " " + *f + ")");
       return;
     }
