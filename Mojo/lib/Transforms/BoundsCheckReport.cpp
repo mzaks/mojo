@@ -1389,6 +1389,24 @@ private:
     HeapAddr addr;
     SmallVector<int> access;
     Sort sort;
+    /// `hlcf.if` conditions known on the way to the read in the current
+    /// context: it lies in an arm of an `if` on that condition. The same
+    /// condition value decides every earlier `if` on it, e.g. the one that
+    /// raises (lowered: `if c { store error }` then `if c { return } else
+    /// { rest }`), so its other arm need not be searched.
+    SmallVector<std::pair<Value, bool>> facts;
+
+    HeapRead withoutFacts() const {
+      HeapRead r = *this;
+      r.facts.clear();
+      return r;
+    }
+    std::optional<bool> fact(Value cond) const {
+      for (auto &[value, known] : facts)
+        if (value == cond)
+          return known;
+      return std::nullopt;
+    }
   };
 
   static constexpr unsigned kMaxHeapDepth = 32;
@@ -1599,6 +1617,8 @@ private:
     os << "|";
     for (int step : r.access)
       os << " " << step;
+    for (auto &[value, known] : r.facts)
+      os << "|" << value.getAsOpaquePointer() << (known ? "t" : "f");
     auto memoKey = std::make_tuple(op, ctx, key);
     if (auto it = heapMemo.find(memoKey); it != heapMemo.end())
       return it->second;
@@ -1619,18 +1639,37 @@ private:
   /// the read, appending their guarded values to `guards` (most recent
   /// first); returns the value before the oldest one.
   MaybeTerm
-  heapScan(const HeapRead &r, Operation *op, unsigned depth,
+  heapScan(const HeapRead &read, Operation *op, unsigned depth,
            SmallVectorImpl<std::pair<std::string, std::string>> &guards) {
+    HeapRead r = read;
     for (Operation *cur = op;;) {
       for (Operation *prev = cur->getPrevNode(); prev;
            prev = prev->getPrevNode()) {
+        // Passing an `if` one of whose arms always leaves (e.g. returns after
+        // a raise) means the read's path took the other arm.
+        if (auto ifOp = dyn_cast<HLCF::IfOp>(prev);
+            ifOp && !r.fact(ifOp.getCond())) {
+          if (armLeaves(ifOp.getThenBlock()))
+            r.facts.push_back({ifOp.getCond(), false});
+          else if (ifOp.getElifRegions().empty() &&
+                   armLeaves(ifOp.getElseBlock()))
+            r.facts.push_back({ifOp.getCond(), true});
+        }
         MaybeTerm found;
         HeapStep step = heapStep(r, prev, depth, guards, found);
         if (step == HeapStep::Found)
           return found;
         if (step == HeapStep::Fail)
           return std::nullopt;
+        // No `if` before a condition's definition can test it: forget facts
+        // as soon as they cannot matter, so memoized values stay shared.
+        llvm::erase_if(r.facts, [&](auto &fact) {
+          return fact.first.getDefiningOp() == prev;
+        });
       }
+      llvm::erase_if(r.facts, [&](auto &fact) {
+        return fact.first.getParentBlock() == cur->getBlock();
+      });
       Operation *parent = cur->getParentOp();
       if (!parent)
         return std::nullopt;
@@ -1639,7 +1678,7 @@ private:
         if (ctx && ctx->call) {
           CallContext *callee = ctx;
           return inContext(callee->parent, [&] {
-            return heapValueBefore(r, callee->call, depth + 1);
+            return heapValueBefore(r.withoutFacts(), callee->call, depth + 1);
           });
         }
         return heapUnknown(r, "at the entry of", parent);
@@ -1652,7 +1691,12 @@ private:
           for (Operation &condOp : elifs[i].front())
             if (heapMayWrite(&condOp))
               return std::nullopt;
-        return heapValueBefore(r, ifOp, depth + 1);
+        HeapRead known = r;
+        if (cur->getBlock() == &ifOp.getThenBlock())
+          known.facts.push_back({ifOp.getCond(), true});
+        else if (cur->getBlock() == &ifOp.getElseBlock() && elifs.empty())
+          known.facts.push_back({ifOp.getCond(), false});
+        return heapValueBefore(known, ifOp, depth + 1);
       }
       // A loop body could see a value an earlier iteration stored.
       if (heapMayWrite(parent))
@@ -1680,7 +1724,7 @@ private:
         return HeapStep::Fail;
       // What the callee left there when it returned.
       found = inContext(context, [&] {
-        return heapValueBefore(r, callee->second, depth + 1);
+        return heapValueBefore(r.withoutFacts(), callee->second, depth + 1);
       });
       return found ? HeapStep::Found : HeapStep::Fail;
     }
@@ -1785,6 +1829,13 @@ private:
         return *t;
       return heapUnknown(r, "written in an arm of", ifOp);
     };
+    // An arm the read's path excludes is not searched.
+    if (std::optional<bool> known = r.fact(ifOp.getCond())) {
+      if (*known)
+        return armValue(ifOp.getThenBlock());
+      if (ifOp.getElifRegions().empty())
+        return armValue(ifOp.getElseBlock());
+    }
     SmallVector<std::pair<std::string, std::string>> arms;
     arms.push_back({boolTerm(ifOp.getCond()), armValue(ifOp.getThenBlock())});
     auto elifs = ifOp.getElifRegions();
