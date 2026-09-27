@@ -854,6 +854,16 @@ private:
            arg.getOwner()->isEntryBlock();
   }
 
+  /// The convention the callee of `call` declares for operand `index`.
+  static std::optional<ArgConvention> argConvention(CallOp call,
+                                                    unsigned index) {
+    ArrayRef<ArgConvention> convs =
+        call.getCalleeType().getBody().getArgConventions();
+    if (index >= convs.size())
+      return std::nullopt;
+    return convs[index];
+  }
+
   /// Whether stores to `a` and `b` (bases of places) may alias.
   static bool mayAlias(Value a, Value b) {
     return a == b || (isEntryArgument(a) && isEntryArgument(b));
@@ -872,7 +882,9 @@ private:
 
   /// The uses through which the address of a stack slot escapes: anything
   /// but plain loads, stores (as the address), views and field addresses of
-  /// it and lifetime markers.
+  /// it, lifetime markers and `imm_mem` call operands (memory the caller
+  /// lends read-only: the callee may read the slot but not mutate it, and any
+  /// pointer it derives from it is immutable too).
   static SmallVector<Operation *> escapingUses(Value slot) {
     SmallVector<Operation *> escapes;
     SmallVector<Value> worklist = {slot};
@@ -896,6 +908,10 @@ private:
         if (name == "pop.stack_alloc.lifetime.start" ||
             name == "pop.stack_alloc.lifetime.end")
           continue;
+        if (auto call = dyn_cast<CallOp>(user))
+          if (argConvention(call, use.getOperandNumber()) ==
+              ArgConvention::ImmMem)
+            continue;
         escapes.push_back(user);
       }
     }
