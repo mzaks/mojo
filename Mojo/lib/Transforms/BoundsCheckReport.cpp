@@ -864,6 +864,23 @@ private:
     return convs[index];
   }
 
+  /// A function entry argument passed `imm_mem`: memory the caller lends
+  /// read-only, which nothing may mutate while the function runs (the
+  /// language forbids writes through it, and the caller's exclusive
+  /// ownership forbids writes through other aliases for the call). Its places
+  /// hold their entry values throughout the body. Trusted, like other
+  /// language guarantees: unsafe code that casts the origin away breaks it.
+  static bool isImmutableArgument(Value ptr) {
+    if (!isEntryArgument(ptr))
+      return false;
+    auto arg = cast<BlockArgument>(ptr);
+    auto func = cast<FuncOp>(arg.getOwner()->getParentOp());
+    ArrayRef<ArgConvention> convs =
+        func.getFuncTypeGenerator().getBody().getArgConventions();
+    return arg.getArgNumber() < convs.size() &&
+           convs[arg.getArgNumber()] == ArgConvention::ImmMem;
+  }
+
   /// Whether stores to `a` and `b` (bases of places) may alias.
   static bool mayAlias(Value a, Value b) {
     return a == b || (isEntryArgument(a) && isEntryArgument(b));
@@ -882,9 +899,9 @@ private:
 
   /// The uses through which the address of a stack slot escapes: anything
   /// but plain loads, stores (as the address), views and field addresses of
-  /// it, lifetime markers and `imm_mem` call operands (memory the caller
-  /// lends read-only: the callee may read the slot but not mutate it, and any
-  /// pointer it derives from it is immutable too).
+  /// it, lifetime markers and `imm_mem` call operands (see
+  /// `isImmutableArgument`: the callee only reads the slot, and any pointer it
+  /// derives from it is immutable too).
   static SmallVector<Operation *> escapingUses(Value slot) {
     SmallVector<Operation *> escapes;
     SmallVector<Value> worklist = {slot};
@@ -1051,6 +1068,8 @@ private:
 
   /// The value of the place just before `op`.
   MaybeTerm valueBefore(const Place &place, Operation *op, unsigned depth) {
+    if (isImmutableArgument(place.loc.slot))
+      return valueAtEntry(place, depth);
     Operation *cur = op;
     while (true) {
       auto [kind, found] = searchBlock(place, *cur->getBlock(), cur, depth);
@@ -1095,6 +1114,34 @@ private:
     callerPlace.slotDef = callerLoc->slot.getDefiningOp();
     return inContext(ctx->parent,
                      [&] { return valueBefore(callerPlace, call, depth + 1); });
+  }
+
+  /// The value of a place in an `imm_mem` argument, which is the same at
+  /// every point of the body: the caller's value at the call when evaluating
+  /// one, else one unknown shared by all reads of the place.
+  MaybeTerm valueAtEntry(const Place &place, unsigned depth) {
+    if (MaybeTerm t = valueAtCall(place, depth))
+      return t;
+    std::string key = "entry.", text;
+    for (int step : place.loc.path) {
+      key += std::to_string(step) + ".";
+      text += " ." + std::to_string(step);
+    }
+    key += "|";
+    for (int step : place.access) {
+      key += (step == kUnwrap ? "u" : std::to_string(step)) + ".";
+      text += step == kUnwrap ? " unwrap" : " ." + std::to_string(step);
+    }
+    // Loads of different types from one place are different reads.
+    llvm::raw_string_ostream(key) << "|" << place.loaded.getAsOpaquePointer();
+    auto [it, inserted] =
+        pathMap().try_emplace({place.loc.slot.getAsOpaquePointer(), key}, "");
+    if (inserted) {
+      it->second = declare(place.sort);
+      noteUnknown(it->second, "read-only argument memory" + text + " of " +
+                                  describe(place.loc.slot));
+    }
+    return it->second;
   }
 
   /// Search `block` backwards from just before `from` (from its end if null)
