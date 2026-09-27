@@ -715,6 +715,22 @@ SourceLocOp::parametric_interpret(ArrayRef<Attribute> operands,
 }
 
 //===----------------------------------------------------------------------===//
+// ObligationOp
+//===----------------------------------------------------------------------===//
+
+// Obligations have no runtime semantics, so compile-time evaluation skips them.
+ErrorTreeOrSuccess ObligationOp::interpret(ArrayRef<Attribute> operands,
+                                           InterpreterState &state) {
+  return state.mapResults({});
+}
+
+ErrorTreeOrSuccess
+ObligationOp::parametric_interpret(ArrayRef<Attribute> operands,
+                                   ParametricInterpreterState &state) {
+  return state.mapResults({});
+}
+
+//===----------------------------------------------------------------------===//
 // VariantCreateOp
 //===----------------------------------------------------------------------===//
 

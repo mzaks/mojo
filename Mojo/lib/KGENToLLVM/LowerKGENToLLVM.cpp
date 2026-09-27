@@ -1036,6 +1036,22 @@ private:
 // ConvertKGENSourceLoc
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// ConvertKGENObligation
+//===----------------------------------------------------------------------===//
+
+/// Obligations only feed static analyses; they have no runtime code.
+struct ConvertKGENObligation : ConvertPOPToLLVMPattern<ObligationOp> {
+  using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(ObligationOp op, ObligationOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct ConvertKGENSourceLoc : ConvertPOPToLLVMPattern<SourceLocOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
@@ -1190,6 +1206,7 @@ static void populateKGENToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
   patterns.insert<
       // clang-format off
       ConvertKGENCall,
+      ConvertKGENObligation,
       ConvertKGENSourceLoc,
       ConvertKGENStructCreate,
       ConvertKGENStructGEP,

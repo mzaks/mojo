@@ -1316,6 +1316,44 @@ def KGEN_SourceLocOp : KGENOp<"source_loc", [Pure,
 }
 
 //===----------------------------------------------------------------------===//
+// ObligationOp
+//===----------------------------------------------------------------------===//
+
+def KGEN_ObligationOp : KGENOp<"obligation", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
+  let summary = "a condition a static verifier should prove";
+  let description = [{
+    The `kgen.obligation` operation marks a condition that is expected to be
+    true whenever execution reaches it, e.g. the index of a bounds check. It
+    has no runtime semantics: static analyses (such as `bounds-check-report`)
+    read it, and lowering to LLVM erases it.
+
+    `kind` classifies the obligation (e.g. "bounds"). `line`, `col` and
+    `fileName` are the user-facing source location, typically the results of
+    a `kgen.source_loc`, which fold to constants once inlining resolves them.
+
+    The op writes to a dedicated abstract resource so that it is not removed as
+    dead code, without acting as a barrier for memory optimizations.
+
+    Example:
+    ```mlir
+    %line, %col, %file = kgen.source_loc[1]
+    kgen.obligation "bounds"(%ok) at(%line, %col, %file)
+        : !kgen.scalar<bool>, !kgen.string
+    ```
+  }];
+
+  let arguments = (ins AttrOfType<KGEN_StringType>:$kind, BoolScalar:$cond,
+                       Index:$line, Index:$col, KGEN_StringType:$fileName);
+  let assemblyFormat = [{
+    custom<StringParam>($kind) `(` $cond `)`
+    `at` `(` $line `,` $col `,` $fileName `)` attr-dict
+    `:` type($cond) `,` type($fileName)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // StructCreateOp
 //===----------------------------------------------------------------------===//
 

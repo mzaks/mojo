@@ -121,6 +121,27 @@ void ParamConstantOp::getEffects(
 }
 
 //===----------------------------------------------------------------------===//
+// ObligationOp
+//===----------------------------------------------------------------------===//
+
+namespace M::KGEN::detail {
+/// Abstract resource written by `kgen.obligation`. Nothing else touches it, so
+/// the write keeps the op alive without ordering it against real memory.
+/// (Resources need a named namespace for their TypeID.)
+struct ObligationResource
+    : mlir::SideEffects::Resource::Base<ObligationResource> {
+  StringRef getName() const final { return "<kgen.obligation>"; }
+};
+} // namespace M::KGEN::detail
+using M::KGEN::detail::ObligationResource;
+
+void ObligationOp::getEffects(
+    SmallVectorImpl<mlir::MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                       ObligationResource::get());
+}
+
+//===----------------------------------------------------------------------===//
 // ParamMaterializeOp
 //===----------------------------------------------------------------------===//
 
