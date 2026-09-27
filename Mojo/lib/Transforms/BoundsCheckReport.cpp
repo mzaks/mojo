@@ -64,6 +64,7 @@
 
 #include <deque>
 #include <map>
+#include <set>
 
 using namespace M;
 using namespace KGEN;
@@ -1431,6 +1432,33 @@ private:
     return name;
   }
 
+  /// The allocation `ptr` (a term) points into, as an uninterpreted function
+  /// of the address. Allocations the heap search passes get distinct constant
+  /// regions (`noteAllocation`); any other pointer's region is unknown, so it
+  /// may point into any of them. Every allocation is treated as live: an
+  /// address reused after a `free` would have two regions, which matters only
+  /// to code that compares such pointers.
+  std::string region(StringRef ptr) {
+    if (!regionDeclared) {
+      prelude += "(declare-fun region ((_ BitVec 64)) (_ BitVec 64))\n";
+      regionDeclared = true;
+    }
+    return ("(region " + ptr + ")").str();
+  }
+  bool regionDeclared = false;
+  unsigned regions = 0;
+  std::set<std::pair<Operation *, CallContext *>> allocationsNoted;
+
+  /// Give the memory returned by an allocation call its own region.
+  void noteAllocation(CallOp call) {
+    if (!call->getNumResults() || !allocationsNoted.insert({call, ctx}).second)
+      return;
+    if (MaybeTerm ptr =
+            resolveAccess(call->getResult(0), {0}, {Sort::Ptr, 64, false}))
+      assertGlobal("(= " + region(*ptr) + " " + bvConst(APInt(64, ++regions)) +
+                   ")");
+  }
+
   static bool isAllocation(CallOp call) {
     return calleeName(call).starts_with("std::memory::alloc::alloc");
   }
@@ -1445,6 +1473,8 @@ private:
            // Reading freed memory is undefined behavior, which the analysis
            // excludes.
            name == "pop.aligned_free" ||
+           // A barrier orders memory accesses but writes nothing itself.
+           name == "pop.fence" ||
            // Control flow (`hlcf.yield`, `hlcf.break`, ...) moves values only.
            op->hasTrait<OpTrait::IsTerminator>() ||
            (!op->getNumRegions() && mlir::isMemoryEffectFree(op));
@@ -1571,9 +1601,13 @@ private:
            MaybeTerm &found) {
     if (auto store = dyn_cast<POP::StoreOp>(op))
       return heapStore(r, store, store.getPtr(), store.getArg(), guards, found);
+    if (op->getName().getStringRef() == "pop.atomic.rmw")
+      return heapStore(r, op, op->getOperand(0), Value(), guards, found);
     if (auto call = dyn_cast<CallOp>(op)) {
-      if (isAllocation(call))
+      if (isAllocation(call)) {
+        noteAllocation(call);
         return HeapStep::Skip; // Fresh memory: writes no existing place.
+      }
       auto callee = singleReturnCallee(call);
       CallContext *context = callee ? contextFor(call) : nullptr;
       if (!context)
@@ -1595,8 +1629,8 @@ private:
     return writesNothing(op) ? HeapStep::Skip : HeapStep::Fail;
   }
 
-  /// A write of `stored` to `ptr` by `op`, met while scanning back for the
-  /// read.
+  /// A write of `stored` (null: an unknown value, e.g. an atomic update) to
+  /// `ptr` by `op`, met while scanning back for the read.
   HeapStep
   heapStore(const HeapRead &r, Operation *op, Value ptr, Value stored,
             SmallVectorImpl<std::pair<std::string, std::string>> &guards,
@@ -1604,34 +1638,54 @@ private:
     if (isStackAddress(ptr))
       return HeapStep::Skip;
     std::optional<HeapAddr> target = heapAddress(ptr);
-    // Addresses counted in different element types are not compared.
-    if (!target || target->element != r.addr.element)
+    if (!target)
       return HeapStep::Fail;
     bool sameBase = target->base == r.addr.base;
+    // Memory of different allocations never overlaps.
+    std::string sameRegion = sameBase ? "true"
+                                      : "(= " + region(target->base) + " " +
+                                            region(r.addr.base) + ")";
+    if (target->element != r.addr.element) {
+      // Addresses counted in different element types are not compared: in
+      // the same allocation, the write may overlap the read.
+      std::string unknown = heapUnknown(r, "possibly overwritten by", op);
+      if (sameBase) {
+        found = unknown;
+        return HeapStep::Found;
+      }
+      guards.push_back({sameRegion, unknown});
+      return HeapStep::Skip;
+    }
     std::string baseEq =
         sameBase ? "true" : "(= " + target->base + " " + r.addr.base + ")";
     std::string sameAddr =
         mkAnd(baseEq, target->index == r.addr.index
                           ? "true"
                           : "(= " + target->index + " " + r.addr.index + ")");
-    // Different base pointers may still overlap (one may point into the
-    // other's memory at another offset): then the value is unknown.
+    // Different base pointers into one allocation may still overlap (one may
+    // point into the other's memory at another offset): then the value is
+    // unknown.
     auto clobbered = [&] {
       if (!sameBase)
         guards.push_back(
-            {"(not " + baseEq + ")",
+            {mkAnd("(not " + baseEq + ")", sameRegion),
              heapUnknown(r, "possibly overwritten through another pointer by",
                          op)});
     };
     if (isPrefix(target->path, r.addr.path)) {
       // The write covers the read field or an enclosing struct.
-      SmallVector<int> path(r.addr.path.begin() + target->path.size(),
-                            r.addr.path.end());
-      path.append(r.access.begin(), r.access.end());
-      MaybeTerm value =
-          path.empty() ? (sortOf(stored.getType()) == r.sort ? term(stored)
-                                                             : std::nullopt)
-                       : resolveAccess(stored, path, r.sort);
+      MaybeTerm value;
+      if (!stored) {
+        value = heapUnknown(r, "written by", op);
+      } else {
+        SmallVector<int> path(r.addr.path.begin() + target->path.size(),
+                              r.addr.path.end());
+        path.append(r.access.begin(), r.access.end());
+        value = path.empty()
+                    ? (sortOf(stored.getType()) == r.sort ? term(stored)
+                                                          : std::nullopt)
+                    : resolveAccess(stored, path, r.sort);
+      }
       if (!value)
         return HeapStep::Fail;
       if (sameAddr == "true") {
