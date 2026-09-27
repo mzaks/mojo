@@ -1,7 +1,8 @@
 # bounds-check-report examples
 
 Example programs for the `bounds-check-report` pass, which tries to prove the
-`kgen.obligation`s that `check_bounds` emits for every `List` index.
+`kgen.obligation`s that `check_bounds` emits for every `List` index, and the
+`_ensures` contracts of `List` methods.
 
 These are not lit tests: the pass needs a `z3` executable, which CI does not
 provide. The lit rule in this directory only collects `.mlir` and `.ll` files,
@@ -16,14 +17,17 @@ toolchain does not know `kgen.obligation`):
 ./bazelw build --config=build-mojo //Mojo/tools/kgen //Mojo/tools/kgen-opt //Mojo/stdlib/std
 ```
 
-Elaborate an example, then run the pass on the result:
+Run the pass in-process right after elaboration:
 
 ```bash
 bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
-    Mojo/test/kgen/bounds-check-report/cases.mojo -elaborate -S -o /tmp/cases.mlir
-bazel-bin/Mojo/tools/kgen-opt/kgen-opt --bounds-check-report="verbose=true" \
-    /tmp/cases.mlir -o /dev/null
+    Mojo/test/kgen/bounds-check-report/cases.mojo -elaborate \
+    --bounds-check-report="verbose=true" -o /dev/null
 ```
+
+Prefer this over dumping the IR and running `kgen-opt --bounds-check-report`
+on it: the textual form of some ops (e.g. `pop.call_llvm_intrinsic
+side_effecting`) does not parse back.
 
 Options: `verbose`, `include-stdlib`, `z3-path`, `timeout-ms`, and `dump-dir`
 (keeps the generated SMT-LIB scripts).
@@ -40,7 +44,16 @@ the first, so each access counts once.
 | `basic.mojo`       | `get`                                       | `sum_all`, `get_or_zero`     |
 | `cases.mojo`       | all `bad_*`, `maybe_mutating` (known limit) | all `ok_*`, `maybe_reversed` |
 | `adversarial.mojo` | all `bad_*`                                 | all `ok_*`                   |
+| `contracts.mojo`   | all `bad_*` (see below)                     | all `ok_*`                   |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
 model with unbounded integers would miss.
+
+`contracts.mojo` exercises the `_ensures` contracts of `List.append`,
+`List.pop` and `List._realloc`, and the `_assume(0 <= len)` type invariant.
+`bad_pop_first_unguarded` guards against using an assumption made after a check
+to justify that check. `bad_pop_unguarded` calls `pop()` without inlining it,
+so its failing bounds check is inside `List.pop` and only shows with
+`include-stdlib=true`; checking it at the call site needs `requires`
+contracts.
