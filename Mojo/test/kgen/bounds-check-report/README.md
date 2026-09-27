@@ -61,6 +61,7 @@ the first, so each access counts once.
 | `loops.mojo`       | all `bad_*`               | all `ok_*`                                     |
 | `memory.mojo`      | all `bad_*` and `limit_*` | all `ok_*`, `Bag.ok_get`                       |
 | `unrolling.mojo`   | all `bad_*` and `limit_*` | all `ok_*`                                     |
+| `tensor.mojo`      | all `bad_*` and `limit_*` | all `ok_*`, `Tensor2D.load`/`store`            |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -145,3 +146,20 @@ iterations; a loop that may run longer (`limit_loop_many_iterations`) or an
 unknown number of times (`bad_loop_unknown_count`) leaves the value unknown.
 Lists that start empty reallocate on the way (`ok_2d_realloc`), which the copy
 markers described above cover.
+
+`tensor.mojo` verifies indexing into a small tensor from GPU-style kernels.
+`Tensor2D[rows, cols]` has static dimensions, like a `LayoutTensor` with a
+static layout, and its `load`/`store` state their bounds as `_requires`: each
+call site must establish them, and the flat index inside is proven from them.
+`ThreadCtx` stands in for `thread_idx`, `block_idx`, `block_dim` and
+`grid_dim`, which only compile for a GPU target (this build has none): each
+accessor `_assume`s what the hardware guarantees, including the bounds of the
+dimensions it relies on (`1 <= block_dim <= 1024`, `grid_dim <= 2^31 - 1`), so
+products of indices cannot wrap. With that, a bounds guard (`ok_kernel_guarded`,
+`ok_kernel_2d`) or a launch precondition `grid_dim * block_dim == N`
+(`ok_kernel_exact_launch`) proves every access, and a host loop that launches
+the kernel for each block and thread is checked against that precondition
+(`ok_launch_exact`, `bad_launch_too_many_blocks`). Unguarded kernels, a launch
+that only covers "at least N" threads, and swapped coordinates stay unproven.
+`limit_global_index` is a known limit: its postcondition multiplies two unknown
+dimensions, which the solver does not bound in time.
