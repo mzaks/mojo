@@ -1009,9 +1009,27 @@ private:
     std::optional<MemLoc> loc = memLocation(loadOp.getPtr());
     if (!loc)
       return std::nullopt;
-    Place place{
-        *loc, loadOp.getResult().getType(),         SmallVector<int>(access),
-        sort, isNonEscapingBefore(loc->slot, load), loc->slot.getDefiningOp()};
+    // Loading a struct and taking a field of it reads the same as loading
+    // that field: move leading field accesses into the place, so stores that
+    // built the struct field by field are found.
+    MemLoc place0 = *loc;
+    Type loaded = loadOp.getResult().getType();
+    size_t fields = 0;
+    for (; fields < access.size() && access[fields] >= 0; ++fields) {
+      auto structType = dyn_cast<StructType>(loaded);
+      std::optional<SmallVector<Type>> elements =
+          structType ? structType.getElementTypes() : std::nullopt;
+      if (!elements || size_t(access[fields]) >= elements->size())
+        break;
+      loaded = (*elements)[access[fields]];
+      place0.path.push_back(access[fields]);
+    }
+    Place place{place0,
+                loaded,
+                SmallVector<int>(access.drop_front(fields)),
+                sort,
+                isNonEscapingBefore(loc->slot, load),
+                loc->slot.getDefiningOp()};
     return valueBefore(place, load, 0);
   }
 
