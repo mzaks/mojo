@@ -38,8 +38,9 @@ def BoundsCheckReport : Pass<"bounds-check-report", "ModuleOp"> {
     Each function is encoded into SMT-LIB: integer values as bitvectors with
     exact wrap-around semantics, structured control flow (`hlcf.if`,
     `hlcf.loop`, `lit.try`) as reachability conditions, and anything not
-    modeled as unconstrained values. Queries are answered by an external `z3`
-    process. The IR is not modified.
+    modeled as unconstrained values. Loop invariants are inferred with
+    Houdini. Queries are answered by an external `z3` process. The IR is not
+    modified.
 
     Designed to run right after elaboration.
   }];

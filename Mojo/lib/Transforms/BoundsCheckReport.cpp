@@ -25,12 +25,16 @@
 //     from several places (if/loop/try results, try handler arguments) are
 //     fresh constants constrained by one implication per source
 //     ("source reached => value = what the source sends").
-//   - A loop's block arguments are fresh, unconstrained constants standing for
-//     "the state of some iteration". This is sound but knows nothing about loop
-//     counters yet; the `continue` edges are recorded for invariant inference.
+//   - A loop's block arguments are fresh constants standing for "the state of
+//     some iteration". They are constrained by invariants inferred with
+//     Houdini: candidates are checked for initiation (loop entry) and
+//     consecution (every `continue` edge), failing candidates are dropped, and
+//     the process repeats until a fixpoint. Each check assumes the current
+//     candidates of the loops enclosing the checked edge only, which keeps the
+//     usual Houdini induction argument valid.
 //
-// An obligation is proven if "reached and condition false" is unsatisfiable.
-// It is "implied" if that only
+// An obligation is proven if "reached and condition false" is unsatisfiable
+// under the invariants of its enclosing loops. It is "implied" if that only
 // holds when additionally assuming the obligations that precede it on the
 // same path.
 //
@@ -48,6 +52,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -170,12 +175,49 @@ struct Edge {
   SmallVector<LoopInfo *> enclosing;
 };
 
+/// A Houdini candidate `arg <rel> other` for a loop head.
+struct Candidate {
+  unsigned arg;
+  std::string rel; // SMT-LIB comparison, e.g. "bvsle"
+  /// Either another loop argument or a term available at the loop head.
+  std::optional<unsigned> otherArg;
+  std::string otherTerm;
+  bool alive = true;
+};
+
 struct LoopInfo {
+  unsigned id = 0;
   std::string reachIn;
   SmallVector<MaybeTerm> args, inits;
   SmallVector<Sort> argSorts;
   SmallVector<LoopInfo *> enclosing;
   SmallVector<Edge> continues, breaks;
+  /// Integer terms available at the loop head that the body compares against.
+  SmallVector<std::pair<std::string, Sort>> boundTerms;
+  std::vector<Candidate> candidates;
+
+  /// Render `cand` with loop arguments replaced by `subst`.
+  MaybeTerm render(const Candidate &cand, ArrayRef<MaybeTerm> subst) const {
+    if (cand.arg >= subst.size() || !subst[cand.arg])
+      return std::nullopt;
+    std::string other = cand.otherTerm;
+    if (cand.otherArg) {
+      if (*cand.otherArg >= subst.size() || !subst[*cand.otherArg])
+        return std::nullopt;
+      other = *subst[*cand.otherArg];
+    }
+    return "(" + cand.rel + " " + *subst[cand.arg] + " " + other + ")";
+  }
+
+  /// Conjunction of the currently alive candidates over the loop arguments.
+  std::string invariant() const {
+    std::string result = "true";
+    for (const Candidate &cand : candidates)
+      if (cand.alive)
+        if (MaybeTerm t = render(cand, args))
+          result = mkAnd(result, *t);
+    return result;
+  }
 };
 
 struct TryInfo {
@@ -734,6 +776,7 @@ private:
 
   std::string encodeLoop(HLCF::LoopOp loopOp, StringRef reach) {
     LoopInfo &loop = loops.emplace_back();
+    loop.id = loops.size() - 1;
     loopOps[&loop] = loopOp;
     loop.reachIn = reachName(reach);
     loop.enclosing.assign(loopStack.begin(), loopStack.end());
@@ -743,6 +786,21 @@ private:
       loop.args.push_back(term(arg));
       loop.argSorts.push_back(sortOf(arg.getType()));
     }
+
+    // Loop-invariant terms the body compares against are good bounds.
+    llvm::SetVector<Value> bounds;
+    loopOp.getBody().walk([&](Operation *op) {
+      if (!isa<POP::CmpOp, mlir::index::CmpOp>(op))
+        return;
+      for (Value operand : op->getOperands()) {
+        Region *region = operand.getParentRegion();
+        if (!loopOp.getBody().isAncestor(region))
+          bounds.insert(operand);
+      }
+    });
+    for (Value bound : bounds)
+      if (MaybeTerm t = term(bound))
+        loop.boundTerms.push_back({*t, sortOf(bound.getType())});
 
     loopStack.push_back(&loop);
     BlockResult bodyResult = encodeBlock(body, loop.reachIn);
@@ -830,13 +888,16 @@ private:
 
 enum class Answer { Unsat, Sat, Unknown };
 
-/// The solver's reply to one query.
+/// The solver's reply to one query: the `check-sat` answer and, for queries
+/// that asked for them, the values of named Boolean terms in the model.
 struct Reply {
   Answer answer = Answer::Unknown;
+  DenseMap<unsigned, bool> values;
 };
 
 /// Each query is preceded by `(echo "@@")`, so the output splits into one
-/// segment per query regardless of error messages.
+/// segment per query regardless of error messages (e.g. `get-value` after
+/// `unsat` reports that no model is available).
 std::optional<std::vector<Reply>> parseReplies(StringRef output,
                                                size_t expected) {
   SmallVector<StringRef> segments;
@@ -855,6 +916,22 @@ std::optional<std::vector<Reply>> parseReplies(StringRef output,
       reply.answer = Answer::Unknown;
     else
       return std::nullopt; // Malformed script.
+    // Values look like `((q0 true) (q1 false))`.
+    StringRef rest = segment;
+    while (true) {
+      size_t pos = rest.find("(q");
+      if (pos == StringRef::npos)
+        break;
+      rest = rest.drop_front(pos + 2);
+      unsigned index;
+      if (rest.consumeInteger(10, index))
+        continue;
+      rest = rest.ltrim();
+      if (rest.starts_with("true"))
+        reply.values[index] = true;
+      else if (rest.starts_with("false"))
+        reply.values[index] = false;
+    }
     replies.push_back(std::move(reply));
   }
   return replies;
@@ -899,16 +976,77 @@ struct QueryBatch {
   std::string text;
   size_t count = 0;
 
-  /// Check `assumptions && goalNegation`.
-  void add(ArrayRef<std::string> assumptions, StringRef goalNegation) {
+  /// Check `assumptions && goalNegation`. `named` terms are defined as
+  /// `q0, q1, ...` inside the query (usable in `goalNegation`) and their
+  /// values are requested when the query is satisfiable.
+  void add(ArrayRef<std::string> assumptions, StringRef goalNegation,
+           ArrayRef<std::string> named = {}) {
     text += "(echo \"@@\")\n(push 1)\n";
     for (const std::string &a : assumptions)
       if (a != "true")
         text += "(assert " + a + ")\n";
-    text += ("(assert " + goalNegation + ")\n(check-sat)\n(pop 1)\n").str();
+    for (auto [i, t] : llvm::enumerate(named))
+      text += "(define-fun q" + std::to_string(i) + " () Bool " + t + ")\n";
+    text += ("(assert " + goalNegation + ")\n(check-sat)\n").str();
+    if (!named.empty()) {
+      text += "(get-value (";
+      for (unsigned i = 0; i < named.size(); ++i)
+        text += " q" + std::to_string(i);
+      text += "))\n";
+    }
+    text += "(pop 1)\n";
     ++count;
   }
 };
+
+/// Named invariant of each loop, defined once per script.
+std::string invariantDefinitions(const std::deque<LoopInfo> &loops) {
+  std::string defs;
+  for (const LoopInfo &loop : loops)
+    defs += "(define-fun inv" + std::to_string(loop.id) + " () Bool " +
+            loop.invariant() + ")\n";
+  return defs;
+}
+
+SmallVector<std::string> invariantsOf(ArrayRef<LoopInfo *> loops) {
+  SmallVector<std::string> result;
+  for (LoopInfo *loop : loops)
+    result.push_back("inv" + std::to_string(loop->id));
+  return result;
+}
+
+void generateCandidates(LoopInfo &loop) {
+  constexpr size_t kMaxCandidates = 256;
+  static const char *rels[] = {"bvsle", "bvsge", "bvule", "bvuge"};
+  auto add = [&](Candidate c) {
+    if (loop.candidates.size() < kMaxCandidates)
+      loop.candidates.push_back(std::move(c));
+  };
+  for (unsigned a = 0; a < loop.args.size(); ++a) {
+    Sort sort = loop.argSorts[a];
+    if (!loop.args[a] || sort.kind != Sort::BV)
+      continue;
+    SmallVector<std::string> others;
+    auto addOther = [&](const std::string &t) {
+      if (t != *loop.args[a] && !llvm::is_contained(others, t))
+        others.push_back(t);
+    };
+    addOther(bvConst(APInt(sort.width, 0)));
+    for (unsigned i = 0; i < loop.inits.size(); ++i)
+      if (loop.inits[i] && loop.argSorts[i] == sort)
+        addOther(*loop.inits[i]);
+    for (auto &[t, s] : loop.boundTerms)
+      if (s == sort)
+        addOther(t);
+    for (const std::string &other : others)
+      for (const char *rel : rels)
+        add({a, rel, std::nullopt, other});
+    for (unsigned b = 0; b < loop.args.size(); ++b)
+      if (b != a && loop.args[b] && loop.argSorts[b] == sort)
+        for (const char *rel : rels)
+          add({a, rel, b, ""});
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // Reporting
@@ -947,34 +1085,119 @@ struct BoundsCheckReportPass
     return "(set-option :timeout " + std::to_string(timeoutMs) + ")\n";
   }
 
+  /// Houdini: drop candidates until every remaining one is inductive. One
+  /// query per loop edge asks for a model violating some candidate; every
+  /// candidate that is false in that model is dropped.
+  bool inferInvariants(Encoder &enc, StringRef name) const {
+    for (LoopInfo &loop : enc.loops)
+      generateCandidates(loop);
+    for (unsigned round = 0; round < 64; ++round) {
+      QueryBatch batch;
+      std::vector<SmallVector<Candidate *>> owners;
+      bool changed = false;
+      auto addEdge = [&](LoopInfo &loop, ArrayRef<MaybeTerm> subst,
+                         SmallVector<std::string> assume) {
+        SmallVector<std::string> named;
+        SmallVector<Candidate *> cands;
+        for (Candidate &cand : loop.candidates) {
+          if (!cand.alive)
+            continue;
+          if (MaybeTerm t = loop.render(cand, subst)) {
+            named.push_back(*t);
+            cands.push_back(&cand);
+          } else {
+            cand.alive = false;
+            changed = true;
+          }
+        }
+        if (named.empty())
+          return;
+        std::string all = "true";
+        for (unsigned i = 0; i < named.size(); ++i)
+          all = mkAnd(all, "q" + std::to_string(i));
+        batch.add(assume, mkNot(all), named);
+        owners.push_back(std::move(cands));
+      };
+      for (LoopInfo &loop : enc.loops) {
+        SmallVector<std::string> assume = invariantsOf(loop.enclosing);
+        assume.push_back(loop.reachIn);
+        addEdge(loop, loop.inits, assume);
+        for (Edge &cont : loop.continues) {
+          SmallVector<std::string> assume = invariantsOf(cont.enclosing);
+          assume.push_back(cont.reach);
+          addEdge(loop, cont.values, assume);
+        }
+      }
+      if (batch.count == 0)
+        return true;
+      std::optional<std::vector<Reply>> replies = runZ3(
+          z3,
+          header() + enc.prelude + invariantDefinitions(enc.loops) + batch.text,
+          batch.count, dumpDir, (name + ".houdini" + Twine(round)).str());
+      if (!replies)
+        return false;
+      for (auto [cands, reply] : llvm::zip(owners, *replies)) {
+        if (reply.answer == Answer::Unsat)
+          continue;
+        // Drop the candidates the counterexample falsifies. Without a usable
+        // model (unknown, or no value is false) drop them all to guarantee
+        // progress; dropping candidates is always sound.
+        bool dropAll =
+            reply.answer != Answer::Sat ||
+            llvm::none_of(reply.values, [](auto &kv) { return !kv.second; });
+        for (auto [i, cand] : llvm::enumerate(cands)) {
+          auto it = reply.values.find(i);
+          if (cand->alive &&
+              (dropAll || (it != reply.values.end() && !it->second))) {
+            cand->alive = false;
+            changed = true;
+          }
+        }
+      }
+      if (!changed)
+        return true;
+    }
+    // No fixpoint within the round limit: drop everything to stay sound.
+    for (LoopInfo &loop : enc.loops)
+      for (Candidate &cand : loop.candidates)
+        cand.alive = false;
+    return true;
+  }
+
   struct FunctionReport {
     StringRef name;
     SmallVector<std::pair<ObligationOp, Status>> results;
     bool solverFailed = false;
   };
 
-  /// Encode one function and check its obligations.
+  /// Encode one function, infer its loop invariants and check its
+  /// obligations.
   FunctionReport analyzeFunction(FuncOp func, unsigned index) const {
     FunctionReport report;
     report.name = func.getSymName();
     Encoder enc;
     enc.encodeFunction(func);
     std::string dumpName = "f" + std::to_string(index);
+    bool solverOk = inferInvariants(enc, dumpName);
 
     // Three queries per obligation: is it reachable at all (guards against
     // vacuous proofs), is it provable on its own, and with earlier ones.
     QueryBatch batch;
     for (ObligationInfo &ob : enc.obligations) {
-      SmallVector<std::string> assume = {ob.reach};
+      SmallVector<std::string> assume = invariantsOf(ob.enclosing);
+      assume.push_back(ob.reach);
       batch.add(assume, "true");
       batch.add(assume, mkNot(ob.cond));
       for (auto &[reach, cond] : ob.earlier)
         assume.push_back("(=> " + reach + " " + cond + ")");
       batch.add(assume, mkNot(ob.cond));
     }
-    std::optional<std::vector<Reply>> replies =
-        runZ3(z3, header() + enc.prelude + batch.text, batch.count, dumpDir,
-              dumpName + ".obligations");
+    std::optional<std::vector<Reply>> replies;
+    if (solverOk)
+      replies = runZ3(z3,
+                      header() + enc.prelude + invariantDefinitions(enc.loops) +
+                          batch.text,
+                      batch.count, dumpDir, dumpName + ".obligations");
     report.solverFailed = !replies;
 
     for (auto [i, ob] : llvm::enumerate(enc.obligations)) {
