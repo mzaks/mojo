@@ -1048,29 +1048,37 @@ private:
         return;
       }
       // Shifts and divisions only by constants that avoid undefined cases.
-      if (name == "pop.shl" || name == "pop.shr" || name == "pop.floordiv") {
+      if (name == "pop.floordiv") {
+        // Rounds towards negative infinity. Division by zero and signed
+        // `MIN / -1` are undefined: the result is unconstrained there.
+        SmallVector<std::string> ts = operandTerms();
+        if (ts.size() != 2)
+          return;
+        std::string zero = bvConst(APInt(sort.width, 0));
+        std::string undefined = "(= " + ts[1] + " " + zero + ")";
+        std::string quotient = "(bvudiv " + ts[0] + " " + ts[1] + ")";
+        if (sort.isSigned) {
+          undefined = "(or " + undefined + " (and (= " + ts[0] + " " +
+                      bvConst(APInt::getSignedMinValue(sort.width)) +
+                      ") (= " + ts[1] + " " +
+                      bvConst(APInt::getAllOnes(sort.width)) + ")))";
+          std::string q = "(bvsdiv " + ts[0] + " " + ts[1] + ")";
+          std::string r = "(bvsrem " + ts[0] + " " + ts[1] + ")";
+          quotient = "(ite (and (distinct " + r + " " + zero +
+                     ") (xor (bvslt " + ts[0] + " " + zero + ") (bvslt " +
+                     ts[1] + " " + zero + "))) (bvsub " + q + " " +
+                     bvConst(APInt(sort.width, 1)) + ") " + q + ")";
+        }
+        setTerm(result, "(ite " + undefined + " " + declare(sort) + " " +
+                            quotient + ")");
+        return;
+      }
+      if (name == "pop.shl" || name == "pop.shr") {
         SmallVector<std::string> ts = operandTerms();
         std::optional<APInt> rhs = constantInt(op->getOperand(1), sort.width);
         if (ts.size() != 2 || !rhs)
           return;
         APInt amount = *rhs;
-        if (name == "pop.floordiv") {
-          if (amount.isZero() || (sort.isSigned && amount.isAllOnes()))
-            return;
-          if (!sort.isSigned) {
-            setTerm(result, "(bvudiv " + ts[0] + " " + ts[1] + ")");
-            return;
-          }
-          std::string zero = bvConst(APInt(sort.width, 0));
-          std::string q = "(bvsdiv " + ts[0] + " " + ts[1] + ")";
-          std::string r = "(bvsrem " + ts[0] + " " + ts[1] + ")";
-          setTerm(result, "(ite (and (distinct " + r + " " + zero +
-                              ") (xor (bvslt " + ts[0] + " " + zero +
-                              ") (bvslt " + ts[1] + " " + zero + "))) (bvsub " +
-                              q + " " + bvConst(APInt(sort.width, 1)) + ") " +
-                              q + ")");
-          return;
-        }
         if (amount.uge(sort.width))
           return;
         StringRef shift =
