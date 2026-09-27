@@ -183,14 +183,19 @@ struct Edge {
   std::string assumed = "true";
 };
 
-/// A Houdini candidate `arg <rel> other` for a loop head.
+/// A Houdini candidate for a loop head: either `arg <rel> other` (e.g.
+/// `i <= n`), or, for a relational template, `(rel arg other) == anchor`
+/// with `rel` "bvadd" or "bvsub" and `anchor` the same expression over the
+/// values at loop entry (e.g. `i + len == i0 + len0`).
 struct Candidate {
   unsigned arg;
-  std::string rel; // SMT-LIB comparison, e.g. "bvsle"
+  std::string rel; // SMT-LIB comparison (e.g. "bvsle") or "bvadd"/"bvsub".
   /// Either another loop argument or a term available at the loop head.
   std::optional<unsigned> otherArg;
+  /// The other term, or the anchor of a relational template.
   std::string otherTerm;
   bool alive = true;
+  bool relational = false;
 };
 
 struct LoopInfo {
@@ -210,6 +215,13 @@ struct LoopInfo {
   MaybeTerm render(const Candidate &cand, ArrayRef<MaybeTerm> subst) const {
     if (cand.arg >= subst.size() || !subst[cand.arg])
       return std::nullopt;
+    if (cand.relational) {
+      if (!cand.otherArg || *cand.otherArg >= subst.size() ||
+          !subst[*cand.otherArg])
+        return std::nullopt;
+      return "(= (" + cand.rel + " " + *subst[cand.arg] + " " +
+             *subst[*cand.otherArg] + ") " + cand.otherTerm + ")";
+    }
     std::string other = cand.otherTerm;
     if (cand.otherArg) {
       if (*cand.otherArg >= subst.size() || !subst[*cand.otherArg])
@@ -2066,12 +2078,33 @@ SmallVector<std::string> invariantsOf(ArrayRef<LoopInfo *> loops) {
 }
 
 void generateCandidates(LoopInfo &loop) {
-  constexpr size_t kMaxCandidates = 256;
+  constexpr size_t kMaxCandidates = 1024;
   static const char *rels[] = {"bvsle", "bvsge", "bvule", "bvuge"};
   auto add = [&](Candidate c) {
     if (loop.candidates.size() < kMaxCandidates)
       loop.candidates.push_back(std::move(c));
   };
+  // Pairs of values that move in lockstep: their sum or difference keeps its
+  // value from loop entry (e.g. an index counting up while a length counts
+  // down).
+  for (unsigned a = 0; a < loop.args.size(); ++a) {
+    Sort sort = loop.argSorts[a];
+    if (!loop.args[a] || sort.kind != Sort::BV || a >= loop.inits.size() ||
+        !loop.inits[a])
+      continue;
+    for (unsigned b = a + 1; b < loop.args.size(); ++b) {
+      if (!loop.args[b] || !(loop.argSorts[b] == sort) ||
+          b >= loop.inits.size() || !loop.inits[b])
+        continue;
+      for (const char *op : {"bvadd", "bvsub"}) {
+        Candidate c{a, op, b,
+                    std::string("(") + op + " " + *loop.inits[a] + " " +
+                        *loop.inits[b] + ")"};
+        c.relational = true;
+        add(std::move(c));
+      }
+    }
+  }
   for (unsigned a = 0; a < loop.args.size(); ++a) {
     Sort sort = loop.argSorts[a];
     if (!loop.args[a] || sort.kind != Sort::BV)
