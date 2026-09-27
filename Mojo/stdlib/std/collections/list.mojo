@@ -41,6 +41,7 @@ from std.memory import (
     unsafe_uninit_move_n,
 )
 from std.builtin.builtin_slice import ContiguousSlice, StridedSlice
+from std.builtin._verification import _assume, _ensures
 from .optional import Optional
 
 # ===-----------------------------------------------------------------------===#
@@ -792,6 +793,8 @@ struct List[T: AnyType, /](
         Returns:
             The number of elements in the list.
         """
+        # Type invariant, maintained by every mutating method.
+        _assume(self._len >= 0)
         return self._len
 
     def __bool__(self) -> Bool:
@@ -876,6 +879,7 @@ struct List[T: AnyType, /](
     def _realloc(
         mut self, new_capacity: Int
     ) where conforms_to(Self.T, Movable):
+        var old_len = len(self)
         var new_data = alloc(Layout[Self.T](count=new_capacity)).unsafe_leak()
 
         unsafe_uninit_move_n[overlapping=False](
@@ -892,6 +896,8 @@ struct List[T: AnyType, /](
         self._data = new_data
         self._capacity = new_capacity
         self._annotate_new()
+        _ensures(len(self) == old_len)
+        _ensures(self._capacity == new_capacity)
 
     @inline(.always)
     def _grow_amortized(
@@ -939,6 +945,7 @@ struct List[T: AnyType, /](
         print(list) # [1, 2, 3, 4, 5, 6]
         ```
         """
+        var old_len = len(self)
         if self._len >= self._capacity:
             self._realloc(self._capacity * 2 | Int(self._capacity == 0))
         self._annotate_increase()
@@ -947,6 +954,7 @@ struct List[T: AnyType, /](
         # just established above from the optimizer.
         self._data.unsafe_offset(self._len).unsafe_write(value^)
         self._len += 1
+        _ensures(len(self) == old_len + 1)
 
     @inline(.always)
     def insert(
@@ -1137,7 +1145,10 @@ struct List[T: AnyType, /](
         print("length", len(numbers))             # length 4
         ```
         """
-        return self.pop(len(self) - 1)
+        var old_len = len(self)
+        var ret_val = self.pop(old_len - 1)
+        _ensures(len(self) == old_len - 1)
+        return ret_val^
 
     @inline(.always)
     def pop(mut self, i: Int) -> Self.T where conforms_to(Self.T, Movable):
@@ -1157,6 +1168,7 @@ struct List[T: AnyType, /](
         print(numbers)                            # ['1', '2', '4', '5']
         ```
         """
+        var old_len = len(self)
         check_bounds(i, len(self))
         var ret_val = self._data.unsafe_offset(i).unsafe_take_pointee()
         unsafe_uninit_move_n[overlapping=True](
@@ -1166,6 +1178,7 @@ struct List[T: AnyType, /](
         )
         self._len -= 1
         self._annotate_shrink(self._len + 1)
+        _ensures(len(self) == old_len - 1)
         return ret_val^
 
     @stable(since="1.0")
