@@ -63,6 +63,7 @@
 #include "llvm/Support/Program.h"
 
 #include <deque>
+#include <map>
 
 using namespace M;
 using namespace KGEN;
@@ -410,6 +411,8 @@ private:
   unsigned counter = 0;
   DenseMap<Value, std::string> terms;
   DenseMap<std::pair<Value, unsigned>, std::string> extracts;
+  /// Opaque multi-step accesses, keyed by aggregate and path.
+  std::map<std::pair<void *, std::string>, std::string> paths;
   SmallVector<LoopInfo *> loopStack;
   /// Loops that have run to completion before the current point, in the
   /// current block and its ancestors. Their invariants held on their last
@@ -427,6 +430,7 @@ private:
     DenseMap<Value, Value> args;
     DenseMap<Value, std::string> terms;
     DenseMap<std::pair<Value, unsigned>, std::string> extracts;
+    std::map<std::pair<void *, std::string>, std::string> paths;
   };
   std::deque<CallContext> contexts;
   /// The callee context being evaluated, or null for the function itself.
@@ -435,6 +439,9 @@ private:
   DenseMap<Value, std::pair<CallContext *, Value>> callResults;
 
   DenseMap<Value, std::string> &termMap() { return ctx ? ctx->terms : terms; }
+  std::map<std::pair<void *, std::string>, std::string> &pathMap() {
+    return ctx ? ctx->paths : paths;
+  }
   DenseMap<std::pair<Value, unsigned>, std::string> &extractMap() {
     return ctx ? ctx->extracts : extracts;
   }
@@ -1037,8 +1044,23 @@ private:
   /// agrees with the caller's view of the operand.
   std::optional<std::string> opaqueField(Value aggregate, ArrayRef<int> path,
                                          Sort sort) {
-    if (path.size() != 1 || path.front() < 0)
+    if (path.empty())
       return std::nullopt;
+    if (path.size() > 1 || path.front() < 0) {
+      std::string key, text;
+      for (int step : path) {
+        key += (step == kUnwrap ? "u" : std::to_string(step)) + ".";
+        text += step == kUnwrap ? " unwrap" : " ." + std::to_string(step);
+      }
+      auto &memo = pathMap();
+      auto [it, inserted] =
+          memo.try_emplace({aggregate.getAsOpaquePointer(), key}, "");
+      if (inserted) {
+        it->second = declare(sort);
+        noteUnknown(it->second, "access" + text + " of " + describe(aggregate));
+      }
+      return it->second;
+    }
     auto &memo = extractMap();
     auto key = std::make_pair(aggregate, unsigned(path.front()));
     auto it = memo.find(key);
