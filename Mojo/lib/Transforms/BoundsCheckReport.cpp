@@ -1430,6 +1430,28 @@ private:
         noteUnknown(name, "uninitialized read of " + describe(place.loc.slot));
         return {Search::Found, name};
       }
+      // An earlier load of the place (or of a struct enclosing it), with
+      // nothing that may write it in between, read the same value: share it,
+      // even when neither value is otherwise known (e.g. both follow a call
+      // the slot's address escaped to).
+      if (auto earlier = dyn_cast<POP::LoadOp>(op)) {
+        std::optional<MemLoc> read = memLocation(earlier.getPtr());
+        if (read && read->slot == place.loc.slot &&
+            isPrefix(read->path, place.loc.path)) {
+          SmallVector<int> path(place.loc.path.begin() + read->path.size(),
+                                place.loc.path.end());
+          path.append(place.access.begin(), place.access.end());
+          Value loaded = earlier.getResult();
+          MaybeTerm t =
+              path.empty()
+                  ? (sortOf(loaded.getType()) == place.sort ? term(loaded)
+                                                            : std::nullopt)
+                  : resolveAccess(loaded, path, place.sort);
+          if (t)
+            return {Search::Found, t};
+        }
+        continue;
+      }
       if (auto store = dyn_cast<POP::StoreOp>(op)) {
         std::optional<MemLoc> target = memLocation(store.getPtr());
         if (!target) {
