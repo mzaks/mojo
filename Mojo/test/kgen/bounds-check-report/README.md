@@ -45,6 +45,7 @@ the first, so each access counts once.
 | `cases.mojo`       | all `bad_*`, `maybe_mutating` (known limit) | all `ok_*`, `maybe_reversed` |
 | `adversarial.mojo` | all `bad_*`                                 | all `ok_*`                   |
 | `contracts.mojo`   | all `bad_*` (see below)                     | all `ok_*`                   |
+| `slicing.mojo`     | all `bad_*`, `limit_strided` (known limit)  | all `ok_*`                   |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -61,3 +62,11 @@ and proves its body from it; `bad_call_without_precondition` and
 `ok_call_with_precondition` call it without and with the guard, and
 `bad_check_before_pop` checks that a later precondition does not justify an
 earlier access. `main` calls the examples on one shared list.
+
+`slicing.mojo` covers the length contracts of `List.extend(Span)` (used by
+`List.copy()`), of the `List` constructor from an iterable (for iterators with
+exact bounds, such as a `Span`'s), and of `List.__getitem__(StridedSlice)`, as
+well as the slice bounds that `check_slice_bounds` now records as obligations.
+For strided slices the contract is proven inside `__getitem__`, but call sites
+cannot yet evaluate `len(range(slice.indices(len)))`, so `limit_strided` stays
+unproven.
