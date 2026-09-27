@@ -1041,8 +1041,8 @@ private:
               name == "pop.stack_alloc.lifetime.end")
             return WalkResult::advance();
           if (nonEscaping || nested->getNumRegions() ||
-              isa<POP::LoadOp, POP::StackAllocationOp, ObligationOp, AssumeOp>(
-                  nested) ||
+              isa<POP::LoadOp, POP::StackAllocationOp, ObligationOp, AssumeOp,
+                  CopyMarkerOp>(nested) ||
               mlir::isMemoryEffectFree(nested))
             return WalkResult::advance();
           return WalkResult::interrupt();
@@ -1550,8 +1550,8 @@ private:
   /// Ops that write no memory at all, heap or stack.
   static bool writesNothing(Operation *op) {
     StringRef name = op->getName().getStringRef();
-    return isa<POP::LoadOp, POP::StackAllocationOp, ObligationOp, AssumeOp>(
-               op) ||
+    return isa<POP::LoadOp, POP::StackAllocationOp, ObligationOp, AssumeOp,
+               CopyMarkerOp>(op) ||
            name == "pop.stack_alloc.lifetime.start" ||
            name == "pop.stack_alloc.lifetime.end" ||
            // Reading freed memory is undefined behavior, which the analysis
