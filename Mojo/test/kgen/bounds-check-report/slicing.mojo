@@ -36,16 +36,52 @@ def bad_slice_bounds() -> Int:
     return len(vs[1:4])  # end is past the list
 
 
-# Known limit: the length contract of `__getitem__(StridedSlice)` is proven,
-# but its call site cannot evaluate `len(range(slice.indices(len)))` yet.
 @inline(.never)
-def limit_strided() -> Int:
+def bad_strided_reverse() -> Int:
+    var vs: List[Int] = [1, 2, 3]
+    var es = vs[::-1]
+    return es[3]  # the reversed list has 3 elements
+
+
+@inline(.never)
+def bad_strided_step() -> Int:
+    var vs: List[Int] = [1, 2, 3]
+    var es = vs[::2]
+    return es[2]  # every other element: 2 elements
+
+
+@inline(.never)
+def bad_strided_backwards_range() -> Int:
+    var vs: List[Int] = [1, 2, 3]
+    var es = vs[1:0:-1]
+    return es[1]  # a single element
+
+
+# --- should be PROVEN ---
+@inline(.never)
+def ok_strided_reverse() -> Int:
     var vs: List[Int] = [1, 2, 3]
     var es = vs[::-1]
     return es[2]
 
 
-# --- should be PROVEN ---
+@inline(.never)
+def ok_strided_step() -> Int:
+    var vs: List[Int] = [1, 2, 3]
+    var es = vs[::2]
+    return es[1]
+
+
+# Known limit: with an explicit start and end, the `Optional` payloads are
+# copied by `Variant`'s copy constructor through `unsafe_ptr[T]()[]`, which
+# the analysis cannot follow yet.
+@inline(.never)
+def limit_strided_backwards_range() -> Int:
+    var vs: List[Int] = [1, 2, 3]
+    var es = vs[1:0:-1]
+    return es[0]
+
+
 @inline(.never)
 def ok_copy() -> Int:
     var vs: List[Int] = [1, 2, 3]
@@ -71,7 +107,12 @@ def main():
         bad_copy(),
         bad_contiguous(),
         bad_slice_bounds(),
-        limit_strided(),
+        bad_strided_reverse(),
+        bad_strided_step(),
+        bad_strided_backwards_range(),
+        ok_strided_reverse(),
+        ok_strided_step(),
+        limit_strided_backwards_range(),
         ok_copy(),
         ok_contiguous(),
         ok_slice_bounds(),

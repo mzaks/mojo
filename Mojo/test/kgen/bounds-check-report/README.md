@@ -55,7 +55,7 @@ the first, so each access counts once.
 | `cases.mojo`       | all `bad_*`, `maybe_mutating` (known limit) | all `ok_*`, `maybe_reversed` |
 | `adversarial.mojo` | all `bad_*`                                 | all `ok_*`                   |
 | `contracts.mojo`   | all `bad_*` (see below)                     | all `ok_*`                   |
-| `slicing.mojo`     | all `bad_*`, `limit_strided` (known limit)  | all `ok_*`                   |
+| `slicing.mojo`     | all `bad_*`, `limit_*` (known limit)        | all `ok_*`                   |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -77,6 +77,7 @@ earlier access. `main` calls the examples on one shared list.
 `List.copy()`), of the `List` constructor from an iterable (for iterators with
 exact bounds, such as a `Span`'s), and of `List.__getitem__(StridedSlice)`, as
 well as the slice bounds that `check_slice_bounds` now records as obligations.
-For strided slices the contract is proven inside `__getitem__`, but call sites
-cannot yet evaluate `len(range(slice.indices(len)))`, so `limit_strided` stays
-unproven.
+Strided slices without explicit bounds (`vs[::-1]`, `vs[::2]`) are proven.
+With explicit bounds (`vs[1:0:-1]`), the `Optional` payloads are copied through
+`Variant`'s copy constructor, which the analysis cannot follow yet, so
+`limit_strided_backwards_range` stays unproven.
