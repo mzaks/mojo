@@ -17,6 +17,62 @@ toolchain does not know `kgen.obligation`):
 ./bazelw build --config=build-mojo //Mojo/tools/kgen //Mojo/tools/kgen-opt //Mojo/stdlib/std
 ```
 
+### Building on Linux or a fresh checkout
+
+Two things are not part of the branch and have to be set up locally.
+
+**`DEFINE_OR_RETURN_ERROR`.** The open-source export uses this macro in
+`Mojo/lib/Compiler/KGENCompiler.cpp` (three uses, around lines 524, 546 and
+812) without shipping the header that defines it, so the build stops in that
+file with an undeclared `DEFINE_OR_RETURN_ERROR`. Add this definition right
+after `using namespace KGEN;` near the top of the file, and keep it out of
+commits (it is only a stand-in for the missing header):
+
+```cpp
+// LOCAL WORKAROUND (do not commit): the open-source export references this
+// macro without shipping its definition.
+#ifndef DEFINE_OR_RETURN_ERROR
+#define DEFINE_OR_RETURN_ERROR(TYPE, NAME, EXPR)                               \
+  auto NAME##OrErr = (EXPR);                                                   \
+  if (NAME##OrErr.isError())                                                   \
+    return NAME##OrErr.takeError();                                            \
+  TYPE NAME = NAME##OrErr.takeValue();
+#endif
+```
+
+The `#ifndef` makes it harmless where the header does exist.
+
+**z3.** The pass runs `z3` as a subprocess and finds it on `PATH`; pass
+`z3-path=/path/to/z3` in the report options otherwise. On Debian or Ubuntu,
+`sudo apt-get install z3`; on Fedora, `sudo dnf install z3`; or take a release
+binary from <https://github.com/Z3Prover/z3/releases>. The results here were
+produced with z3 4.16 on macOS.
+
+Then build as above, always with `--config=build-mojo`: without it Bazel
+compiles the stdlib with the prebuilt toolchain, which does not know
+`kgen.obligation`, `kgen.assume` or `kgen.copy_marker`. A cold build takes
+about 15 minutes, a rebuild of the pass alone under a minute. If
+`./bazelw run //:format` was run in between, rebuild `kgen` and `std` again
+before running the report: formatting can leave `bazel-bin` without the stdlib
+(the report then fails with "unable to locate module 'std'").
+
+To check the setup, run the report on `cases.mojo` (as below): every `bad_*`
+function should stay unproven and every `ok_*` function be proven.
+`Mojo/stdlib/test/collections/test_list.mojo` (add
+`-I Mojo/stdlib/test`) should report 963/963 obligations proven. The runtime
+tests should still pass:
+
+```bash
+./bazelw test --config=build-mojo //Mojo/stdlib/test/collections/... //Mojo/stdlib/test/memory/...
+```
+
+On macOS this build registers no GPU target (`--target-triple` rejects both
+NVPTX and the Metal `air64` triples), which is why `tensor.mojo` uses a
+stand-in for the GPU index functions. A Linux build ships the NVPTX backend
+separately, so elaborating a real kernel with
+`--target-triple=nvptx64-nvidia-cuda --target-cpu=sm_80` may work there;
+this has not been tried.
+
 Run the pass in-process right after elaboration:
 
 ```bash
