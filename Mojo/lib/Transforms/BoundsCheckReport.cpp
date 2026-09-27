@@ -1409,7 +1409,7 @@ private:
     }
   };
 
-  static constexpr unsigned kMaxHeapDepth = 32;
+  static constexpr unsigned kMaxHeapDepth = 256;
 
   /// Whether `ptr` points into a stack slot, of the function itself or of a
   /// caller of the callee being evaluated. Heap memory never overlaps one.
@@ -1559,6 +1559,8 @@ private:
            name == "pop.aligned_free" ||
            // A barrier orders memory accesses but writes nothing itself.
            name == "pop.fence" ||
+           // Materializing a compile-time constant only produces a value.
+           name == "kgen.param.materialize" ||
            // Control flow (`hlcf.yield`, `hlcf.break`, ...) moves values only.
            op->hasTrait<OpTrait::IsTerminator>() ||
            (!op->getNumRegions() && mlir::isMemoryEffectFree(op));
@@ -1627,6 +1629,10 @@ private:
     if (rest)
       for (auto &[cond, value] : llvm::reverse(guards))
         rest = "(ite " + cond + " " + value + " " + *rest + ")";
+    // Name composite values: they are shared by every later read that
+    // reaches this point, and copying them would grow exponentially.
+    if (rest && rest->front() == '(')
+      rest = define(r.sort, *rest);
     heapMemo[memoKey] = rest;
     return rest;
   }
