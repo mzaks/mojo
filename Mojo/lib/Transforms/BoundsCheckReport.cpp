@@ -431,6 +431,8 @@ private:
     /// analyzed); the callee's arguments are values there.
     CallContext *parent = nullptr;
     unsigned depth = 0;
+    /// The call being evaluated.
+    Operation *call = nullptr;
     /// Results of calls inside this callee, backed by nested contexts.
     DenseMap<Value, std::pair<CallContext *, Value>> results;
     DenseMap<Value, Value> args;
@@ -460,6 +462,7 @@ private:
       return std::nullopt;
     CallContext &nested = contexts.emplace_back();
     nested.callee = calleeName(call);
+    nested.call = call;
     nested.parent = ctx;
     nested.depth = ctx->depth + 1;
     Block &entry = callee->first->getRegion(0).front();
@@ -816,9 +819,23 @@ private:
         break;
       }
     }
-    if (!ptr.getDefiningOp<POP::StackAllocationOp>())
+    if (!ptr.getDefiningOp<POP::StackAllocationOp>() && !isEntryArgument(ptr))
       return std::nullopt;
     return MemLoc{ptr, SmallVector<int>(llvm::reverse(reversed))};
+  }
+
+  /// A pointer argument of a function's entry block: a place in the caller's
+  /// memory. Two such arguments may alias each other, but not a local stack
+  /// slot.
+  static bool isEntryArgument(Value ptr) {
+    auto arg = dyn_cast<BlockArgument>(ptr);
+    return arg && isa<FuncOp>(arg.getOwner()->getParentOp()) &&
+           arg.getOwner()->isEntryBlock();
+  }
+
+  /// Whether stores to `a` and `b` (bases of places) may alias.
+  static bool mayAlias(Value a, Value b) {
+    return a == b || (isEntryArgument(a) && isEntryArgument(b));
   }
 
   static Value stackSlot(Value ptr) {
@@ -893,6 +910,8 @@ private:
   /// (e.g. into a closure created later), so no call or other pointer can
   /// write it before then.
   static bool isNonEscapingBefore(Value slot, Operation *point) {
+    if (isEntryArgument(slot))
+      return false; // The caller may have let it escape.
     // The escape at `point` itself (e.g. the call whose operand the value
     // is read for) has not happened yet either.
     return llvm::all_of(escapingUses(slot), [&](Operation *escape) {
@@ -911,6 +930,8 @@ private:
                                  : WalkResult::interrupt();
             if (target->slot == loc.slot && (isPrefix(target->path, loc.path) ||
                                              isPrefix(loc.path, target->path)))
+              return WalkResult::interrupt();
+            if (target->slot != loc.slot && mayAlias(target->slot, loc.slot))
               return WalkResult::interrupt();
             return WalkResult::advance();
           }
@@ -984,7 +1005,9 @@ private:
         return std::nullopt;
       // Continue in the enclosing block, before the op containing `cur`.
       Operation *parent = cur->getParentOp();
-      if (!parent || isa<FuncOp>(parent))
+      if (parent && isa<FuncOp>(parent))
+        return valueAtCall(place, depth);
+      if (!parent)
         return std::nullopt;
       if (auto ifOp = dyn_cast<HLCF::IfOp>(parent)) {
         if (elifConditionsMayWrite(place, ifOp))
@@ -994,6 +1017,29 @@ private:
       }
       cur = parent;
     }
+  }
+
+  /// Reaching the entry of a callee evaluated for a call: a place in the
+  /// callee's argument memory holds what the caller's memory held at the
+  /// call, so continue the search in the caller, before the call.
+  MaybeTerm valueAtCall(const Place &place, unsigned depth) {
+    if (!ctx || !ctx->call || !isEntryArgument(place.loc.slot))
+      return std::nullopt;
+    auto arg = ctx->args.find(place.loc.slot);
+    if (arg == ctx->args.end())
+      return std::nullopt;
+    std::optional<MemLoc> callerLoc = memLocation(arg->second);
+    if (!callerLoc)
+      return std::nullopt;
+    Operation *call = ctx->call;
+    Place callerPlace = place;
+    callerPlace.loc.slot = callerLoc->slot;
+    callerPlace.loc.path = callerLoc->path;
+    callerPlace.loc.path.append(place.loc.path.begin(), place.loc.path.end());
+    callerPlace.nonEscaping = isNonEscapingBefore(callerLoc->slot, call);
+    callerPlace.slotDef = callerLoc->slot.getDefiningOp();
+    return inContext(ctx->parent,
+                     [&] { return valueBefore(callerPlace, call, depth + 1); });
   }
 
   /// Search `block` backwards from just before `from` (from its end if null)
@@ -1012,8 +1058,11 @@ private:
             continue;
           return {Search::Fail, std::nullopt}; // May alias the place.
         }
-        if (target->slot != place.loc.slot)
+        if (target->slot != place.loc.slot) {
+          if (mayAlias(target->slot, place.loc.slot))
+            return {Search::Fail, std::nullopt};
           continue;
+        }
         if (isPrefix(target->path, place.loc.path)) {
           MaybeTerm t = fromStore(place, store, *target);
           return {t ? Search::Found : Search::Fail, t};
@@ -1701,6 +1750,7 @@ private:
       return;
 
     CallContext &context = contexts.emplace_back();
+    context.call = call;
     context.callee =
         callee.getSymbol().getRootReference().getValue().split('(').first.str();
     for (auto [arg, operand] :
