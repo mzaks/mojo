@@ -42,6 +42,8 @@
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/Timing.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/CodeGen/CommandFlags.h"
@@ -115,6 +117,14 @@ public:
 
   M::cl::MOpt<bool> emitTextualAsm{
       "S", cl::desc("Print MLIR output files in textual form")};
+
+  // Runs the report in-process on the elaborated module, which avoids
+  // printing and re-parsing the IR.
+  M::cl::MOpt<std::string> boundsCheckReport{
+      "bounds-check-report", llvm::cl::ValueOptional,
+      cl::value_desc("pass options"),
+      cl::desc("Run the bounds-check-report pass after elaboration, e.g. "
+               "--bounds-check-report=\"verbose=true\"")};
 
   M::cl::MOpt<bool> ignoreFailures{
       "ignore-failure",
@@ -582,6 +592,15 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
   // We don't need to try to look anything up.
   if (ErrorOrSuccess err = compiler.runKGENPipeline(*theModule, target))
     return failure(clOptions.reportError(err.getError()));
+
+  if (clOptions.boundsCheckReport.getNumOccurrences()) {
+    mlir::PassManager reportPM(theModule->getContext());
+    if (failed(mlir::parsePassPipeline("bounds-check-report{" +
+                                           clOptions.boundsCheckReport + "}",
+                                       reportPM)) ||
+        failed(reportPM.run(*theModule)))
+      return failure();
+  }
 
   // If all we're doing is generating a library file or elaborating, we're done
   // now.
