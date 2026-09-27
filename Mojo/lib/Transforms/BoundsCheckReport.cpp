@@ -1320,7 +1320,9 @@ private:
            }).wasInterrupted();
     if (!singleReturn)
       postconditions.clear();
-    if (preconditions.empty() && postconditions.empty())
+    // With a single return, the call's results are the callee's returned
+    // values even without contracts; they are evaluated on demand.
+    if (preconditions.empty() && !singleReturn)
       return;
 
     CallContext &context = contexts.emplace_back();
@@ -1338,7 +1340,7 @@ private:
       activeObligations.push_back({r, cond});
       ++contractsUsed;
     }
-    if (postconditions.empty())
+    if (!singleReturn)
       return;
     for (auto [result, returned] :
          llvm::zip(call->getResults(), ret->getOperands()))
