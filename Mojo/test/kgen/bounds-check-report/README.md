@@ -59,6 +59,7 @@ the first, so each access counts once.
 | `contracts.mojo`   | all `bad_*` (see below)                     | all `ok_*`                   |
 | `slicing.mojo`     | all `bad_*`                                 | all `ok_*`                   |
 | `loops.mojo`       | all `bad_*`                                 | all `ok_*`                   |
+| `memory.mojo`      | all `bad_*`                                 | all `ok_*`, `Bag.ok_get`     |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -86,3 +87,14 @@ Strided slices (`vs[::-1]`, `vs[::2]`, `vs[1:0:-1]`) are proven.
 index and the length of a list that shrinks by one per iteration keep their
 sum (`i + len == i0 + len0`), and one that grows keeps their difference. The
 analysis tries both templates for every pair of values of the same type.
+
+`memory.mojo` covers lists in memory that calls may or may not write. A call
+that takes a list `read` receives its address as an `imm_mem` argument, which
+the callee may read but not mutate, so it does not stop the analysis from
+tracking the list's fields past the call (`ok_strided_twice`,
+`ok_read_calls_keep_length`). For the same reason a `read self` stays unchanged
+throughout a method, even across calls in between (`Bag.ok_get`). This is a
+trusted language guarantee: unsafe code that casts the origin away breaks it.
+`mut` calls (`bad_after_mut_call`, `bad_read_then_mut_call`,
+`Bag.bad_get_after_clear`) and a mutable `Pointer` taken to the list before a
+read-only call (`bad_escaped_pointer`) still count as writes.
