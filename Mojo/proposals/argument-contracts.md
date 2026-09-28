@@ -1,8 +1,8 @@
 # Argument contracts: runtime `where` clauses for verification
 
 **September 28, 2026**
-Status: Draft. Preconditions on `imm`, `var` and owned arguments are
-implemented; see [Implementation status](#implementation-status).
+Status: Draft. Preconditions and postconditions are implemented; see
+[Implementation status](#implementation-status).
 
 This document proposes contracts on function arguments, written as `where`
 clauses on the arguments themselves:
@@ -339,35 +339,47 @@ Dafny usable while typing.
 
 Implemented, on the `mojo-bounds-verifier` branch:
 
-- `kgen.requires` and its terminator `kgen.contract.yield`, kept through the
-  LIT lowering, elaboration and SCCP, and erased when lowering to LLVM.
-- The parser accepts clauses on `imm`, `var` and owned arguments (including
-  `self`) and emits one `kgen.requires` per clause at the start of the body.
-  Clauses on `mut`, `out`, `ref` and `deinit` arguments are rejected until
-  postconditions exist.
-- `bounds-check-report` assumes a function's own preconditions, checks an
-  inlined callee's where it was inlined, and checks a non-inlined callee's at
-  each call. The examples are in
-  `Mojo/test/kgen/bounds-check-report/where_clauses.mojo`.
+- `kgen.requires`, `kgen.ensures` and `kgen.old`, with the terminator
+  `kgen.contract.yield`, kept through the LIT lowering, elaboration and SCCP,
+  and erased when lowering to LLVM. `arg-promotion` treats their uses of an
+  argument as reads, so contracts do not keep `mut` arguments in memory.
+- The parser accepts clauses on every argument but `ref` and `deinit` ones,
+  with the semantics of the table above: preconditions become `kgen.requires`
+  at the start of the body, postconditions a `kgen.ensures` before every
+  return, and the `old(e)` values they use a `kgen.old` at the start.
+- `bounds-check-report` assumes a function's own preconditions and proves its
+  postconditions at every return; it checks a callee's preconditions at each
+  call (inlined or not) and assumes its postconditions after the call. The
+  examples are in `Mojo/test/kgen/bounds-check-report/where_clauses.mojo`.
 
 Differences from the design above, found while implementing it:
 
-- The region's terminator is its own op, `kgen.contract.yield`, not a reuse of
-  `hlcf.yield`: HLCF analyses take every `hlcf.yield` to end a region of an
+- The regions end in their own terminator, `kgen.contract.yield`, not a reuse
+  of `hlcf.yield`: HLCF analyses take every `hlcf.yield` to end a region of an
   HLCF op, and crash on anything else.
-- The region is not `IsolatedFromAbove`. Canonicalization hoists constants
-  out of it into the function body, and that is harmless: only the function's
-  arguments must not be used directly, and the parser binds their names to the
-  region's block arguments. Each op takes all the function's arguments as
-  operands rather than only the ones its clause uses.
-- To tell a function's own precondition from an inlined callee's, the op
-  carries the location of the call to the function (`kgen.source_loc[0]`),
-  which only resolves once the function is inlined. That is the same
-  mechanism `_requires` uses; the [Adoption](#adoption) section expected it to
-  go away, but inlining leaves no other trace.
+- The regions are not `IsolatedFromAbove`. Canonicalization hoists constants
+  out of them into the function body, and that is harmless: only the
+  function's arguments must not be used directly, and the parser binds their
+  names to the regions' block arguments. Each op takes all the function's
+  arguments as operands rather than only the ones its clause uses.
+- To tell a function's own contract from an inlined callee's, the ops carry
+  the location of the call to the function (`kgen.source_loc[0]`), which only
+  resolves once the function is inlined. That is the same mechanism
+  `_requires` uses; the [Adoption](#adoption) section expected it to go away,
+  but inlining leaves no other trace.
+- `old` is not a keyword: a call `old(e)` is recognized while a clause on a
+  `mut` or `out` argument is emitted, and nowhere else. The parser emits such
+  a clause at the start of the body once to record the `old(e)` values, and
+  once more to see whether it uses any `mut` or `out` argument's value on
+  exit, which decides between precondition and postcondition.
+- The comptime interpreter cannot evaluate `kgen.old`: a function whose
+  postcondition uses `old` cannot run at compile time.
+- Postconditions are only assumed after calls to callees with a single
+  return, and the analysis still reads the callee's body as well. A callee
+  that breaks its postcondition then makes the rest of its caller unreachable;
+  the broken postcondition is reported in the callee.
 - The parser does not emit runtime `debug_assert`s for the clauses yet.
-- Not implemented yet: `kgen.ensures`, `kgen.old`, clauses on `mut` and `out`
-  arguments, and checking a call without opening the callee's body.
+- Not implemented yet: checking a call without opening the callee's body.
 
 ## Alternatives considered
 
