@@ -372,7 +372,9 @@ def whitespace(
             return NO
 
         if t == token.EQUAL:
-            if prev.type not in TYPED_NAMES:
+            # A default after an argument's `where` clauses follows a typed
+            # name too.
+            if prev.type not in TYPED_NAMES and prev.type != syms.where_clause:
                 return NO
 
         elif prev.type == token.EQUAL:

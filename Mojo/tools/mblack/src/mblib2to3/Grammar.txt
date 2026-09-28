@@ -55,7 +55,7 @@ result_type: [REF '[' test [',' test [',']] ']'] (functype | generatortype | or_
 convention: VAR | (OUT ['[' test [',' test [',']] ']']) | IMM | MUT | DEINIT | (REF ['[' test [',' test [',']] ']'])
 #tname: NAME [metaparams] [':' test]
 
-typedargslist: ((([convention] ['**'|'*'] tfpdef ['=' test])|'/'|'*'|'//') [','])*
+typedargslist: ((([convention] ['**'|'*'] tfpdef (where_clause)* ['=' test])|'/'|'*'|'//') [','])*
 
 tname: NAME [metaparams] [':' (type_test|star_expr)]
 
