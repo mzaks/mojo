@@ -1442,11 +1442,10 @@ private:
                                 place.loc.path.end());
           path.append(place.access.begin(), place.access.end());
           Value loaded = earlier.getResult();
-          MaybeTerm t =
-              path.empty()
-                  ? (sortOf(loaded.getType()) == place.sort ? term(loaded)
-                                                            : std::nullopt)
-                  : resolveAccess(loaded, path, place.sort);
+          MaybeTerm t = path.empty() ? (sortOf(loaded.getType()) == place.sort
+                                            ? term(loaded)
+                                            : std::nullopt)
+                                     : resolveAccess(loaded, path, place.sort);
           if (t)
             return {Search::Found, t};
         }
@@ -3216,6 +3215,14 @@ struct Reply {
 /// `unsat` reports that no model is available).
 std::optional<std::vector<Reply>> parseReplies(StringRef output,
                                                size_t expected) {
+  // A failed `push` or `pop` misaligns every later query's scope: none of
+  // the answers can be trusted.
+  SmallVector<StringRef> lines;
+  output.split(lines, '\n');
+  for (StringRef line : lines)
+    if (line.starts_with("(error") &&
+        (line.contains("push") || line.contains("pop")))
+      return std::nullopt;
   SmallVector<StringRef> segments;
   output.split(segments, "@@\n");
   if (segments.empty() || segments.size() - 1 != expected)
@@ -3229,6 +3236,9 @@ std::optional<std::vector<Reply>> parseReplies(StringRef output,
     else if (answer == "sat")
       reply.answer = Answer::Sat;
     else if (answer == "unknown" || answer == "timeout")
+      reply.answer = Answer::Unknown;
+    else if (answer.starts_with("(error") && answer.contains("canceled"))
+      // The timeout hit inside `check-sat`: no answer for this query.
       reply.answer = Answer::Unknown;
     else
       return std::nullopt; // Malformed script.
@@ -3292,6 +3302,10 @@ std::optional<std::vector<Reply>> runZ3(StringRef z3, StringRef script,
 struct QueryBatch {
   std::string text;
   size_t count = 0;
+  /// Solver limits for each `check-sat`, and the options that lift them for
+  /// `push`/`pop`: taking in the prelude at the first `push` can take longer
+  /// than a query may, and a canceled `push` shifts every later scope.
+  std::string limits, unlimited;
 
   /// Check `assumptions && goalNegation`. `named` terms are defined as
   /// `q0, q1, ...` inside the query (usable in `goalNegation`) and their
@@ -3299,13 +3313,14 @@ struct QueryBatch {
   /// `show` lists existing terms whose values are requested as well.
   void add(ArrayRef<std::string> assumptions, StringRef goalNegation,
            ArrayRef<std::string> named = {}, ArrayRef<std::string> show = {}) {
-    text += "(echo \"@@\")\n(push 1)\n";
+    text += "(echo \"@@\")\n" + unlimited + "(push 1)\n";
     for (const std::string &a : assumptions)
       if (a != "true")
         text += "(assert " + a + ")\n";
     for (auto [i, t] : llvm::enumerate(named))
       text += "(define-fun q" + std::to_string(i) + " () Bool " + t + ")\n";
-    text += ("(assert " + goalNegation + ")\n(check-sat)\n").str();
+    text +=
+        ("(assert " + goalNegation + ")\n" + limits + "(check-sat)\n").str();
     if (!named.empty()) {
       text += "(get-value (";
       for (unsigned i = 0; i < named.size(); ++i)
@@ -3318,7 +3333,7 @@ struct QueryBatch {
         text += " " + name;
       text += "))\n";
     }
-    text += "(pop 1)\n";
+    text += unlimited + "(pop 1)\n";
     ++count;
   }
 };
@@ -3423,8 +3438,20 @@ struct BoundsCheckReportPass
 
   std::string z3;
 
-  std::string header() const {
+  /// The script starts without limits; each query sets them for its
+  /// `check-sat` only (see `QueryBatch`).
+  std::string header() const { return unlimited(); }
+
+  std::string limits() const {
     return "(set-option :timeout " + std::to_string(timeoutMs) + ")\n";
+  }
+  std::string unlimited() const { return "(set-option :timeout 0)\n"; }
+
+  QueryBatch newBatch() const {
+    QueryBatch batch;
+    batch.limits = limits();
+    batch.unlimited = unlimited();
+    return batch;
   }
 
   /// Houdini: drop candidates until every remaining one is inductive. One
@@ -3434,7 +3461,7 @@ struct BoundsCheckReportPass
     for (LoopInfo &loop : enc.loops)
       generateCandidates(loop);
     for (unsigned round = 0; round < 64; ++round) {
-      QueryBatch batch;
+      QueryBatch batch = newBatch();
       std::vector<SmallVector<Candidate *>> owners;
       bool changed = false;
       auto addEdge = [&](LoopInfo &loop, ArrayRef<MaybeTerm> subst,
@@ -3540,7 +3567,7 @@ struct BoundsCheckReportPass
     // values of the unknowns the condition depends on.
     constexpr size_t kMaxShown = 8;
     std::vector<SmallVector<std::pair<std::string, std::string>>> inputs;
-    QueryBatch batch;
+    QueryBatch batch = newBatch();
     for (ObligationInfo &ob : enc.obligations) {
       SmallVector<std::string> assume = invariantsOf(ob.enclosing);
       assume.push_back(ob.reach);
