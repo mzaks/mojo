@@ -1880,6 +1880,29 @@ void IREmitter::checkInferredErrorType(ASTType rvalueType, SMLoc loc) {
 }
 
 //===----------------------------------------------------------------------===//
+// Contract helpers.
+
+AnyValue IREmitter::emitOldCall(const ExprNode *call, const ExprNode *operand,
+                                ExprDest &dest) {
+  if (oldCalls->mode == OldCalls::Replace) {
+    for (OldCalls::Call &old : oldCalls->values)
+      if (old.call == call)
+        return emitResult(old.value, call, dest);
+    emitError(call->getLoc(), "'old' value was not computed on entry");
+    return {};
+  }
+  AnyValue value = emitExpr(operand, EC_OperatorOperandValue);
+  if (!value || oldCalls->mode == OldCalls::Plain)
+    return value ? emitResult(value, call, dest) : AnyValue();
+  // Record: keep a copy of the value for the postcondition.
+  Value copy = emitSRValue({value, operand}, EC_OperatorOperandValue);
+  if (!copy)
+    return {};
+  oldCalls->values.push_back({call, AnyValue(SBValue(copy)), copy});
+  return emitResult(AnyValue(SBValue(copy)), call, dest);
+}
+
+//===----------------------------------------------------------------------===//
 // Return emission helpers.
 
 void IREmitter::emitNormalReturn(ImplicitLocOpBuilder &builder, Value value,
@@ -1943,6 +1966,12 @@ void IREmitter::emitNormalReturn(ImplicitLocOpBuilder &builder, Value value,
 /// with any special logic that goes with it.  If the value is missing this is
 /// treated as a 'return;' synthesizing a None result.
 void IREmitter::emitNormalReturn(Location loc, Value value, bool emitEndFunc) {
+  // Postconditions hold when the function returns: check them before the
+  // result is moved out.
+  if (builder)
+    if (auto func = getBlockParentOfType<FnOp>(builder->getInsertionBlock()))
+      if (failed(getDeclResolver().emitPostconditions(func, *this)))
+        return;
 
   // If this function returns in a register, load the result value from the
   // result slot temp. We compile things like:

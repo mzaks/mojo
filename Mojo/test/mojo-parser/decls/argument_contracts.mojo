@@ -63,3 +63,61 @@ def imm_and_var(imm a: Int where a >= 0, var b: Int where b >= a):
 # CHECK: lit.end_fn
 def no_clauses(a: Int):
     pass
+
+
+# Postconditions: a clause on an `out` argument becomes a `kgen.ensures` right
+# before every return, over the arguments, the named result and the values of
+# its `old(e)` calls, which a `kgen.old` computes on entry.
+
+# CHECK-LABEL: lit.fn @"out_result
+# CHECK-NOT: kgen.requires
+# CHECK: kgen.ensures(%{{.*}}, %{{.*}} : {{.*}}, {{.*}})
+# CHECK: kgen.contract.yield
+# CHECK: lit.return
+def out_result(a: Int, out r: Int where r > a):
+    r = a + 1
+
+
+# Every return gets its own copy.
+# CHECK-LABEL: lit.fn @"two_returns
+# CHECK: kgen.ensures
+# CHECK: lit.return
+# CHECK: kgen.ensures
+# CHECK: lit.return
+def two_returns(a: Int, out r: Int where r >= 0):
+    if a > 0:
+        r = a
+        return
+    r = 0
+
+
+# On a `mut` argument, `old(e)` is `e` on entry: a `kgen.old` computes it, and
+# its result is the last operand of the `kgen.ensures`.
+# CHECK-LABEL: lit.fn @"mut_with_old
+# CHECK-NOT: kgen.requires
+# CHECK: %[[OLD:.*]] = kgen.old({{.*}}) -> !Int
+# CHECK: kgen.contract.yield
+# CHECK: kgen.ensures({{.*}}, %[[OLD]] : {{.*}})
+# CHECK: lit.return
+def mut_with_old(mut a: Int where a == old(a) + 1):
+    a += 1
+
+
+# Without `old`, a `mut` clause holds on entry and on exit.
+# CHECK-LABEL: lit.fn @"mut_without_old
+# CHECK: kgen.requires
+# CHECK-NOT: kgen.old
+# CHECK: kgen.ensures
+# CHECK: lit.return
+def mut_without_old(mut a: Int where a >= 0):
+    a = 1
+
+
+# Written only in terms of `old`, it is a precondition.
+# CHECK-LABEL: lit.fn @"mut_only_old
+# CHECK: kgen.requires
+# CHECK-NOT: kgen.old
+# CHECK-NOT: kgen.ensures
+# CHECK: lit.end_fn
+def mut_only_old(mut a: Int where old(a) > 0):
+    a -= 1

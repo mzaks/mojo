@@ -129,6 +129,31 @@ public:
   /// This is scope to resolve declaration references against.
   ASTDecl &declScope;
 
+  /// While emitting a `where` clause of a postcondition, how calls to
+  /// `old(e)` are handled (see `DeclResolver::emitArgumentContracts`).
+  struct OldCalls {
+    enum Mode {
+      /// `old(e)` is `e`: the clause is evaluated on entry.
+      Plain,
+      /// Emit `e` and record its value, on entry.
+      Record,
+      /// Use the value recorded for the call.
+      Replace,
+    } mode;
+    struct Call {
+      const ExprNode *call;
+      AnyValue value;
+      /// The recorded value itself (Record mode).
+      Value recorded;
+    };
+    SmallVector<Call, 2> values;
+  };
+  OldCalls *oldCalls = nullptr;
+
+  /// Emit a call to `old(operand)` in a `where` clause (see `oldCalls`).
+  AnyValue emitOldCall(const ExprNode *call, const ExprNode *operand,
+                       ExprDest &dest);
+
   /// When non-null, body-constraint inconclusiveness during emission is
   /// silently accepted at single-candidate emission sites, and the unprovable
   /// body constraints are inserted into this context for the caller to

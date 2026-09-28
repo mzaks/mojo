@@ -57,3 +57,39 @@ def main():
     print(first(xs))
     # CHECK: 3
     print(Counter(5).minus(2))
+    postconditions()
+
+
+# Postconditions, including `old(e)`, have no runtime effect either.
+@inline(.never)
+def make(n: Int where n >= 0, out result: List[Int] where len(result) == n):
+    result = List[Int](capacity=n)
+    for i in range(n):
+        result.append(i)
+
+
+@inline(.never)
+def push(mut xs: List[Int] where len(xs) == old(len(xs)) + 1, v: Int):
+    xs.append(v)
+
+
+@inline(.never)
+def shrink(
+    mut xs: List[Int] where old(len(xs)) > 0 where len(xs) == old(len(xs)) - 1,
+):
+    _ = xs.pop()
+
+
+@always_inline
+def bump(mut a: Int where a == old(a) + 1):
+    a += 1
+
+
+def postconditions():
+    var xs = make(3)
+    push(xs, 7)
+    shrink(xs)
+    var a = 41
+    bump(a)
+    # CHECK: 3 2 42
+    print(len(xs), xs[2], a)

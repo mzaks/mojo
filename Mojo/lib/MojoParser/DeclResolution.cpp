@@ -2518,12 +2518,28 @@ LogicalResult DeclResolver::resolveSignature(FnOp funcOp, Lexer &lexer,
   decl.takeDecls(sigDecl);
 
   // Keep the contracts on runtime arguments for the body, which emits them.
-  SmallVector<ParsedConstraint, 2> contracts;
-  for (ParsedArgument &arg : fnSignature.parsedArgs)
-    llvm::append_range(contracts, arg.whereClauses);
+  SmallVector<ArgumentContract, 2> contracts;
+  for (ParsedArgument &arg : fnSignature.parsedArgs) {
+    auto kind = arg.convention == ParsedArgument::kConventionMut
+                    ? ArgumentContract::Mut
+                : arg.convention == ParsedArgument::kConventionOut ||
+                        arg.convention == ParsedArgument::kConventionByRefResult
+                    ? ArgumentContract::Out
+                    : ArgumentContract::Input;
+    for (const ParsedConstraint &clause : arg.whereClauses)
+      contracts.push_back({&clause, kind});
+  }
+  // An `out` argument returned in a register is only the result argument (a
+  // memory-only one is also the result slot, collected above).
+  if (!llvm::any_of(contracts, [&](const ArgumentContract &contract) {
+        return !fnSignature.resultArg.whereClauses.empty() &&
+               contract.clause == &fnSignature.resultArg.whereClauses.front();
+      }))
+    for (const ParsedConstraint &clause : fnSignature.resultArg.whereClauses)
+      contracts.push_back({&clause, ArgumentContract::Out});
   if (!contracts.empty())
     argumentContracts[funcOp] =
-        shared.getPersistentCopy(ArrayRef<ParsedConstraint>(contracts));
+        shared.getPersistentCopy(ArrayRef<ArgumentContract>(contracts));
 
   // Now that all the structural properties are determined, perform any
   // name-binding specific checks over the declaration.  This happens after
@@ -2694,63 +2710,255 @@ LogicalResult DeclResolver::resolveSyntheticBody(FnOp fn, ASTDecl &decl) {
   }
 }
 
+/// The named result of a function returned in a register: the local variable
+/// holding it (see `resolveBody`), or null.
+static Value namedRegisterResult(FnOp funcOp, ASTDecl &decl) {
+  if (!funcOp.getNamedResultAttr() ||
+      funcOp.getFuncTypeGenerator().hasMemoryOnlyResult())
+    return {};
+  ArrayRef<ASTDecl *> resultDecls =
+      decl.lookupInCurrentScope(funcOp.getNamedResultAttr());
+  if (resultDecls.size() != 1)
+    return {};
+  return resultDecls[0]->getIfIRValue().getIfMLValue();
+}
+
+/// The operands of a contract op, which its region's block arguments stand
+/// for: the function's arguments, then (for a postcondition) its named result
+/// in a register and the `kgen.old` values the clause uses.
+static SmallVector<Value> contractOperands(FnOp funcOp, ASTDecl &decl,
+                                           bool withResult,
+                                           ValueRange olds = {}) {
+  SmallVector<Value> operands(funcOp.getBody()->getArguments());
+  if (withResult)
+    if (Value result = namedRegisterResult(funcOp, decl))
+      operands.push_back(result);
+  llvm::append_range(operands, olds);
+  return operands;
+}
+
+/// Emit the condition of a `where` clause into the region of the contract op
+/// `op`, whose operands are `operands` (see `contractOperands`). A scope binds
+/// the function's argument names (and a named result) to the region's block
+/// arguments, like `resolveBody` binds them to the entry block's; `olds`
+/// handles the clause's `old(e)` calls. Returns the region's block.
+static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
+                                    ASTDecl &decl,
+                                    const ParsedConstraint &clause,
+                                    Operation *op, ValueRange operands,
+                                    bool withResult,
+                                    IREmitter::OldCalls *olds) {
+  SharedState &shared = resolver.shared;
+  Location loc = shared.translateLocation(clause.loc);
+  SmallVector<Location> argLocs;
+  for (Value operand : operands)
+    argLocs.push_back(operand.getLoc());
+  OpBuilder regionBuilder(resolver.getContext());
+  Block *block = regionBuilder.createBlock(
+      &op->getRegion(0), {}, ValueRange(operands).getTypes(), argLocs);
+
+  ASTDecl &scope =
+      resolver.addFullyResolvedDecl(nullptr, StringAttr(), clause.loc, &decl);
+  FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
+  unsigned numArgs = funcOp.getBody()->getNumArguments();
+  for (auto [argIdx, convention] :
+       llvm::enumerate(funcSignature.getArgConventions())) {
+    StringAttr argName = funcSignature.getArgName(argIdx);
+    // The result slot is the `out` argument; the error slot has no name.
+    if (!argName || argName.empty() || convention == ArgConvention::ByRefError)
+      continue;
+    BlockArgument regionArg = block->getArgument(argIdx);
+    if (convention == ArgConvention::ImmMem)
+      resolver.addFullyResolvedDecl(MBValue(regionArg), argName, clause.loc,
+                                    &scope);
+    else if (convention == ArgConvention::ImmReg)
+      resolver.addFullyResolvedDecl(SBValue(regionArg), argName, clause.loc,
+                                    &scope);
+    else
+      resolver.addFullyResolvedDecl(CValue::getMValueForRef(regionArg), argName,
+                                    clause.loc, &scope);
+  }
+  // A named result in a register follows the arguments.
+  unsigned next = numArgs;
+  if (withResult && namedRegisterResult(funcOp, decl)) {
+    resolver.addFullyResolvedDecl(
+        CValue::getMValueForRef(block->getArgument(next)),
+        funcOp.getNamedResultAttr(), clause.loc, &scope);
+    ++next;
+  }
+  // Then the values on entry, standing for the `old(e)` calls.
+  IREmitter::OldCalls replaced{IREmitter::OldCalls::Replace, {}};
+  if (olds && olds->mode == IREmitter::OldCalls::Replace) {
+    for (IREmitter::OldCalls::Call &old : olds->values) {
+      if (next >= operands.size())
+        break;
+      BlockArgument value = block->getArgument(next++);
+      replaced.values.push_back({old.call, AnyValue(SBValue(value)), value});
+    }
+    olds = &replaced;
+  }
+
+  IREmitter clauseEmitter(scope, regionBuilder);
+  clauseEmitter.oldCalls = olds;
+  RValue cond =
+      clauseEmitter.emitExprScalarBool(clause.propExpr, EC_BoolCondition);
+  Value condVal = clauseEmitter.emitSRValue({AnyValue(cond), clause.propExpr},
+                                            EC_BoolCondition);
+  if (!condVal)
+    return nullptr;
+  KGEN::ContractYieldOp::create(*clauseEmitter.builder, loc, condVal);
+  return block;
+}
+
+/// The location of the call to the function: it only resolves once the
+/// function is inlined, which tells analyses its own contract from an inlined
+/// callee's.
+static KGEN::SourceLocOp emitCallLocation(OpBuilder &builder, Location loc) {
+  return KGEN::SourceLocOp::create(builder, loc, builder.getIndexAttr(0));
+}
+
 LogicalResult DeclResolver::emitArgumentContracts(FnOp funcOp, ASTDecl &decl,
                                                   IREmitter &emitter) {
   auto it = argumentContracts.find(funcOp);
   if (it == argumentContracts.end() || !emitter.builder)
     return success();
-  ArrayRef<ParsedConstraint> clauses = it->second;
+  ArrayRef<ArgumentContract> contracts = it->second;
   argumentContracts.erase(it);
 
   OpBuilder &builder = *emitter.builder;
-  Block &entry = *funcOp.getBody();
+  auto callLoc =
+      emitCallLocation(builder, shared.translateLocation(decl.getLoc()));
+  auto emitRequires = [&](const ParsedConstraint &clause,
+                          IREmitter::OldCalls *olds) -> LogicalResult {
+    SmallVector<Value> operands =
+        contractOperands(funcOp, decl, /*withResult=*/false);
+    auto requiresOp =
+        KGEN::RequiresOp::create(builder, shared.translateLocation(clause.loc),
+                                 operands, callLoc.getLine(), callLoc.getCol(),
+                                 callLoc.getFileName(), clause.message);
+    return mlir::success(emitContractCondition(*this, funcOp, decl, clause,
+                                               requiresOp, operands,
+                                               /*withResult=*/false, olds));
+  };
+
   FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
-  // The location of the call to the function: it only resolves once the
-  // function is inlined, which tells analyses its own precondition from an
-  // inlined callee's.
-  auto callLoc = KGEN::SourceLocOp::create(
-      builder, shared.translateLocation(decl.getLoc()),
-      builder.getIndexAttr(0));
-  SmallVector<Location> argLocs;
-  for (BlockArgument arg : entry.getArguments())
-    argLocs.push_back(arg.getLoc());
-
-  for (const ParsedConstraint &clause : clauses) {
-    Location loc = shared.translateLocation(clause.loc);
-    auto requiresOp = KGEN::RequiresOp::create(
-        builder, loc, entry.getArguments(), callLoc.getLine(), callLoc.getCol(),
-        callLoc.getFileName(), clause.message);
-
-    // The condition is computed from the region's block arguments: a scope
-    // binds the function's argument names to them, like `resolveBody` binds
-    // them to the entry block's arguments.
-    OpBuilder regionBuilder(getContext());
-    Block *block = regionBuilder.createBlock(&requiresOp.getBody(), {},
-                                             entry.getArgumentTypes(), argLocs);
-    ASTDecl &scope =
-        addFullyResolvedDecl(nullptr, StringAttr(), clause.loc, &decl);
-    for (auto [argIdx, regionArg, convention] : llvm::enumerate(
-             block->getArguments(), funcSignature.getArgConventions())) {
-      StringAttr argName = funcSignature.getArgName(argIdx);
-      if (!argName || argName.empty() || isResultSlot(convention))
-        continue;
-      if (convention == ArgConvention::ImmMem)
-        addFullyResolvedDecl(MBValue(regionArg), argName, clause.loc, &scope);
-      else if (convention == ArgConvention::ImmReg)
-        addFullyResolvedDecl(SBValue(regionArg), argName, clause.loc, &scope);
-      else
-        addFullyResolvedDecl(CValue::getMValueForRef(regionArg), argName,
-                             clause.loc, &scope);
+  SmallVector<PostconditionClause, 1> posts;
+  for (const ArgumentContract &contract : contracts) {
+    const ParsedConstraint &clause = *contract.clause;
+    // An input's clause is a precondition; `old` has no meaning there.
+    if (contract.kind == ArgumentContract::Input) {
+      if (failed(emitRequires(clause, /*olds=*/nullptr)))
+        return failure();
+      continue;
     }
 
-    IREmitter clauseEmitter(scope, regionBuilder);
-    RValue cond =
-        clauseEmitter.emitExprScalarBool(clause.propExpr, EC_BoolCondition);
-    Value condVal = clauseEmitter.emitSRValue({AnyValue(cond), clause.propExpr},
-                                              EC_BoolCondition);
-    if (!condVal)
+    // Compute the `old(e)` values of a `mut` or `out` clause on entry, in a
+    // `kgen.old` (the region yields them; the op's results are created once
+    // their types are known).
+    Location loc = shared.translateLocation(clause.loc);
+    SmallVector<Value> entryOperands =
+        contractOperands(funcOp, decl, /*withResult=*/false);
+    auto probe = KGEN::OldOp::create(builder, loc, TypeRange(), entryOperands);
+    IREmitter::OldCalls recorded{IREmitter::OldCalls::Record, {}};
+    Block *oldBlock =
+        emitContractCondition(*this, funcOp, decl, clause, probe, entryOperands,
+                              /*withResult=*/false, &recorded);
+    if (!oldBlock)
       return failure();
-    KGEN::ContractYieldOp::create(*clauseEmitter.builder, loc, condVal);
+    // The region computed the whole condition; it only needs the values.
+    Operation *terminator = oldBlock->getTerminator();
+    SmallVector<Value> yielded;
+    for (IREmitter::OldCalls::Call &old : recorded.values)
+      yielded.push_back(old.recorded);
+    OpBuilder yieldBuilder(terminator);
+    KGEN::ContractYieldOp::create(yieldBuilder, terminator->getLoc(), yielded);
+    terminator->erase();
+    KGEN::OldOp oldOp;
+    SmallVector<Value> oldValues;
+    if (!recorded.values.empty()) {
+      oldOp = KGEN::OldOp::create(builder, loc, ValueRange(yielded).getTypes(),
+                                  entryOperands);
+      oldOp.getBody().takeBody(probe.getBody());
+      llvm::append_range(oldValues, oldOp.getValues());
+    }
+    probe.erase();
+
+    // Classify the clause by a trial postcondition: a clause on a `mut`
+    // argument without `old` holds on entry and on exit; one that uses no
+    // `mut` or `out` argument's value on exit is a precondition.
+    IREmitter::OldCalls replace{IREmitter::OldCalls::Replace, recorded.values};
+    SmallVector<Value> postOperands =
+        contractOperands(funcOp, decl, /*withResult=*/true, oldValues);
+    auto trial = KGEN::EnsuresOp::create(builder, loc, postOperands,
+                                         callLoc.getLine(), callLoc.getCol(),
+                                         callLoc.getFileName(), clause.message);
+    Block *trialBlock =
+        emitContractCondition(*this, funcOp, decl, clause, trial, postOperands,
+                              /*withResult=*/true, &replace);
+    if (!trialBlock)
+      return failure();
+    bool usesExit = false;
+    for (auto [argIdx, convention] :
+         llvm::enumerate(funcSignature.getArgConventions()))
+      if (convention == ArgConvention::Mut ||
+          convention == ArgConvention::MutRef ||
+          convention == ArgConvention::ByRefResult)
+        usesExit |= !trialBlock->getArgument(argIdx).use_empty();
+    unsigned numArgs = funcOp.getBody()->getNumArguments();
+    if (postOperands.size() > numArgs + oldValues.size())
+      usesExit |= !trialBlock->getArgument(numArgs).use_empty();
+    trial.erase();
+
+    bool isPost = usesExit || contract.kind == ArgumentContract::Out;
+    bool isPre = contract.kind == ArgumentContract::Mut &&
+                 (recorded.values.empty() || !usesExit);
+    if (isPre) {
+      IREmitter::OldCalls plain{IREmitter::OldCalls::Plain, {}};
+      if (failed(emitRequires(clause, &plain)))
+        return failure();
+    }
+    if (!isPost) {
+      if (oldOp)
+        oldOp.erase();
+      continue;
+    }
+    PostconditionClause post{&clause, {}};
+    for (auto [old, value] : llvm::zip(recorded.values, oldValues))
+      post.olds.push_back({old.call, value});
+    posts.push_back(std::move(post));
+  }
+  if (!posts.empty())
+    postconditions[funcOp] = std::move(posts);
+  return success();
+}
+
+LogicalResult DeclResolver::emitPostconditions(FnOp funcOp,
+                                               IREmitter &emitter) {
+  auto it = postconditions.find(funcOp);
+  if (it == postconditions.end() || !emitter.builder)
+    return success();
+  ASTDecl *decl = emitter.declScope.getNearestDeclOfType<FnOp>();
+  if (!decl)
+    return success();
+  OpBuilder &builder = *emitter.builder;
+  auto callLoc =
+      emitCallLocation(builder, shared.translateLocation(decl->getLoc()));
+  for (const PostconditionClause &post : it->second) {
+    SmallVector<Value> oldValues;
+    IREmitter::OldCalls olds{IREmitter::OldCalls::Replace, {}};
+    for (auto &[call, value] : post.olds) {
+      oldValues.push_back(value);
+      olds.values.push_back({call, AnyValue(), value});
+    }
+    SmallVector<Value> operands =
+        contractOperands(funcOp, *decl, /*withResult=*/true, oldValues);
+    auto ensuresOp = KGEN::EnsuresOp::create(
+        builder, shared.translateLocation(post.clause->loc), operands,
+        callLoc.getLine(), callLoc.getCol(), callLoc.getFileName(),
+        post.clause->message);
+    if (!emitContractCondition(*this, funcOp, *decl, *post.clause, ensuresOp,
+                               operands, /*withResult=*/true, &olds))
+      return failure();
   }
   return success();
 }
@@ -2915,6 +3123,10 @@ ParseResult DeclResolver::resolveBody(FnOp funcOp, Lexer &lexer,
     shared.notifyListenerOnArgumentDecl(argDecl, resultName, argDecl.getLoc());
   }
 
+  // The postconditions recorded for the returns are only needed while the
+  // body is emitted.
+  auto dropPostconditions =
+      llvm::scope_exit([&] { postconditions.erase(funcOp); });
   if (failed(emitArgumentContracts(funcOp, decl, emitter)))
     return failure();
 

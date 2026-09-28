@@ -2869,6 +2869,13 @@ static AnyValue emitMLIROperatorCall(const CallNode &call,
 }
 
 AnyValue CallNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
+  // In a postcondition, `old(e)` is the value of `e` on entry.
+  if (emitter.oldCalls)
+    if (auto *ref = dyn_cast<DeclRefNode>(callee);
+        ref && ref->spelling == "old" && operands.size() == 1 &&
+        operands.front().unpackStyle == ArgUnpackStyle::kPositional)
+      return emitter.emitOldCall(this, operands.front().expr, dest);
+
   AnyValue calleeVal = emitter.emitExpr(callee, EC_CallCalleeValue);
   if (!calleeVal)
     return {};

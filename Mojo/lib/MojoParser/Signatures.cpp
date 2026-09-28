@@ -397,13 +397,12 @@ ParseResult ParsedArgument::parse(ParserBase &p, KWArgMarkerInfo &markerInfo,
   while (p.getToken().isIdentifier() && p.getToken().getSpelling() == "where") {
     SMLoc whereLoc = p.consumeIdentifier().getLoc();
     // On a runtime argument, a clause is a contract for static verification
-    // rather than a parse-time constraint. Only preconditions on arguments the
-    // callee cannot change are supported so far.
+    // rather than a parse-time constraint: a precondition on an input, a
+    // postcondition (or both) on a `mut` or `out` argument.
     if (kind == ArgListKind::kArgList) {
-      if (convention != kConventionUnspec && convention != kConventionImm &&
-          convention != kConventionVar) {
-        p.emitError(whereLoc, "'where' clauses are only supported on 'imm', "
-                              "'var' and owned arguments");
+      if (convention == kConventionRef || convention == kConventionDeinit) {
+        p.emitError(whereLoc, "'where' clauses are not supported on 'ref' "
+                              "and 'deinit' arguments");
         return failure();
       }
       ParsedConstraint clause;

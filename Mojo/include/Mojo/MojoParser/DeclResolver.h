@@ -50,10 +50,27 @@ class TraitDeclOp;
 class ExtensionDeclOp;
 struct ParsedArgument;
 struct ParsedConstraint;
+class ExprNode;
 struct LambdaNode;
 class IREmitter;
 class ExprDest;
 class BaseDLValue;
+
+/// A `where` clause on a runtime argument (see `emitArgumentContracts`).
+struct ArgumentContract {
+  const ParsedConstraint *clause;
+  /// The kind of argument it is written on: an input's clause is a
+  /// precondition; a `mut` or `out` argument's may be a postcondition.
+  enum Kind : uint8_t { Input, Mut, Out } kind;
+};
+
+/// A postcondition to emit before each return of a function.
+struct PostconditionClause {
+  const ParsedConstraint *clause;
+  /// The `old(e)` calls in the clause, and the `kgen.old` results computing
+  /// their values on entry.
+  SmallVector<std::pair<const ExprNode *, mlir::Value>, 1> olds;
+};
 
 //===----------------------------------------------------------------------===//
 // DeclResolver
@@ -219,6 +236,10 @@ public:
   LogicalResult resolveSignature(ASTDecl &decl, llvm::SMLoc loc) {
     return resolve(decl, DeclResolvedness::signature, loc);
   }
+  /// Emit the postconditions of the function being emitted before one of its
+  /// returns, at the emitter's insertion point.
+  LogicalResult emitPostconditions(FnOp op, IREmitter &emitter);
+
   LogicalResult resolveBody(ASTDecl &decl, llvm::SMLoc loc) {
     return resolve(decl, DeclResolvedness::body, loc);
   }
@@ -387,14 +408,19 @@ private:
   LogicalResult resolveSignature(FnOp op, Lexer &lexer, ASTDecl &decl);
   ParseResult resolveBody(FnOp op, Lexer &lexer, ASTDecl &decl);
 
-  /// Emit the `where` clauses on a function's runtime arguments as
-  /// `kgen.requires` ops at the start of its body.
+  /// Emit the `where` clauses on a function's runtime arguments at the start
+  /// of its body: preconditions as `kgen.requires` ops, the values on entry of
+  /// postconditions as `kgen.old` ops, and record the postconditions for its
+  /// returns.
   LogicalResult emitArgumentContracts(FnOp op, ASTDecl &decl,
                                       IREmitter &emitter);
   /// The `where` clauses on runtime arguments, recorded with a function's
   /// signature for its body (persistently allocated).
-  llvm::DenseMap<mlir::Operation *, ArrayRef<ParsedConstraint>>
+  llvm::DenseMap<mlir::Operation *, ArrayRef<ArgumentContract>>
       argumentContracts;
+  /// The postconditions of functions whose bodies are being emitted.
+  llvm::DenseMap<mlir::Operation *, SmallVector<PostconditionClause, 1>>
+      postconditions;
   LogicalResult resolveSyntheticBody(FnOp op, ASTDecl &decl);
   LogicalResult resolveSyntheticSignature(FnOp op, ASTDecl &decl);
   LogicalResult resolveSyntheticSignature(AliasDeclOp op, ASTDecl &decl);
