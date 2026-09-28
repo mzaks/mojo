@@ -400,6 +400,49 @@ public:
   /// precision.
   bool lazyHeap = false;
 
+  /// Experimental (`modular` option): a call to an opaque callee (see
+  /// `isOpaque`) is evaluated by the callee's contract alone, like a method
+  /// call in Dafny. Its results are unknowns that only the `ensures`
+  /// constrain, and memory it may write holds, after it, an unknown per place
+  /// (`afterCall`) that the callee's `ensures` and the caller's later reads
+  /// share. The body is never searched.
+  enum class Modular { Off, Contracts, All };
+  Modular modular = Modular::Off;
+  std::map<std::string, std::string> afterCallValues;
+
+  bool isOpaque(Operation *op) const {
+    auto call = dyn_cast<CallOp>(op);
+    if (modular == Modular::Off || !call || !symbols || isAllocation(call))
+      return false;
+    auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!callee)
+      return false;
+    auto fn = symbols->lookup<FuncOp>(callee.getSymbol().getRootReference());
+    if (!fn || fn == self || fn->getRegion(0).empty())
+      return false;
+    if (modular == Modular::All)
+      return true;
+    for (Operation &op : fn->getRegion(0).front())
+      if (auto ob = dyn_cast<ObligationOp>(&op))
+        if (isOwnPrecondition(ob) || getObligationKind(ob) == "ensures")
+          return true;
+    return false;
+  }
+
+  /// The unknown value a place (described by `key`, in the caller's terms)
+  /// holds after the opaque call `call`.
+  std::string afterCall(Operation *call, const std::string &key, Sort sort) {
+    std::string full;
+    llvm::raw_string_ostream(full) << call << "|" << key;
+    auto [it, inserted] = afterCallValues.try_emplace(full, "");
+    if (inserted) {
+      it->second = declare(sort);
+      noteUnknown(it->second,
+                  "memory after the call to " + calleeName(cast<CallOp>(call)));
+    }
+    return it->second;
+  }
+
   /// Resolve the pending values in the cone of `exprs`, including those the
   /// resolved values themselves use, until none is left. Returns how many
   /// were resolved.
@@ -555,6 +598,8 @@ private:
     unsigned depth = 0;
     /// The call being evaluated.
     Operation *call = nullptr;
+    /// Whether only the callee's contract is evaluated (see `isOpaque`).
+    bool opaque = false;
     /// Results of calls inside this callee, backed by nested contexts.
     DenseMap<Value, std::pair<CallContext *, Value>> results;
     /// Contexts of calls inside this callee (see `contextFor`).
@@ -612,6 +657,8 @@ private:
     if (!ctx || ctx->depth >= kMaxNesting)
       return std::nullopt;
     auto call = value.getDefiningOp<CallOp>();
+    if (call && isOpaque(call))
+      return std::nullopt;
     std::optional<std::pair<FuncOp, HLCF::ReturnOp>> callee =
         call ? singleReturnCallee(call) : std::nullopt;
     if (!callee)
@@ -647,7 +694,7 @@ private:
     if (call->getNumResults())
       if (auto res = callResult(call->getResult(0)))
         result = res->first;
-    if (!result && ctx && ctx->depth < kMaxNesting)
+    if (!result && ctx && ctx->depth < kMaxNesting && !isOpaque(call))
       if (auto callee = singleReturnCallee(call)) {
         CallContext &nested = contexts.emplace_back();
         nested.callee = calleeName(call);
@@ -1490,6 +1537,17 @@ private:
   /// callee's argument memory holds what the caller's memory held at the
   /// call, so continue the search in the caller, before the call.
   MaybeTerm valueAtCall(const Place &place, unsigned depth) {
+    std::optional<Place> callerPlace = callerPlaceOf(place);
+    if (!callerPlace)
+      return std::nullopt;
+    Operation *call = ctx->call;
+    return inContext(ctx->parent, [&] {
+      return valueBefore(*callerPlace, call, depth + 1);
+    });
+  }
+
+  /// For a place in a callee argument's memory, the caller's place it is.
+  std::optional<Place> callerPlaceOf(const Place &place) {
     if (!ctx || !ctx->call || !isEntryArgument(place.loc.slot))
       return std::nullopt;
     auto arg = ctx->args.find(place.loc.slot);
@@ -1498,15 +1556,26 @@ private:
     std::optional<MemLoc> callerLoc = memLocation(arg->second);
     if (!callerLoc)
       return std::nullopt;
-    Operation *call = ctx->call;
     Place callerPlace = place;
     callerPlace.loc.slot = callerLoc->slot;
     callerPlace.loc.path = callerLoc->path;
     callerPlace.loc.path.append(place.loc.path.begin(), place.loc.path.end());
-    callerPlace.nonEscaping = isNonEscapingBefore(callerLoc->slot, call);
+    callerPlace.nonEscaping = isNonEscapingBefore(callerLoc->slot, ctx->call);
     callerPlace.slotDef = callerLoc->slot.getDefiningOp();
-    return inContext(ctx->parent,
-                     [&] { return valueBefore(callerPlace, call, depth + 1); });
+    return callerPlace;
+  }
+
+  static std::string placeKey(const Place &place) {
+    std::string key;
+    llvm::raw_string_ostream os(key);
+    os << "stack|" << place.loc.slot.getAsOpaquePointer() << "|";
+    for (int step : place.loc.path)
+      os << step << ".";
+    os << "|";
+    for (int step : place.access)
+      os << step << ".";
+    os << "|" << place.loaded.getAsOpaquePointer() << "|" << place.sort.str();
+    return key;
   }
 
   /// The value of a place in an `imm_mem` argument, which is the same at
@@ -1543,7 +1612,28 @@ private:
                                            Operation *from, unsigned depth) {
     Operation *op =
         from ? from->getPrevNode() : (block.empty() ? nullptr : &block.back());
+    // In an opaque callee, a write to the caller's memory is not searched:
+    // the value is the one the place holds after the call.
+    std::optional<Place> callerPlace =
+        ctx && ctx->opaque ? callerPlaceOf(place) : std::nullopt;
     for (; op; op = op->getPrevNode()) {
+      if (callerPlace) {
+        bool writes;
+        if (auto store = dyn_cast<POP::StoreOp>(op)) {
+          std::optional<MemLoc> target = memLocation(store.getPtr());
+          writes = !target ? !place.nonEscaping
+                   : target->slot == place.loc.slot
+                       ? isPrefix(target->path, place.loc.path) ||
+                             isPrefix(place.loc.path, target->path)
+                       : mayAlias(target->slot, place.loc.slot);
+        } else {
+          writes = !isa<POP::LoadOp>(op) &&
+                   mayWrite(op, place.loc, place.nonEscaping);
+        }
+        if (writes)
+          return {Search::Found,
+                  afterCall(ctx->call, placeKey(*callerPlace), place.sort)};
+      }
       if (op == place.slotDef) {
         // Nothing stored yet: an uninitialized read, whose value is simply
         // arbitrary (e.g. a union member for a tag that never occurs).
@@ -1594,6 +1684,8 @@ private:
       }
       if (!mayWrite(op, place.loc, place.nonEscaping))
         continue;
+      if (isOpaque(op))
+        return {Search::Found, afterCall(op, placeKey(place), place.sort)};
       if (auto ifOp = dyn_cast<HLCF::IfOp>(op);
           ifOp && depth < kMaxMergeDepth) {
         MaybeTerm t = mergeIf(place, ifOp, depth + 1);
@@ -2271,10 +2363,32 @@ private:
     }
   }
 
+  static std::string heapKey(const HeapRead &r) {
+    std::string key;
+    llvm::raw_string_ostream os(key);
+    os << "heap|" << r.addr.base << "|" << r.addr.index << "|"
+       << r.addr.element.getAsOpaquePointer() << "|" << r.sort.str();
+    for (int step : r.addr.path)
+      os << " " << step;
+    os << "|";
+    for (int step : r.access)
+      os << " " << step;
+    return key;
+  }
+
   HeapStep
   heapStep(const HeapRead &r, Operation *op, unsigned depth,
            SmallVectorImpl<std::pair<std::string, std::string>> &guards,
            MaybeTerm &found) {
+    // An opaque call, met in the caller or in the callee's own body: the
+    // value after the call.
+    Operation *opaqueCall = isOpaque(op)                             ? op
+                            : ctx && ctx->opaque && heapMayWrite(op) ? ctx->call
+                                                                     : nullptr;
+    if (opaqueCall) {
+      found = afterCall(opaqueCall, heapKey(r), r.sort);
+      return HeapStep::Found;
+    }
     if (auto store = dyn_cast<POP::StoreOp>(op))
       return heapStore(r, store, store.getPtr(), store.getArg(), guards, found);
     if (auto marker = dyn_cast<CopyMarkerOp>(op);
@@ -3135,6 +3249,7 @@ private:
     CallContext &context = contexts.emplace_back();
     callContexts[call] = &context;
     context.call = call;
+    context.opaque = isOpaque(call);
     context.callee =
         callee.getSymbol().getRootReference().getValue().split('(').first.str();
     for (auto [arg, operand] :
@@ -3155,7 +3270,12 @@ private:
       return;
     for (auto [result, returned] :
          llvm::zip(call->getResults(), ret->getOperands()))
-      callResults[result] = {&context, returned};
+      if (!context.opaque)
+        callResults[result] = {&context, returned};
+      else if (!context.args.count(returned))
+        // The body is not evaluated: the returned value is the call's result,
+        // which only the `ensures` constrain.
+        context.args[returned] = result;
     for (ObligationOp post : postconditions) {
       std::string cond =
           inContext(&context, [&] { return boolTerm(post.getCond()); });
@@ -3765,6 +3885,10 @@ struct BoundsCheckReportPass
     Encoder enc(&symbols);
     enc.annotate = explain || !dumpDir.empty();
     enc.lazyHeap = lazyHeap;
+    StringRef mode = modular.getValue();
+    enc.modular = mode == "all"         ? Encoder::Modular::All
+                  : mode == "contracts" ? Encoder::Modular::Contracts
+                                        : Encoder::Modular::Off;
     enc.encodeFunction(func);
     std::string dumpName = "f" + std::to_string(index);
     if (!allLoopInvariants)

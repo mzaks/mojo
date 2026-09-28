@@ -61,6 +61,10 @@ def BoundsCheckReport : Pass<"bounds-check-report", "ModuleOp"> {
            /*default=*/"false",
            "Infer invariants for every loop, not only for loops whose values "
            "an obligation's condition or reach depends on">,
+    Option<"modular", "modular", "std::string", /*default=*/"\"\"",
+           "Experimental: evaluate calls by their callee's contract only, "
+           "without its body: 'contracts' for callees with a contract "
+           "(requires/ensures), 'all' for every call">,
     Option<"dumpDir", "dump-dir", "std::string", /*default=*/"\"\"",
            "If set, keep the generated SMT-LIB scripts in this directory "
            "(annotated with the IR value each term stands for)">,
