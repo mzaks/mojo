@@ -763,6 +763,22 @@ CopyMarkerOp::parametric_interpret(ArrayRef<Attribute> operands,
 }
 
 //===----------------------------------------------------------------------===//
+// RequiresOp
+//===----------------------------------------------------------------------===//
+
+// Preconditions have no runtime semantics either: the region is not evaluated.
+ErrorTreeOrSuccess RequiresOp::interpret(ArrayRef<Attribute> operands,
+                                         InterpreterState &state) {
+  return state.mapResults({});
+}
+
+ErrorTreeOrSuccess
+RequiresOp::parametric_interpret(ArrayRef<Attribute> operands,
+                                 ParametricInterpreterState &state) {
+  return state.mapResults({});
+}
+
+//===----------------------------------------------------------------------===//
 // VariantCreateOp
 //===----------------------------------------------------------------------===//
 

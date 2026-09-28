@@ -164,6 +164,27 @@ void CopyMarkerOp::getEffects(
 }
 
 //===----------------------------------------------------------------------===//
+// RequiresOp
+//===----------------------------------------------------------------------===//
+
+// Same effects as `kgen.obligation`: kept alive, but no memory ordering. The
+// region is never executed, so its ops' effects do not count.
+void RequiresOp::getEffects(
+    SmallVectorImpl<mlir::MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                       ObligationResource::get());
+}
+
+LogicalResult RequiresOp::verify() {
+  Block &block = getBody().front();
+  if (block.getArgumentTypes() != getArgs().getTypes())
+    return emitOpError("region arguments must match the operand types");
+  if (!isa<ContractYieldOp>(block.getTerminator()))
+    return emitOpError("region must end in a 'kgen.contract.yield'");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // ParamMaterializeOp
 //===----------------------------------------------------------------------===//
 

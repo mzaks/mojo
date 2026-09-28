@@ -1425,6 +1425,75 @@ def KGEN_CopyMarkerOp : KGENOp<"copy_marker", [
 }
 
 //===----------------------------------------------------------------------===//
+// RequiresOp
+//===----------------------------------------------------------------------===//
+
+def KGEN_RequiresOp : KGENOp<"requires", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
+  let summary = "a precondition of the enclosing function";
+  let description = [{
+    The `kgen.requires` operation states a precondition of the function it is
+    written in, from a `where` clause on one of its arguments. `args` are the
+    function's arguments; the single block of `body` has an argument for each
+    of them and yields the condition with a `kgen.contract.yield`.
+
+    The condition is computed in its own region, over the region's block
+    arguments rather than the function's, so optimizing the function body
+    cannot fold it against the body. It has no runtime semantics: static
+    analyses (such as `bounds-check-report`) assume it in the function and
+    check it at every call, and lowering to LLVM erases it.
+
+    `line`, `col` and `fileName` are the location of the call to the function
+    (`kgen.source_loc[0]`). They only resolve once the function is inlined into
+    a caller, which is how analyses tell the function's own precondition from
+    an inlined callee's. `message` is the clause's optional failure message.
+
+    Like `kgen.obligation`, the op writes to a dedicated abstract resource so
+    that it is not removed as dead code, without acting as a barrier for memory
+    optimizations.
+
+    Example:
+    ```mlir
+    %line, %col, %file = kgen.source_loc[0]
+    kgen.requires(%xs, %i : !kgen.pointer<...>, !kgen.scalar<index>)
+        at(%line, %col, %file) : !kgen.string {
+    ^bb0(%a: !kgen.pointer<...>, %b: !kgen.scalar<index>):
+      ...
+      kgen.contract.yield %ok : !kgen.scalar<bool>
+    }
+    ```
+  }];
+
+  let arguments = (ins Variadic<AnyType>:$args, Index:$line, Index:$col,
+                       KGEN_StringType:$fileName,
+                       OptionalAttr<StrAttr>:$message);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = [{
+    `(` ($args^ `:` type($args))? `)`
+    `at` `(` $line `,` $col `,` $fileName `)` attr-dict `:` type($fileName)
+    $body
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ContractYieldOp
+//===----------------------------------------------------------------------===//
+
+def KGEN_ContractYieldOp : KGENOp<"contract.yield", [
+    Pure, Terminator, HasParent<"RequiresOp">]> {
+  let summary = "yields the condition of a contract";
+  let description = [{
+    Terminates the region of a `kgen.requires` with the condition it states.
+    It is not a control flow terminator: the region is never executed.
+  }];
+
+  let arguments = (ins BoolScalar:$cond);
+  let assemblyFormat = "$cond attr-dict `:` type($cond)";
+}
+
+//===----------------------------------------------------------------------===//
 // StructCreateOp
 //===----------------------------------------------------------------------===//
 

@@ -635,6 +635,9 @@ LogicalResult SCCPAnalysis::processRegion(Region &region,
       //  result as Unknown.
       for (Value result : op.getResults())
         setToEntryState(getLatticeElement(result, state));
+    } else if (isa<KGEN::RequiresOp>(op)) {
+      // A precondition's region is never executed, and has no results.
+      continue;
     } else if (op.getNumRegions() > 0) {
       for (Region &region : op.getRegions()) {
         AnalysisStateType nestedState = state;

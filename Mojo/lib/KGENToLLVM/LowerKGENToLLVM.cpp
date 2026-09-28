@@ -1076,6 +1076,19 @@ struct ConvertKGENCopyMarker : ConvertPOPToLLVMPattern<CopyMarkerOp> {
   }
 };
 
+/// Preconditions only feed static analyses too; their region is dropped with
+/// them.
+struct ConvertKGENRequires : ConvertPOPToLLVMPattern<RequiresOp> {
+  using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(RequiresOp op, RequiresOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct ConvertKGENSourceLoc : ConvertPOPToLLVMPattern<SourceLocOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
@@ -1233,6 +1246,7 @@ static void populateKGENToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
       ConvertKGENCall,
       ConvertKGENCopyMarker,
       ConvertKGENObligation,
+      ConvertKGENRequires,
       ConvertKGENSourceLoc,
       ConvertKGENStructCreate,
       ConvertKGENStructGEP,

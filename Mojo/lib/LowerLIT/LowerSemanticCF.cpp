@@ -799,6 +799,14 @@ void LowerSemanticCF::lowerBlock(Block &block, CodeEffects &effects) {
       continue;
     }
 
+    // A precondition's region computes its condition; it is never executed
+    // and does not affect the control flow around it.
+    if (auto requiresOp = dyn_cast<KGEN::RequiresOp>(op)) {
+      CodeEffects conditionEffects;
+      lowerBlock(requiresOp.getBody().front(), conditionEffects);
+      continue;
+    }
+
     // Ignore nested functions, they are handled (and lowered) separately by the
     // outer walker, which we are recursing within post-order.
     if (isa<LIT::FnOp>(op))
@@ -999,7 +1007,7 @@ void LowerSemanticCF::lowerBlock(Block &block, CodeEffects &effects) {
   // If we fell off the bottom, then we have a fall-through terminator.
   assert((isa<HLCF::YieldOp, HLCF::IfElifCondYieldOp, LIT::TryYieldOp,
               HLCF::ComptimeYieldOp, LIT::EndFnOp, CO::SuspendEndOp,
-              LIT::LoopYieldOp>(block.back())));
+              LIT::LoopYieldOp, KGEN::ContractYieldOp>(block.back())));
   effects.doesFallThrough = true;
 }
 
