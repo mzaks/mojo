@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# Preconditions written as `where` clauses on arguments, for
+# Contracts written as `where` clauses on arguments, for
 # `bounds-check-report`; see README.md and
 # Mojo/proposals/argument-contracts.md.
 
@@ -91,6 +91,99 @@ def ok_at_checked(xs: List[Int]) -> Int:
     return 0
 
 
+# --- Postconditions: clauses on `out` and `mut` arguments ---
+# Proven from the body, and assumed after calls.
+@inline(.never)
+def ok_make_two(out result: List[Int] where len(result) == 2):
+    result = List[Int]()
+    result.append(1)
+    result.append(2)
+
+
+@inline(.never)
+def ok_next(a: Int where a < 1000, out r: Int where r > a):
+    r = a + 1
+
+
+@inline(.never)
+def ok_push(mut xs: List[Int] where len(xs) == old(len(xs)) + 1, v: Int):
+    xs.append(v)
+
+
+# A clause only in terms of `old` is a precondition: `pop` needs it.
+@inline(.never)
+def ok_shrink(
+    mut xs: List[Int] where old(len(xs)) > 0 where len(xs) == old(len(xs)) - 1,
+):
+    _ = xs.pop()
+
+
+# Without `old`, a `mut` clause holds on entry and on exit.
+@inline(.never)
+def ok_keep(mut xs: List[Int] where len(xs) >= 1):
+    xs[0] = 5
+
+
+# The loop's effect on the length is not followed, so the body does not prove
+# the postcondition; callers still get it from the contract.
+@inline(.never)
+def limit_make(
+    n: Int where n >= 0, out result: List[Int] where len(result) == n
+):
+    result = List[Int](capacity=n)
+    for i in range(n):
+        result.append(i)
+
+
+# --- must stay UNPROVEN ---
+@inline(.never)
+def bad_push_twice(mut xs: List[Int] where len(xs) == old(len(xs)) + 2, v: Int):
+    xs.append(v)  # grows by one
+
+
+@inline(.never)
+def bad_keep_cleared(mut xs: List[Int] where len(xs) >= 1):
+    xs.clear()  # empty on exit
+
+
+@inline(.never)
+def bad_shrink_unchecked(mut xs: List[Int]):
+    ok_shrink(xs)  # xs may be empty
+
+
+@inline(.never)
+def bad_after_make() -> Int:
+    var xs = limit_make(3)
+    return xs[3]  # one past the end
+
+
+# --- must be PROVEN ---
+@inline(.never)
+def ok_after_make_two() -> Int:
+    var xs = ok_make_two()
+    return xs[1]
+
+
+@inline(.never)
+def ok_after_make() -> Int:
+    var xs = limit_make(3)
+    return xs[2]  # from the contract alone
+
+
+@inline(.never)
+def ok_after_push(mut xs: List[Int]) -> Int:
+    ok_push(xs, 7)
+    return xs[len(xs) - 1]
+
+
+@inline(.never)
+def ok_after_shrink(mut xs: List[Int]) -> Int:
+    if len(xs) > 1:
+        ok_shrink(xs)
+        return xs[0]
+    return 0
+
+
 def main():
     var xs: List[Int] = [1, 2, 3]
     print(
@@ -102,4 +195,14 @@ def main():
         ok_get_last(xs),
         ok_window_all(xs),
         ok_at_checked(xs),
+        ok_next(1),
+        bad_after_make(),
+        ok_after_make_two(),
+        ok_after_make(),
+        ok_after_push(xs),
+        ok_after_shrink(xs),
     )
+    bad_push_twice(xs, 1)
+    ok_keep(xs)
+    bad_keep_cleared(xs)
+    bad_shrink_unchecked(xs)

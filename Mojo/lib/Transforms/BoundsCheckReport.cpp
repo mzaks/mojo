@@ -317,6 +317,27 @@ bool isOwnRequires(RequiresOp op) {
   return op.getLine().getDefiningOp<SourceLocOp>() != nullptr;
 }
 
+/// Likewise for a `kgen.ensures`: unresolved, it is the postcondition of the
+/// function being analyzed, and holds after calls to it.
+bool isOwnEnsures(EnsuresOp op) {
+  return op.getLine().getDefiningOp<SourceLocOp>() != nullptr;
+}
+
+/// The ops whose regions compute a contract: never executed, they read their
+/// operands and write nothing.
+bool isContractOp(Operation *op) {
+  return isa<RequiresOp, EnsuresOp, OldOp>(op);
+}
+
+/// Whether `op` is inside the region of a contract op.
+bool isInContractRegion(Operation *op) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (isContractOp(parent))
+      return true;
+  return false;
+}
+
 struct ObligationInfo {
   ObligationOp op;
   /// What to report: usually taken from `op`, but a callee's precondition
@@ -1057,6 +1078,8 @@ private:
       if (Operation *def = value.getDefiningOp()) {
         if (auto ifOp = dyn_cast<HLCF::IfOp>(def))
           encodeIfResultOnDemand(ifOp, cast<OpResult>(value));
+        else if (auto oldOp = dyn_cast<OldOp>(def))
+          encodeOld(oldOp);
         else if (auto loop = dyn_cast<HLCF::LoopOp>(def)) {
           OpResult result = cast<OpResult>(value);
           if (lazyHeap)
@@ -1293,7 +1316,9 @@ private:
     auto arg = dyn_cast<BlockArgument>(ptr);
     // The region of a `kgen.requires` is evaluated like a callee whose
     // arguments are the op's operands.
-    return arg && isa<FuncOp, RequiresOp>(arg.getOwner()->getParentOp()) &&
+    return arg &&
+           isa<FuncOp, RequiresOp, EnsuresOp, OldOp>(
+               arg.getOwner()->getParentOp()) &&
            arg.getOwner()->isEntryBlock();
   }
 
@@ -1374,8 +1399,8 @@ private:
           if (argConvention(call, use.getOperandNumber()) ==
               ArgConvention::ImmMem)
             continue;
-        // A precondition only reads its operands, and is never executed.
-        if (isa<RequiresOp>(user))
+        // A contract only reads its operands, and is never executed.
+        if (isContractOp(user))
           continue;
         escapes.push_back(user);
       }
@@ -1425,8 +1450,8 @@ private:
   static bool mayWrite(Operation *op, const MemLoc &loc, bool nonEscaping) {
     return op
         ->walk([&](Operation *nested) {
-          // A precondition's region is never executed.
-          if (nested->getParentOfType<RequiresOp>())
+          // A contract's region is never executed.
+          if (isContractOp(nested) || isInContractRegion(nested))
             return WalkResult::advance();
           if (auto store = dyn_cast<POP::StoreOp>(nested)) {
             std::optional<MemLoc> target = memLocation(store.getPtr());
@@ -1541,7 +1566,7 @@ private:
         return std::nullopt;
       // Continue in the enclosing block, before the op containing `cur`.
       Operation *parent = cur->getParentOp();
-      if (parent && isa<RequiresOp>(parent))
+      if (parent && isContractOp(parent))
         return valueAtCall(place, depth);
       // The function's entry: the caller's value when evaluating a callee,
       // else one unknown per place, shared by every read that reaches it.
@@ -2241,7 +2266,8 @@ private:
   static bool writesNothing(Operation *op) {
     StringRef name = op->getName().getStringRef();
     return isa<POP::LoadOp, POP::StackAllocationOp, ObligationOp, AssumeOp,
-               CopyMarkerOp, RequiresOp, ContractYieldOp>(op) ||
+               CopyMarkerOp, RequiresOp, EnsuresOp, OldOp, ContractYieldOp>(
+               op) ||
            name == "pop.stack_alloc.lifetime.start" ||
            name == "pop.stack_alloc.lifetime.end" ||
            // Reading freed memory is undefined behavior, which the analysis
@@ -2260,7 +2286,7 @@ private:
   bool heapMayWrite(Operation *op) {
     return op
         ->walk([&](Operation *nested) {
-          if (nested->getParentOfType<RequiresOp>())
+          if (isContractOp(nested) || isInContractRegion(nested))
             return WalkResult::advance();
           if (auto store = dyn_cast<POP::StoreOp>(nested))
             return isStackAddress(store.getPtr()) ? WalkResult::advance()
@@ -2372,7 +2398,7 @@ private:
       Operation *parent = cur->getParentOp();
       if (!parent)
         return std::nullopt;
-      if (isa<FuncOp, RequiresOp>(parent)) {
+      if (isa<FuncOp>(parent) || isContractOp(parent)) {
         // A callee's entry: continue in the caller, before the call.
         if (ctx && ctx->call) {
           CallContext *callee = ctx;
@@ -3236,12 +3262,34 @@ private:
       addAssumption(reachName(reach), cond);
       return reach;
     }
+    if (auto oldOp = dyn_cast<OldOp>(op)) {
+      std::string facts = encodeOld(oldOp);
+      if (facts != "true")
+        addAssumption(reachName(reach), facts);
+      return reach;
+    }
+    if (auto ensuresOp = dyn_cast<EnsuresOp>(op)) {
+      // A postcondition is checked where the function returns, whether it is
+      // the function's own or an inlined callee's; reported at the clause.
+      std::string r = reachName(reach);
+      std::string cond = contractCondition(ensuresOp, ensuresOp.getArgs(), ctx,
+                                           /*toAssume=*/false);
+      obligations.push_back(
+          {ObligationOp(), "ensures", locationOf(ensuresOp.getLoc()), r, cond,
+           assumedLoops(),
+           SmallVector<std::pair<std::string, std::string>>(activeObligations),
+           assumed});
+      activeObligations.push_back({r, cond});
+      return reach;
+    }
     if (auto requiresOp = dyn_cast<RequiresOp>(op)) {
       // The function's own precondition is assumed; an inlined callee's is
       // checked, and reported at the call.
       std::string r = reachName(reach);
-      std::string cond = requiresCondition(requiresOp, ctx);
-      if (isOwnRequires(requiresOp)) {
+      bool own = isOwnRequires(requiresOp);
+      std::string cond = contractCondition(requiresOp, requiresOp.getArgs(),
+                                           ctx, /*toAssume=*/own);
+      if (own) {
         addAssumption(r, cond);
         return reach;
       }
@@ -3284,22 +3332,61 @@ private:
     return reach;
   }
 
-  /// The condition of a `kgen.requires`, evaluated like a callee: the region's
-  /// block arguments are the op's operands, which are values of `owner` (the
-  /// context the op is evaluated in), and memory is read as it is just before
-  /// the op.
-  std::string requiresCondition(RequiresOp op, CallContext *owner) {
+  /// The region of a contract op, evaluated like a callee: its block arguments
+  /// are the op's operands, which are values of `owner` (the context the op is
+  /// evaluated in), and memory is read as it is just before the op.
+  CallContext &contractContext(Operation *op, ValueRange operands,
+                               CallContext *owner) {
     CallContext &context = contexts.emplace_back();
-    context.callee = "precondition";
+    context.callee = "contract";
     context.parent = owner;
     context.depth = owner ? owner->depth + 1 : 1;
     context.call = op;
-    Block &block = op.getBody().front();
-    for (auto [arg, operand] : llvm::zip(block.getArguments(), op.getArgs()))
+    Block &block = op->getRegion(0).front();
+    for (auto [arg, operand] : llvm::zip(block.getArguments(), operands))
       context.args[arg] = operand;
-    auto yield = cast<ContractYieldOp>(block.getTerminator());
-    return inContext(&context,
-                     [&] { return boolTerm(yield.getValues().front()); });
+    return context;
+  }
+
+  /// The `kgen.assume`s in a contract's region, such as the type invariants
+  /// of the accessors it calls, evaluated in its context.
+  std::string contractFacts(Operation *op, CallContext &context) {
+    std::string facts = "true";
+    op->getRegion(0).walk([&](AssumeOp assume) {
+      facts = mkAnd(facts, inContext(&context, [&] {
+                      return boolTerm(assume.getCond());
+                    }));
+    });
+    return facts;
+  }
+
+  /// The condition of a `kgen.requires` or `kgen.ensures`: to prove, the
+  /// condition given its region's trusted facts; to assume, both.
+  std::string contractCondition(Operation *op, ValueRange operands,
+                                CallContext *owner, bool toAssume) {
+    CallContext &context = contractContext(op, operands, owner);
+    auto yield =
+        cast<ContractYieldOp>(op->getRegion(0).front().getTerminator());
+    std::string cond = inContext(
+        &context, [&] { return boolTerm(yield.getValues().front()); });
+    std::string facts = contractFacts(op, context);
+    if (facts == "true")
+      return cond;
+    return toAssume ? mkAnd(facts, cond) : "(=> " + facts + " " + cond + ")";
+  }
+
+  /// The values on entry of a `kgen.old`, as the terms of its results in the
+  /// current context. Returns the trusted facts of its region.
+  std::string encodeOld(OldOp op) {
+    CallContext &context = contractContext(op, op.getArgs(), ctx);
+    auto yield = cast<ContractYieldOp>(op.getBody().front().getTerminator());
+    for (auto [result, yielded] :
+         llvm::zip(op.getValues(), yield.getValues())) {
+      MaybeTerm t = inContext(&context, [&] { return term(yielded); });
+      if (t)
+        termMap()[result] = *t;
+    }
+    return contractFacts(op, context);
   }
 
   /// Apply the contract of a (non-inlined) callee at a call to it: its
@@ -3321,6 +3408,7 @@ private:
       return;
     SmallVector<ObligationOp> preconditions, postconditions;
     SmallVector<RequiresOp> requirements;
+    SmallVector<EnsuresOp> guarantees;
     for (Operation &op : entry)
       if (auto ob = dyn_cast<ObligationOp>(&op)) {
         if (isOwnPrecondition(ob))
@@ -3330,6 +3418,9 @@ private:
       } else if (auto requiresOp = dyn_cast<RequiresOp>(&op)) {
         if (isOwnRequires(requiresOp))
           requirements.push_back(requiresOp);
+      } else if (auto ensuresOp = dyn_cast<EnsuresOp>(&op)) {
+        if (isOwnEnsures(ensuresOp))
+          guarantees.push_back(ensuresOp);
       }
     // A postcondition must hold on every normal exit: require exactly one
     // return, at the end of the entry block, preceded by the `ensures`.
@@ -3339,8 +3430,10 @@ private:
         !fn->walk([&](HLCF::ReturnOp r) {
              return r == ret ? WalkResult::advance() : WalkResult::interrupt();
            }).wasInterrupted();
-    if (!singleReturn)
+    if (!singleReturn) {
       postconditions.clear();
+      guarantees.clear();
+    }
     // With a single return, the call's results are the callee's returned
     // values even without contracts; they are evaluated on demand.
     if (preconditions.empty() && requirements.empty() && !singleReturn)
@@ -3367,7 +3460,8 @@ private:
       ++contractsUsed;
     }
     for (RequiresOp requiresOp : requirements) {
-      std::string cond = requiresCondition(requiresOp, &context);
+      std::string cond = contractCondition(requiresOp, requiresOp.getArgs(),
+                                           &context, /*toAssume=*/false);
       obligations.push_back(
           {ObligationOp(), "requires", locationOf(call.getLoc()), r, cond,
            assumedLoops(),
@@ -3392,6 +3486,25 @@ private:
       addAssumption(r, cond);
       ++contractsUsed;
     }
+    // A `where` postcondition, evaluated in the callee's context just before
+    // its return: its operands (the callee's arguments, result and `kgen.old`
+    // values) are the call's.
+    for (EnsuresOp ensuresOp : guarantees) {
+      std::string cond = contractCondition(ensuresOp, ensuresOp.getArgs(),
+                                           &context, /*toAssume=*/true);
+      addAssumption(r, cond);
+      ++contractsUsed;
+    }
+    // The trusted facts of the values on entry they use hold too.
+    if (!guarantees.empty())
+      for (Operation &op : entry)
+        if (auto oldOp = dyn_cast<OldOp>(&op)) {
+          CallContext &oldContext =
+              contractContext(oldOp, oldOp.getArgs(), &context);
+          std::string facts = contractFacts(oldOp, oldContext);
+          if (facts != "true")
+            addAssumption(r, facts);
+        }
   }
 
   /// Bind `results` to the values yielded by the arms that fall through.
@@ -4095,9 +4208,12 @@ struct BoundsCheckReportPass
     auto hasWork = [&](Operation *op) {
       if (isa<ObligationOp>(op))
         return true;
-      // An inlined callee's precondition is checked here.
+      // An inlined callee's precondition is checked here, and every
+      // postcondition where it holds.
       if (auto requiresOp = dyn_cast<RequiresOp>(op))
         return !isOwnRequires(requiresOp);
+      if (isa<EnsuresOp>(op))
+        return true;
       auto call = dyn_cast<CallOp>(op);
       auto callee =
           call ? dyn_cast<SymbolConstantAttr>(call.getCallee()) : nullptr;

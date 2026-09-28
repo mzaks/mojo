@@ -128,7 +128,7 @@ the first, so each access counts once.
 | `memory.mojo`        | all `bad_*` and `limit_*` | all `ok_*`, `Bag.ok_get`                       |
 | `unrolling.mojo`     | all `bad_*` and `limit_*` | all `ok_*`                                     |
 | `tensor.mojo`        | all `bad_*` and `limit_*` | all `ok_*`, `Tensor2D.load`/`store`            |
-| `where_clauses.mojo` | all `bad_*`               | all `ok_*`                                     |
+| `where_clauses.mojo` | all `bad_*` and `limit_*` | all `ok_*`                                     |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -156,8 +156,25 @@ assumes it in the function (`ok_get` and `ok_window` prove their indices from
 it), checks it at every call to a function that is not inlined (reported as a
 `requires` at the call: `bad_get_unchecked`, `bad_get_past_end`,
 `bad_window_swapped`), and checks an inlined function's clause where it was
-inlined (`ok_at`, `bad_at_unchecked`). Clauses are only supported on `imm`,
-`var` and owned arguments so far.
+inlined (`ok_at`, `bad_at_unchecked`).
+
+A clause on an `out` or `mut` argument is a postcondition: a `kgen.ensures`
+before every return, proven there (`ok_make_two`, `ok_next`, `ok_push`;
+`bad_push_twice` and `bad_keep_cleared` break theirs) and assumed after calls
+(`ok_after_make_two`, `ok_after_push`). `old(e)` is `e` on entry, computed by a
+`kgen.old` at the start of the function. On a `mut` argument, a clause without
+`old` holds on entry and on exit (`ok_keep`), and one written only in terms of
+`old` is a precondition (`ok_shrink`, whose `pop` needs `old(len(xs)) > 0`;
+`bad_shrink_unchecked` calls it without the check). `limit_make` fills its
+result in a loop whose effect on the length the analysis does not follow, so
+its own postcondition stays unproven, but callers still get it from the
+contract (`ok_after_make`, `bad_after_make`). Postconditions are only assumed
+after calls to callees with a single return.
+
+A caller's proofs are conditional on its callees' contracts: after a call to a
+callee that breaks its postcondition, the callee's body and its contract
+contradict each other, and the rest of the caller is unreachable (`main` calls
+`bad_keep_cleared`). The broken postcondition is reported in the callee.
 
 `slicing.mojo` covers the length contracts of `List.extend(Span)` (used by
 `List.copy()`), of the `List` constructor from an iterable (for iterators with
