@@ -63,6 +63,7 @@
 #include "llvm/Support/Program.h"
 
 #include <deque>
+#include <functional>
 #include <map>
 #include <set>
 
@@ -364,6 +365,74 @@ public:
     return result;
   }
 
+  /// The names `exprs` transitively depend on: through definitions, and
+  /// through the global assertions that constrain a name (e.g. the
+  /// implications defining a merged value).
+  llvm::StringSet<> cone(ArrayRef<std::string> exprs) const {
+    llvm::StringSet<> seen;
+    llvm::DenseSet<size_t> assertsSeen;
+    SmallVector<std::string> worklist;
+    for (const std::string &expr : exprs)
+      for (std::string &name : namesIn(expr))
+        worklist.push_back(std::move(name));
+    while (!worklist.empty()) {
+      std::string name = worklist.pop_back_val();
+      if (!seen.insert(name).second)
+        continue;
+      if (auto it = deps.find(name); it != deps.end())
+        worklist.append(it->second.begin(), it->second.end());
+      if (auto it = assertsMentioning.find(name); it != assertsMentioning.end())
+        for (size_t k : it->second)
+          if (assertsSeen.insert(k).second)
+            worklist.append(globalAssertNames[k].begin(),
+                            globalAssertNames[k].end());
+    }
+    return seen;
+  }
+
+  /// With `lazyHeap`, the expensive values are not computed while encoding:
+  /// heap loads (a backward search through stores, callees and loops) and
+  /// loop results in callee and iteration contexts (unrolling). Each gets a
+  /// fresh name, which `resolvePending` defines later for the obligations
+  /// that need it. Leaving a value unknown is sound; defining it only adds
+  /// precision.
+  bool lazyHeap = false;
+
+  /// Resolve the pending values in the cone of `exprs`, including those the
+  /// resolved values themselves use, until none is left. Returns how many
+  /// were resolved.
+  unsigned resolvePending(ArrayRef<std::string> exprs) {
+    unsigned total = 0;
+    for (unsigned pass = 0; pass < 64; ++pass) {
+      llvm::StringSet<> names = cone(exprs);
+      unsigned resolved = 0;
+      for (size_t i = 0; i < pending.size(); ++i) {
+        if (pending[i].resolved || !names.contains(pending[i].name))
+          continue;
+        pending[i].resolved = true;
+        ++resolved;
+        // Copy: resolving may add pending values and grow the vector.
+        std::string name = pending[i].name;
+        CallContext *context = pending[i].context;
+        std::function<MaybeTerm()> compute = pending[i].compute;
+        CallContext *saved = ctx;
+        ctx = context;
+        MaybeTerm value = compute();
+        ctx = saved;
+        if (!value)
+          continue;
+        assertGlobal("(= " + name + " " + *value + ")");
+        // Now defined: `explain` looks through it.
+        deps[name] = namesIn(*value);
+        unknowns.erase(name);
+      }
+      total += resolved;
+      if (!resolved)
+        break;
+    }
+    return total;
+  }
+
   void encodeFunction(FuncOp func) {
     self = func;
     // Name the function in the script, for `dump-dir` debugging.
@@ -378,6 +447,33 @@ private:
   FuncOp self;
   llvm::StringMap<std::string> unknowns;
   llvm::StringMap<SmallVector<std::string>> deps;
+
+  struct CallContext;
+  struct Pending {
+    std::string name;
+    CallContext *context;
+    std::function<MaybeTerm()> compute;
+    bool resolved = false;
+  };
+  std::vector<Pending> pending;
+  std::map<std::tuple<Operation *, CallContext *, std::string>, std::string>
+      pendingByKey;
+
+  /// A fresh name for a value `compute` gives in the current context,
+  /// computed only if an unproven obligation turns out to need it.
+  std::string pendingValue(Operation *op, StringRef key, Sort sort,
+                           StringRef what, Value value,
+                           std::function<MaybeTerm()> compute) {
+    auto [it, inserted] =
+        pendingByKey.try_emplace({op, ctx, (key + sort.str()).str()}, "");
+    if (!inserted)
+      return it->second;
+    it->second = declare(sort);
+    noteUnknown(it->second,
+                (what + " (not needed so far) ").str() + describe(value));
+    pending.push_back({it->second, ctx, std::move(compute), false});
+    return it->second;
+  }
 
   /// The names of terms (`h12`, `v3`, `r7`, `a9`) used in an SMT expression.
   static SmallVector<std::string> namesIn(StringRef expr) {
@@ -831,8 +927,7 @@ private:
     prelude +=
         ("(define-fun " + name + " () " + sort.str() + " " + expr + ")\n")
             .str();
-    if (annotate)
-      deps[name] = namesIn(expr);
+    deps[name] = namesIn(expr);
     return name;
   }
 
@@ -847,7 +942,13 @@ private:
   /// assignment can satisfy. Facts go through `addAssumption`.
   void assertGlobal(StringRef expr) {
     prelude += ("(assert " + expr + ")\n").str();
+    size_t k = globalAssertNames.size();
+    globalAssertNames.push_back(namesIn(expr));
+    for (const std::string &name : globalAssertNames.back())
+      assertsMentioning[name].push_back(k);
   }
+  std::vector<SmallVector<std::string>> globalAssertNames;
+  llvm::StringMap<SmallVector<size_t>> assertsMentioning;
 
   /// The conjunction of assumptions (`kgen.assume`, callee `ensures`) made so
   /// far, in program order. A check may only use the assumptions made before
@@ -896,7 +997,14 @@ private:
         if (auto ifOp = dyn_cast<HLCF::IfOp>(def))
           encodeIfResultOnDemand(ifOp, cast<OpResult>(value));
         else if (auto loop = dyn_cast<HLCF::LoopOp>(def)) {
-          if (MaybeTerm t = loopResultTerm(loop, cast<OpResult>(value)))
+          OpResult result = cast<OpResult>(value);
+          if (lazyHeap)
+            map[value] =
+                pendingValue(loop, std::to_string(result.getResultNumber()),
+                             sort, "loop result", value, [this, loop, result] {
+                               return loopResultTerm(loop, result);
+                             });
+          else if (MaybeTerm t = loopResultTerm(loop, result))
             map[value] = *t;
         } else
           encodeOp(def);
@@ -1312,8 +1420,19 @@ private:
     if (!loadOp)
       return std::nullopt;
     std::optional<MemLoc> loc = memLocation(loadOp.getPtr());
-    if (!loc)
+    if (!loc) {
+      if (lazyHeap && !isStackAddress(loadOp.getPtr())) {
+        std::string key;
+        for (int step : access)
+          key += std::to_string(step) + ".";
+        SmallVector<int> path(access);
+        return pendingValue(loadOp, key, sort, "heap load", loadOp.getResult(),
+                            [this, loadOp, path, sort] {
+                              return heapLoadTerm(loadOp, path, sort);
+                            });
+      }
       return heapLoadTerm(loadOp, access, sort);
+    }
     // Loading a struct and taking a field of it reads the same as loading
     // that field: move leading field accesses into the place, so stores that
     // built the struct field by field are found.
@@ -3551,24 +3670,22 @@ struct BoundsCheckReportPass
 
   /// Encode one function, infer its loop invariants and check its
   /// obligations. Only reads the IR, so functions can run in parallel.
-  FunctionReport analyzeFunction(FuncOp func, unsigned index,
-                                 const mlir::SymbolTable &symbols) const {
-    FunctionReport report;
-    report.name = func.getSymName();
-    Encoder enc(&symbols);
-    enc.annotate = explain || !dumpDir.empty();
-    enc.encodeFunction(func);
-    std::string dumpName = "f" + std::to_string(index);
-    bool solverOk = inferInvariants(enc, dumpName);
+  struct Outcome {
+    Status status = Status::SolverFailed;
+    SmallVector<std::string> unknowns;
+  };
 
-    // Three queries per obligation: is it reachable at all (guards against
-    // vacuous proofs), is it provable on its own, and with earlier ones.
-    // With `explain`, the second query also asks for a counterexample: the
-    // values of the unknowns the condition depends on.
+  /// Three queries per obligation: is it reachable at all (guards against
+  /// vacuous proofs), is it provable on its own, and with earlier ones.
+  /// With `explain`, the second query also asks for a counterexample: the
+  /// values of the unknowns the condition depends on.
+  std::vector<Outcome> checkObligations(Encoder &enc, ArrayRef<size_t> which,
+                                        StringRef dumpName) const {
     constexpr size_t kMaxShown = 8;
     std::vector<SmallVector<std::pair<std::string, std::string>>> inputs;
     QueryBatch batch = newBatch();
-    for (ObligationInfo &ob : enc.obligations) {
+    for (size_t i : which) {
+      ObligationInfo &ob = enc.obligations[i];
       SmallVector<std::string> assume = invariantsOf(ob.enclosing);
       assume.push_back(ob.reach);
       assume.push_back(ob.assumed);
@@ -3586,39 +3703,107 @@ struct BoundsCheckReportPass
         assume.push_back("(=> " + reach + " " + cond + ")");
       batch.add(assume, mkNot(ob.cond));
     }
-    std::optional<std::vector<Reply>> replies;
-    if (solverOk)
-      replies = runZ3(z3,
-                      header() + enc.prelude + invariantDefinitions(enc.loops) +
-                          batch.text,
-                      batch.count, dumpDir, dumpName + ".obligations");
-    report.solverFailed = !replies;
-    report.contractsUsed = enc.contractsUsed;
-
-    for (auto [i, ob] : llvm::enumerate(enc.obligations)) {
-      Status status = Status::SolverFailed;
-      if (replies) {
-        if ((*replies)[3 * i].answer == Answer::Unsat)
-          status = Status::Unreachable;
-        else if ((*replies)[3 * i + 1].answer == Answer::Unsat)
-          status = Status::Proven;
-        else if (!ob.earlier.empty() &&
-                 (*replies)[3 * i + 2].answer == Answer::Unsat)
-          status = Status::Implied;
-        else
-          status = Status::Unproven;
-      }
-      SmallVector<std::string> unknowns;
-      if (explain && status == Status::Unproven)
-        for (auto &[name, description] : inputs[i]) {
+    std::vector<Outcome> outcomes(which.size());
+    std::optional<std::vector<Reply>> replies = runZ3(
+        z3,
+        header() + enc.prelude + invariantDefinitions(enc.loops) + batch.text,
+        batch.count, dumpDir, dumpName);
+    if (!replies)
+      return outcomes;
+    for (auto [k, i] : llvm::enumerate(which)) {
+      ObligationInfo &ob = enc.obligations[i];
+      Outcome &out = outcomes[k];
+      if ((*replies)[3 * k].answer == Answer::Unsat)
+        out.status = Status::Unreachable;
+      else if ((*replies)[3 * k + 1].answer == Answer::Unsat)
+        out.status = Status::Proven;
+      else if (!ob.earlier.empty() &&
+               (*replies)[3 * k + 2].answer == Answer::Unsat)
+        out.status = Status::Implied;
+      else
+        out.status = Status::Unproven;
+      if (explain && out.status == Status::Unproven)
+        for (auto &[name, description] : inputs[k]) {
           std::string line = description;
           if (std::optional<std::string> value =
-                  modelValue((*replies)[3 * i + 1].text, name))
+                  modelValue((*replies)[3 * k + 1].text, name))
             line += "  (= " + *value + " in a counterexample)";
-          unknowns.push_back(line);
+          out.unknowns.push_back(line);
         }
-      report.results.push_back({ob.kind, ob.location, status, unknowns});
     }
+    return outcomes;
+  }
+
+  FunctionReport analyzeFunction(FuncOp func, unsigned index,
+                                 const mlir::SymbolTable &symbols) const {
+    FunctionReport report;
+    report.name = func.getSymName();
+    Encoder enc(&symbols);
+    enc.annotate = explain || !dumpDir.empty();
+    enc.lazyHeap = lazyHeap;
+    enc.encodeFunction(func);
+    std::string dumpName = "f" + std::to_string(index);
+    bool solverOk = inferInvariants(enc, dumpName);
+
+    std::vector<size_t> all;
+    for (size_t i = 0; i < enc.obligations.size(); ++i)
+      all.push_back(i);
+    std::vector<Outcome> outcomes(all.size());
+    if (solverOk)
+      outcomes = checkObligations(enc, all, dumpName + ".obligations");
+
+    // Heap loads left unknown may be what an obligation needs: resolve the
+    // ones its condition reads (level 1), then the ones its reach and
+    // assumptions read too (level 2), and check again. Resolving only adds
+    // facts, so a result can only improve.
+    auto rank = [](Status s) {
+      switch (s) {
+      case Status::Unreachable:
+      case Status::Proven:
+        return 3;
+      case Status::Implied:
+        return 2;
+      case Status::Unproven:
+        return 1;
+      default:
+        return 0;
+      }
+    };
+    for (unsigned level = 1; solverOk && lazyHeap && level <= 2; ++level) {
+      std::vector<size_t> todo;
+      SmallVector<std::string> roots;
+      for (size_t i : all) {
+        if (rank(outcomes[i].status) >= 3)
+          continue;
+        todo.push_back(i);
+        ObligationInfo &ob = enc.obligations[i];
+        roots.push_back(ob.cond);
+        if (level == 2) {
+          roots.push_back(ob.reach);
+          roots.push_back(ob.assumed);
+          for (auto &[reach, cond] : ob.earlier) {
+            roots.push_back(reach);
+            roots.push_back(cond);
+          }
+        }
+      }
+      if (todo.empty() || !enc.resolvePending(roots))
+        continue;
+      std::vector<Outcome> again = checkObligations(
+          enc, todo, dumpName + ".obligations" + std::to_string(level));
+      for (auto [k, i] : llvm::enumerate(todo))
+        if (rank(again[k].status) >= rank(outcomes[i].status))
+          outcomes[i] = std::move(again[k]);
+    }
+
+    report.solverFailed =
+        !solverOk || llvm::any_of(outcomes, [](const Outcome &o) {
+          return o.status == Status::SolverFailed;
+        });
+    report.contractsUsed = enc.contractsUsed;
+    for (auto [i, ob] : llvm::enumerate(enc.obligations))
+      report.results.push_back(
+          {ob.kind, ob.location, outcomes[i].status, outcomes[i].unknowns});
     return report;
   }
 

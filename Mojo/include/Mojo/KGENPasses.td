@@ -53,6 +53,10 @@ def BoundsCheckReport : Pass<"bounds-check-report", "ModuleOp"> {
            "Path to the z3 executable (default: search PATH)">,
     Option<"timeoutMs", "timeout-ms", "unsigned", /*default=*/"2000",
            "Solver timeout per query in milliseconds">,
+    Option<"lazyHeap", "lazy-heap", "bool", /*default=*/"true",
+           "Resolve heap loads only for the obligations that stay unproven "
+           "without them (by their condition, then their reach and "
+           "assumptions)">,
     Option<"dumpDir", "dump-dir", "std::string", /*default=*/"\"\"",
            "If set, keep the generated SMT-LIB scripts in this directory "
            "(annotated with the IR value each term stands for)">,
