@@ -260,14 +260,20 @@ struct ObligationLocation {
   int64_t line = 0, col = 0;
 };
 
-std::optional<ObligationLocation> getObligationLocation(ObligationOp op) {
+/// A source location given as constant line, column and file operands.
+std::optional<ObligationLocation>
+constantLocation(Value lineValue, Value colValue, Value fileValue) {
   IntegerAttr line, col;
   StringAttr file;
-  if (!mlir::matchPattern(op.getLine(), mlir::m_Constant(&line)) ||
-      !mlir::matchPattern(op.getCol(), mlir::m_Constant(&col)) ||
-      !mlir::matchPattern(op.getFileName(), mlir::m_Constant(&file)))
+  if (!mlir::matchPattern(lineValue, mlir::m_Constant(&line)) ||
+      !mlir::matchPattern(colValue, mlir::m_Constant(&col)) ||
+      !mlir::matchPattern(fileValue, mlir::m_Constant(&file)))
     return std::nullopt;
   return ObligationLocation{file.getValue(), line.getInt(), col.getInt()};
+}
+
+std::optional<ObligationLocation> getObligationLocation(ObligationOp op) {
+  return constantLocation(op.getLine(), op.getCol(), op.getFileName());
 }
 
 StringRef getObligationKind(ObligationOp op) {
@@ -303,6 +309,12 @@ std::optional<ObligationLocation> locationOf(Location loc) {
 bool isOwnPrecondition(ObligationOp op) {
   return getObligationKind(op) == "requires" &&
          op.getLine().getDefiningOp<SourceLocOp>();
+}
+
+/// The same for a `kgen.requires` from a `where` clause: its location is the
+/// call to the function it was written in.
+bool isOwnRequires(RequiresOp op) {
+  return op.getLine().getDefiningOp<SourceLocOp>() != nullptr;
 }
 
 struct ObligationInfo {
@@ -1279,7 +1291,9 @@ private:
   /// slot.
   static bool isEntryArgument(Value ptr) {
     auto arg = dyn_cast<BlockArgument>(ptr);
-    return arg && isa<FuncOp>(arg.getOwner()->getParentOp()) &&
+    // The region of a `kgen.requires` is evaluated like a callee whose
+    // arguments are the op's operands.
+    return arg && isa<FuncOp, RequiresOp>(arg.getOwner()->getParentOp()) &&
            arg.getOwner()->isEntryBlock();
   }
 
@@ -1303,7 +1317,9 @@ private:
     if (!isEntryArgument(ptr))
       return false;
     auto arg = cast<BlockArgument>(ptr);
-    auto func = cast<FuncOp>(arg.getOwner()->getParentOp());
+    auto func = dyn_cast<FuncOp>(arg.getOwner()->getParentOp());
+    if (!func)
+      return false;
     ArrayRef<ArgConvention> convs =
         func.getFuncTypeGenerator().getBody().getArgConventions();
     return arg.getArgNumber() < convs.size() &&
@@ -1358,6 +1374,9 @@ private:
           if (argConvention(call, use.getOperandNumber()) ==
               ArgConvention::ImmMem)
             continue;
+        // A precondition only reads its operands, and is never executed.
+        if (isa<RequiresOp>(user))
+          continue;
         escapes.push_back(user);
       }
     }
@@ -1406,6 +1425,9 @@ private:
   static bool mayWrite(Operation *op, const MemLoc &loc, bool nonEscaping) {
     return op
         ->walk([&](Operation *nested) {
+          // A precondition's region is never executed.
+          if (nested->getParentOfType<RequiresOp>())
+            return WalkResult::advance();
           if (auto store = dyn_cast<POP::StoreOp>(nested)) {
             std::optional<MemLoc> target = memLocation(store.getPtr());
             if (!target)
@@ -1426,7 +1448,7 @@ private:
             return WalkResult::advance();
           if (nonEscaping || nested->getNumRegions() ||
               isa<POP::LoadOp, POP::StackAllocationOp, ObligationOp, AssumeOp,
-                  CopyMarkerOp>(nested) ||
+                  CopyMarkerOp, ContractYieldOp>(nested) ||
               mlir::isMemoryEffectFree(nested))
             return WalkResult::advance();
           return WalkResult::interrupt();
@@ -1519,8 +1541,12 @@ private:
         return std::nullopt;
       // Continue in the enclosing block, before the op containing `cur`.
       Operation *parent = cur->getParentOp();
-      if (parent && isa<FuncOp>(parent))
+      if (parent && isa<RequiresOp>(parent))
         return valueAtCall(place, depth);
+      // The function's entry: the caller's value when evaluating a callee,
+      // else one unknown per place, shared by every read that reaches it.
+      if (parent && isa<FuncOp>(parent))
+        return valueAtEntry(place, depth);
       if (!parent)
         return std::nullopt;
       if (auto ifOp = dyn_cast<HLCF::IfOp>(parent)) {
@@ -2190,7 +2216,7 @@ private:
   static bool writesNothing(Operation *op) {
     StringRef name = op->getName().getStringRef();
     return isa<POP::LoadOp, POP::StackAllocationOp, ObligationOp, AssumeOp,
-               CopyMarkerOp>(op) ||
+               CopyMarkerOp, RequiresOp, ContractYieldOp>(op) ||
            name == "pop.stack_alloc.lifetime.start" ||
            name == "pop.stack_alloc.lifetime.end" ||
            // Reading freed memory is undefined behavior, which the analysis
@@ -2209,6 +2235,8 @@ private:
   bool heapMayWrite(Operation *op) {
     return op
         ->walk([&](Operation *nested) {
+          if (nested->getParentOfType<RequiresOp>())
+            return WalkResult::advance();
           if (auto store = dyn_cast<POP::StoreOp>(nested))
             return isStackAddress(store.getPtr()) ? WalkResult::advance()
                                                   : WalkResult::interrupt();
@@ -2277,6 +2305,7 @@ private:
   }
   std::map<std::tuple<Operation *, CallContext *, std::string>, MaybeTerm>
       heapMemo;
+  std::map<std::string, std::string> entryHeapValues;
 
   enum class HeapStep { Skip, Found, Fail };
 
@@ -2318,7 +2347,7 @@ private:
       Operation *parent = cur->getParentOp();
       if (!parent)
         return std::nullopt;
-      if (isa<FuncOp>(parent)) {
+      if (isa<FuncOp, RequiresOp>(parent)) {
         // A callee's entry: continue in the caller, before the call.
         if (ctx && ctx->call) {
           CallContext *callee = ctx;
@@ -2326,7 +2355,12 @@ private:
             return heapValueBefore(r.withoutFacts(), callee->call, depth + 1);
           });
         }
-        return heapUnknown(r, "at the entry of", parent);
+        // The function's own entry: one memory state, so every read of the
+        // same address there reads the same unknown.
+        auto [it, inserted] = entryHeapValues.try_emplace(heapKey(r), "");
+        if (inserted)
+          it->second = heapUnknown(r, "at the entry of", parent);
+        return it->second;
       }
       if (auto ifOp = dyn_cast<HLCF::IfOp>(parent)) {
         // Leaving an arm: the value before the `if`, unless an elif
@@ -3177,6 +3211,25 @@ private:
       addAssumption(reachName(reach), cond);
       return reach;
     }
+    if (auto requiresOp = dyn_cast<RequiresOp>(op)) {
+      // The function's own precondition is assumed; an inlined callee's is
+      // checked, and reported at the call.
+      std::string r = reachName(reach);
+      std::string cond = requiresCondition(requiresOp, ctx);
+      if (isOwnRequires(requiresOp)) {
+        addAssumption(r, cond);
+        return reach;
+      }
+      obligations.push_back(
+          {ObligationOp(), "requires",
+           constantLocation(requiresOp.getLine(), requiresOp.getCol(),
+                            requiresOp.getFileName()),
+           r, cond, assumedLoops(),
+           SmallVector<std::pair<std::string, std::string>>(activeObligations),
+           assumed});
+      activeObligations.push_back({r, cond});
+      return reach;
+    }
     if (auto call = dyn_cast<CallOp>(op)) {
       instantiateContracts(call, reach);
       if (isAllocation(call))
@@ -3206,6 +3259,23 @@ private:
     return reach;
   }
 
+  /// The condition of a `kgen.requires`, evaluated like a callee: the region's
+  /// block arguments are the op's operands, which are values of `owner` (the
+  /// context the op is evaluated in), and memory is read as it is just before
+  /// the op.
+  std::string requiresCondition(RequiresOp op, CallContext *owner) {
+    CallContext &context = contexts.emplace_back();
+    context.callee = "precondition";
+    context.parent = owner;
+    context.depth = owner ? owner->depth + 1 : 1;
+    context.call = op;
+    Block &block = op.getBody().front();
+    for (auto [arg, operand] : llvm::zip(block.getArguments(), op.getArgs()))
+      context.args[arg] = operand;
+    auto yield = cast<ContractYieldOp>(block.getTerminator());
+    return inContext(&context, [&] { return boolTerm(yield.getCond()); });
+  }
+
   /// Apply the contract of a (non-inlined) callee at a call to it: its
   /// `requires` become obligations of the caller, reported at the call, and
   /// its `ensures` are assumed after them. The callee's entry arguments are
@@ -3224,12 +3294,16 @@ private:
     if (entry.getNumArguments() != call->getNumOperands())
       return;
     SmallVector<ObligationOp> preconditions, postconditions;
+    SmallVector<RequiresOp> requirements;
     for (Operation &op : entry)
       if (auto ob = dyn_cast<ObligationOp>(&op)) {
         if (isOwnPrecondition(ob))
           preconditions.push_back(ob);
         else if (getObligationKind(ob) == "ensures")
           postconditions.push_back(ob);
+      } else if (auto requiresOp = dyn_cast<RequiresOp>(&op)) {
+        if (isOwnRequires(requiresOp))
+          requirements.push_back(requiresOp);
       }
     // A postcondition must hold on every normal exit: require exactly one
     // return, at the end of the entry block, preceded by the `ensures`.
@@ -3243,7 +3317,7 @@ private:
       postconditions.clear();
     // With a single return, the call's results are the callee's returned
     // values even without contracts; they are evaluated on demand.
-    if (preconditions.empty() && !singleReturn)
+    if (preconditions.empty() && requirements.empty() && !singleReturn)
       return;
 
     CallContext &context = contexts.emplace_back();
@@ -3261,6 +3335,16 @@ private:
           inContext(&context, [&] { return boolTerm(pre.getCond()); });
       obligations.push_back(
           {pre, "requires", locationOf(call.getLoc()), r, cond, assumedLoops(),
+           SmallVector<std::pair<std::string, std::string>>(activeObligations),
+           assumed});
+      activeObligations.push_back({r, cond});
+      ++contractsUsed;
+    }
+    for (RequiresOp requiresOp : requirements) {
+      std::string cond = requiresCondition(requiresOp, &context);
+      obligations.push_back(
+          {ObligationOp(), "requires", locationOf(call.getLoc()), r, cond,
+           assumedLoops(),
            SmallVector<std::pair<std::string, std::string>>(activeObligations),
            assumed});
       activeObligations.push_back({r, cond});
@@ -3976,13 +4060,18 @@ struct BoundsCheckReportPass
       if (!func->getRegion(0).empty() &&
           llvm::any_of(func->getRegion(0).front(), [](Operation &op) {
             auto ob = dyn_cast<ObligationOp>(&op);
-            return ob && isOwnPrecondition(ob);
+            auto requiresOp = dyn_cast<RequiresOp>(&op);
+            return (ob && isOwnPrecondition(ob)) ||
+                   (requiresOp && isOwnRequires(requiresOp));
           }))
         withPreconditions.insert(func);
     });
     auto hasWork = [&](Operation *op) {
       if (isa<ObligationOp>(op))
         return true;
+      // An inlined callee's precondition is checked here.
+      if (auto requiresOp = dyn_cast<RequiresOp>(op))
+        return !isOwnRequires(requiresOp);
       auto call = dyn_cast<CallOp>(op);
       auto callee =
           call ? dyn_cast<SymbolConstantAttr>(call.getCallee()) : nullptr;

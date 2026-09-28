@@ -117,17 +117,18 @@ that should be proven. Every `List` access produces two obligations, one from
 `__getitem__` and one from `unsafe_get`. The second is reported as "implied" by
 the first, so each access counts once.
 
-| File               | Must stay unproven        | Should be proven                               |
-|--------------------|---------------------------|------------------------------------------------|
-| `basic.mojo`       | `get`                     | `sum_all`, `get_or_zero`                       |
-| `cases.mojo`       | all `bad_*`               | all `ok_*`, `maybe_reversed`, `maybe_mutating` |
-| `adversarial.mojo` | all `bad_*`               | all `ok_*`                                     |
-| `contracts.mojo`   | all `bad_*` (see below)   | all `ok_*`                                     |
-| `slicing.mojo`     | all `bad_*`               | all `ok_*`                                     |
-| `loops.mojo`       | all `bad_*`               | all `ok_*`                                     |
-| `memory.mojo`      | all `bad_*` and `limit_*` | all `ok_*`, `Bag.ok_get`                       |
-| `unrolling.mojo`   | all `bad_*` and `limit_*` | all `ok_*`                                     |
-| `tensor.mojo`      | all `bad_*` and `limit_*` | all `ok_*`, `Tensor2D.load`/`store`            |
+| File                 | Must stay unproven        | Should be proven                               |
+|----------------------|---------------------------|------------------------------------------------|
+| `basic.mojo`         | `get`                     | `sum_all`, `get_or_zero`                       |
+| `cases.mojo`         | all `bad_*`               | all `ok_*`, `maybe_reversed`, `maybe_mutating` |
+| `adversarial.mojo`   | all `bad_*`               | all `ok_*`                                     |
+| `contracts.mojo`     | all `bad_*` (see below)   | all `ok_*`                                     |
+| `slicing.mojo`       | all `bad_*`               | all `ok_*`                                     |
+| `loops.mojo`         | all `bad_*`               | all `ok_*`                                     |
+| `memory.mojo`        | all `bad_*` and `limit_*` | all `ok_*`, `Bag.ok_get`                       |
+| `unrolling.mojo`     | all `bad_*` and `limit_*` | all `ok_*`                                     |
+| `tensor.mojo`        | all `bad_*` and `limit_*` | all `ok_*`, `Tensor2D.load`/`store`            |
+| `where_clauses.mojo` | all `bad_*`               | all `ok_*`                                     |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -144,6 +145,19 @@ and proves its body from it; `bad_call_without_precondition` and
 `ok_call_with_precondition` call it without and with the guard, and
 `bad_check_before_pop` checks that a later precondition does not justify an
 earlier access. `main` calls the examples on one shared list.
+
+`where_clauses.mojo` states preconditions as `where` clauses on arguments
+(see `Mojo/proposals/argument-contracts.md`), as in
+`def ok_get(xs: List[Int], i: Int where 0 <= i and i < len(xs))`. The parser
+lowers each clause to a `kgen.requires` op whose region computes the condition
+from block arguments that stand for the function's arguments, so optimizing the
+body cannot fold it away. The analysis
+assumes it in the function (`ok_get` and `ok_window` prove their indices from
+it), checks it at every call to a function that is not inlined (reported as a
+`requires` at the call: `bad_get_unchecked`, `bad_get_past_end`,
+`bad_window_swapped`), and checks an inlined function's clause where it was
+inlined (`ok_at`, `bad_at_unchecked`). Clauses are only supported on `imm`,
+`var` and owned arguments so far.
 
 `slicing.mojo` covers the length contracts of `List.extend(Span)` (used by
 `List.copy()`), of the `List` constructor from an iterable (for iterators with
