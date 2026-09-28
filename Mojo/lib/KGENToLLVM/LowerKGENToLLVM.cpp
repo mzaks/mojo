@@ -1089,6 +1089,40 @@ struct ConvertKGENRequires : ConvertPOPToLLVMPattern<RequiresOp> {
   }
 };
 
+/// So do postconditions.
+struct ConvertKGENEnsures : ConvertPOPToLLVMPattern<EnsuresOp> {
+  using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(EnsuresOp op, EnsuresOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// And the values on entry that postconditions use: the `kgen.ensures` using
+/// them are erased with them.
+struct ConvertKGENOld : ConvertPOPToLLVMPattern<OldOp> {
+  using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(OldOp op, OldOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Operation *> users(op->getUsers());
+    for (Operation *user : users) {
+      if (!isa<EnsuresOp>(user))
+        return rewriter.notifyMatchFailure(op, "used by other than ensures");
+    }
+    llvm::SmallPtrSet<Operation *, 4> erased;
+    for (Operation *user : users)
+      if (erased.insert(user).second)
+        rewriter.eraseOp(user);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct ConvertKGENSourceLoc : ConvertPOPToLLVMPattern<SourceLocOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
@@ -1245,7 +1279,9 @@ static void populateKGENToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
       ConvertKGENAssume,
       ConvertKGENCall,
       ConvertKGENCopyMarker,
+      ConvertKGENEnsures,
       ConvertKGENObligation,
+      ConvertKGENOld,
       ConvertKGENRequires,
       ConvertKGENSourceLoc,
       ConvertKGENStructCreate,

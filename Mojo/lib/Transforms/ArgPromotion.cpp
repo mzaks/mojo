@@ -188,6 +188,11 @@ State Graph::doAnalysis(BlockArgument arg) {
       continue;
     }
 
+    // Contract ops only read their operands, for static verification: they
+    // are never executed, and follow the argument where it is promoted.
+    if (isa<KGEN::RequiresOp, KGEN::EnsuresOp, KGEN::OldOp>(user))
+      continue;
+
     // Otherwise, if this isn't a call, assume it's a capture.
     auto call = dyn_cast<CallOp>(user);
     if (!call)

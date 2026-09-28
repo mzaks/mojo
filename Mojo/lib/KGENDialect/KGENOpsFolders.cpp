@@ -779,6 +779,43 @@ RequiresOp::parametric_interpret(ArrayRef<Attribute> operands,
 }
 
 //===----------------------------------------------------------------------===//
+// EnsuresOp
+//===----------------------------------------------------------------------===//
+
+// Postconditions have no runtime semantics either.
+ErrorTreeOrSuccess EnsuresOp::interpret(ArrayRef<Attribute> operands,
+                                        InterpreterState &state) {
+  return state.mapResults({});
+}
+
+ErrorTreeOrSuccess
+EnsuresOp::parametric_interpret(ArrayRef<Attribute> operands,
+                                ParametricInterpreterState &state) {
+  return state.mapResults({});
+}
+
+//===----------------------------------------------------------------------===//
+// OldOp
+//===----------------------------------------------------------------------===//
+
+// The values only exist for static verification: computing them would mean
+// evaluating the region, which is not code the function runs.
+ErrorTreeOrSuccess OldOp::interpret(ArrayRef<Attribute> operands,
+                                    InterpreterState &state) {
+  return ErrorTree(getLoc(), Error("a function whose postcondition uses "
+                                   "'old' cannot be evaluated at compile "
+                                   "time"));
+}
+
+ErrorTreeOrSuccess
+OldOp::parametric_interpret(ArrayRef<Attribute> operands,
+                            ParametricInterpreterState &state) {
+  return ErrorTree(getLoc(), Error("a function whose postcondition uses "
+                                   "'old' cannot be evaluated at compile "
+                                   "time"));
+}
+
+//===----------------------------------------------------------------------===//
 // VariantCreateOp
 //===----------------------------------------------------------------------===//
 

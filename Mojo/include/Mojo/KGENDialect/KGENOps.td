@@ -1478,19 +1478,98 @@ def KGEN_RequiresOp : KGENOp<"requires", [
 }
 
 //===----------------------------------------------------------------------===//
+// EnsuresOp
+//===----------------------------------------------------------------------===//
+
+def KGEN_EnsuresOp : KGENOp<"ensures", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
+  let summary = "a postcondition of the enclosing function";
+  let description = [{
+    The `kgen.ensures` operation states a postcondition of the function it is
+    written in, from a `where` clause on an `out` or `mut` argument. It sits
+    right before each return of the function. `args` are the function's
+    arguments, then the function's named result in a register (if any), then
+    the `kgen.old` values the clause uses; the single block of `body` has an
+    argument for each of them and yields the condition with a
+    `kgen.contract.yield`. Memory the region reads through its arguments is
+    read as it is at the op, i.e. when the function returns.
+
+    Like `kgen.requires`, it has no runtime semantics: static analyses prove
+    it in the function and assume it after calls, and lowering to LLVM erases
+    it. `line`, `col` and `fileName` are the location of the call to the
+    function (`kgen.source_loc[0]`), which tells the function's own
+    postcondition from an inlined callee's.
+
+    Example:
+    ```mlir
+    kgen.ensures(%self, %old : !kgen.pointer<...>, !kgen.scalar<index>)
+        at(%line, %col, %file) : !kgen.string {
+    ^bb0(%a: !kgen.pointer<...>, %b: !kgen.scalar<index>):
+      ...
+      kgen.contract.yield %ok : !kgen.scalar<bool>
+    }
+    ```
+  }];
+
+  let arguments = (ins Variadic<AnyType>:$args, Index:$line, Index:$col,
+                       KGEN_StringType:$fileName,
+                       OptionalAttr<StrAttr>:$message);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = [{
+    `(` ($args^ `:` type($args))? `)`
+    `at` `(` $line `,` $col `,` $fileName `)` attr-dict `:` type($fileName)
+    $body
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// OldOp
+//===----------------------------------------------------------------------===//
+
+def KGEN_OldOp : KGENOp<"old", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
+  let summary = "values on entry for postconditions";
+  let description = [{
+    The `kgen.old` operation computes the values of the `old(e)` expressions
+    of a postcondition on entry to the function: it sits at the start of the
+    function, and its results are operands of the function's `kgen.ensures`.
+    `args` are the function's arguments; the single block of `body` has an
+    argument for each of them and yields the values with a
+    `kgen.contract.yield`. Memory the region reads is read as it is at the op.
+
+    It has no runtime semantics: only static analyses evaluate it, and
+    lowering to LLVM erases it with the `kgen.ensures` using its results. The
+    comptime interpreter cannot evaluate it.
+  }];
+
+  let arguments = (ins Variadic<AnyType>:$args);
+  let results = (outs Variadic<AnyType>:$values);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = [{
+    `(` ($args^ `:` type($args))? `)` (`->` type($values)^)?
+    attr-dict-with-keyword $body
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // ContractYieldOp
 //===----------------------------------------------------------------------===//
 
 def KGEN_ContractYieldOp : KGENOp<"contract.yield", [
-    Pure, Terminator, HasParent<"RequiresOp">]> {
-  let summary = "yields the condition of a contract";
+    Pure, Terminator, ParentOneOf<["RequiresOp", "EnsuresOp", "OldOp"]>]> {
+  let summary = "yields the condition or values of a contract region";
   let description = [{
-    Terminates the region of a `kgen.requires` with the condition it states.
-    It is not a control flow terminator: the region is never executed.
+    Terminates the region of a `kgen.requires` or `kgen.ensures` with the
+    condition it states, or the region of a `kgen.old` with its values. It is
+    not a control flow terminator: the region is never executed.
   }];
 
-  let arguments = (ins BoolScalar:$cond);
-  let assemblyFormat = "$cond attr-dict `:` type($cond)";
+  let arguments = (ins Variadic<AnyType>:$values);
+  let assemblyFormat = "($values^ `:` type($values))? attr-dict";
 }
 
 //===----------------------------------------------------------------------===//

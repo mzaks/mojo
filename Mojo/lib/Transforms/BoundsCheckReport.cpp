@@ -3273,7 +3273,8 @@ private:
     for (auto [arg, operand] : llvm::zip(block.getArguments(), op.getArgs()))
       context.args[arg] = operand;
     auto yield = cast<ContractYieldOp>(block.getTerminator());
-    return inContext(&context, [&] { return boolTerm(yield.getCond()); });
+    return inContext(&context,
+                     [&] { return boolTerm(yield.getValues().front()); });
   }
 
   /// Apply the contract of a (non-inlined) callee at a call to it: its

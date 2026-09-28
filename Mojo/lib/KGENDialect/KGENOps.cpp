@@ -175,12 +175,66 @@ void RequiresOp::getEffects(
                        ObligationResource::get());
 }
 
-LogicalResult RequiresOp::verify() {
-  Block &block = getBody().front();
-  if (block.getArgumentTypes() != getArgs().getTypes())
-    return emitOpError("region arguments must match the operand types");
+/// The region of a contract op: one block whose arguments stand for the
+/// operands, ending in a `kgen.contract.yield`.
+static LogicalResult verifyContractRegion(Operation *op, Region &region,
+                                          ValueRange operands) {
+  Block &block = region.front();
+  if (block.getArgumentTypes() != operands.getTypes())
+    return op->emitOpError("region arguments must match the operand types");
   if (!isa<ContractYieldOp>(block.getTerminator()))
-    return emitOpError("region must end in a 'kgen.contract.yield'");
+    return op->emitOpError("region must end in a 'kgen.contract.yield'");
+  return success();
+}
+
+/// The same for a region that yields a condition.
+static LogicalResult verifyConditionRegion(Operation *op, Region &region,
+                                           ValueRange operands) {
+  if (failed(verifyContractRegion(op, region, operands)))
+    return failure();
+  auto yield = cast<ContractYieldOp>(region.front().getTerminator());
+  if (yield.getValues().size() != 1)
+    return op->emitOpError("region must yield a single condition");
+  return success();
+}
+
+LogicalResult RequiresOp::verify() {
+  return verifyConditionRegion(*this, getBody(), getArgs());
+}
+
+//===----------------------------------------------------------------------===//
+// EnsuresOp
+//===----------------------------------------------------------------------===//
+
+// Same effects as `kgen.obligation`.
+void EnsuresOp::getEffects(
+    SmallVectorImpl<mlir::MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                       ObligationResource::get());
+}
+
+LogicalResult EnsuresOp::verify() {
+  return verifyConditionRegion(*this, getBody(), getArgs());
+}
+
+//===----------------------------------------------------------------------===//
+// OldOp
+//===----------------------------------------------------------------------===//
+
+// Same effects as `kgen.obligation`: the op is kept even when only erased
+// contract ops use its results.
+void OldOp::getEffects(
+    SmallVectorImpl<mlir::MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                       ObligationResource::get());
+}
+
+LogicalResult OldOp::verify() {
+  if (failed(verifyContractRegion(*this, getBody(), getArgs())))
+    return failure();
+  auto yield = cast<ContractYieldOp>(getBody().front().getTerminator());
+  if (yield.getValues().getTypes() != getValues().getTypes())
+    return emitOpError("region must yield a value for each result");
   return success();
 }
 

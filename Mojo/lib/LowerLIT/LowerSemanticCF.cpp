@@ -799,11 +799,12 @@ void LowerSemanticCF::lowerBlock(Block &block, CodeEffects &effects) {
       continue;
     }
 
-    // A precondition's region computes its condition; it is never executed
-    // and does not affect the control flow around it.
-    if (auto requiresOp = dyn_cast<KGEN::RequiresOp>(op)) {
-      CodeEffects conditionEffects;
-      lowerBlock(requiresOp.getBody().front(), conditionEffects);
+    // The region of a contract op (a precondition, a postcondition or the
+    // values on entry it uses) is never executed and does not affect the
+    // control flow around it.
+    if (isa<KGEN::RequiresOp, KGEN::EnsuresOp, KGEN::OldOp>(op)) {
+      CodeEffects contractEffects;
+      lowerBlock(op.getRegion(0).front(), contractEffects);
       continue;
     }
 
