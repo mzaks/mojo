@@ -1,7 +1,8 @@
 # Argument contracts: runtime `where` clauses for verification
 
 **September 28, 2026**
-Status: Draft.
+Status: Draft. Preconditions on `imm`, `var` and owned arguments are
+implemented; see [Implementation status](#implementation-status).
 
 This document proposes contracts on function arguments, written as `where`
 clauses on the arguments themselves:
@@ -101,8 +102,8 @@ The grammar is the one trailing `where` clauses already use:
   the value of `e` on entry to the function. `old` is a soft keyword that is
   only recognized inside argument `where` clauses.
 
-The parser already parses a `where` after an argument's type
-(`Mojo/lib/MojoParser/Signatures.cpp`, `ParsedArgument::parse`) and rejects
+The parser already parsed a `where` after an argument's type
+(`Mojo/lib/MojoParser/Signatures.cpp`, `ParsedArgument::parse`) and rejected
 it with "'where' clauses must be used with parameters and cannot be used with
 arguments". This proposal gives that syntax a meaning for arguments. The
 deprecated `where` inside parameter lists stays an error: parameters have
@@ -113,15 +114,15 @@ trailing `where` clauses.
 A clause states a fact about the argument's value at a point of the call. The
 argument convention decides which point:
 
-| Convention | Clause | Checked | Assumed |
-| --- | --- | --- | --- |
-| `read`, `var`, owned, `deinit` | on entry | at the call | in the body |
-| `out` | on exit | at every return | after the call |
-| `mut`, without `old` | on entry and exit | at the call and at every return | in the body and after the call |
-| `mut`, with `old` and current values | on exit, relating entry and exit | at every return | after the call |
-| `mut`, only `old` | on entry | at the call | in the body |
+| Convention                           | Clause                           | Checked                         | Assumed                        |
+|--------------------------------------|----------------------------------|---------------------------------|--------------------------------|
+| `imm`, `var`, owned, `deinit`        | on entry                         | at the call                     | in the body                    |
+| `out`                                | on exit                          | at every return                 | after the call                 |
+| `mut`, without `old`                 | on entry and exit                | at the call and at every return | in the body and after the call |
+| `mut`, with `old` and current values | on exit, relating entry and exit | at every return                 | after the call                 |
+| `mut`, only `old`                    | on entry                         | at the call                     | in the body                    |
 
-A mutable `ref` argument follows `mut`, and an immutable one follows `read`.
+A mutable `ref` argument follows `mut`, and an immutable one follows `imm`.
 
 The three `mut` rows cover the facts the standard library needs:
 
@@ -185,7 +186,7 @@ note: use a trailing 'where' clause after the signature instead
 Contract expressions are not executed by default (see
 [Runtime checking](#runtime-checking)). The verifier reads them as
 specifications, so they must be pure: calls may only take their arguments as
-`read` or by value, must not raise, and must not write memory other than
+`imm` or by value, must not raise, and must not write memory other than
 their own locals. The parser can enforce the first two; the third is part of
 what the verifier assumes, like the other stdlib trust assumptions.
 
@@ -262,7 +263,7 @@ The pass handles a function with contracts as follows.
    the call's results, `kgen.old` evaluated on the call's operands before the
    call, and memory reads in its region reading the memory after the call.
 
-The experimental `modular` mode of the pass (not committed) already
+The experimental `modular` mode of the pass (an option, off by default) already
 implements step 2 and the memory side of step 3: it names each place's value
 after an opaque call once, and shares that name between the callee's contract
 and the caller's later reads. With contract regions it would evaluate a
@@ -333,6 +334,40 @@ callee, as long as its contract stays the same. Each function's formula stays
 small, and a cache keyed by the function's IR and its callees' contracts
 turns most re-verification into a lookup. That is the property that makes
 Dafny usable while typing.
+
+## Implementation status
+
+Implemented, on the `mojo-bounds-verifier` branch:
+
+- `kgen.requires` and its terminator `kgen.contract.yield`, kept through the
+  LIT lowering, elaboration and SCCP, and erased when lowering to LLVM.
+- The parser accepts clauses on `imm`, `var` and owned arguments (including
+  `self`) and emits one `kgen.requires` per clause at the start of the body.
+  Clauses on `mut`, `out`, `ref` and `deinit` arguments are rejected until
+  postconditions exist.
+- `bounds-check-report` assumes a function's own preconditions, checks an
+  inlined callee's where it was inlined, and checks a non-inlined callee's at
+  each call. The examples are in
+  `Mojo/test/kgen/bounds-check-report/where_clauses.mojo`.
+
+Differences from the design above, found while implementing it:
+
+- The region's terminator is its own op, `kgen.contract.yield`, not a reuse of
+  `hlcf.yield`: HLCF analyses take every `hlcf.yield` to end a region of an
+  HLCF op, and crash on anything else.
+- The region is not `IsolatedFromAbove`. Canonicalization hoists constants
+  out of it into the function body, and that is harmless: only the function's
+  arguments must not be used directly, and the parser binds their names to the
+  region's block arguments. Each op takes all the function's arguments as
+  operands rather than only the ones its clause uses.
+- To tell a function's own precondition from an inlined callee's, the op
+  carries the location of the call to the function (`kgen.source_loc[0]`),
+  which only resolves once the function is inlined. That is the same
+  mechanism `_requires` uses; the [Adoption](#adoption) section expected it to
+  go away, but inlining leaves no other trace.
+- The parser does not emit runtime `debug_assert`s for the clauses yet.
+- Not implemented yet: `kgen.ensures`, `kgen.old`, clauses on `mut` and `out`
+  arguments, and checking a call without opening the callee's body.
 
 ## Alternatives considered
 
