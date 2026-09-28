@@ -49,6 +49,7 @@ class StructFieldOp;
 class TraitDeclOp;
 class ExtensionDeclOp;
 struct ParsedArgument;
+struct ParsedConstraint;
 struct LambdaNode;
 class IREmitter;
 class ExprDest;
@@ -385,6 +386,15 @@ private:
   /// for further references.
   LogicalResult resolveSignature(FnOp op, Lexer &lexer, ASTDecl &decl);
   ParseResult resolveBody(FnOp op, Lexer &lexer, ASTDecl &decl);
+
+  /// Emit the `where` clauses on a function's runtime arguments as
+  /// `kgen.requires` ops at the start of its body.
+  LogicalResult emitArgumentContracts(FnOp op, ASTDecl &decl,
+                                      IREmitter &emitter);
+  /// The `where` clauses on runtime arguments, recorded with a function's
+  /// signature for its body (persistently allocated).
+  llvm::DenseMap<mlir::Operation *, ArrayRef<ParsedConstraint>>
+      argumentContracts;
   LogicalResult resolveSyntheticBody(FnOp op, ASTDecl &decl);
   LogicalResult resolveSyntheticSignature(FnOp op, ASTDecl &decl);
   LogicalResult resolveSyntheticSignature(AliasDeclOp op, ASTDecl &decl);

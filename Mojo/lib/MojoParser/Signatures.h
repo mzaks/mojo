@@ -160,6 +160,10 @@ struct ParsedArgument {
   ExprNode *initExpr = nullptr;
   // If this is a ref convention, this specifies the origin expression.
   ExprNode *refOriginExpr = nullptr;
+  /// `where` clauses on a runtime argument: contracts for static
+  /// verification (see Mojo/proposals/argument-contracts.md). Persistently
+  /// allocated.
+  ArrayRef<ParsedConstraint> whereClauses;
 
   /// This gets set to true when there is a /diagnosed/ error that should
   /// prevent subsequent references to this argument.

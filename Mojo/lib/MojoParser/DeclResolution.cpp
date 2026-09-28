@@ -2517,6 +2517,14 @@ LogicalResult DeclResolver::resolveSignature(FnOp funcOp, Lexer &lexer,
   // Propagate errors and the parsed decls in the signature.
   decl.takeDecls(sigDecl);
 
+  // Keep the contracts on runtime arguments for the body, which emits them.
+  SmallVector<ParsedConstraint, 2> contracts;
+  for (ParsedArgument &arg : fnSignature.parsedArgs)
+    llvm::append_range(contracts, arg.whereClauses);
+  if (!contracts.empty())
+    argumentContracts[funcOp] =
+        shared.getPersistentCopy(ArrayRef<ParsedConstraint>(contracts));
+
   // Now that all the structural properties are determined, perform any
   // name-binding specific checks over the declaration.  This happens after
   // decorator processing because that is how defs work in Python.  This also
@@ -2686,6 +2694,67 @@ LogicalResult DeclResolver::resolveSyntheticBody(FnOp fn, ASTDecl &decl) {
   }
 }
 
+LogicalResult DeclResolver::emitArgumentContracts(FnOp funcOp, ASTDecl &decl,
+                                                  IREmitter &emitter) {
+  auto it = argumentContracts.find(funcOp);
+  if (it == argumentContracts.end() || !emitter.builder)
+    return success();
+  ArrayRef<ParsedConstraint> clauses = it->second;
+  argumentContracts.erase(it);
+
+  OpBuilder &builder = *emitter.builder;
+  Block &entry = *funcOp.getBody();
+  FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
+  // The location of the call to the function: it only resolves once the
+  // function is inlined, which tells analyses its own precondition from an
+  // inlined callee's.
+  auto callLoc = KGEN::SourceLocOp::create(
+      builder, shared.translateLocation(decl.getLoc()),
+      builder.getIndexAttr(0));
+  SmallVector<Location> argLocs;
+  for (BlockArgument arg : entry.getArguments())
+    argLocs.push_back(arg.getLoc());
+
+  for (const ParsedConstraint &clause : clauses) {
+    Location loc = shared.translateLocation(clause.loc);
+    auto requiresOp = KGEN::RequiresOp::create(
+        builder, loc, entry.getArguments(), callLoc.getLine(), callLoc.getCol(),
+        callLoc.getFileName(), clause.message);
+
+    // The condition is computed from the region's block arguments: a scope
+    // binds the function's argument names to them, like `resolveBody` binds
+    // them to the entry block's arguments.
+    OpBuilder regionBuilder(getContext());
+    Block *block = regionBuilder.createBlock(&requiresOp.getBody(), {},
+                                             entry.getArgumentTypes(), argLocs);
+    ASTDecl &scope =
+        addFullyResolvedDecl(nullptr, StringAttr(), clause.loc, &decl);
+    for (auto [argIdx, regionArg, convention] : llvm::enumerate(
+             block->getArguments(), funcSignature.getArgConventions())) {
+      StringAttr argName = funcSignature.getArgName(argIdx);
+      if (!argName || argName.empty() || isResultSlot(convention))
+        continue;
+      if (convention == ArgConvention::ImmMem)
+        addFullyResolvedDecl(MBValue(regionArg), argName, clause.loc, &scope);
+      else if (convention == ArgConvention::ImmReg)
+        addFullyResolvedDecl(SBValue(regionArg), argName, clause.loc, &scope);
+      else
+        addFullyResolvedDecl(CValue::getMValueForRef(regionArg), argName,
+                             clause.loc, &scope);
+    }
+
+    IREmitter clauseEmitter(scope, regionBuilder);
+    RValue cond =
+        clauseEmitter.emitExprScalarBool(clause.propExpr, EC_BoolCondition);
+    Value condVal = clauseEmitter.emitSRValue({AnyValue(cond), clause.propExpr},
+                                              EC_BoolCondition);
+    if (!condVal)
+      return failure();
+    KGEN::ContractYieldOp::create(*clauseEmitter.builder, loc, condVal);
+  }
+  return success();
+}
+
 ParseResult DeclResolver::resolveBody(FnOp funcOp, Lexer &lexer,
                                       ASTDecl &decl) {
   // TODO: Sink this to when the body is actually resolved.
@@ -2845,6 +2914,9 @@ ParseResult DeclResolver::resolveBody(FnOp funcOp, Lexer &lexer,
                                             decl.getLoc(), &decl);
     shared.notifyListenerOnArgumentDecl(argDecl, resultName, argDecl.getLoc());
   }
+
+  if (failed(emitArgumentContracts(funcOp, decl, emitter)))
+    return failure();
 
   // With all the argument declarations set up, we can resolve the body of the
   // function.

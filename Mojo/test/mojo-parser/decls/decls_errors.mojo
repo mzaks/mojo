@@ -342,8 +342,8 @@ def always_inline_builtin_4(a: Bool):
   if a:
      pass
 
-# expected-error @+1 {{'where' clauses must be used with parameters and cannot be used with arguments}}
-def illegal_runtime_where[x: Int](a: Int where a > 1):
+# expected-error @+1 {{'where' clauses are only supported on 'imm', 'var' and owned arguments}}
+def illegal_runtime_where[x: Int](mut a: Int where a > 1):
   pass
 
 # expected-note @+1 {{function declared here}}

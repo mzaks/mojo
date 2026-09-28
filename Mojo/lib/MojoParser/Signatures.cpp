@@ -393,9 +393,26 @@ ParseResult ParsedArgument::parse(ParserBase &p, KWArgMarkerInfo &markerInfo,
     name = StringAttr::get(p.getContext());
 
   // Parse optional where clauses.
+  SmallVector<ParsedConstraint, 1> argClauses;
   while (p.getToken().isIdentifier() && p.getToken().getSpelling() == "where") {
     SMLoc whereLoc = p.consumeIdentifier().getLoc();
-    if (kind == ArgListKind::kArgList || kind == ArgListKind::kFnTypeArgList) {
+    // On a runtime argument, a clause is a contract for static verification
+    // rather than a parse-time constraint. Only preconditions on arguments the
+    // callee cannot change are supported so far.
+    if (kind == ArgListKind::kArgList) {
+      if (convention != kConventionUnspec && convention != kConventionImm &&
+          convention != kConventionVar) {
+        p.emitError(whereLoc, "'where' clauses are only supported on 'imm', "
+                              "'var' and owned arguments");
+        return failure();
+      }
+      ParsedConstraint clause;
+      if (clause.parse(p, /*stmtIndent=*/std::nullopt))
+        return failure();
+      argClauses.push_back(clause);
+      continue;
+    }
+    if (kind == ArgListKind::kFnTypeArgList) {
       p.emitError(loc,
                   "'where' clauses must be used with parameters and cannot "
                   "be used with arguments");
@@ -426,6 +443,8 @@ ParseResult ParsedArgument::parse(ParserBase &p, KWArgMarkerInfo &markerInfo,
     if (p.consumeIf(Token::kw_else) && p.parseExpression(discarded))
       return failure();
   }
+  whereClauses =
+      p.shared.getPersistentCopy(ArrayRef<ParsedConstraint>(argClauses));
 
   // Parse an optional default argument value: `"=" expression`.
   SMLoc equalLoc;
