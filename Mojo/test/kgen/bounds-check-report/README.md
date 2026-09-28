@@ -100,6 +100,16 @@ obligation without unknowns has a condition that is false in some execution
 the analysis considers, rather than one it cannot see into. Uninitialized
 reads, typically from arms that cannot be taken, are listed last.
 
+Two options switch off speedups, for comparison: `lazy-heap=false` encodes
+every heap load eagerly instead of on demand for obligations not proven
+without it, and `all-loop-invariants=true` infers invariants for every loop,
+not only for loops some obligation's condition or reach depends on.
+
+`timeout-ms` (default 2000) is wall-clock time per query, so results near the
+limit depend on the machine and its load: on a busy machine an obligation can
+come out unproven that is proven on an idle one. Raise it before concluding
+that an obligation cannot be proven.
+
 ## Expected results
 
 Each file groups its functions into cases that must stay unproven and cases
