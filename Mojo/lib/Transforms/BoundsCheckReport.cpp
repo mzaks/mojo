@@ -1632,6 +1632,30 @@ private:
     return it->second;
   }
 
+  /// The value of the place right after `writer`, which may write it in a way
+  /// the search cannot follow: an unknown, but one per place and writer, so
+  /// every read the search reaches it from (with nothing writing the place in
+  /// between) reads the same value.
+  std::string afterWrite(const Place &place, Operation *writer) {
+    std::string key;
+    llvm::raw_string_ostream(key)
+        << "after." << writer << "|" << placeKey(place);
+    auto [it, inserted] =
+        pathMap().try_emplace({place.loc.slot.getAsOpaquePointer(), key}, "");
+    if (inserted) {
+      it->second = declare(place.sort);
+      std::string text;
+      llvm::raw_string_ostream os(text);
+      os << describe(place.loc.slot) << " after "
+         << writer->getName().getStringRef();
+      if (std::optional<ObligationLocation> where =
+              locationOf(writer->getLoc()))
+        os << " at " << where->file << ":" << where->line << ":" << where->col;
+      noteUnknown(it->second, text);
+    }
+    return it->second;
+  }
+
   /// Search `block` backwards from just before `from` (from its end if null)
   /// for the value of the place.
   std::pair<Search, MaybeTerm> searchBlock(const Place &place, Block &block,
@@ -1693,20 +1717,21 @@ private:
         if (!target) {
           if (place.nonEscaping)
             continue;
-          return {Search::Fail, std::nullopt}; // May alias the place.
+          // May alias the place.
+          return {Search::Found, afterWrite(place, op)};
         }
         if (target->slot != place.loc.slot) {
           if (mayAlias(target->slot, place.loc.slot))
-            return {Search::Fail, std::nullopt};
+            return {Search::Found, afterWrite(place, op)};
           continue;
         }
         if (isPrefix(target->path, place.loc.path)) {
           MaybeTerm t = fromStore(place, store, *target);
-          return {t ? Search::Found : Search::Fail, t};
+          return {Search::Found, t ? *t : afterWrite(place, op)};
         }
         if (isPrefix(place.loc.path, target->path))
-          return {Search::Fail, std::nullopt}; // Partial write.
-        continue;                              // A disjoint field.
+          return {Search::Found, afterWrite(place, op)}; // Partial write.
+        continue;                                        // A disjoint field.
       }
       if (!mayWrite(op, place.loc, place.nonEscaping))
         continue;
@@ -1715,9 +1740,9 @@ private:
       if (auto ifOp = dyn_cast<HLCF::IfOp>(op);
           ifOp && depth < kMaxMergeDepth) {
         MaybeTerm t = mergeIf(place, ifOp, depth + 1);
-        return {t ? Search::Found : Search::Fail, t};
+        return {Search::Found, t ? *t : afterWrite(place, op)};
       }
-      return {Search::Fail, std::nullopt};
+      return {Search::Found, afterWrite(place, op)};
     }
     return {Search::NotWritten, std::nullopt};
   }
