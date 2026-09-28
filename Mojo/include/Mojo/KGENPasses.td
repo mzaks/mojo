@@ -57,6 +57,10 @@ def BoundsCheckReport : Pass<"bounds-check-report", "ModuleOp"> {
            "Resolve heap loads only for the obligations that stay unproven "
            "without them (by their condition, then their reach and "
            "assumptions)">,
+    Option<"allLoopInvariants", "all-loop-invariants", "bool",
+           /*default=*/"false",
+           "Infer invariants for every loop, not only for loops whose values "
+           "an obligation's condition or reach depends on">,
     Option<"dumpDir", "dump-dir", "std::string", /*default=*/"\"\"",
            "If set, keep the generated SMT-LIB scripts in this directory "
            "(annotated with the IR value each term stands for)">,

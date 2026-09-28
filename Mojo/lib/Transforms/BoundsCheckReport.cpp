@@ -206,6 +206,8 @@ struct Candidate {
 
 struct LoopInfo {
   unsigned id = 0;
+  /// Whether invariants are inferred for the loop (see `markRelevantLoops`).
+  bool relevant = true;
   std::string reachIn;
   /// Assumptions made before the loop is entered.
   std::string assumedAtEntry = "true";
@@ -3578,7 +3580,8 @@ struct BoundsCheckReportPass
   /// candidate that is false in that model is dropped.
   bool inferInvariants(Encoder &enc, StringRef name) const {
     for (LoopInfo &loop : enc.loops)
-      generateCandidates(loop);
+      if (loop.relevant)
+        generateCandidates(loop);
     for (unsigned round = 0; round < 64; ++round) {
       QueryBatch batch = newBatch();
       std::vector<SmallVector<Candidate *>> owners;
@@ -3670,6 +3673,27 @@ struct BoundsCheckReportPass
 
   /// Encode one function, infer its loop invariants and check its
   /// obligations. Only reads the IR, so functions can run in parallel.
+  /// Loops whose values no obligation's condition or reach depends on get
+  /// no invariants: inferring them costs solver time and cannot help a
+  /// proof. Loops enclosing a relevant loop stay relevant (its queries
+  /// assume their invariants).
+  void markRelevantLoops(Encoder &enc) const {
+    SmallVector<std::string> roots;
+    for (ObligationInfo &ob : enc.obligations) {
+      roots.push_back(ob.cond);
+      roots.push_back(ob.reach);
+    }
+    llvm::StringSet<> names = enc.cone(roots);
+    for (LoopInfo &loop : enc.loops)
+      loop.relevant = llvm::any_of(loop.args, [&](const MaybeTerm &t) {
+        return t && names.contains(*t);
+      });
+    for (LoopInfo &loop : enc.loops)
+      if (loop.relevant)
+        for (LoopInfo *outer : loop.enclosing)
+          outer->relevant = true;
+  }
+
   struct Outcome {
     Status status = Status::SolverFailed;
     SmallVector<std::string> unknowns;
@@ -3743,6 +3767,8 @@ struct BoundsCheckReportPass
     enc.lazyHeap = lazyHeap;
     enc.encodeFunction(func);
     std::string dumpName = "f" + std::to_string(index);
+    if (!allLoopInvariants)
+      markRelevantLoops(enc);
     bool solverOk = inferInvariants(enc, dumpName);
 
     std::vector<size_t> all;
