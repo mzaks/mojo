@@ -129,6 +129,7 @@ the first, so each access counts once.
 | `unrolling.mojo`     | all `bad_*` and `limit_*` | all `ok_*`                                     |
 | `tensor.mojo`        | all `bad_*` and `limit_*` | all `ok_*`, `Tensor2D.load`/`store`            |
 | `where_clauses.mojo` | all `bad_*`               | all `ok_*`                                     |
+| `modular.mojo`       | all `bad_*` and `limit_*` | all `ok_*`                                     |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -178,6 +179,16 @@ may use the index. A quantifier is proven through a fresh index in the range:
 `ok_first_nonneg`'s precondition that every element is non-negative
 (`bad_first_negative` cannot). Assumed, a quantifier only says its condition for
 one unknown index, which is sound but weak.
+
+`modular.mojo` is checked with `modular=contracts`, where a call to a callee
+with contracts uses them alone and the callee's body is not opened. After the
+call, a heap read the callee's postcondition describes with a quantifier of the
+form `all([p[i] == old(e) for i in range(lo, hi)])` is `e` for that index,
+evaluated before the call: `ok_index_after_reset` uses
+`ok_reset_first`'s promise that it keeps every element but the first.
+`bad_index_reset_element` reads the one it changes, and
+`limit_index_after_length_only` calls a callee whose contract only states the
+length, so the element is unknown after the call.
 
 A caller's proofs are conditional on its callees' contracts: after a call to a
 callee that breaks its postcondition, the callee's body and its contract

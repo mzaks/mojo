@@ -2528,6 +2528,82 @@ private:
     return key;
   }
 
+  /// After an opaque call, a heap read the callee's postconditions describe:
+  /// a quantifier of the form `all([p[i] == old(e) for i in range(lo, hi)])`
+  /// says that where the read is `p[t]` with `lo <= t < hi`, its value is `e`
+  /// for `i = t`, evaluated on entry to the callee (i.e. before the call).
+  /// Each such quantifier guards `value` (the unknown value after the call)
+  /// with an `ite` on that condition. This is how a contract states that a
+  /// callee keeps (or moves) elements, as a `kgen.copy_marker` does for a
+  /// copy.
+  std::string frameValue(Operation *op, const HeapRead &r, std::string value) {
+    auto call = dyn_cast<CallOp>(op);
+    CallContext *callee = call ? callContexts.lookup(call) : nullptr;
+    auto symbol =
+        call ? dyn_cast<SymbolConstantAttr>(call.getCallee()) : nullptr;
+    FuncOp fn =
+        symbol && symbols
+            ? symbols->lookup<FuncOp>(symbol.getSymbol().getRootReference())
+            : FuncOp();
+    if (!callee || !fn || fn->getRegion(0).empty() || !r.access.empty())
+      return value;
+    for (Operation &op : fn->getRegion(0).front()) {
+      auto ensuresOp = dyn_cast<EnsuresOp>(&op);
+      if (!ensuresOp || !isOwnEnsures(ensuresOp))
+        continue;
+      ensuresOp.getBody().walk([&](ForallOp forall) {
+        Block &body = forall.getBody().front();
+        auto yield = cast<ContractYieldOp>(body.getTerminator());
+        auto cmp = yield.getValues().front().getDefiningOp<POP::CmpOp>();
+        if (!cmp || cmp.getPred() != CmpPredicate::EQ)
+          return;
+        Value element = cmp.getLhs(), old = cmp.getRhs();
+        if (!element.getDefiningOp<POP::LoadOp>())
+          std::swap(element, old);
+        auto load = element.getDefiningOp<POP::LoadOp>();
+        if (!load || !old.getDefiningOp<OldOp>() ||
+            !(sortOf(element.getType()) == r.sort))
+          return;
+        // The postcondition, evaluated for the call, at the read's index.
+        CallContext &region =
+            contractContext(ensuresOp, ensuresOp.getArgs(), callee);
+        Sort indexSort = sortOf(body.getArgument(0).getType());
+        if (indexSort.kind != Sort::BV)
+          return;
+        MaybeTerm hi = inContext(&region, [&] { return term(forall.getHi()); });
+        MaybeTerm lo =
+            forall.getLo()
+                ? inContext(&region, [&] { return term(forall.getLo()); })
+                : MaybeTerm(bvConst(APInt(indexSort.width, 0)));
+        if (!lo || !hi)
+          return;
+        const std::string &index = r.addr.index;
+        CallContext &at = contexts.emplace_back();
+        at.callee = "forall";
+        at.contract = true;
+        at.parent = &region;
+        at.depth = region.depth + 1;
+        at.region = forall;
+        at.terms[body.getArgument(0)] = index;
+        std::optional<HeapAddr> addr =
+            inContext(&at, [&] { return heapAddress(load.getPtr()); });
+        if (!addr || addr->element != r.addr.element ||
+            addr->path != r.addr.path)
+          return;
+        MaybeTerm before = inContext(&at, [&] { return term(old); });
+        if (!before)
+          return;
+        std::string guard =
+            mkAnd(mkAnd("(= " + addr->base + " " + r.addr.base + ")",
+                        "(= " + addr->index + " " + index + ")"),
+                  mkAnd("(bvsle " + *lo + " " + index + ")",
+                        "(bvslt " + index + " " + *hi + ")"));
+        value = "(ite " + guard + " " + *before + " " + value + ")";
+      });
+    }
+    return value;
+  }
+
   HeapStep
   heapStep(const HeapRead &r, Operation *op, unsigned depth,
            SmallVectorImpl<std::pair<std::string, std::string>> &guards,
@@ -2538,7 +2614,8 @@ private:
                             : ctx && ctx->opaque && heapMayWrite(op) ? ctx->call
                                                                      : nullptr;
     if (opaqueCall) {
-      found = afterCall(opaqueCall, heapKey(r), r.sort);
+      std::string after = afterCall(opaqueCall, heapKey(r), r.sort);
+      found = opaqueCall == op ? frameValue(op, r, after) : after;
       return HeapStep::Found;
     }
     if (auto store = dyn_cast<POP::StoreOp>(op))
