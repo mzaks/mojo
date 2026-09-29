@@ -216,7 +216,14 @@ std::optional<SmallVector<Answer>> runZ3(const SolverConfig &config,
   SmallString<128> cachePath;
   if (!config.cacheDir.empty()) {
     uint64_t hash = llvm::xxh3_64bits(script);
-    uint64_t solverHash = llvm::xxh3_64bits(config.z3);
+    // The solver: its path, and its binary's size and modification time,
+    // so an upgraded z3 does not reuse answers.
+    std::string solver = config.z3;
+    llvm::sys::fs::file_status status;
+    if (!llvm::sys::fs::status(config.z3, status))
+      solver += "|" + std::to_string(status.getSize()) + "|" +
+                std::to_string(llvm::sys::toTimeT(status.getLastModificationTime()));
+    uint64_t solverHash = llvm::xxh3_64bits(solver);
     cachePath = config.cacheDir;
     llvm::sys::path::append(cachePath, llvm::utohexstr(hash) + "-" +
                                            llvm::utohexstr(solverHash) +
