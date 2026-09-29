@@ -3620,9 +3620,12 @@ private:
       return;
     for (auto [result, returned] :
          llvm::zip(call->getResults(), ret->getOperands()))
-      if (!context.opaque)
+      if (!context.opaque || context.args.count(returned))
+        // In an opaque callee too, a returned argument (e.g. a `mut` struct
+        // the body does not change, as `arg-promotion` returns it) is the
+        // operand: the body passes it through.
         callResults[result] = {&context, returned};
-      else if (!context.args.count(returned))
+      else
         // The body is not evaluated: the returned value is the call's result,
         // which only the `ensures` constrain.
         context.args[returned] = result;
