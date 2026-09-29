@@ -263,7 +263,7 @@ struct Span[
 
     @inline(.nodebug)
     @stable(since="1.0")
-    def __init__(out self):
+    def __init__(out self where len(self) == 0):
         """Create an empty / zero-length span."""
         self._data = Self._PointerType.unsafe_dangling()
         self._len = 0
@@ -306,7 +306,11 @@ struct Span[
     @inline(.always)
     @implicit
     def __init__(
-        out self,
+        # `list` is a reference the span's origin may make mutable, so the
+        # clause also says its length is kept.
+        out self where len(self) == old(len(list)) and len(list) == old(
+            len(list)
+        ),
         ref[Self.origin] list: List[Self.T],
     ):
         """Construct a `Span` from a `List`.
@@ -359,7 +363,7 @@ struct Span[
     @stable(since="1.0")
     @inline(.always)
     def __getitem__(
-        self, idx: Int, /
+        self, idx: Int where 0 <= idx and idx < len(self), /
     ) -> ref[Self.origin, Self.address_space] Self.T:
         """Gets the span element at the given index.
 
@@ -389,7 +393,7 @@ struct Span[
 
     @inline(.always)
     def __getitem__(
-        self, idx: IntLiteral
+        self, idx: IntLiteral where Int(idx) < len(self)
     ) -> ref[Self.origin, Self.address_space] Self.T:
         """Gets the span element at the given index.
 
@@ -407,7 +411,17 @@ struct Span[
         return self._data[unsafe_offset=idx]
 
     @inline(.always)
-    def __getitem__(self, slc: ContiguousSlice) -> Self:
+    def __getitem__(
+        self,
+        slc: ContiguousSlice where (
+            0 <= slc.start.or_else(0)
+            and slc.start.or_else(0) <= slc.end.or_else(len(self))
+            and slc.end.or_else(len(self)) <= len(self)
+        ),
+        out result: Self where len(result) == slc.end.or_else(
+            len(self)
+        ) - slc.start.or_else(0),
+    ):
         """Get a new span from a slice of the current span.
 
         Aborts if `slc`'s start or end index is out of bounds (valid range is
@@ -421,7 +435,7 @@ struct Span[
             A new span that points to the same data as the current span.
         """
         var start, end = check_slice_bounds(slc, len(self))
-        return self._unchecked_subspan(start=start, end=end)
+        result = self._unchecked_subspan(start=start, end=end)
 
     @inline(.always)
     def __iter__(var self) -> Self.IteratorOwnedType where Self._is_generic_as:

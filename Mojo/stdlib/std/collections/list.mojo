@@ -1560,8 +1560,20 @@ struct List[T: AnyType, /](
     @stable(since="1.0")
     @inline(.always)
     def __getitem__(
-        ref self, slice: ContiguousSlice
-    ) -> Span[Self.T, Self._InteriorOrigin[origin_of(self)]]:
+        ref self,
+        slice: ContiguousSlice where (
+            0 <= slice.start.or_else(0)
+            and slice.start.or_else(0) <= slice.end.or_else(len(self))
+            and slice.end.or_else(len(self)) <= len(self)
+        ),
+        out result: Span[
+            Self.T, Self._InteriorOrigin[origin_of(self)]
+        ] where len(result) == slice.end.or_else(
+            len(self)
+        ) - slice.start.or_else(
+            0
+        ),
+    ):
         """Gets the sequence of elements at the specified positions.
 
         Aborts if `slice`'s start or end index is out of bounds (valid range
@@ -1575,7 +1587,7 @@ struct List[T: AnyType, /](
             A span over the specified slice.
         """
         var start, end = check_slice_bounds(slice, len(self))
-        return {
+        result = {
             unsafe_ptr = self._unsafe_interior_ptr().unsafe_offset(start),
             length = end - start,
         }
