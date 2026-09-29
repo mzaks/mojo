@@ -47,6 +47,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -1965,18 +1966,32 @@ struct VerifyContractsPass
       getOperation().emitError("verify-contracts: z3 not found");
       return signalPassFailure();
     }
-    SymbolTableCollection symbols;
     SolverConfig solver{z3, rlimit, wallSeconds, dumpDir};
-    unsigned total = 0, proven = 0, index = 0, loops = 0, invariants = 0;
+    // Functions are verified independently, in parallel; their results are
+    // reported afterwards, in order.
+    SmallVector<LIT::FnOp> fns;
     getOperation().walk([&](LIT::FnOp fn) {
-      if (!includeStdlib && inStdlib(fn))
-        return;
-      std::string name = "f" + std::to_string(index++);
-      FunctionEncoder enc(fn, getOperation(), symbols, solver, name);
+      if (includeStdlib || !inStdlib(fn))
+        fns.push_back(fn);
+    });
+    struct Result {
+      SmallVector<Obligation> obligations;
+      SmallVector<Answer> answers;
+      unsigned loops = 0, invariants = 0;
+    };
+    std::vector<Result> results(fns.size());
+    ModuleOp module = getOperation();
+    llvm::DefaultThreadPool pool(llvm::hardware_concurrency());
+    for (size_t i = 0; i < fns.size(); ++i)
+      pool.async([&, i] {
+      SymbolTableCollection symbols;
+      std::string name = "f" + std::to_string(i);
+      FunctionEncoder enc(fns[i], module, symbols, solver, name);
       if (!enc.encode())
         return;
-      loops += enc.loopsAnalyzed;
-      invariants += enc.invariantsFound;
+      Result &result = results[i];
+      result.loops = enc.loopsAnalyzed;
+      result.invariants = enc.invariantsFound;
       if (enc.obligations.empty())
         return;
       std::optional<SmallVector<Answer>> answers =
@@ -1984,11 +1999,21 @@ struct VerifyContractsPass
       unsigned next = 0;
       for (Obligation &ob : enc.obligations) {
         Answer answer = Answer::NotAnalyzed;
-        if (ob.analyzed)
+        if (ob.analyzed) {
           answer = answers && next < answers->size() ? (*answers)[next]
                                                      : Answer::Unknown;
-        if (ob.analyzed)
           ++next;
+        }
+        result.answers.push_back(answer);
+      }
+      result.obligations = std::move(enc.obligations);
+      });
+    pool.wait();
+    unsigned total = 0, proven = 0, loops = 0, invariants = 0;
+    for (Result &result : results) {
+      loops += result.loops;
+      invariants += result.invariants;
+      for (auto [ob, answer] : llvm::zip(result.obligations, result.answers)) {
         ++total;
         StringRef what = ob.postcondition ? "postcondition" : "precondition";
         if (answer == Answer::Proven) {
@@ -2014,7 +2039,7 @@ struct VerifyContractsPass
         }
         diag.attachNote(ob.clauseLoc) << what << " declared here";
       }
-    });
+    }
     llvm::errs() << "verify-contracts: " << proven << "/" << total
                  << " obligations proven (" << loops << " loops, "
                  << invariants << " invariants)\n";

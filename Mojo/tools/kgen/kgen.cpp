@@ -455,6 +455,8 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
       (void)compiler.runCheckLITPipeline(*clone);
 
       if (clOptions.verifyContracts.getNumOccurrences()) {
+        // The pass verifies functions in parallel.
+        ctx->enableMultithreading();
         mlir::PassManager verifyPM(ctx);
         if (failed(mlir::parsePassPipeline("verify-contracts{" +
                                                clOptions.verifyContracts + "}",
