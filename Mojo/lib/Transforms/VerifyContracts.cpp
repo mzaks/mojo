@@ -518,6 +518,16 @@ private:
   DenseMap<Value, Value> actuals;
   /// The call whose callee's postcondition is being assumed: its result.
   Value callResult;
+  /// While evaluating a callee's contract: the call's values of the callee's
+  /// parameters (its struct's, then its own), which are expressions in the
+  /// caller's parameters (`parent`). `scope` keeps the callee's unknown
+  /// parameter expressions apart from the caller's of the same name.
+  struct ParamFrame {
+    llvm::StringMap<TypedAttr> values;
+    ParamFrame *parent = nullptr;
+    std::string scope;
+  };
+  ParamFrame *params = nullptr;
   /// Element references `__getitem__` returned: the list's place and the
   /// index.
   DenseMap<Value, std::pair<Loc, std::string>> elements;
@@ -1137,8 +1147,9 @@ private:
   /// The value of a parameter expression (printed): one unknown per
   /// expression in the function.
   std::string parameterValue(const std::string &expr, Sort sort) {
-    auto [it, inserted] = parameterValues.try_emplace(expr + "|" + sort.str(),
-                                                      "");
+    std::string scope = params ? params->scope + "|" : "";
+    auto [it, inserted] =
+        parameterValues.try_emplace(scope + expr + "|" + sort.str(), "");
     if (inserted) {
       it->second = declare(sort, "p");
       // Name it in the script, for `dump-dir` debugging.
@@ -1641,6 +1652,16 @@ private:
       return parameterValue(printed(attr), sort);
     if (auto sugar = dyn_cast<SugarAttr>(attr))
       return paramTerm(sugar.getCanonical(), sort, depth + 1);
+    // A callee's parameter: the call's value for it, in the caller.
+    if (auto ref = dyn_cast<ParamDeclRefAttr>(attr); ref && params)
+      if (auto it = params->values.find(ref.getName());
+          it != params->values.end()) {
+        ParamFrame *callee = params;
+        params = callee->parent;
+        std::string t = paramTerm(it->second, sort, depth + 1);
+        params = callee;
+        return t;
+      }
     if (auto simd = dyn_cast<SIMDAttr>(attr)) {
       ArrayRef<DTypeValue> vals = simd.getValues();
       if (vals.size() == 1) {
@@ -1767,6 +1788,7 @@ private:
     std::optional<CalleeName> name = calleeName(call.getCallee());
     LIT::FnOp callee = lookup(call);
     bool hasBody = callee && !callee.getFunctionBody().empty();
+    ParamFrame frame = paramFrame(call, callee);
     // A call to a function with preconditions: they are obligations here.
     if (hasBody && !inContract) {
       for (Operation &calleeOp : callee.getFunctionBody().front()) {
@@ -1775,9 +1797,12 @@ private:
           continue;
         Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
                       displayName(callee)};
-        if (MaybeTerm cond =
-                instantiate(req.getBody(), req.getArgs(), state,
-                            call.getOperands(), callee, nullptr, false)) {
+        params = &frame;
+        MaybeTerm cond =
+            instantiate(req.getBody(), req.getArgs(), state, call.getOperands(),
+                        callee, nullptr, false);
+        params = frame.parent;
+        if (cond) {
           ob.cond = *cond;
           noteCondition(ob.cond);
         } else {
@@ -1810,8 +1835,31 @@ private:
     for (StringRef origin : topLevelElements(origins))
       if (!origin.ends_with(": !lit.origin<false>"))
         havocOrigin(origin, state);
-    if (hasBody)
+    if (hasBody) {
+      params = &frame;
       assumeEnsures(call, callee, before, state);
+      params = frame.parent;
+    }
+  }
+
+  /// The parameters `call` binds for `callee`: the callee's struct's
+  /// parameters, then its own, in order. None when they do not line up.
+  ParamFrame paramFrame(LIT::CallOp call, LIT::FnOp callee) {
+    ParamFrame frame;
+    frame.parent = params;
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!callee || !symbol)
+      return frame;
+    frame.scope = printed(symbol.getSymbol());
+    SmallVector<ParamDeclAttr> decls;
+    if (auto parent = callee->getParentOfType<LIT::StructDeclOp>())
+      llvm::append_range(decls, parent.getParams());
+    llvm::append_range(decls, callee.getParams());
+    ArrayRef<TypedAttr> values = symbol.getParamValues();
+    if (decls.size() == values.size())
+      for (auto [decl, value] : llvm::zip(decls, values))
+        frame.values[decl.getName()] = value;
+    return frame;
   }
 
   /// After a call, the callee's postcondition: its arguments as they are
