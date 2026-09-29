@@ -546,6 +546,21 @@ struct List[T: AnyType, /](
         # list has exactly that many elements.
         _ensures(not upper or upper.value() != lower or len(self) == lower)
 
+    def __init__(
+        out self where len(self) == len(span),
+        span: Span[Self.T, _],
+    ) where conforms_to(Self.T, Copyable):
+        """Constructs a list by copying the elements of a span.
+
+        Unlike the constructor from an arbitrary iterable, it states the new
+        list's length.
+
+        Args:
+            span: The elements to copy into the list.
+        """
+        self = Self(capacity=len(span))
+        self.extend(span)
+
     @inline(.always)
     def __init__(
         out self where len(self) == unsafe_uninit_length,
