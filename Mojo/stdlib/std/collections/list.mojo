@@ -430,14 +430,14 @@ struct List[T: AnyType, /](
     # ===-------------------------------------------------------------------===#
 
     @stable(since="1.0")
-    def __init__(out self):
+    def __init__(out self where len(self) == 0):
         """Constructs an empty list."""
         self._data = Self._PointerType.unsafe_dangling()
         self._len = 0
         self._capacity = 0
 
     @stable(since="1.0")
-    def __init__(out self, *, capacity: Int):
+    def __init__(out self where len(self) == 0, *, capacity: Int):
         """Constructs a list with the given capacity.
 
         Args:
@@ -453,7 +453,10 @@ struct List[T: AnyType, /](
 
     @stable(since="1.0")
     def __init__(
-        out self, *, length: Int, fill: Self.T
+        out self where len(self) == length,
+        *,
+        length: Int where length >= 0,
+        fill: Self.T,
     ) where conforms_to(Self.T, Copyable):
         """Constructs a list with the given length.
 
@@ -465,7 +468,12 @@ struct List[T: AnyType, /](
         self._unchecked_grow(length, fill)
 
     @inline(.always)
-    def __init__(out self, *, length: Int, fill_with: Some[def(Int) -> Self.T]):
+    def __init__(
+        out self where len(self) == length,
+        *,
+        length: Int where length >= 0,
+        fill_with: Some[def(Int) -> Self.T],
+    ):
         """Constructs a list by calling `fill_with(i)` for each index `i`.
 
         Args:
@@ -491,7 +499,9 @@ struct List[T: AnyType, /](
 
     @inline(.always)
     def __init__(
-        out self, var *values: Self.T, __list_literal__: NoneType
+        out self where len(self) == old(len(values)),
+        var *values: Self.T,
+        __list_literal__: NoneType,
     ) where conforms_to(Self.T, Movable):
         """Constructs a list from the given values.
 
@@ -537,7 +547,11 @@ struct List[T: AnyType, /](
         _ensures(not upper or upper.value() != lower or len(self) == lower)
 
     @inline(.always)
-    def __init__(out self, *, unsafe_uninit_length: Int):
+    def __init__(
+        out self where len(self) == unsafe_uninit_length,
+        *,
+        unsafe_uninit_length: Int where unsafe_uninit_length >= 0,
+    ):
         """Construct a list with the specified length, with uninitialized
         memory. This is unsafe, as it relies on the caller initializing the
         elements with unsafe operations, not assigning over the uninitialized
@@ -551,7 +565,9 @@ struct List[T: AnyType, /](
         self._len = unsafe_uninit_length
 
     @stable(since="1.0")
-    def __init__(out self, *, copy: Self) where conforms_to(Self.T, Copyable):
+    def __init__(
+        out self where len(self) == len(copy), *, copy: Self
+    ) where conforms_to(Self.T, Copyable):
         """Creates a deep copy of the given list.
 
         Args:
@@ -965,7 +981,10 @@ struct List[T: AnyType, /](
 
     @inline(.always)
     def insert(
-        mut self, i: Int, var value: Self.T, /
+        mut self where len(self) == old(len(self)) + 1,
+        i: Int where 0 <= i and i <= len(self),
+        var value: Self.T,
+        /,
     ) where conforms_to(Self.T, Movable):
         """Inserts a value to the list at the given index.
         `a.insert(len(a), value)` is equivalent to `a.append(value)`.
@@ -999,7 +1018,10 @@ struct List[T: AnyType, /](
         self._len = old_len + 1
 
     @stable(since="1.0")
-    def extend(mut self, var other: Self) where conforms_to(Self.T, Movable):
+    def extend(
+        mut self where len(self) == old(len(self)) + old(len(other)),
+        var other: Self,
+    ) where conforms_to(Self.T, Movable):
         """Extends this list by consuming the elements of `other`.
 
         Args:
@@ -1171,7 +1193,7 @@ struct List[T: AnyType, /](
                 len(self) - i,
             )
         ),
-        i: Int,
+        i: Int where 0 <= i and i < len(self),
     ) -> Self.T where conforms_to(Self.T, Movable):
         """Pops a value from the list at the given index.
 
@@ -1217,7 +1239,10 @@ struct List[T: AnyType, /](
 
     @stable(since="1.0")
     def resize(
-        mut self, length: Int, fill: Self.T
+        # The `old` makes the clause a postcondition only.
+        mut self where len(self) == length and old(len(self)) >= 0,
+        length: Int where length >= 0,
+        fill: Self.T,
     ) where conforms_to(Self.T, Copyable & Deinitable):
         """Resizes the list to the given new length.
 
@@ -1257,7 +1282,12 @@ struct List[T: AnyType, /](
         self._len = new_length
 
     def resize(
-        mut self, *, unsafe_uninit_length: Int
+        # The `old` makes the clause a postcondition only.
+        mut self where (
+            len(self) == unsafe_uninit_length and old(len(self)) >= 0
+        ),
+        *,
+        unsafe_uninit_length: Int where unsafe_uninit_length >= 0,
     ) where conforms_to(Self.T, Deinitable & Movable):
         """Resizes the list to the given new size leaving any new elements
         uninitialized.
@@ -1322,7 +1352,9 @@ struct List[T: AnyType, /](
         self._len = new_length
         self._annotate_shrink(old_length)
 
-    def reverse(mut self) where conforms_to(Self.T, Movable):
+    def reverse(
+        mut self where len(self) == old(len(self)),
+    ) where conforms_to(Self.T, Movable):
         """Reverses the elements of the list.
 
         Examples:
@@ -1434,7 +1466,9 @@ struct List[T: AnyType, /](
         return result.value()
 
     def clear(
-        mut self,
+        # The `old` makes the clause a postcondition only (a `mut` clause
+        # without one holds on entry too); lengths are never negative.
+        mut self where len(self) == 0 and old(len(self)) >= 0,
     ) where conforms_to(Self.T, Deinitable):
         """Clears the elements in the list.
 
@@ -1549,7 +1583,7 @@ struct List[T: AnyType, /](
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
-        ref self, idx: IntLiteral, /
+        ref self, idx: IntLiteral where Int(idx) < len(self), /
     ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T:
         """Gets the list element at the given index.
 
