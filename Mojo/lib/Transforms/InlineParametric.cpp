@@ -625,6 +625,12 @@ uint64_t ParametricInliningGraph::getNumOperations(
         return WalkResult::skip();
       }
 
+      // Nothing for static verification only becomes code (this walk visits
+      // nested ops first, so check their parents too).
+      for (Operation *parent = op; parent && parent != operation;
+           parent = parent->getParentOp())
+        if (isVerificationOnly(parent))
+          return WalkResult::advance();
       if (!isa_and_nonnull<DebugInfo::DebugInfoDialect>(op->getDialect()))
         ++count;
 

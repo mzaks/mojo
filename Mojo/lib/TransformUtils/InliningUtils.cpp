@@ -321,14 +321,39 @@ mlir::PassManager &PerThreadPassManagers::getPassManager() {
   return pm;
 }
 
+bool KGEN::isVerificationOnly(Operation *op) {
+  // Checked by name: TransformUtils cannot depend on the dialects.
+  StringRef name = op->getName().getStringRef();
+  if (name == "kgen.requires" || name == "kgen.ensures" || name == "kgen.old")
+    return true;
+  auto isSnapshot = [](Value ptr) {
+    Operation *def = ptr.getDefiningOp();
+    return def && def->hasAttr("kgen.contract_snapshot");
+  };
+  if (op->hasAttr("kgen.contract_snapshot"))
+    return true;
+  // The store into a snapshot, and the load that only feeds it.
+  if (name == "pop.store")
+    return isSnapshot(op->getOperand(1));
+  if (name == "pop.load" && op->hasOneUse()) {
+    Operation *user = *op->getUsers().begin();
+    return user->getName().getStringRef() == "pop.store" &&
+           isSnapshot(user->getOperand(1));
+  }
+  return false;
+}
+
 uint64_t KGEN::getNumOperations(Operation *op) {
   if (!op)
     return 0;
 
   uint64_t result = 0;
-  op->walk([&](Operation *op) {
+  op->walk<mlir::WalkOrder::PreOrder>([&](Operation *op) {
+    if (isVerificationOnly(op))
+      return WalkResult::skip();
     if (!isa_and_nonnull<DebugInfo::DebugInfoDialect>(op->getDialect()))
       ++result;
+    return WalkResult::advance();
   });
   return result;
 }
