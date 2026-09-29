@@ -301,6 +301,8 @@ struct Obligation {
   Location callLoc, clauseLoc;
   std::string callee;
   bool analyzed = true;
+  /// The function's own postcondition, at a return (`callLoc`).
+  bool postcondition = false;
 };
 
 /// A loop being walked: where its iterations continue and exit, and what
@@ -357,8 +359,10 @@ public:
     // The function's own preconditions hold at its entry.
     for (Operation &op : entry)
       if (auto req = dyn_cast<RequiresOp>(&op))
-        if (MaybeTerm cond = instantiate(req, req.getArgs(), state, {}))
+        if (MaybeTerm cond = instantiate(req.getBody(), req.getArgs(), state,
+                                         {}, {}, nullptr, /*assumed=*/true))
           facts.push_back(*cond);
+    entryState = state;
     walkBlock(entry, state);
     return true;
   }
@@ -390,6 +394,8 @@ private:
   std::map<Loc, std::string> entryValues;
   std::map<std::pair<Loc, unsigned>, std::string> epochValues;
   std::map<std::pair<std::string, std::string>, std::string> fieldValues;
+  /// The struct value and field path each field value belongs to.
+  std::map<std::string, std::pair<std::string, std::string>> fieldOwners;
   DenseMap<Value, Loc> refArgs; // Contract block arguments bound to places.
   /// The function's reference arguments and local variables.
   SmallVector<Value> roots;
@@ -397,6 +403,22 @@ private:
   SmallVector<std::string> facts;
   std::map<std::string, Sort> sorts;
   std::map<std::string, SmallVector<std::string>> deps;
+  std::map<std::string, std::string> definitions;
+  std::map<std::pair<std::string, std::string>, bool> dependsMemo;
+  /// The state at the function's `kgen.contract.entry`, for its `old`s.
+  std::optional<State> entryState;
+  /// While evaluating a contract: where its `kgen.old`s look, whether its
+  /// quantifiers are assumed, and the caller's values of the callee's
+  /// arguments.
+  State *oldState = nullptr;
+  bool assuming = false;
+  DenseMap<Value, Value> actuals;
+  /// The call whose callee's postcondition is being assumed: its result.
+  Value callResult;
+  /// Element references `__getitem__` returned: the list's place and the
+  /// index.
+  DenseMap<Value, std::pair<Loc, std::string>> elements;
+  std::set<std::string> elementFunctions;
   unsigned counter = 0;
   bool lenDeclared = false;
   /// Inside a contract region: calls there are evaluated, not checked.
@@ -426,6 +448,7 @@ private:
                    .str();
     sorts[name] = sort;
     deps[name] = namesIn(expr);
+    definitions[name] = expr.str();
     return name;
   }
 
@@ -541,11 +564,12 @@ private:
       if (it == state.env.end())
         continue;
       std::string rest = StringRef(loc.path).drop_front(path.size()).str();
-      auto [field, inserted] = fieldValues.try_emplace({it->second, rest}, "");
-      if (inserted)
-        field->second = declare(sort, "f");
-      return field->second;
+      return fieldOf(it->second, rest, sort);
     }
+    // A field of a root whose value is unknown: a function of that value.
+    if (!loc.path.empty())
+      return fieldOf(load(Loc{loc.root, ""}, state, Sort{false, 64, false}),
+                     loc.path, sort);
     if (state.epoch) {
       auto [it, inserted] = epochValues.try_emplace({loc, state.epoch}, "");
       if (inserted)
@@ -556,6 +580,17 @@ private:
     if (inserted)
       it->second = declare(sort, "e");
     return it->second;
+  }
+
+  /// The value of field path `rest` of the struct value `value`.
+  std::string fieldOf(const std::string &value, const std::string &rest,
+                      Sort sort) {
+    auto [field, inserted] = fieldValues.try_emplace({value, rest}, "");
+    if (inserted) {
+      field->second = declare(sort, "f");
+      fieldOwners[field->second] = {value, rest};
+    }
+    return field->second;
   }
 
   std::string load(const Loc &loc, State &state, Type type) {
@@ -817,8 +852,30 @@ private:
   }
 
   void walkOp(Operation *op, State &state) {
-    if (isa<RequiresOp, EnsuresOp, ContractEntryOp>(op))
-      return; // Handled at entry, or not yet (postconditions: stage 3).
+    if (isa<RequiresOp>(op))
+      return; // Assumed at entry.
+    if (isa<ContractEntryOp>(op)) {
+      if (!inContract)
+        entryState = state;
+      return;
+    }
+    if (auto ensures = dyn_cast<EnsuresOp>(op)) {
+      if (!inContract)
+        proveEnsures(ensures, state);
+      return;
+    }
+    if (auto old = dyn_cast<OldOp>(op)) {
+      evalOld(old, state);
+      return;
+    }
+    if (auto forall = dyn_cast<ForallOp>(op)) {
+      evalForall(forall, state);
+      return;
+    }
+    if (op->getName().getStringRef() == "lit.error_return") {
+      state.alive = false; // Raises out of the function.
+      return;
+    }
     if (isa<HLCF::ReturnOp>(op)) {
       state.alive = false;
       return;
@@ -1128,6 +1185,21 @@ private:
                                         : declare(sortOf(result.getType()));
   }
 
+  /// The function's own postcondition, where it returns.
+  void proveEnsures(EnsuresOp ensures, State &state) {
+    Operation *next = ensures->getNextNode();
+    Location at = next ? next->getLoc() : ensures.getLoc();
+    Obligation ob{state.pc, "false", at, ensures.getLoc(), displayName(fn)};
+    ob.postcondition = true;
+    State *old = entryState ? &*entryState : nullptr;
+    if (MaybeTerm cond = instantiate(ensures.getBody(), ensures.getArgs(),
+                                     state, {}, {}, old, /*assumed=*/false))
+      ob.cond = *cond;
+    else
+      ob.analyzed = false;
+    obligations.push_back(ob);
+  }
+
   /// Code the encoder does not follow: memory is unknown after it, and its
   /// obligations are not analyzed.
   void notAnalyzed(Operation *op, State &state) {
@@ -1169,10 +1241,17 @@ private:
       values[result] = term(input, state);
       if (auto it = records.find(input); it != records.end())
         records[result] = it->second;
+      if (auto it = elements.find(input); it != elements.end())
+        elements[result] = it->second;
       return;
     }
     if (auto storeOp = dyn_cast<LIT::RefStoreOp>(op)) {
       Value value = storeOp->getOperand(0), dest = storeOp->getOperand(1);
+      if (auto it = elements.find(dest); it != elements.end()) {
+        auto [list, index] = it->second;
+        storeElement(list, index, term(value, state), state);
+        return;
+      }
       if (std::optional<Loc> loc = placeOf(dest))
         store(*loc, state, term(value, state), value);
       else if (auto ref = dyn_cast<LIT::RefType>(dest.getType()))
@@ -1183,6 +1262,12 @@ private:
     }
     if (auto loadOp = dyn_cast<LIT::RefLoadOp>(op)) {
       Value ref = loadOp->getOperand(0), result = loadOp->getResult(0);
+      if (auto it = elements.find(ref); it != elements.end()) {
+        auto [list, index] = it->second;
+        values[result] = elem(load(list, state, placeType(list)), index,
+                              sortOf(result.getType()));
+        return;
+      }
       std::optional<Loc> loc = placeOf(ref);
       if (!loc) {
         setResultsUnknown(op);
@@ -1206,6 +1291,11 @@ private:
       evalCall(call, state);
       return;
     }
+    if (isa<LIT::RefImmutOp>(op))
+      if (auto it = elements.find(op->getOperand(0)); it != elements.end()) {
+        auto element = it->second;
+        elements[op->getResult(0)] = element;
+      }
     // Declarations, lifetimes, debug info, and ops producing values not
     // modelled: results are unknown, memory unchanged.
     setResultsUnknown(op);
@@ -1240,19 +1330,19 @@ private:
 
   void evalCall(LIT::CallOp call, State &state) {
     std::optional<CalleeName> name = calleeName(call);
-    if (name && evalBuiltin(call, *name, state))
-      return;
-    // A call to a function with preconditions: they are obligations here.
     LIT::FnOp callee = lookup(call);
-    if (callee && !inContract && !callee.getFunctionBody().empty()) {
+    bool hasBody = callee && !callee.getFunctionBody().empty();
+    // A call to a function with preconditions: they are obligations here.
+    if (hasBody && !inContract) {
       for (Operation &calleeOp : callee.getFunctionBody().front()) {
         auto req = dyn_cast<RequiresOp>(&calleeOp);
         if (!req)
           continue;
         Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
                       displayName(callee)};
-        if (MaybeTerm cond = instantiate(req, req.getArgs(), state,
-                                         call.getOperands(), callee)) {
+        if (MaybeTerm cond =
+                instantiate(req.getBody(), req.getArgs(), state,
+                            call.getOperands(), callee, nullptr, false)) {
           ob.cond = *cond;
           noteCondition(ob.cond);
         } else {
@@ -1261,9 +1351,15 @@ private:
         obligations.push_back(ob);
       }
     }
+    if (name && evalBuiltin(call, *name, state))
+      return;
+    if (name && evalElementAccess(call, *name, state))
+      return;
     // The call's effects: its results are unknown, and so is memory it may
     // write: through its mutable reference arguments, and through the
     // mutable origins it is given (e.g. inside a struct passed by value).
+    State before = state;
+    before.yields.clear();
     setResultsUnknown(call);
     for (Value operand : call.getOperands()) {
       auto ref = dyn_cast<LIT::RefType>(operand.getType());
@@ -1279,6 +1375,132 @@ private:
     for (StringRef origin : topLevelElements(origins))
       if (!origin.ends_with(": !lit.origin<false>"))
         havocOrigin(origin, state);
+    if (hasBody)
+      assumeEnsures(call, callee, before, state);
+  }
+
+  /// After a call, the callee's postcondition: its arguments as they are
+  /// now, its `old`s as they were before the call. A raising callee's holds
+  /// only where it did not raise (its first result is the raised flag).
+  void assumeEnsures(LIT::CallOp call, LIT::FnOp callee, State &before,
+                     State &state) {
+    EnsuresOp ensures;
+    callee.getFunctionBody().walk([&](EnsuresOp op) {
+      if (!ensures)
+        ensures = op;
+    });
+    if (!ensures)
+      return;
+    callResult = call->getNumResults() == 1 ? call->getResult(0) : Value();
+    MaybeTerm cond =
+        instantiate(ensures.getBody(), ensures.getArgs(), state,
+                    call.getOperands(), callee, &before, /*assumed=*/true);
+    callResult = {};
+    if (!cond)
+      return;
+    std::string holds = *cond;
+    std::string type = printed(call.getCallee().getType());
+    if (StringRef(type).contains(" throws") && call->getNumResults() >= 1 &&
+        sortOf(call->getResult(0).getType()).isBool)
+      holds = "(=> (not " + values[call->getResult(0)] + ") " + holds + ")";
+    state.pc = define({true, 1, false}, "(and " + state.pc + " " + holds + ")",
+                      "r");
+  }
+
+  /// `_same_elements(a._data, b._data, n)` for lists `a` and `b`: their first
+  /// `n` elements are equal, for every element sort read so far. Anything
+  /// else is unknown (nothing when assumed, false to prove).
+  std::string sameElements(const std::string &dst, const std::string &src,
+                           const std::string &count) {
+    auto dstField = fieldOwners.find(dst), srcField = fieldOwners.find(src);
+    if (dstField == fieldOwners.end() || srcField == fieldOwners.end() ||
+        !StringRef(dstField->second.second).contains("_data") ||
+        dstField->second.second != srcField->second.second)
+      return assuming ? "true" : "false";
+    const std::string &a = dstField->second.first, &b = srcField->second.first;
+    elem(a, bvConst(0, 64), {false, 64, true}); // At least `Int` elements.
+    std::string k = declare({false, 64, true}, "k");
+    std::string equal = "true";
+    for (const std::string &fn : elementFunctions)
+      equal = "(and " + equal + " (= (" + fn + " " + a + " " + k + ") (" + fn +
+              " " + b + " " + k + ")))";
+    std::string range = "(and (bvsle " + bvConst(0, 64) + " " + k +
+                        ") (bvslt " + k + " " + count + "))";
+    if (!assuming)
+      return define({true, 1, false}, "(=> " + range + " " + equal + ")");
+    return define({true, 1, false}, "(forall ((" + k +
+                                        " (_ BitVec 64))) (=> " + range + " " +
+                                        equal + "))");
+  }
+
+  /// `List.__getitem__`: a reference to an element, the list's place and an
+  /// index. Reading it reads `elem(list, index)`; writing it makes a new list
+  /// with the same length and the other elements unchanged.
+  bool evalElementAccess(LIT::CallOp call, const CalleeName &name,
+                         State &state) {
+    StringRef path = name.path;
+    if (!path.starts_with("std::collections::list::List::__getitem__[") ||
+        call->getNumResults() != 1 || call.getNumOperands() < 1 ||
+        !isa<LIT::RefType>(call->getResult(0).getType()))
+      return false;
+    std::optional<Loc> list = placeOf(call.getOperands()[0]);
+    if (!list)
+      return false;
+    std::string index;
+    // `xs[0]`: the index is a parameter, `!pop.int_literal`.
+    static llvm::Regex literalRe("int_literal (-?[0-9]+)|"
+                                 "#pop<int_literal (-?[0-9]+)>");
+    SmallVector<StringRef> m;
+    if (call.getNumOperands() == 2 &&
+        sortOf(call.getOperands()[1].getType()).width == 64 &&
+        !sortOf(call.getOperands()[1].getType()).isBool &&
+        !path.contains("IntLiteral")) {
+      index = term(call.getOperands()[1], state);
+    } else if (call.getNumOperands() == 2) {
+      // The literal's value is in the index's type (`IntLiteral[0]`).
+      std::string type = printed(call.getOperands()[1].getType());
+      if (literalRe.match(type, &m)) {
+        int64_t v;
+        StringRef digits = m[1].empty() ? m[2] : m[1];
+        if (!digits.getAsInteger(10, v))
+          index = bvConst(v, 64);
+      }
+    }
+    if (index.empty())
+      return false;
+    Value result = call->getResult(0);
+    values[result] = declare({false, 64, false}, "g");
+    elements[result] = {*list, index};
+    return true;
+  }
+
+  std::string elem(StringRef list, StringRef index, Sort sort) {
+    std::string fn = "elem" + std::to_string(sort.isBool ? 1 : sort.width) +
+                     (sort.isBool ? "b" : "");
+    if (elementFunctions.insert(fn).second)
+      prelude += "(declare-fun " + fn + " ((_ BitVec 64) (_ BitVec 64)) " +
+                 sort.str() + ")\n";
+    return define(sort, ("(" + fn + " " + list + " " + index + ")").str());
+  }
+
+  /// Writing element `index` of the list at `list` with `value`.
+  void storeElement(const Loc &list, StringRef index, StringRef value,
+                    State &state) {
+    std::string old = load(list, state, placeType(list));
+    std::string updated = declare({false, 64, false}, "h");
+    Sort sort = sortOfTerm(value);
+    std::string fn = "elem" + std::to_string(sort.isBool ? 1 : sort.width) +
+                     (sort.isBool ? "b" : "");
+    elem(updated, index, sort); // Declares the function.
+    facts.push_back("(= " + lenOf(updated) + " " + lenOf(old) + ")");
+    facts.push_back(("(= (" + fn + " " + updated + " " + index + ") " + value +
+                     ")")
+                        .str());
+    facts.push_back(("(forall ((j (_ BitVec 64))) (! (=> (not (= j " + index +
+                     ")) (= (" + fn + " " + updated + " j) (" + fn + " " + old +
+                     " j))) :pattern ((" + fn + " " + updated + " j))))")
+                        .str());
+    store(list, state, updated);
   }
 
   /// Integer and Boolean operators, `len`, and `range` iteration.
@@ -1303,6 +1525,13 @@ private:
     }
     if (evalRange(call, name, state))
       return true;
+    if (path.starts_with("std::builtin::_verification::_same_elements[") &&
+        call.getNumOperands() == 3) {
+      values[result] = sameElements(term(call.getOperands()[0], state),
+                                    term(call.getOperands()[1], state),
+                                    term(call.getOperands()[2], state));
+      return true;
+    }
     if (!path.starts_with("std::simd::SIMD::__") || name.params.size() < 2)
       return false;
     std::optional<Sort> sort = dtypeSort(name.params[0]);
@@ -1445,50 +1674,239 @@ private:
     return false;
   }
 
-  /// The condition of a `kgen.requires` region of `callee` (the function
-  /// itself when `callee` is null), with its block arguments bound to the
-  /// caller's `operands` (the function's own arguments when empty).
-  MaybeTerm instantiate(RequiresOp req, OperandRange args, State &state,
-                        ValueRange operands, LIT::FnOp callee = {}) {
-    Block &body = req.getBody().front();
+  /// The condition of a contract region (`kgen.requires` or `kgen.ensures`)
+  /// of `callee` (the function itself when `callee` is null), with its block
+  /// arguments bound to the caller's `operands` (the function's own arguments
+  /// when empty) in `state`. `kgen.old` inside it is evaluated in `old`.
+  /// Quantifiers are real `forall`s when the condition is `assumed`, and a
+  /// fresh index (enough to prove one) otherwise.
+  MaybeTerm instantiate(Region &region, OperandRange args, State &state,
+                        ValueRange operands, LIT::FnOp callee, State *old,
+                        bool assumed) {
+    Block &body = region.front();
     Block &calleeEntry = (callee ? callee : fn).getFunctionBody().front();
     DenseMap<Value, std::string> saved = values;
+    DenseMap<Value, Value> savedActuals = actuals;
+    State *savedOld = oldState;
+    bool savedAssuming = assuming;
     SmallVector<Value> boundRefs;
+    auto restore = [&] {
+      for (Value ref : boundRefs)
+        refArgs.erase(ref);
+      // Values of the region's ops belong to this instantiation only.
+      values = std::move(saved);
+      actuals = std::move(savedActuals);
+      oldState = savedOld;
+      assuming = savedAssuming;
+    };
+    // The callee's arguments, as the caller's values (for `kgen.old`).
+    if (callee)
+      for (BlockArgument formal : calleeEntry.getArguments())
+        if (formal.getArgNumber() < operands.size())
+          actuals[formal] = operands[formal.getArgNumber()];
     for (auto [i, blockArg] : llvm::enumerate(body.getArguments())) {
-      if (i >= args.size())
+      if (i >= args.size()) {
+        restore();
         return std::nullopt;
-      Value formal = args[i];
-      auto formalArg = dyn_cast<BlockArgument>(formal);
-      if (!formalArg || formalArg.getOwner() != &calleeEntry)
-        return std::nullopt;
-      Value actual = formal;
-      if (callee) {
-        if (formalArg.getArgNumber() >= operands.size())
-          return std::nullopt;
-        actual = operands[formalArg.getArgNumber()];
       }
-      if (isa<LIT::RefType>(blockArg.getType())) {
-        std::optional<Loc> loc = placeOf(actual);
-        if (!loc)
-          return std::nullopt;
-        refArgs[blockArg] = *loc;
+      Value formal = args[i];
+      Value actual = callee ? actuals.lookup(formal) : formal;
+      // A register `out` result is a local of the callee
+      // (`lit.var.decl "r" arg`): at a call, the call's result.
+      if (callee && !actual && isNamedResult(callee, formal) &&
+          callResult && isa<LIT::RefType>(blockArg.getType())) {
+        Loc loc{callResult, ""};
+        state.env[loc] = term(callResult, state);
+        refArgs[blockArg] = loc;
         boundRefs.push_back(blockArg);
-      } else {
-        values[blockArg] = term(actual, state);
+        continue;
+      }
+      auto formalArg = dyn_cast<BlockArgument>(formal);
+      bool ownLocal = !callee && formal.getDefiningOp<LIT::VarDeclOp>();
+      if (!ownLocal &&
+          (!formalArg || formalArg.getOwner() != &calleeEntry || !actual)) {
+        restore();
+        return std::nullopt;
+      }
+      if (!bind(blockArg, actual, state, boundRefs)) {
+        restore();
+        return std::nullopt;
       }
     }
+    oldState = old;
+    assuming = assumed;
     State inner = state;
     inner.yields.clear();
     ++inContract;
     walkBlock(body, inner);
     --inContract;
-    for (Value ref : boundRefs)
-      refArgs.erase(ref);
     MaybeTerm result;
     if (inner.yields.size() == 1)
       result = inner.yields.front();
-    // Values of the region's ops belong to this instantiation only.
+    restore();
+    return result;
+  }
+
+  static bool isNamedResult(LIT::FnOp callee, Value formal) {
+    auto decl = formal.getDefiningOp<LIT::VarDeclOp>();
+    auto named = callee->getAttrOfType<StringAttr>("namedResult");
+    if (!decl || !named)
+      return false;
+    auto name = decl->getAttrOfType<StringAttr>("name");
+    return !name || name.getValue() == named.getValue();
+  }
+
+  /// Binds a region's block argument to the caller's value `actual`: a
+  /// reference to its place, a value to its term in `state`.
+  bool bind(BlockArgument blockArg, Value actual, State &state,
+            SmallVectorImpl<Value> &boundRefs) {
+    if (isa<LIT::RefType>(blockArg.getType())) {
+      std::optional<Loc> loc = placeOf(actual);
+      if (!loc)
+        return false;
+      refArgs[blockArg] = *loc;
+      boundRefs.push_back(blockArg);
+      return true;
+    }
+    values[blockArg] = term(actual, state);
+    return true;
+  }
+
+  /// `kgen.old(%entry, args...)`: its region evaluated on its arguments as
+  /// they were at the entry token (`oldState`).
+  void evalOld(OldOp old, State &state) {
+    Value result = old->getResult(0);
+    Region &region = old->getRegion(0);
+    if (!oldState || region.empty() ||
+        region.front().getNumArguments() + 1 != old->getNumOperands()) {
+      values[result] = declare(sortOf(result.getType()));
+      return;
+    }
+    SmallVector<Value> boundRefs;
+    DenseMap<Value, std::string> saved = values;
+    bool ok = true;
+    for (auto [i, blockArg] : llvm::enumerate(region.front().getArguments())) {
+      Value operand = old->getOperand(i + 1);
+      // A callee's argument stands for the caller's value.
+      if (Value actual = actuals.lookup(operand))
+        operand = actual;
+      ok = ok && bind(blockArg, operand, *oldState, boundRefs);
+    }
+    State inner = *oldState;
+    inner.yields.clear();
+    if (ok)
+      walkBlock(region.front(), inner);
+    for (Value ref : boundRefs)
+      refArgs.erase(ref);
+    std::string value = ok && inner.yields.size() == 1
+                            ? inner.yields.front()
+                            : declare(sortOf(result.getType()));
     values = std::move(saved);
+    values[result] = value;
+  }
+
+  /// `kgen.forall(lo?, hi)`: its condition for every index in `[lo, hi)`.
+  void evalForall(ForallOp forall, State &state) {
+    Value result = forall->getResult(0);
+    Region &region = forall->getRegion(0);
+    auto unknown = [&] {
+      // Assumed, nothing; to prove, false.
+      values[result] = assuming ? "true" : "false";
+    };
+    if (region.empty() || region.front().getNumArguments() != 1 ||
+        forall->getNumOperands() < 1 || forall->getNumOperands() > 2) {
+      unknown();
+      return;
+    }
+    BlockArgument index = region.front().getArgument(0);
+    Sort sort = sortOf(index.getType());
+    std::string lo = forall->getNumOperands() == 2
+                         ? term(forall->getOperand(0), state)
+                         : bvConst(0, sort.width);
+    std::string hi = term(forall->getOperands().back(), state);
+    unsigned firstName = counter;
+    std::string k = declare(sort, "k");
+    values[index] = k;
+    State inner = state;
+    inner.yields.clear();
+    walkBlock(region.front(), inner);
+    if (inner.yields.size() != 1) {
+      unknown();
+      return;
+    }
+    std::string body = inner.yields.front();
+    std::string range = "(and (bvsle " + lo + " " + k + ") (bvslt " + k +
+                        " " + hi + "))";
+    if (!assuming) {
+      // To prove it, one arbitrary index in the range suffices.
+      values[result] =
+          define({true, 1, false}, "(=> " + range + " " + body + ")");
+      return;
+    }
+    // Assumed: a real quantifier over the body, with the definitions that
+    // depend on the index inlined. An unknown made while evaluating the
+    // body (e.g. a call's result) would be one value for every index, so
+    // the quantifier is not assumed then.
+    llvm::StringSet<> used = closure({body});
+    for (auto &entry : used) {
+      StringRef name = entry.getKey();
+      unsigned id;
+      if (name != k && StringRef("ugh").contains(name.front()) &&
+          !name.drop_front(1).getAsInteger(10, id) && id >= firstName) {
+        unknown();
+        return;
+      }
+    }
+    std::map<std::string, std::string> memo;
+    std::string expanded = expandOver(body, k, memo);
+    values[result] = define({true, 1, false},
+                            "(forall ((" + k + " " + sort.str() + ")) (=> " +
+                                range + " " + expanded + "))");
+  }
+
+  /// `term` with every definition that depends on `var` inlined, so `var`
+  /// can be bound by a quantifier.
+  std::string expandOver(StringRef term, StringRef var,
+                         std::map<std::string, std::string> &memo) {
+    std::string out;
+    for (size_t i = 0; i < term.size();) {
+      if (llvm::isAlpha(term[i]) && (i == 0 || !llvm::isAlnum(term[i - 1]))) {
+        size_t j = i + 1;
+        while (j < term.size() && llvm::isAlnum(term[j]))
+          ++j;
+        std::string name = term.slice(i, j).str();
+        auto def = definitions.find(name);
+        if (def != definitions.end() && dependsOn(name, var)) {
+          auto [it, inserted] = memo.try_emplace(name, "");
+          if (inserted)
+            it->second = expandOver(def->second, var, memo);
+          out += it->second;
+        } else {
+          out += name;
+        }
+        i = j;
+        continue;
+      }
+      out += term[i++];
+    }
+    return out;
+  }
+
+  bool dependsOn(const std::string &name, StringRef var) {
+    if (name == var)
+      return true;
+    auto key = std::make_pair(name, var.str());
+    if (auto it = dependsMemo.find(key); it != dependsMemo.end())
+      return it->second;
+    dependsMemo[key] = false; // Definitions are acyclic.
+    bool result = false;
+    if (auto it = deps.find(name); it != deps.end())
+      for (const std::string &dep : it->second)
+        if (dependsOn(dep, var)) {
+          result = true;
+          break;
+        }
+    dependsMemo[key] = result;
     return result;
   }
 };
@@ -1541,32 +1959,33 @@ struct VerifyContractsPass
         if (ob.analyzed)
           ++next;
         ++total;
+        StringRef what = ob.postcondition ? "postcondition" : "precondition";
         if (answer == Answer::Proven) {
           ++proven;
           if (verbose)
             mlir::emitRemark(ob.callLoc)
-                << "precondition of '" << ob.callee << "' proven";
+                << what << " of '" << ob.callee << "' proven";
           continue;
         }
         auto diag = mlir::emitWarning(ob.callLoc);
         switch (answer) {
         case Answer::Unproven:
-          diag << "cannot prove the precondition of '" << ob.callee << "'";
+          diag << "cannot prove the " << what << " of '" << ob.callee << "'";
           break;
         case Answer::Unknown:
-          diag << "the precondition of '" << ob.callee
+          diag << "the " << what << " of '" << ob.callee
                << "' was not decided within the solver limits";
           break;
         default:
-          diag << "the precondition of '" << ob.callee
+          diag << "the " << what << " of '" << ob.callee
                << "' is not analyzed yet (this control flow is not supported)";
           break;
         }
-        diag.attachNote(ob.clauseLoc) << "precondition declared here";
+        diag.attachNote(ob.clauseLoc) << what << " declared here";
       }
     });
     llvm::errs() << "verify-contracts: " << proven << "/" << total
-                 << " preconditions proven (" << loops << " loops, "
+                 << " obligations proven (" << loops << " loops, "
                  << invariants << " invariants)\n";
   }
 };
