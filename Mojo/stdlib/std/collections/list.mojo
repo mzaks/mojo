@@ -41,7 +41,7 @@ from std.memory import (
     unsafe_uninit_move_n,
 )
 from std.builtin.builtin_slice import ContiguousSlice, StridedSlice
-from std.builtin._verification import _assume, _ensures
+from std.builtin._verification import _assume, _ensures, _same_elements
 from .optional import Optional
 
 # ===-----------------------------------------------------------------------===#
@@ -881,7 +881,9 @@ struct List[T: AnyType, /](
     @inline(.never)
     def _realloc(
         mut self where (
-            len(self) == old(len(self)) and self._capacity == new_capacity
+            len(self) == old(len(self))
+            and self._capacity == new_capacity
+            and _same_elements(self._data, old(self._data), len(self))
         ),
         new_capacity: Int,
     ) where conforms_to(Self.T, Movable):
@@ -929,7 +931,11 @@ struct List[T: AnyType, /](
     @__unsafe_nested_origins_read_only
     @stable(since="1.1")
     def append(
-        mut self where len(self) == old(len(self)) + 1, var value: Self.T, /
+        mut self where len(self) == old(len(self)) + 1 and _same_elements(
+            self._data, old(self._data), old(len(self))
+        ),
+        var value: Self.T,
+        /,
     ) where conforms_to(Self.T, Movable):
         """Appends a value to this list.
 
@@ -1134,7 +1140,9 @@ struct List[T: AnyType, /](
         self._len += count
 
     def pop(
-        mut self where old(len(self)) > 0 where len(self) == old(len(self)) - 1,
+        mut self where old(len(self)) > 0 where len(self) == old(
+            len(self)
+        ) - 1 and _same_elements(self._data, old(self._data), len(self)),
     ) -> Self.T where conforms_to(Self.T, Movable):
         """Pops the last value from the list.
 
@@ -1154,7 +1162,16 @@ struct List[T: AnyType, /](
 
     @inline(.always)
     def pop(
-        mut self where len(self) == old(len(self)) - 1, i: Int
+        mut self where (
+            len(self) == old(len(self)) - 1
+            and _same_elements(self._data, old(self._data), i)
+            and _same_elements(
+                self._data.unsafe_offset(i),
+                old(self._data).unsafe_offset(i + 1),
+                len(self) - i,
+            )
+        ),
+        i: Int,
     ) -> Self.T where conforms_to(Self.T, Movable):
         """Pops a value from the list at the given index.
 

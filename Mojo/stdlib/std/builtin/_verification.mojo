@@ -18,6 +18,7 @@ LLVM, and the comptime interpreter skips them.
 """
 
 from std.collections.string.string_span import _get_kgen_string
+from std.traits import IsTriviallyMovable
 
 
 @inline(.nodebug)
@@ -93,4 +94,40 @@ def _assume(cond: Bool):
     ]()
     __mlir_op.`kgen.assume`[kind=_get_kgen_string["invariant"](), _type=None](
         cond._mlir_value, line, col, file_name
+    )
+
+
+@inline(.nodebug)
+def _same_elements[
+    T: AnyType
+](dst: Pointer[T, _], src: Pointer[T, _], count: Int) -> Bool:
+    """States, in a postcondition, that the `count` elements at `dst` on exit
+    are the elements that were at `src` on entry.
+
+    Use it in a `where` clause on a `mut` or `out` argument, typically with
+    `src` an `old(...)` pointer, to say that a function keeps or moves elements
+    it does not otherwise change. Unlike comparing elements with `==` in a
+    quantifier, it works for any element type. It has no runtime effect.
+
+    It compares the elements' bits, which a move keeps only when it is
+    trivial: for a `T` that is not trivially movable it states nothing
+    (it is `True`).
+
+    Parameters:
+        T: The element type.
+
+    Args:
+        dst: The elements on exit.
+        src: The elements on entry.
+        count: The number of elements.
+
+    Returns:
+        The statement, for the verifier.
+    """
+    comptime if not IsTriviallyMovable[T]:
+        return True
+    return Bool(
+        mlir_value=__mlir_op.`kgen.contract.same_elements`[
+            _type=__mlir_type.`!kgen.scalar<bool>`
+        ](dst._mlir_value, src._mlir_value, count._mlir_value)
     )
