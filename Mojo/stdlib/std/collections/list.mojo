@@ -1569,7 +1569,7 @@ struct List[T: AnyType, /](
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
-        ref self, idx: Int, /
+        ref self, idx: Int where 0 <= idx and idx < len(self), /
     ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T:
         """Gets the list element at the given index.
 
