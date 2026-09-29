@@ -147,6 +147,10 @@ public:
       Value recorded;
     };
     SmallVector<Call, 2> values;
+    /// Record mode: the block the values are computed in, at its top level,
+    /// so the region can yield them whatever arm of the condition a call is
+    /// in.
+    Block *topLevel = nullptr;
   };
   OldCalls *oldCalls = nullptr;
 

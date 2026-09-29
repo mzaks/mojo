@@ -1891,15 +1891,28 @@ AnyValue IREmitter::emitOldCall(const ExprNode *call, const ExprNode *operand,
     emitError(call->getLoc(), "'old' value was not computed on entry");
     return {};
   }
-  AnyValue value = emitExpr(operand, EC_OperatorOperandValue);
-  if (!value || oldCalls->mode == OldCalls::Plain)
+  if (oldCalls->mode == OldCalls::Plain) {
+    AnyValue value = emitExpr(operand, EC_OperatorOperandValue);
     return value ? emitResult(value, call, dest) : AnyValue();
-  // Record: keep a copy of the value for the postcondition.
-  Value copy = emitSRValue({value, operand}, EC_OperatorOperandValue);
-  if (!copy)
-    return {};
-  oldCalls->values.push_back({call, AnyValue(SBValue(copy)), copy});
-  return emitResult(AnyValue(SBValue(copy)), call, dest);
+  }
+  // Record: compute the value at the top of the block, where the region can
+  // yield it, and keep a copy for the postcondition. This comes first, so
+  // anything the emission below reuses is defined there too.
+  Value recorded;
+  {
+    OpBuilder::InsertionGuard guard(*builder);
+    builder->setInsertionPointToStart(oldCalls->topLevel);
+    AnyValue top = emitExpr(operand, EC_OperatorOperandValue);
+    if (!top)
+      return {};
+    recorded = emitSRValue({top, operand}, EC_OperatorOperandValue);
+    if (!recorded)
+      return {};
+  }
+  oldCalls->values.push_back({call, AnyValue(), recorded});
+  // The value where the call is, for the rest of the clause.
+  AnyValue value = emitExpr(operand, EC_OperatorOperandValue);
+  return value ? emitResult(value, call, dest) : AnyValue();
 }
 
 //===----------------------------------------------------------------------===//

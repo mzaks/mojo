@@ -40,6 +40,7 @@
 
 #include "Mojo/HLCFDialect/HLCFOps.h"
 #include "Mojo/LITDialect/LITUtils.h"
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -2799,6 +2800,8 @@ static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
   }
 
   IREmitter clauseEmitter(scope, regionBuilder);
+  if (olds && olds->mode == IREmitter::OldCalls::Record)
+    olds->topLevel = block;
   clauseEmitter.oldCalls = olds;
   RValue cond =
       clauseEmitter.emitExprScalarBool(clause.propExpr, EC_BoolCondition);
@@ -2871,8 +2874,20 @@ LogicalResult DeclResolver::emitArgumentContracts(FnOp funcOp, ASTDecl &decl,
     for (IREmitter::OldCalls::Call &old : recorded.values)
       yielded.push_back(old.recorded);
     OpBuilder yieldBuilder(terminator);
-    KGEN::ContractYieldOp::create(yieldBuilder, terminator->getLoc(), yielded);
+    auto yield = KGEN::ContractYieldOp::create(yieldBuilder,
+                                               terminator->getLoc(), yielded);
     terminator->erase();
+    // Drop the rest of the condition: the comptime interpreter evaluates the
+    // region when it runs the function, and should only compute the values.
+    llvm::SetVector<Operation *> needed;
+    mlir::BackwardSliceOptions sliceOptions;
+    sliceOptions.omitUsesFromAbove = false;
+    sliceOptions.inclusive = true;
+    for (Value value : yielded)
+      (void)mlir::getBackwardSlice(value, &needed, sliceOptions);
+    for (Operation &op : llvm::make_early_inc_range(llvm::reverse(*oldBlock)))
+      if (&op != yield && !needed.contains(&op))
+        op.erase();
     KGEN::OldOp oldOp;
     SmallVector<Value> oldValues;
     if (!recorded.values.empty()) {
