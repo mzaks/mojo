@@ -170,6 +170,15 @@ result in a loop, and callers get its length from the contract
 (`ok_after_make`, `bad_after_make`). Postconditions are only assumed after
 calls to callees with a single return.
 
+A clause may quantify over a range of indices with
+`all([cond for i in range(lo, hi)])` (a `kgen.forall`), and `old(e)` inside it
+may use the index. A quantifier is proven through a fresh index in the range:
+`ok_swap_front` proves that it leaves every element from index 2 on unchanged
+(`bad_swap_touches_rest` does not), and `ok_first_of_appended` establishes
+`ok_first_nonneg`'s precondition that every element is non-negative
+(`bad_first_negative` cannot). Assumed, a quantifier only says its condition for
+one unknown index, which is sound but weak.
+
 A caller's proofs are conditional on its callees' contracts: after a call to a
 callee that breaks its postcondition, the callee's body and its contract
 contradict each other, and the rest of the caller is unreachable (`main` calls

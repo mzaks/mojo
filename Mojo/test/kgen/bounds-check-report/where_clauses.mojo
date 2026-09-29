@@ -134,7 +134,48 @@ def ok_make_loop(
         result.append(i)
 
 
+# Quantifiers: `all([cond for i in range(lo, hi)])`.
+@inline(.never)
+def ok_swap_front(
+    mut xs: List[Int] where old(len(xs)) >= 2 where len(xs) == old(
+        len(xs)
+    ) and all([xs[i] == old(xs[i]) for i in range(2, len(xs))])
+):
+    var t = xs[0]
+    xs[0] = xs[1]
+    xs[1] = t
+
+
+@inline(.never)
+def ok_first_nonneg(
+    xs: List[Int] where len(xs) > 0 and all(
+        [xs[i] >= 0 for i in range(len(xs))]
+    ),
+) -> Int:
+    return xs[0]
+
+
 # --- must stay UNPROVEN ---
+@inline(.never)
+def bad_swap_touches_rest(
+    mut xs: List[Int] where old(len(xs)) >= 4 where len(xs) == old(
+        len(xs)
+    ) and all([xs[i] == old(xs[i]) for i in range(2, len(xs))])
+):
+    var t = xs[0]
+    xs[0] = xs[1]
+    xs[1] = t
+    xs[3] = 7  # not unchanged
+
+
+@inline(.never)
+def bad_first_negative() -> Int:
+    var xs = List[Int]()
+    xs.append(1)
+    xs.append(-2)
+    return ok_first_nonneg(xs)  # xs[1] < 0
+
+
 @inline(.never)
 def bad_push_twice(mut xs: List[Int] where len(xs) == old(len(xs)) + 2, v: Int):
     xs.append(v)  # grows by one
@@ -157,6 +198,14 @@ def bad_after_make() -> Int:
 
 
 # --- must be PROVEN ---
+@inline(.never)
+def ok_first_of_appended() -> Int:
+    var xs = List[Int]()
+    xs.append(1)
+    xs.append(2)
+    return ok_first_nonneg(xs)
+
+
 @inline(.never)
 def ok_after_make_two() -> Int:
     var xs = ok_make_two()
@@ -202,6 +251,9 @@ def main():
         ok_after_shrink(xs),
     )
     bad_push_twice(xs, 1)
+    ok_swap_front(xs)
+    bad_swap_touches_rest(xs)
+    print(bad_first_negative(), ok_first_of_appended())
     ok_keep(xs)
     bad_keep_cleared(xs)
     bad_shrink_unchecked(xs)

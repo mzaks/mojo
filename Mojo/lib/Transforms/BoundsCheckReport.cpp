@@ -642,6 +642,9 @@ private:
     bool opaque = false;
     /// Whether this evaluates a contract op's region (see `contractContext`).
     bool contract = false;
+    /// For the body of a quantifier (see `forallTerm`): the `kgen.forall`.
+    /// Values defined outside its region belong to `parent`.
+    Operation *region = nullptr;
     /// Results of calls inside this callee, backed by nested contexts.
     DenseMap<Value, std::pair<CallContext *, Value>> results;
     /// Contexts of calls inside this callee (see `contextFor`).
@@ -675,9 +678,15 @@ private:
   /// context the loop is in.
   CallContext *contextOf(Value value) {
     CallContext *c = ctx;
-    while (c && c->loop &&
-           !c->loop->getRegion(0).isAncestor(value.getParentRegion()))
-      c = c->owner;
+    while (c) {
+      if (c->loop && !c->loop->getRegion(0).isAncestor(value.getParentRegion()))
+        c = c->owner;
+      else if (c->region &&
+               !c->region->getRegion(0).isAncestor(value.getParentRegion()))
+        c = c->parent;
+      else
+        break;
+    }
     return c;
   }
 
@@ -685,7 +694,7 @@ private:
   /// the context evaluating that callee and the returned value backing it.
   /// Calls met while evaluating a callee get nested contexts on demand.
   std::optional<std::pair<CallContext *, Value>> callResult(Value value) {
-    if (ctx && ctx->loop)
+    if (ctx && (ctx->loop || ctx->region))
       if (CallContext *owner = contextOf(value); owner != ctx) {
         CallContext *saved = ctx;
         ctx = owner;
@@ -1059,7 +1068,7 @@ private:
     Sort sort = sortOf(value.getType());
     if (sort.kind == Sort::None)
       return std::nullopt;
-    if (ctx && ctx->loop)
+    if (ctx && (ctx->loop || ctx->region))
       if (CallContext *owner = contextOf(value); owner != ctx)
         return inContext(owner, [&] { return term(value); });
     if (ctx) {
@@ -1089,6 +1098,9 @@ private:
           encodeIfResultOnDemand(ifOp, cast<OpResult>(value));
         else if (auto oldOp = dyn_cast<OldOp>(def)) {
           if (MaybeTerm t = oldTerm(oldOp))
+            map[value] = *t;
+        } else if (auto forall = dyn_cast<ForallOp>(def)) {
+          if (MaybeTerm t = forallTerm(forall))
             map[value] = *t;
         } else if (auto loop = dyn_cast<HLCF::LoopOp>(def)) {
           OpResult result = cast<OpResult>(value);
@@ -1579,6 +1591,10 @@ private:
         return std::nullopt;
       // Continue in the enclosing block, before the op containing `cur`.
       Operation *parent = cur->getParentOp();
+      // Leaving a quantifier's body: memory is the same around it.
+      if (parent && isa<ForallOp>(parent) && ctx && ctx->region == parent)
+        return inContext(ctx->parent,
+                         [&] { return valueBefore(place, parent, depth); });
       if (parent && isContractOp(parent))
         return valueAtCall(place, depth);
       // The function's entry: the caller's value when evaluating a callee,
@@ -2445,6 +2461,10 @@ private:
       Operation *parent = cur->getParentOp();
       if (!parent)
         return std::nullopt;
+      if (isa<ForallOp>(parent) && ctx && ctx->region == parent)
+        return inContext(ctx->parent, [&] {
+          return heapValueBefore(r.withoutFacts(), parent, depth + 1);
+        });
       if (isa<FuncOp>(parent) || isContractOp(parent)) {
         // A callee's entry: continue in the caller, before the call.
         if (ctx && ctx->call) {
@@ -2781,7 +2801,7 @@ private:
   /// values visible through e.g. the `Optional` returned by iterators.
   MaybeTerm resolveAccess(Value aggregate, ArrayRef<int> path, Sort sort,
                           unsigned depth = 0) {
-    if (ctx && ctx->loop)
+    if (ctx && (ctx->loop || ctx->region))
       if (CallContext *owner = contextOf(aggregate); owner != ctx)
         return inContext(
             owner, [&] { return resolveAccess(aggregate, path, sort, depth); });
@@ -3406,8 +3426,9 @@ private:
   std::string contractFacts(Operation *op, CallContext &context) {
     std::string facts = "true";
     op->getRegion(0).walk<mlir::WalkOrder::PreOrder>([&](Operation *nested) {
-      // A `kgen.old`'s facts are collected when it is evaluated.
-      if (isa<OldOp>(nested))
+      // A `kgen.old`'s facts are collected when it is evaluated; a
+      // quantifier's depend on its index.
+      if (isa<OldOp, ForallOp>(nested))
         return WalkResult::skip();
       if (auto assume = dyn_cast<AssumeOp>(nested))
         facts = mkAnd(facts, inContext(&context, [&] {
@@ -3440,6 +3461,41 @@ private:
     if (facts == "true")
       return cond;
     return toAssume ? mkAnd(facts, cond) : "(=> " + facts + " " + cond + ")";
+  }
+
+  /// The value of a `kgen.forall`, for every index in `[lo, hi)`: the
+  /// condition for a fresh index `k` in the range, i.e.
+  /// `(=> (lo <= k < hi) cond(k))`. As an obligation that proves the
+  /// condition for every index, since `k` is arbitrary; assumed, it only says
+  /// it for one unknown index, which is weaker than the quantifier, so sound.
+  /// (Callers get more from a postcondition quantifier through
+  /// `frameValue`.)
+  MaybeTerm forallTerm(ForallOp op) {
+    Block &block = op.getBody().front();
+    BlockArgument index = block.getArgument(0);
+    Sort sort = sortOf(index.getType());
+    if (sort.kind != Sort::BV)
+      return std::nullopt;
+    MaybeTerm hi = term(op.getHi());
+    MaybeTerm lo = op.getLo() ? term(op.getLo())
+                              : MaybeTerm(bvConst(APInt(sort.width, 0)));
+    if (!lo || !hi)
+      return std::nullopt;
+    std::string k = declare(sort);
+    noteUnknown(k, "the index of a quantifier");
+    CallContext &body = contexts.emplace_back();
+    body.callee = "forall";
+    body.contract = true;
+    body.parent = ctx;
+    body.depth = ctx ? ctx->depth + 1 : 1;
+    body.region = op;
+    body.terms[index] = k;
+    auto yield = cast<ContractYieldOp>(block.getTerminator());
+    std::string cond =
+        inContext(&body, [&] { return boolTerm(yield.getValues().front()); });
+    std::string inRange =
+        mkAnd("(bvsle " + *lo + " " + k + ")", "(bvslt " + k + " " + *hi + ")");
+    return "(=> " + inRange + " " + cond + ")";
   }
 
   /// The value of a `kgen.old`: its region evaluated like a callee's, with
