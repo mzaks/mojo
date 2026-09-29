@@ -6,15 +6,22 @@ elaboration and inlining. See `Mojo/proposals/modular-verification.md`.
 
 ## Running
 
-The pass runs on the module `kgen -lsp` checks, and reports through the same
-diagnostics, with source locations. It needs `z3` on `PATH` (or `z3-path=`).
+`kgen --verify-contracts` parses the file (with the functions it calls),
+runs the check pipeline (up to lifetime checking), runs the pass, and stops
+before elaboration. Results are diagnostics with source locations. It needs
+`z3` on `PATH` (or `z3-path=`).
 
 ```bash
 ./bazelw build --config=build-mojo //Mojo/tools/kgen:kgen //Mojo/stdlib/std:std
 bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
     Mojo/test/kgen/verify-contracts/straight_line.mojo \
-    -lsp=no-dump --verify-contracts="verbose=true"
+    -elaborate --verify-contracts="verbose=true"
 ```
+
+With `-lsp=no-dump` instead of `-elaborate`, it runs on the module the
+language server checks. That parse is lazy: a stdlib function whose body
+was not needed has no body there, and so no contracts, and calls to it are
+not checked.
 
 Options: `verbose=true` reports proven obligations as remarks,
 `include-stdlib=true` also checks `std`, `rlimit=` sets the solver's
@@ -44,7 +51,7 @@ function warned about, none in an `ok_*` one):
 
 ```bash
 f=Mojo/test/kgen/verify-contracts/straight_line.mojo
-bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std $f -lsp=no-dump \
+bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std $f -elaborate \
     --verify-contracts 2>&1 | grep "warning:" |
   grep -oE "^[^ ]*$(basename $f):[0-9]+" |
   cut -d: -f2 | while read l; do
@@ -93,11 +100,15 @@ The output must be exactly the `bad_*` functions.
   integer or Boolean operators (`n >= 0` on a parameter `n` is `n >= 0`);
   anything else about a parameter is unknown.
 
+- `List` states its lengths: its constructors (empty, `capacity=`,
+  `length=`, literals, `copy=`) and `append`, `pop`, `insert`, `clear`,
+  `extend`, `reverse` and `resize`; element access (`xs[i]`, `xs[0]`),
+  `pop(i)` and `insert(i, ...)` state their index bounds.
+
 Not analyzed yet: loops with loop-carried values, and
 `reversed(range(...))` (a strided range). The obligations inside
-unsupported control flow are reported as not analyzed. Constructors and
-literals do not state their lengths yet (`List()`, `[1, 2]`), nor does
-`append` state the value it adds.
+unsupported control flow are reported as not analyzed. `append` does not state the value it adds (a
+generic `T` has no `==` to state it with).
 
 ## Expected results
 
@@ -107,3 +118,4 @@ literals do not state their lengths yet (`List()`, `[1, 2]`), nor does
 | `loops.mojo`         | all `bad_*`        | all `ok_*`       |
 | `postconditions.mojo`| all `bad_*`        | all `ok_*`       |
 | `comptime.mojo`      | all `bad_*`        | all `ok_*`       |
+| `lists.mojo`         | all `bad_*`        | all `ok_*`       |
