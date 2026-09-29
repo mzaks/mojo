@@ -147,6 +147,18 @@ Sort sortOf(Type type) {
   return {false, 64, false};
 }
 
+/// Whether values of `type` are integers or Booleans the encoding models
+/// exactly (not opaque handles).
+bool isScalar(Type type) {
+  std::string text = printed(type);
+  StringRef t(text);
+  if (sortOf(type).isBool || t == "index" || t.starts_with("!kgen.scalar<"))
+    return true;
+  t.consume_front("!kgen.param<:meta<");
+  return t.starts_with("!lit.struct<@std::@simd::@SIMD<") && isWidthOne(t) &&
+         dtypeSort(t).has_value();
+}
+
 std::string bvConst(int64_t value, unsigned width) {
   APInt bits(width, static_cast<uint64_t>(value), /*isSigned=*/true);
   return "(_ bv" + llvm::toString(bits, 10, /*Signed=*/false) + " " +
@@ -1074,8 +1086,9 @@ private:
 
   /// `hlcf.comptime.if`: elaboration keeps the first arm whose condition (a
   /// parameter expression in `conds`) is true, or the else arm (the last
-  /// region). A condition is one unknown per parameter expression, so the
-  /// same expression in two places is the same choice.
+  /// region). Conditions are evaluated with `paramTerm`, so a literal or an
+  /// expression over the function's parameters decides or constrains the
+  /// arm; the same expression in two places is the same choice.
   void walkComptimeIf(Operation *op, State &state) {
     auto ifOp = dyn_cast<HLCF::ComptimeIfOp>(op);
     if (!ifOp || op->getNumResults() ||
@@ -1087,7 +1100,7 @@ private:
     std::string none = "true"; // No earlier condition held.
     for (auto [i, condAttr] : llvm::enumerate(ifOp.getConds())) {
       auto typed = dyn_cast<TypedAttr>(condAttr);
-      std::string cond = typed ? parameterValue(printed(typed), {true, 1, false})
+      std::string cond = typed ? paramTerm(typed, {true, 1, false})
                                : declare({true, 1, false}, "p");
       State arm = state;
       arm.yields.clear();
@@ -1555,9 +1568,177 @@ private:
       if (!literal.getAsInteger(10, v))
         values[result] = bvConst(v, sort.width);
     }
-    // A parameter expression: the same unknown wherever it appears.
+    // A parameter expression.
     if (!values.count(result))
-      values[result] = parameterValue(text, sort);
+      values[result] = paramTerm(cst.getValue(), sort);
+  }
+
+  /// An integer or Boolean `SIMD` operator on terms, as its SMT expression.
+  static MaybeTerm simdOperator(StringRef method, Sort sort,
+                                ArrayRef<std::string> args, Sort &resultSort) {
+    bool s = sort.isSigned;
+    static const std::pair<const char *, const char *> binary[] = {
+        {"__add__", "bvadd"}, {"__sub__", "bvsub"}, {"__mul__", "bvmul"},
+        {"__and__", "bvand"}, {"__or__", "bvor"},   {"__xor__", "bvxor"},
+    };
+    const std::pair<const char *, const char *> compare[] = {
+        {"__lt__", s ? "bvslt" : "bvult"}, {"__le__", s ? "bvsle" : "bvule"},
+        {"__gt__", s ? "bvsgt" : "bvugt"}, {"__ge__", s ? "bvsge" : "bvuge"},
+    };
+    if (args.size() == 2) {
+      for (auto &[m, smt] : binary)
+        if (method == m) {
+          resultSort = sort;
+          return "(" + std::string(smt) + " " + args[0] + " " + args[1] + ")";
+        }
+      for (auto &[m, smt] : compare)
+        if (method == m) {
+          resultSort = {true, 1, false};
+          return "(" + std::string(smt) + " " + args[0] + " " + args[1] + ")";
+        }
+      if (method == "__eq__" || method == "__ne__") {
+        resultSort = {true, 1, false};
+        std::string eq = "(= " + args[0] + " " + args[1] + ")";
+        return method == "__eq__" ? eq : "(not " + eq + ")";
+      }
+    }
+    if (args.size() == 1 && method == "__neg__") {
+      resultSort = sort;
+      return "(bvneg " + args[0] + ")";
+    }
+    return std::nullopt;
+  }
+
+  /// A parameter expression's value: literals, and the integer and Boolean
+  /// operators of parameter expressions (`add`, `lt`, `cond`, ...) and of
+  /// `SIMD` (`apply` of `__ge__`, ...) over them. Anything else (a parameter,
+  /// a value computed at comptime) is one unknown per expression, so the same
+  /// expression in two places has the same value.
+  std::string paramTerm(TypedAttr attr, Sort sort, unsigned depth = 0) {
+    if (depth > 32)
+      return parameterValue(printed(attr), sort);
+    if (auto sugar = dyn_cast<SugarAttr>(attr))
+      return paramTerm(sugar.getCanonical(), sort, depth + 1);
+    if (auto simd = dyn_cast<SIMDAttr>(attr)) {
+      ArrayRef<DTypeValue> vals = simd.getValues();
+      if (vals.size() == 1) {
+        if (sort.isBool)
+          return vals[0].getBoolVal() ? "true" : "false";
+        if (vals[0].getData().getBitWidth() == sort.width)
+          return "(_ bv" +
+                 llvm::toString(vals[0].getData(), 10, /*Signed=*/false) +
+                 " " + std::to_string(sort.width) + ")";
+      }
+    }
+    if (auto integer = dyn_cast<IntegerAttr>(attr)) {
+      if (sort.isBool)
+        return integer.getValue().isZero() ? "false" : "true";
+      if (integer.getValue().getBitWidth() <= sort.width)
+        return bvConst(integer.getValue().getSExtValue(), sort.width);
+    }
+    if (auto value = dyn_cast<LIT::LITStructAttr>(attr);
+        value && value.getValues().size() == 1 &&
+        std::get<0>(value.getValues()[0]).getValue() == "_mlir_value")
+      return paramTerm(std::get<1>(value.getValues()[0]), sort, depth + 1);
+    if (auto extract = dyn_cast<LIT::StructExtractAttr>(attr);
+        extract && extract.getField().getValue() == "_mlir_value")
+      return paramTerm(extract.getStructValue(), sort, depth + 1);
+    // "All operands denote the same value": for integers and Booleans,
+    // equality; anything else (types, structs) stays unknown.
+    if (auto identical = dyn_cast<ParamIdenticalAttr>(attr);
+        identical && sort.isBool && identical.getOperands().size() >= 2 &&
+        llvm::all_of(identical.getOperands(), [](TypedAttr op) {
+          return isScalar(op.getType());
+        })) {
+      ArrayRef<TypedAttr> ops = identical.getOperands();
+      Sort operand = sortOf(ops[0].getType());
+      std::string first = paramTerm(ops[0], operand, depth + 1);
+      std::string all = "true";
+      for (TypedAttr op : ops.drop_front())
+        all = "(and " + all + " (= " + first + " " +
+              paramTerm(op, operand, depth + 1) + "))";
+      return define({true, 1, false}, all);
+    }
+    if (auto expr = dyn_cast<ParamOperatorAttr>(attr)) {
+      ArrayRef<TypedAttr> ops = expr.getOperands();
+      auto sub = [&](size_t i, Sort s) {
+        return paramTerm(ops[i], s, depth + 1);
+      };
+      Sort operand = ops.empty() ? sort : sortOf(ops[0].getType());
+      auto fold = [&](StringRef smt, Sort s) -> std::string {
+        std::string acc = sub(0, s);
+        for (size_t i = 1; i < ops.size(); ++i)
+          acc = ("(" + smt + " " + acc + " " + sub(i, s) + ")").str();
+        return acc;
+      };
+      switch (expr.getOpcode()) {
+      case POC::Add:
+        if (!sort.isBool && !ops.empty())
+          return define(sort, fold("bvadd", sort));
+        break;
+      case POC::Mul:
+        if (!sort.isBool && !ops.empty())
+          return define(sort, fold("bvmul", sort));
+        break;
+      case POC::And:
+      case POC::Or:
+      case POC::Xor:
+        if (!ops.empty()) {
+          bool b = sort.isBool;
+          StringRef smt = expr.getOpcode() == POC::And  ? (b ? "and" : "bvand")
+                          : expr.getOpcode() == POC::Or ? (b ? "or" : "bvor")
+                                                        : (b ? "xor" : "bvxor");
+          return define(sort, fold(smt, sort));
+        }
+        break;
+      case POC::EQ:
+        if (ops.size() == 2)
+          return define({true, 1, false}, "(= " + sub(0, operand) + " " +
+                                               sub(1, operand) + ")");
+        break;
+      case POC::LT:
+      case POC::LE:
+        if (ops.size() == 2 && !operand.isBool)
+          return define({true, 1, false},
+                        "(" +
+                            std::string(expr.getOpcode() == POC::LT ? "bvslt"
+                                                                    : "bvsle") +
+                            " " + sub(0, operand) + " " + sub(1, operand) + ")");
+        break;
+      case POC::Cond:
+        if (ops.size() == 3)
+          return define(sort, "(ite " + sub(0, {true, 1, false}) + " " +
+                                  sub(1, sort) + " " + sub(2, sort) + ")");
+        break;
+      case POC::Rebind:
+        if (ops.size() == 1)
+          return sub(0, sort);
+        break;
+      case POC::Apply:
+        if (ops.size() >= 2)
+          if (std::optional<CalleeName> name = calleeName(ops[0]);
+              name && name->params.size() >= 2 &&
+              StringRef(name->path).starts_with("std::simd::SIMD::__"))
+            if (std::optional<Sort> simdSort = dtypeSort(name->params[0]);
+                simdSort && isWidthOne(name->params[1])) {
+              SmallVector<std::string> args;
+              for (size_t i = 1; i < ops.size(); ++i)
+                args.push_back(sub(i, *simdSort));
+              StringRef method = StringRef(name->path)
+                                     .drop_front(strlen("std::simd::SIMD::"))
+                                     .take_until([](char c) { return c == '('; });
+              Sort resultSort;
+              if (MaybeTerm t = simdOperator(method, *simdSort, args, resultSort);
+                  t && resultSort.isBool == sort.isBool &&
+                  (sort.isBool || resultSort.width == sort.width))
+                return define(sort, *t);
+            }
+        break;
+      default:
+        break;
+      }
+    }
+    return parameterValue(printed(attr), sort);
   }
 
   void evalCall(LIT::CallOp call, State &state) {
