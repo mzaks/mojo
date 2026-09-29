@@ -1,7 +1,7 @@
 # Modular verification before elaboration
 
 **September 29, 2026**
-Status: Draft. Stages 1 to 3 are implemented; see
+Status: Draft. Stages 1 to 4 are implemented; see
 [Implementation status](#implementation-status).
 
 This document proposes moving static verification of contracts and bounds
@@ -332,6 +332,28 @@ Stage 3:
 - `test_list.mojo` proves 14 of the 24 calls the pass checks, in 4.5 s. The
   rest need contracts the stdlib does not state yet: the lengths of `List()`
   and list literals, and the value `append` adds (stage 6).
+
+Stage 4:
+
+- Functions are verified on a thread pool and reported in order afterwards.
+- Scripts are deterministic: places are ordered by their position in the
+  function rather than by address. Until then, 99 of test_list.mojo's 123
+  scripts changed from run to run.
+- `cache-dir=` caches each script's answers under a hash of the script and
+  of the z3 binary; runs stopped at the wall-clock cap are not cached.
+- test_list.mojo (the check pipeline alone takes 1.1 s):
+
+  | Stage end | Verification's share |
+  |-----------|----------------------|
+  | 3         | 3.4 s                |
+  | 4, cold   | 0.7 s                |
+  | 4, warm   | 0.3 s                |
+
+- One incremental z3 process per function (instead of one per Houdini round)
+  is not done: in parallel, the remaining solver time is about 0.4 s, and it
+  needs a two-way pipe to z3 that LLVM's process API does not provide.
+- Each query still sees the whole function's encoding; before inlining the
+  encodings are small enough that slicing per query has not been needed.
 
 ## Risks and open questions
 
