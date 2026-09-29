@@ -515,6 +515,9 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
     mlir::SourceMgrDiagnosticHandler diagHandler(mgr, ctx);
     (void)compiler.runCheckLITPipeline(*theModule);
     mlir::PassManager verifyPM(ctx);
+    // Honour --mlir-print-ir-before=verify-contracts and friends.
+    if (failed(mlir::applyPassManagerCLOptions(verifyPM)))
+      return failure();
     if (failed(mlir::parsePassPipeline("verify-contracts{" +
                                            clOptions.verifyContracts + "}",
                                        verifyPM)) ||
