@@ -1,7 +1,8 @@
 # Modular verification before elaboration
 
 **September 29, 2026**
-Status: Draft. Stages 1 to 5 are implemented; see
+Status: Draft. Stages 1 to 5 and `List`'s part of stage 6 are implemented;
+see
 [Implementation status](#implementation-status).
 
 This document proposes moving static verification of contracts and bounds
@@ -372,6 +373,34 @@ Stage 5:
 - Reporting a function as not verifiable generically, for the
   post-elaboration pass to check its instances, is not done yet: nothing is
   unanalyzed in the examples and test_list.mojo.
+
+Stage 6, `List`:
+
+- `kgen --verify-contracts` parses the file as a compilation does, runs the
+  check pipeline and the pass, and stops before elaboration. The `-lsp`
+  parse is lazy, so stdlib functions whose bodies nothing needed there had
+  no contracts for the pass.
+- `List` states its lengths in its constructors (including literals, whose
+  element count the pass reads from the variadic pack) and mutating
+  methods, and its index bounds in `__getitem__` (`Int` and `IntLiteral`),
+  `pop(i)` and `insert`; `Mojo/test/kgen/verify-contracts/lists.mojo`
+  proves all its `ok_*` functions and flags all its `bad_*` ones.
+- The post-elaboration pass proves the new clauses where it inlines them
+  (1822 of test_list.mojo's 1833 obligations; the rest are on lists of
+  lists, through heap memory), which checks the contracts against their
+  bodies.
+- test_list.mojo, one run each at load 9 to 14:
+
+  | Pass                     | Time   | Proven                |
+  |--------------------------|--------|-----------------------|
+  | post-elaboration         | 47 s   | 1822 of 1833          |
+  | `verify-contracts`       | 1.7 s  | 150 of 222            |
+
+  The obligations differ: the new pass checks each call once, generically.
+  Its 72 unproven calls need what `List`'s contracts cannot say yet
+  (the value `append` adds, the length of a list that is an element of
+  another), `Span` and slicing contracts (`test_list_span`, 23), and
+  `reversed(range(...))`. Other collections come next.
 
 ## Risks and open questions
 
