@@ -123,3 +123,26 @@ def mut_without_old(mut a: Int where a >= 0):
 # CHECK: lit.end_fn
 def mut_only_old(mut a: Int where old(a) > 0):
     a -= 1
+
+
+# `all([cond for i in range(...)])` in a contract is a quantifier: a
+# `kgen.forall` over the index, whose region yields the condition.
+# CHECK-LABEL: lit.fn @"all_nonneg
+# CHECK: kgen.requires
+# CHECK: kgen.forall({{ *}}%{{.*}} : !Int) -> !Bool
+# CHECK: ^bb0(%{{.*}}: !Int):
+# CHECK: kgen.contract.yield
+def all_nonneg(n: Int where all([i * i >= 0 for i in range(n)])):
+    pass
+
+
+# With both bounds, and `old(e)` using the index: the `kgen.old` takes it as
+# an operand.
+# CHECK-LABEL: lit.fn @"shift_rest
+# CHECK: %[[ENTRY:.*]] = kgen.contract.entry
+# CHECK: kgen.ensures
+# CHECK: kgen.forall({{ *}}%{{.*}} : !Int, %{{.*}} : !Int) -> !Bool
+# CHECK: ^bb0(%[[I:.*]]: !Int):
+# CHECK: kgen.old(%[[ENTRY]], {{.*}}%[[I]] : {{.*}}) -> !Int
+def shift_rest(mut a: Int where all([a + i == old(a) + i for i in range(1, 3)])):
+    pass

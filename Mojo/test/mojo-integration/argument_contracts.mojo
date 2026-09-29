@@ -85,11 +85,24 @@ def bump(mut a: Int where a == old(a) + 1):
     a += 1
 
 
+# Quantifiers too.
+@inline(.never)
+def swap_front(
+    mut xs: List[Int] where old(len(xs)) >= 2 where len(xs) == old(
+        len(xs)
+    ) and all([xs[i] == old(xs[i]) for i in range(2, len(xs))])
+):
+    var t = xs[0]
+    xs[0] = xs[1]
+    xs[1] = t
+
+
 def postconditions():
     var xs = make(3)
     push(xs, 7)
     shrink(xs)
     var a = 41
     bump(a)
-    # CHECK: 3 2 42
-    print(len(xs), xs[2], a)
+    swap_front(xs)
+    # CHECK: 3 1 42
+    print(len(xs), xs[0], a)

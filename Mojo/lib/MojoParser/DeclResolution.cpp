@@ -2794,6 +2794,7 @@ static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
 
   IREmitter clauseEmitter(scope, regionBuilder);
   clauseEmitter.oldCalls = olds;
+  clauseEmitter.inContract = true;
   RValue cond =
       clauseEmitter.emitExprScalarBool(clause.propExpr, EC_BoolCondition);
   Value condVal = clauseEmitter.emitSRValue({AnyValue(cond), clause.propExpr},
@@ -2807,10 +2808,12 @@ static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
 AnyValue DeclResolver::emitOldValue(IREmitter &emitter, const ExprNode *call,
                                     const ExprNode *operand, ExprDest &dest) {
   IREmitter::OldCalls &olds = *emitter.oldCalls;
-  auto funcOp =
-      getBlockParentOfType<FnOp>(emitter.builder->getInsertionBlock());
+  // The emitter may be filling a block not attached yet (a quantifier's
+  // body): find the function through the scope.
   ASTDecl *funcDecl = emitter.declScope.getNearestDeclOfType<FnOp>();
-  if (!funcOp || !funcDecl || !olds.entry)
+  auto funcOp =
+      funcDecl ? dyn_cast_or_null<FnOp>(funcDecl->getIfOperation()) : FnOp();
+  if (!funcOp || !olds.entry)
     return {};
   Location loc = shared.translateLocation(call->getLoc());
 

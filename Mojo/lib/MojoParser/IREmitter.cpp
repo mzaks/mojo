@@ -1890,6 +1890,60 @@ AnyValue IREmitter::emitOldCall(const ExprNode *call, const ExprNode *operand,
   return value ? emitResult(value, call, dest) : AnyValue();
 }
 
+AnyValue IREmitter::emitForall(const ExprNode *call, const ExprNode *cond,
+                               StringRef index, ArrayRef<Operand> bounds,
+                               ExprDest &dest) {
+  Location loc = translateLocation(call->getLoc());
+  // The index and the bounds are `Int`s (literals convert implicitly).
+  ASTType intType =
+      shared.lookupBuiltinType("Int", getDeclScope(), call->getLoc());
+  auto emitBound = [&](const ExprNode *bound) -> Value {
+    return emitExprSRValue(bound, EC_OperatorOperandValue, intType);
+  };
+  Value lo;
+  if (bounds.size() == 2 && !(lo = emitBound(bounds.front().expr)))
+    return {};
+  Value hi = emitBound(bounds.back().expr);
+  if (!hi)
+    return {};
+
+  // The condition is computed in the op's region, from the index.
+  auto *block = new Block();
+  BlockArgument indexArg = block->addArgument(hi.getType(), loc);
+  StringAttr indexName = StringAttr::get(getContext(), index);
+  ASTDecl &scope = getDeclResolver().addFullyResolvedDecl(
+      nullptr, StringAttr(), call->getLoc(), &declScope);
+  getDeclResolver().addFullyResolvedDecl(SBValue(indexArg), indexName,
+                                         call->getLoc(), &scope);
+  OpBuilder bodyBuilder(getContext());
+  bodyBuilder.setInsertionPointToEnd(block);
+  IREmitter bodyEmitter(scope, bodyBuilder);
+  bodyEmitter.inContract = true;
+  // An `old(e)` in the condition may use the index.
+  std::optional<OldCalls> olds;
+  if (oldCalls) {
+    olds = *oldCalls;
+    olds->indices.push_back({indexName, indexArg});
+    olds->count = 0;
+    bodyEmitter.oldCalls = &*olds;
+  }
+  AnyValue value = bodyEmitter.emitExpr(cond, EC_OperatorOperandValue);
+  Value condValue =
+      value ? bodyEmitter.emitSRValue({value, cond}, EC_OperatorOperandValue)
+            : Value();
+  if (oldCalls)
+    oldCalls->count += olds->count;
+  if (!condValue) {
+    delete block;
+    return {};
+  }
+  KGEN::ContractYieldOp::create(bodyBuilder, loc, condValue);
+  auto forall =
+      KGEN::ForallOp::create(*builder, loc, condValue.getType(), lo, hi);
+  forall.getBody().push_back(block);
+  return emitResult(AnyValue(SRValue(forall.getValue())), call, dest);
+}
+
 //===----------------------------------------------------------------------===//
 // Return emission helpers.
 

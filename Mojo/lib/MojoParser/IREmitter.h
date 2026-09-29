@@ -152,6 +152,16 @@ public:
   AnyValue emitOldCall(const ExprNode *call, const ExprNode *operand,
                        ExprDest &dest);
 
+  /// Whether a `where` clause on an argument is being emitted: there,
+  /// `all([cond for i in range(...)])` is a quantifier (see `emitForall`).
+  bool inContract = false;
+
+  /// Emit `all([cond for index in range(bounds...)])` in a contract as a
+  /// `kgen.forall`.
+  AnyValue emitForall(const ExprNode *call, const ExprNode *cond,
+                      StringRef index, ArrayRef<Operand> bounds,
+                      ExprDest &dest);
+
   /// When non-null, body-constraint inconclusiveness during emission is
   /// silently accepted at single-candidate emission sites, and the unprovable
   /// body constraints are inserted into this context for the caller to

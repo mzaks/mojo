@@ -2876,6 +2876,27 @@ AnyValue CallNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
         operands.front().unpackStyle == ArgUnpackStyle::kPositional)
       return emitter.emitOldCall(this, operands.front().expr, dest);
 
+  // In a contract, `all([cond for i in range(...)])` is a quantifier.
+  if (emitter.inContract)
+    if (auto *ref = dyn_cast<DeclRefNode>(callee);
+        ref && ref->spelling == "all" && operands.size() == 1 &&
+        operands.front().unpackStyle == ArgUnpackStyle::kPositional)
+      if (auto *comp = dyn_cast<ComprehensionNode>(operands.front().expr);
+          comp && comp->kind == kListComprehension &&
+          comp->clauses.size() == 1 &&
+          comp->clauses.front().kind == ComprehensionClause::kFor)
+        if (auto *index =
+                dyn_cast<DeclRefNode>(comp->clauses.front().forPattern))
+          if (auto *range = dyn_cast<CallNode>(comp->clauses.front().expr))
+            if (auto *rangeRef = dyn_cast<DeclRefNode>(range->callee);
+                rangeRef && rangeRef->spelling == "range" &&
+                (range->operands.size() == 1 || range->operands.size() == 2) &&
+                llvm::all_of(range->operands, [](const Operand &bound) {
+                  return bound.unpackStyle == ArgUnpackStyle::kPositional;
+                }))
+              return emitter.emitForall(this, comp->expr, index->spelling,
+                                        range->operands, dest);
+
   AnyValue calleeVal = emitter.emitExpr(callee, EC_CallCalleeValue);
   if (!calleeVal)
     return {};
