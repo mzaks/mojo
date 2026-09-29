@@ -642,7 +642,9 @@ private:
       else
         havocOrigin(printed(ref.getOrigin()), state);
     }
-    for (StringRef origin : topLevelElements(printed(call.getImplicitOriginsAttr())))
+    // Keep the printed list alive while its elements are used.
+    std::string origins = printed(call.getImplicitOriginsAttr());
+    for (StringRef origin : topLevelElements(origins))
       if (!origin.ends_with(": !lit.origin<false>"))
         havocOrigin(origin, state);
   }
