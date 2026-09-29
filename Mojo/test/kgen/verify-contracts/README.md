@@ -105,8 +105,16 @@ The output must be exactly the `bad_*` functions.
   `extend`, `reverse` and `resize`; element access (`xs[i]`, `xs[0]`),
   `pop(i)` and `insert(i, ...)` state their index bounds.
 
+- `Span` and contiguous slices: `Span(list=)` is as long as the list,
+  `span[i]` requires `i` in range, and `xs[a:b]` (on a list or a span)
+  requires `0 <= a <= b <= len(xs)` and has length `b - a`, with absent
+  bounds meaning 0 and `len(xs)`. The pass models `Optional` (its
+  constructors, `or_else`, `__bool__`) to read the bounds.
+
 Not analyzed yet: loops with loop-carried values, and
-`reversed(range(...))` (a strided range). The obligations inside
+`reversed(range(...))` (a strided range). Strided slices (`xs[::2]`), a
+list built from a span (`List(span)`, whose generic iterable constructor
+states no length), and spans over `Array` have no length contracts yet. The obligations inside
 unsupported control flow are reported as not analyzed. `append` does not state the value it adds (a
 generic `T` has no `==` to state it with).
 
@@ -119,3 +127,4 @@ generic `T` has no `==` to state it with).
 | `postconditions.mojo`| all `bad_*`        | all `ok_*`       |
 | `comptime.mojo`      | all `bad_*`        | all `ok_*`       |
 | `lists.mojo`         | all `bad_*`        | all `ok_*`       |
+| `spans.mojo`         | all `bad_*`        | all `ok_*`       |
