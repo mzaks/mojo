@@ -41,7 +41,7 @@ from std.memory import (
     unsafe_uninit_move_n,
 )
 from std.builtin.builtin_slice import ContiguousSlice, StridedSlice
-from std.builtin._verification import _assume, _ensures, _requires
+from std.builtin._verification import _assume, _ensures
 from .optional import Optional
 
 # ===-----------------------------------------------------------------------===#
@@ -880,9 +880,11 @@ struct List[T: AnyType, /](
 
     @inline(.never)
     def _realloc(
-        mut self, new_capacity: Int
+        mut self where (
+            len(self) == old(len(self)) and self._capacity == new_capacity
+        ),
+        new_capacity: Int,
     ) where conforms_to(Self.T, Movable):
-        var old_len = len(self)
         var new_data = alloc(Layout[Self.T](count=new_capacity)).unsafe_leak()
 
         unsafe_uninit_move_n[overlapping=False](
@@ -899,8 +901,6 @@ struct List[T: AnyType, /](
         self._data = new_data
         self._capacity = new_capacity
         self._annotate_new()
-        _ensures(len(self) == old_len)
-        _ensures(self._capacity == new_capacity)
 
     @inline(.always)
     def _grow_amortized(
@@ -929,7 +929,7 @@ struct List[T: AnyType, /](
     @__unsafe_nested_origins_read_only
     @stable(since="1.1")
     def append(
-        mut self, var value: Self.T, /
+        mut self where len(self) == old(len(self)) + 1, var value: Self.T, /
     ) where conforms_to(Self.T, Movable):
         """Appends a value to this list.
 
@@ -948,7 +948,6 @@ struct List[T: AnyType, /](
         print(list) # [1, 2, 3, 4, 5, 6]
         ```
         """
-        var old_len = len(self)
         if self._len >= self._capacity:
             self._realloc(self._capacity * 2 | Int(self._capacity == 0))
         self._annotate_increase()
@@ -957,7 +956,6 @@ struct List[T: AnyType, /](
         # just established above from the optimizer.
         self._data.unsafe_offset(self._len).unsafe_write(value^)
         self._len += 1
-        _ensures(len(self) == old_len + 1)
 
     @inline(.always)
     def insert(
@@ -1032,7 +1030,8 @@ struct List[T: AnyType, /](
         other^._unsafe_assume_destroyed_and_deallocate()
 
     def extend(
-        mut self, elements: Span[Self.T, _]
+        mut self where len(self) == old(len(self)) + len(elements),
+        elements: Span[Self.T, _],
     ) where conforms_to(Self.T, Copyable):
         """Extend this list by copying elements from a `Span`.
 
@@ -1050,7 +1049,6 @@ struct List[T: AnyType, /](
         print(numbers)   # [1, 2, 3, 4, 5, 6]
         ```
         """
-        var old_len = len(self)
         var elements_len = len(elements)
         var new_num_elts = self._len + elements_len
         self._grow_amortized(new_num_elts)
@@ -1064,7 +1062,6 @@ struct List[T: AnyType, /](
             src=elements.unsafe_ptr(),
             count=elements_len,
         )
-        _ensures(len(self) == old_len + elements_len)
 
     @__allow_legacy_custom_self_type
     def extend[
@@ -1136,7 +1133,9 @@ struct List[T: AnyType, /](
         )
         self._len += count
 
-    def pop(mut self) -> Self.T where conforms_to(Self.T, Movable):
+    def pop(
+        mut self where old(len(self)) > 0 where len(self) == old(len(self)) - 1,
+    ) -> Self.T where conforms_to(Self.T, Movable):
         """Pops the last value from the list.
 
         Returns:
@@ -1150,14 +1149,13 @@ struct List[T: AnyType, /](
         print("length", len(numbers))             # length 4
         ```
         """
-        _requires(len(self) > 0)
-        var old_len = len(self)
-        var ret_val = self.pop(old_len - 1)
-        _ensures(len(self) == old_len - 1)
+        var ret_val = self.pop(len(self) - 1)
         return ret_val^
 
     @inline(.always)
-    def pop(mut self, i: Int) -> Self.T where conforms_to(Self.T, Movable):
+    def pop(
+        mut self where len(self) == old(len(self)) - 1, i: Int
+    ) -> Self.T where conforms_to(Self.T, Movable):
         """Pops a value from the list at the given index.
 
         Args:
@@ -1174,7 +1172,6 @@ struct List[T: AnyType, /](
         print(numbers)                            # ['1', '2', '4', '5']
         ```
         """
-        var old_len = len(self)
         check_bounds(i, len(self))
         var ret_val = self._data.unsafe_offset(i).unsafe_take_pointee()
         unsafe_uninit_move_n[overlapping=True](
@@ -1184,7 +1181,6 @@ struct List[T: AnyType, /](
         )
         self._len -= 1
         self._annotate_shrink(self._len + 1)
-        _ensures(len(self) == old_len - 1)
         return ret_val^
 
     @stable(since="1.0")
