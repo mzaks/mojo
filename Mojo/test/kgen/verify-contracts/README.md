@@ -69,10 +69,23 @@ The output must be exactly the `bad_*` functions.
   loop's variables. Only variables the loop's conditions depend on are
   considered. The invariants hold only where the loop is reached.
 
+- Postconditions: a function's own clauses on `out` and `mut` arguments are
+  proven where it returns, with `old(...)` evaluated at its entry, and a
+  callee's are assumed after the call (only where it did not raise). An
+  unproven one is reported at the return, with a note at the clause.
+- Quantifiers (`all([... for i in range(lo, hi)])`) are proven for an
+  arbitrary index and assumed as real quantifiers.
+- List elements: `xs[i]` reads `elem(xs, i)`; writing it keeps the length
+  and the other elements. `_same_elements(a._data, b._data, n)` says the
+  first `n` elements of two lists are equal, which is how `List.append`,
+  `pop` and `_realloc` state what they keep.
+- Loop invariants also bound the lengths of lists a loop appends to.
+
 Not analyzed yet: comptime control flow, loops with loop-carried values,
-`reversed(range(...))` (a strided range), and postconditions (so nothing is
-known about a list's length after `append` or a literal). The obligations
-inside unsupported control flow are reported as not analyzed.
+and `reversed(range(...))` (a strided range). The obligations inside
+unsupported control flow are reported as not analyzed. Constructors and
+literals do not state their lengths yet (`List()`, `[1, 2]`), nor does
+`append` state the value it adds.
 
 ## Expected results
 
@@ -80,3 +93,4 @@ inside unsupported control flow are reported as not analyzed.
 |----------------------|--------------------|------------------|
 | `straight_line.mojo` | all `bad_*`        | all `ok_*`       |
 | `loops.mojo`         | all `bad_*`        | all `ok_*`       |
+| `postconditions.mojo`| all `bad_*`        | all `ok_*`       |
