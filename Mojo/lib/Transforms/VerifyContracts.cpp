@@ -2002,19 +2002,14 @@ private:
     }
     if (path.starts_with("std::builtin::len::len[") &&
         call.getNumOperands() == 1) {
-      // An `Array`'s length is its size parameter, in its type.
-      if (std::optional<Loc> loc = placeOf(call.getOperands()[0])) {
-        static llvm::Regex arrayRe(
-            "^!lit.struct<@std::@collections::@array::@Array<.*"
-            "\\{:scalar<index> (-?[0-9]+)\\}>>$");
-        SmallVector<StringRef> m;
-        std::string type = printed(placeType(*loc));
-        int64_t n;
-        if (arrayRe.match(type, &m) && !m[1].getAsInteger(10, n)) {
-          values[result] = bvConst(n, 64);
+      // An `Array`'s length is its size parameter, in its type (an
+      // expression in the parameters of the function the place is in).
+      if (std::optional<Loc> loc = placeOf(call.getOperands()[0]);
+          loc && loc->path.empty())
+        if (MaybeTerm n = arrayLength(*loc)) {
+          values[result] = *n;
           return true;
         }
-      }
       values[result] = define(
           {false, 64, true}, lenOf(valueThrough(call.getOperands()[0], state)));
       return true;
@@ -2110,6 +2105,32 @@ private:
       return true;
     }
     return false;
+  }
+
+  /// The length of the `Array` at `loc`, from its type.
+  MaybeTerm arrayLength(const Loc &loc) {
+    auto type = dyn_cast<LIT::StructType>(placeType(loc));
+    if (!type || type.getParamValues().size() != 2 ||
+        printed(type.getSymbol()) != "@std::@collections::@array::@Array")
+      return std::nullopt;
+    TypedAttr size = type.getParamValues()[1];
+    Sort sort = sortOf(size.getType());
+    if (sort.isBool || sort.width != 64)
+      return std::nullopt;
+    // The type is the caller's when the place is (a callee's contract binds
+    // its arguments to the caller's places).
+    ParamFrame *saved = params;
+    Operation *owner =
+        isa<BlockArgument>(loc.root)
+            ? cast<BlockArgument>(loc.root).getOwner()->getParentOp()
+            : loc.root.getDefiningOp();
+    if (owner && (owner == fn.getOperation() ||
+                  owner->getParentOfType<LIT::FnOp>() == fn))
+      while (params)
+        params = params->parent;
+    std::string n = paramTerm(size, sort);
+    params = saved;
+    return n;
   }
 
   /// Writes a struct value with known fields to `loc`: the struct itself is
