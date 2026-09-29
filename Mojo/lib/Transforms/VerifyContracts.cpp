@@ -1568,6 +1568,14 @@ private:
       if (!literal.getAsInteger(10, v))
         values[result] = bvConst(v, sort.width);
     }
+    // An `IntLiteral`: its value is in its type.
+    if (!values.count(result)) {
+      static llvm::Regex intLiteralRe("IntLiteral ?<:!pop.int_literal (-?[0-9]+)>");
+      std::string type = printed(result.getType());
+      int64_t v;
+      if (intLiteralRe.match(type, &m) && !m[1].getAsInteger(10, v))
+        values[result] = bvConst(v, 64);
+    }
     // A parameter expression.
     if (!values.count(result))
       values[result] = paramTerm(cst.getValue(), sort);
@@ -1938,6 +1946,29 @@ private:
     }
     if (evalRange(call, name, state))
       return true;
+    // `Int(literal)`: the literal's value.
+    if (path.starts_with("std::simd::SIMD::__init__[!pop.int_literal](") &&
+        call.getNumOperands() == 1) {
+      values[result] = term(call.getOperands()[0], state);
+      return true;
+    }
+    // The pack of a variadic call (`[1, 2, 3]`): as long as the array of
+    // references it is built from (`array<3, ...>`).
+    if ((path.starts_with("std::builtin::variadics::VariadicList::__init__[") ||
+         path.starts_with(
+             "std::builtin::variadics::VariadicListMem::__init__[")) &&
+        call.getNumOperands() == 1) {
+      static llvm::Regex arrayRe("array<([0-9]+),");
+      SmallVector<StringRef> m;
+      std::string type = printed(call.getOperands()[0].getType());
+      int64_t n;
+      if (arrayRe.match(type, &m) && !m[1].getAsInteger(10, n)) {
+        std::string pack = declare({false, 64, false}, "g");
+        facts.push_back("(= " + lenOf(pack) + " " + bvConst(n, 64) + ")");
+        values[result] = pack;
+        return true;
+      }
+    }
     if (path.starts_with("std::builtin::_verification::_same_elements[") &&
         call.getNumOperands() == 3) {
       values[result] = sameElements(term(call.getOperands()[0], state),
