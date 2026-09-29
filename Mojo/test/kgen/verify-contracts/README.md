@@ -109,12 +109,18 @@ The output must be exactly the `bad_*` functions.
   `span[i]` requires `i` in range, and `xs[a:b]` (on a list or a span)
   requires `0 <= a <= b <= len(xs)` and has length `b - a`, with absent
   bounds meaning 0 and `len(xs)`. The pass models `Optional` (its
-  constructors, `or_else`, `__bool__`) to read the bounds.
+  constructors, `or_else`, `__bool__`) to read the bounds. `List(span)`
+  copies a span and is as long as it.
+
+- `Array`: `len(a)` is the size parameter in `a`'s type (a number, or a
+  parameter such as `n` in generic code), `a[i]` requires `i` in range, and
+  `Span(array=)` is as long as the array. A callee's contract that names its
+  parameters (`array.length`, `Self.size`) sees the values the call binds.
 
 Not analyzed yet: loops with loop-carried values, and
-`reversed(range(...))` (a strided range). Strided slices (`xs[::2]`), a
-list built from a span (`List(span)`, whose generic iterable constructor
-states no length), and spans over `Array` have no length contracts yet. The obligations inside
+`reversed(range(...))` (a strided range). Strided slices (`xs[::2]`) and
+lists built from other iterables (the generic constructor states no length)
+have no length contracts yet. The obligations inside
 unsupported control flow are reported as not analyzed. `append` does not state the value it adds (a
 generic `T` has no `==` to state it with).
 
@@ -128,3 +134,4 @@ generic `T` has no `==` to state it with).
 | `comptime.mojo`      | all `bad_*`        | all `ok_*`       |
 | `lists.mojo`         | all `bad_*`        | all `ok_*`       |
 | `spans.mojo`         | all `bad_*`        | all `ok_*`       |
+| `arrays.mojo`        | all `bad_*`        | all `ok_*`       |

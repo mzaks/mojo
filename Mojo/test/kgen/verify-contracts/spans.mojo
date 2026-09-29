@@ -50,6 +50,19 @@ def ok_slice_middle(vs: List[Int], a: Int, b: Int) -> Int:
     return 0
 
 
+def ok_list_of_slice(vs: List[Int]) -> Int:
+    if len(vs) > 2:
+        var es = List(vs[1:])  # copies the span: as long as it
+        return es[len(vs) - 2]
+    return 0
+
+
+def ok_list_of_local_slice() -> Int:
+    var vs: List[Int] = [1, 2, 3]
+    var es = List(vs[1:])  # slicing a mutable list keeps its length
+    return es[1]
+
+
 # --- must stay UNPROVEN ---
 def bad_slice_tail_past(vs: List[Int]) -> Int:
     if len(vs) > 0:
@@ -72,3 +85,9 @@ def bad_span_past_end() -> Int:
     var l: List[Int] = [1, 2, 3]
     var s = Span(list=l)
     return s[3]
+
+
+def bad_list_of_slice_past() -> Int:
+    var vs: List[Int] = [1, 2, 3]
+    var es = List(vs[1:])
+    return es[2]  # the copy is one shorter
