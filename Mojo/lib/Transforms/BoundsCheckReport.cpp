@@ -99,6 +99,11 @@ struct Sort {
   }
 };
 
+/// The sort of a scalar as stored bits: `sortOf`, or an unsigned bit-vector
+/// for a float (whose values the solver only compares, e.g. elements a
+/// postcondition keeps).
+Sort storageSort(Type type);
+
 Sort sortOf(Type type) {
   if (isa<PointerType>(type))
     return {Sort::Ptr, 64, false};
@@ -125,6 +130,22 @@ Sort sortOf(Type type) {
       if (width <= 0)
         return {};
       return {Sort::BV, static_cast<unsigned>(width), dtype->isSInt()};
+    }
+  }
+  return {};
+}
+
+Sort storageSort(Type type) {
+  Sort sort = sortOf(type);
+  if (sort.kind != Sort::None)
+    return sort;
+  if (auto simd = dyn_cast<SIMDType>(type)) {
+    auto size = dyn_cast_or_null<IntegerAttr>(simd.getSize());
+    std::optional<KGENDType> dtype = simd.getResolvedDType();
+    if (size && size.getInt() == 1 && dtype && dtype->isFloat()) {
+      ssize_t width = dtype->getWidthInBits(TargetInfoAttr());
+      if (width > 0)
+        return {Sort::BV, static_cast<unsigned>(width), false};
     }
   }
   return {};
@@ -1184,6 +1205,9 @@ private:
             map[value] = *t;
         } else if (auto forall = dyn_cast<ForallOp>(def)) {
           if (MaybeTerm t = forallTerm(forall))
+            map[value] = *t;
+        } else if (auto same = dyn_cast<SameElementsOp>(def)) {
+          if (MaybeTerm t = sameElementsTerm(same))
             map[value] = *t;
         } else if (auto loop = dyn_cast<HLCF::LoopOp>(def)) {
           OpResult result = cast<OpResult>(value);
@@ -2678,14 +2702,142 @@ private:
     return key;
   }
 
-  /// After an opaque call, a heap read the callee's postconditions describe:
-  /// a quantifier of the form `all([p[i] == old(e) for i in range(lo, hi)])`
-  /// says that where the read is `p[t]` with `lo <= t < hi`, its value is `e`
-  /// for `i = t`, evaluated on entry to the callee (i.e. before the call).
-  /// Each such quantifier guards `value` (the unknown value after the call)
-  /// with an `ite` on that condition. This is how a contract states that a
-  /// callee keeps (or moves) elements, as a `kgen.copy_marker` does for a
-  /// copy.
+  /// Whether `value` holds whenever `root` (a contract's condition) does:
+  /// `root` itself, or a conjunct of it (`a and b` is an `hlcf.if` on `a`
+  /// yielding `b`, else false), in `context`.
+  bool holdsWhen(Value value, Value root, CallContext &context) {
+    if (value == root)
+      return true;
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      // The condition of a conjunction, or its second operand.
+      auto ifOp = dyn_cast<HLCF::IfOp>(user);
+      unsigned index = 0;
+      if (auto yield = dyn_cast<HLCF::YieldOp>(user)) {
+        ifOp = dyn_cast<HLCF::IfOp>(yield->getParentOp());
+        if (!ifOp || yield->getBlock() != &ifOp.getThenBlock())
+          continue;
+        index = use.getOperandNumber();
+      } else if (!ifOp || use.getOperandNumber() != 0) {
+        continue;
+      }
+      if (!ifOp.getElifRegions().empty() || ifOp->getNumResults() != 1)
+        continue;
+      auto elseYield =
+          dyn_cast<HLCF::YieldOp>(ifOp.getElseBlock().getTerminator());
+      if (!elseYield || elseYield->getNumOperands() <= index)
+        continue;
+      std::string otherwise = inContext(&context, [&] {
+        return boolTerm(elseYield->getOperand(index));
+      });
+      std::optional<APInt> known = evalConst(otherwise);
+      if (known && known->isZero() &&
+          holdsWhen(ifOp->getResult(index), root, context))
+        return true;
+    }
+    return false;
+  }
+
+  /// The value of a `kgen.contract.same_elements`, to prove it where the
+  /// function returns: for a fresh index `k` below `count`, each scalar of the
+  /// element at `dst` just before the `kgen.ensures` equals the one at `src`
+  /// at the function's entry (the `kgen.contract.entry` of the `old` it comes
+  /// from, else the same point).
+  MaybeTerm sameElementsTerm(SameElementsOp op) {
+    CallContext *region = ctx;
+    while (region &&
+           !(region->contract && region->call && isa<EnsuresOp>(region->call)))
+      region = region->parent;
+    auto ptrType = dyn_cast<PointerType>(op.getDst().getType());
+    if (!region || !ptrType)
+      return std::nullopt;
+    Operation *exitAt = region->call;
+    // `src` computed from an `old(...)` names memory at that entry token.
+    Operation *entryAt = exitAt;
+    SmallVector<Value> pending{op.getSrc()};
+    for (unsigned steps = 0; !pending.empty() && steps < 32; ++steps) {
+      Operation *def = pending.pop_back_val().getDefiningOp();
+      if (!def)
+        continue;
+      if (auto oldOp = dyn_cast<OldOp>(def)) {
+        entryAt = oldOp.getEntry().getDefiningOp();
+        break;
+      }
+      llvm::append_range(pending, def->getOperands());
+    }
+    std::optional<HeapAddr> dst = heapAddress(op.getDst()),
+                            src = heapAddress(op.getSrc());
+    MaybeTerm count = term(op.getCount());
+    Type element = ptrType.getElementType();
+    if (!dst || !src || !count || !entryAt || !dst->path.empty() ||
+        !src->path.empty() || dst->element != element ||
+        src->element != element)
+      return std::nullopt;
+    Sort indexSort{Sort::BV, 64, true};
+    std::string k = declare(indexSort);
+    noteUnknown(k, "the index of an element a postcondition keeps");
+    std::string equal = "true";
+    SmallVector<std::pair<SmallVector<int>, Sort>> leaves;
+    scalarLeaves(element, {}, leaves);
+    if (leaves.empty())
+      return std::nullopt;
+    for (auto &[path, sort] : leaves) {
+      HeapRead onExit{HeapAddr{dst->base, linearSum(dst->index, k), element,
+                               path, dst->root},
+                      {},
+                      sort};
+      HeapRead onEntry{HeapAddr{src->base, linearSum(src->index, k), element,
+                                path, src->root},
+                       {},
+                       sort};
+      MaybeTerm exitValue = inContext(region->parent, [&] {
+        return heapValueBefore(onExit, exitAt, 0);
+      });
+      MaybeTerm entryValue = inContext(region->parent, [&] {
+        return heapValueBefore(onEntry, entryAt, 0);
+      });
+      if (!exitValue || !entryValue)
+        return std::nullopt;
+      equal = mkAnd(equal, "(= " + *exitValue + " " + *entryValue + ")");
+    }
+    std::string inRange = mkAnd("(bvsle " + bvConst(APInt(64, 0)) + " " + k +
+                                    ")",
+                                "(bvslt " + k + " " + *count + ")");
+    return "(=> " + inRange + " " + equal + ")";
+  }
+
+  /// The scalar fields of `type`, by path, with their sorts (a scalar type is
+  /// its own leaf).
+  void scalarLeaves(Type type, SmallVector<int> path,
+                    SmallVectorImpl<std::pair<SmallVector<int>, Sort>> &out,
+                    unsigned depth = 0) {
+    Sort sort = storageSort(type);
+    if (sort.kind != Sort::None) {
+      out.push_back({path, sort});
+      return;
+    }
+    auto structType = dyn_cast<StructType>(type);
+    std::optional<SmallVector<Type>> elements =
+        structType ? structType.getElementTypes() : std::nullopt;
+    if (!elements || depth > 4)
+      return;
+    for (auto [i, field] : llvm::enumerate(*elements)) {
+      SmallVector<int> fieldPath(path);
+      fieldPath.push_back(i);
+      scalarLeaves(field, fieldPath, out, depth + 1);
+    }
+  }
+
+  /// After an opaque call, a heap read the callee's postconditions describe
+  /// guards `value` (the unknown value after the call) with an `ite` for each
+  /// clause conjunct that says what it is:
+  /// - `_same_elements(dst, src, count)`: where the read is `dst[t]` with
+  ///   `0 <= t < count`, its value is `src[t]` before the call;
+  /// - a quantifier `all([p[i] == old(e) for i in range(lo, hi)])`: where the
+  ///   read is `p[t]` with `lo <= t < hi`, its value is `e` for `i = t`,
+  ///   evaluated on entry to the callee (i.e. before the call).
+  /// This is how a contract states that a callee keeps (or moves) elements,
+  /// as a `kgen.copy_marker` does for a copy.
   std::string frameValue(Operation *op, const HeapRead &r, std::string value) {
     auto call = dyn_cast<CallOp>(op);
     CallContext *callee = call ? callContexts.lookup(call) : nullptr;
@@ -2697,10 +2849,48 @@ private:
             : FuncOp();
     if (!callee || !fn || fn->getRegion(0).empty() || !r.access.empty())
       return value;
-    for (Operation &op : fn->getRegion(0).front()) {
-      auto ensuresOp = dyn_cast<EnsuresOp>(&op);
+    for (Operation &calleeOp : fn->getRegion(0).front()) {
+      auto ensuresOp = dyn_cast<EnsuresOp>(&calleeOp);
       if (!ensuresOp || !isOwnEnsures(ensuresOp))
         continue;
+      Value condition = cast<ContractYieldOp>(
+                            ensuresOp.getBody().front().getTerminator())
+                            .getValues()
+                            .front();
+      // Elements the callee keeps or moves: a read of `dst[t]`, `t < count`,
+      // is the read of `src[t]` before the call.
+      ensuresOp.getBody().walk([&](SameElementsOp same) {
+        CallContext &region =
+            contractContext(ensuresOp, ensuresOp.getArgs(), callee);
+        auto ptrType = dyn_cast<PointerType>(same.getDst().getType());
+        if (!ptrType || ptrType.getElementType() != r.addr.element ||
+            !holdsWhen(same.getResult(), condition, region))
+          return;
+        std::optional<HeapAddr> dst =
+            inContext(&region, [&] { return heapAddress(same.getDst()); });
+        std::optional<HeapAddr> src =
+            inContext(&region, [&] { return heapAddress(same.getSrc()); });
+        MaybeTerm count =
+            inContext(&region, [&] { return term(same.getCount()); });
+        if (!dst || !src || !count || !dst->path.empty() ||
+            !src->path.empty() || dst->element != r.addr.element ||
+            src->element != r.addr.element)
+          return;
+        // The read is element `t` of the kept range.
+        std::string t = linearSum(r.addr.index, dst->index, /*negate=*/true);
+        HeapRead moved{HeapAddr{src->base, linearSum(src->index, t),
+                                r.addr.element, r.addr.path, src->root},
+                       {},
+                       r.sort};
+        MaybeTerm before = heapValueBefore(moved, op, 0);
+        if (!before)
+          return;
+        std::string guard = mkAnd(
+            "(= " + dst->base + " " + r.addr.base + ")",
+            mkAnd("(bvsle " + bvConst(APInt(64, 0)) + " " + t + ")",
+                  "(bvslt " + t + " " + *count + ")"));
+        value = "(ite " + guard + " " + *before + " " + value + ")";
+      });
       ensuresOp.getBody().walk([&](ForallOp forall) {
         Block &body = forall.getBody().front();
         auto yield = cast<ContractYieldOp>(body.getTerminator());
@@ -2714,9 +2904,12 @@ private:
         if (!load || !old.getDefiningOp<OldOp>() ||
             !(sortOf(element.getType()) == r.sort))
           return;
-        // The postcondition, evaluated for the call, at the read's index.
+        // The postcondition, evaluated for the call, at the read's index;
+        // only a quantifier the whole clause implies says anything.
         CallContext &region =
             contractContext(ensuresOp, ensuresOp.getArgs(), callee);
+        if (!holdsWhen(forall.getValue(), condition, region))
+          return;
         Sort indexSort = sortOf(body.getArgument(0).getType());
         if (indexSort.kind != Sort::BV)
           return;
