@@ -2277,6 +2277,13 @@ private:
 
   /// An unknown for the read, described by why and where (`at`) it arises.
   std::string heapUnknown(const HeapRead &r, const Twine &why, Operation *at) {
+    // The memory after `at` (in this context) is one state: every read of an
+    // address there reads the same value.
+    if (at) {
+      std::string state;
+      llvm::raw_string_ostream(state) << at << "|" << ctx << "|" << why;
+      return stateValue(r, state, why, at);
+    }
     std::string name = declare(r.sort);
     std::string text;
     llvm::raw_string_ostream os(text);
@@ -2421,6 +2428,64 @@ private:
       heapMemo;
   std::map<std::string, std::string> entryHeapValues;
 
+  /// The value of an unknown memory state (`state`, e.g. the function's
+  /// entry) at the read's address: one uninterpreted function per state and
+  /// value shape, applied to the base and index, so reads of one address
+  /// through different terms (e.g. a pointer merged by an `if` and the
+  /// argument it may equal) read the same value.
+  std::string stateValue(const HeapRead &r, StringRef state, const Twine &why,
+                         Operation *at) {
+    std::string shape;
+    llvm::raw_string_ostream os(shape);
+    os << state << "|" << r.addr.element.getAsOpaquePointer() << "|"
+       << r.sort.str();
+    for (int step : r.addr.path)
+      os << " " << step;
+    os << "|";
+    for (int step : r.access)
+      os << " " << step;
+    auto [it, inserted] = stateFunctions.try_emplace(shape, "");
+    if (inserted) {
+      it->second = "s" + std::to_string(stateFunctions.size());
+      prelude += "(declare-fun " + it->second +
+                 " ((_ BitVec 64) (_ BitVec 64)) " + r.sort.str() + ")\n";
+    }
+    std::string name = define(r.sort, "(" + it->second + " " + r.addr.base +
+                                          " " + r.addr.index + ")",
+                              "h");
+    std::string text;
+    llvm::raw_string_ostream note(text);
+    if (ctx)
+      note << "in " << ctx->callee << ": ";
+    note << "heap memory " << why;
+    if (at) {
+      note << " " << at->getName().getStringRef();
+      if (std::optional<ObligationLocation> where = locationOf(at->getLoc()))
+        note << " at " << where->file << ":" << where->line << ":"
+             << where->col;
+    }
+    noteUnknown(name, text);
+    return name;
+  }
+  std::map<std::string, std::string> stateFunctions;
+
+  /// The value of heap memory where the search gives up (after `at`, which it
+  /// cannot follow, or at the start of an iteration of the loop `at`): an
+  /// unknown, but one per address, point and context, so every read that
+  /// reaches that point with nothing writing the address in between reads the
+  /// same value (like `afterWrite` for stack places).
+  std::string heapAfterWrite(const HeapRead &r, Operation *at,
+                             StringRef what) {
+    std::string key;
+    llvm::raw_string_ostream(key)
+        << at << "|" << ctx << "|" << what << "|" << heapKey(r);
+    auto [it, inserted] = heapWriteValues.try_emplace(key, "");
+    if (inserted)
+      it->second = heapUnknown(r, what, at);
+    return it->second;
+  }
+  std::map<std::string, std::string> heapWriteValues;
+
   enum class HeapStep { Skip, Found, Fail };
 
   /// Scan backwards from just before `op` for stores that may have written
@@ -2448,7 +2513,8 @@ private:
         if (step == HeapStep::Found)
           return found;
         if (step == HeapStep::Fail)
-          return std::nullopt;
+          return heapAfterWrite(r, prev, "after a write the search cannot "
+                                         "follow by");
         // No `if` before a condition's definition can test it: forget facts
         // as soon as they cannot matter, so memoized values stay shared.
         llvm::erase_if(r.facts, [&](auto &fact) {
@@ -2510,7 +2576,7 @@ private:
       }
       // A loop body could see a value an earlier iteration stored.
       if (heapMayWrite(parent))
-        return std::nullopt;
+        return heapAfterWrite(r, parent, "at the start of an iteration of");
       cur = parent;
     }
   }
@@ -2725,8 +2791,9 @@ private:
                                                           : std::nullopt)
                     : resolveAccess(stored, path, r.sort);
       }
+      // A value the solver cannot represent (e.g. a float): an unknown.
       if (!value)
-        return HeapStep::Fail;
+        value = heapUnknown(r, "written by", op);
       if (sameAddr == "true") {
         found = value;
         return HeapStep::Found;
