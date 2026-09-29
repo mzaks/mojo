@@ -18,7 +18,7 @@ bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
 
 Options: `verbose=true` reports proven obligations as remarks,
 `include-stdlib=true` also checks `std`, `rlimit=` sets the solver's
-deterministic resource limit per query (default 2000000), `wall-seconds=` caps
+deterministic resource limit per query (default 100000000), `wall-seconds=` caps
 each z3 process (default 60), and `dump-dir=` writes the SMT-LIB scripts.
 
 An unproven precondition is a warning at the call, with a note at the clause:
@@ -47,7 +47,7 @@ bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std $f -lsp=no-dump \
 
 The output must be exactly the `bad_*` functions.
 
-## What is checked (stage 1)
+## What is checked
 
 - A function's own preconditions are assumed at its entry.
 - At every call to a function with preconditions, they are obligations,
@@ -56,18 +56,27 @@ The output must be exactly the `bad_*` functions.
 - Integer and Boolean operators are bit-vector and Boolean operations, and
   `len(x)` is an uninterpreted function of `x`'s value (assumed
   non-negative).
-- Local variables are followed through `var` declarations, stores and loads;
-  control flow through `if` and `return`.
+- Local variables are followed through `var` declarations, stores and loads,
+  `ref` locals to what they refer to, and fields of known structs.
 - A call changes only what it can write: memory reachable through its `mut`
   references is unknown after it (`bad_after_mut_call`), and memory passed by
   immutable reference is kept (`ok_after_imm_call`). Its results are unknown.
+- Control flow: `if`, `return`, `try`, and loops (`for` over `range(n)` and
+  `range(start, end)`, `while`, `break`). `range` iteration follows the
+  stdlib's definition. At each loop head, what the loop may write is unknown,
+  bound by invariants found with Houdini over small templates: bounds
+  against 0, against the values before the loop and lengths, and between the
+  loop's variables. Only variables the loop's conditions depend on are
+  considered. The invariants hold only where the loop is reached.
 
-Loops, `try` (which `for` loops use), comptime control flow, and
-postconditions are not analyzed yet: memory is unknown after such code, and
-the obligations inside it are reported as not analyzed.
+Not analyzed yet: comptime control flow, loops with loop-carried values,
+`reversed(range(...))` (a strided range), and postconditions (so nothing is
+known about a list's length after `append` or a literal). The obligations
+inside unsupported control flow are reported as not analyzed.
 
 ## Expected results
 
 | File                 | Must stay unproven | Should be proven |
 |----------------------|--------------------|------------------|
 | `straight_line.mojo` | all `bad_*`        | all `ok_*`       |
+| `loops.mojo`         | all `bad_*`        | all `ok_*`       |
