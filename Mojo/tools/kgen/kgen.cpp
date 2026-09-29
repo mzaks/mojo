@@ -126,13 +126,14 @@ public:
       cl::desc("Run the bounds-check-report pass after elaboration, e.g. "
                "--bounds-check-report=\"verbose=true\"")};
 
-  // Runs verify-contracts on the checked LIT module of `-lsp`, right after
-  // the check pipeline (see Mojo/proposals/modular-verification.md).
+  // Runs verify-contracts right after the check pipeline (see
+  // Mojo/proposals/modular-verification.md).
   M::cl::MOpt<std::string> verifyContracts{
       "verify-contracts", llvm::cl::ValueOptional,
       cl::value_desc("pass options"),
-      cl::desc("With -lsp, run the verify-contracts pass after the check "
-               "pipeline, e.g. --verify-contracts=\"verbose=true\"")};
+      cl::desc("Run the verify-contracts pass after the check pipeline and "
+               "stop (with -lsp, on the module it checks), e.g. "
+               "--verify-contracts=\"verbose=true\"")};
 
   M::cl::MOpt<bool> ignoreFailures{
       "ignore-failure",
@@ -506,6 +507,21 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
   // Extend the module with the Module env-attrs.
   extendWithModularEnvAttr(theModule.get(),
                            (*ctxOr)->get<CompilationContext>());
+
+  // With --verify-contracts (outside -lsp): run the check pipeline on the
+  // fully parsed module, where the functions it calls have their bodies (and
+  // so their contracts), verify it, and stop before elaboration.
+  if (clOptions.verifyContracts.getNumOccurrences()) {
+    mlir::SourceMgrDiagnosticHandler diagHandler(mgr, ctx);
+    (void)compiler.runCheckLITPipeline(*theModule);
+    mlir::PassManager verifyPM(ctx);
+    if (failed(mlir::parsePassPipeline("verify-contracts{" +
+                                           clOptions.verifyContracts + "}",
+                                       verifyPM)) ||
+        failed(verifyPM.run(*theModule)))
+      return failure();
+    return mlir::success();
+  }
 
   // If we are generating a dependency file, do so now.
   if (!clOptions.dependencyFilename.empty()) {
