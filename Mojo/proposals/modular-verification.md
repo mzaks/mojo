@@ -1,7 +1,8 @@
 # Modular verification before elaboration
 
 **September 29, 2026**
-Status: Draft.
+Status: Draft. Stage 1 is implemented; see
+[Implementation status](#implementation-status).
 
 This document proposes moving static verification of contracts and bounds
 from after elaboration to right after lifetime checking, where functions are
@@ -269,6 +270,33 @@ Each stage is measured on the `bounds-check-report` examples and on
 6. **Collections.** Contracts for `List` (then `Span`, `String`, `InlineArray`,
    `Dict`) until `test_list.mojo` proves what it proves today. Target: at
    least ten times faster.
+
+## Implementation status
+
+Stage 1, on the `mojo-bounds-verifier` branch:
+
+- The `verify-contracts` pass (`Mojo/lib/Transforms/VerifyContracts.cpp`)
+  runs through `kgen -lsp --verify-contracts[=options]`, on the module the
+  check pipeline produced. It is not part of the compiler's pipelines yet.
+- `List.__getitem__(idx: Int)` states its bound as a `where` precondition.
+  The post-elaboration pass checks the inlined clause too, and still proves
+  every obligation of `test_list.mojo` (1219 of 1219, 242 of them the new
+  clause).
+- `Mojo/test/kgen/verify-contracts/straight_line.mojo` proves all its `ok_*`
+  functions and flags all its `bad_*` ones.
+
+Differences from the design above, found while implementing it:
+
+- Frames come from origins in two places: a call's mutable reference
+  operands, and the implicit origins of the call (`lit.call @f[mut *"xs"]`),
+  which also cover memory reached through structs passed by value. A store
+  through a reference the pass cannot trace makes unknown the roots its
+  type's origin names. When an origin names no root of the function, all of
+  its memory is unknown after the call.
+- Literal indices (`xs[0]`) call `__getitem__(idx: IntLiteral)`, which has
+  no precondition yet; `test_list.mojo` indexes mostly that way, so only 24
+  of its calls are checked so far.
+- `len(x)` is assumed non-negative, for every `Sized` type.
 
 ## Risks and open questions
 
