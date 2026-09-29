@@ -351,6 +351,13 @@ Implemented, on the `mojo-bounds-verifier` branch:
   postconditions at every return; it checks a callee's preconditions at each
   call (inlined or not) and assumes its postconditions after the call. The
   examples are in `Mojo/test/kgen/bounds-check-report/where_clauses.mojo`.
+- The contract ops cost nothing at runtime: SROA and mem2reg give a contract
+  op that reads a stack slot a snapshot of it, so the slot stays promotable,
+  and inlining leaves contract ops (and snapshots) out of its size estimates.
+- `List`'s contracts (`append`, `extend`, `pop`, `pop(i)`, `_realloc`) are
+  `where` clauses.
+- The experimental `modular=contracts` mode of the pass checks a call to a
+  callee with contracts against them alone, without opening its body.
 
 Differences from the design above, found while implementing it:
 
@@ -372,14 +379,32 @@ Differences from the design above, found while implementing it:
   a clause at the start of the body once to record the `old(e)` values, and
   once more to see whether it uses any `mut` or `out` argument's value on
   exit, which decides between precondition and postcondition.
-- The comptime interpreter cannot evaluate `kgen.old`: a function whose
-  postcondition uses `old` cannot run at compile time.
+- The comptime interpreter evaluates `kgen.old`, since it runs functions such
+  as `List.append` at compile time. The parser therefore keeps only the
+  computation of the `old(e)` values in its region: it emits each one at the
+  top of the region, where the region can yield it even if the call sits in a
+  short-circuit arm, and drops the rest of the condition.
 - Postconditions are only assumed after calls to callees with a single
   return, and the analysis still reads the callee's body as well. A callee
   that breaks its postcondition then makes the rest of its caller unreachable;
   the broken postcondition is reported in the callee.
 - The parser does not emit runtime `debug_assert`s for the clauses yet.
-- Not implemented yet: checking a call without opening the callee's body.
+
+Findings from using the contracts:
+
+- The open question about `mut` clauses without `old` came up at once:
+  `_realloc` ensures `self._capacity == new_capacity`, which on `mut self`
+  would also be a precondition. Joining it with an `old` clause by `and`
+  (`len(self) == old(len(self)) and self._capacity == new_capacity`) makes it a
+  postcondition only. A way to say "on exit" without `old` would read better.
+- Closing callee bodies (`modular=contracts`) on `test_list.mojo` proves 927
+  of 951 obligations instead of 977 of 977, in about the same time: `List`'s
+  methods are mostly inlined, and `_realloc` is small. The 24 lost proofs need
+  facts about elements, which `_realloc`'s contract cannot state: that it
+  keeps them. That takes quantified clauses (for every index below `len`, the
+  element is unchanged), which are not supported. Contracts only replace a
+  body when they say everything callers rely on.
+
 
 ## Alternatives considered
 
