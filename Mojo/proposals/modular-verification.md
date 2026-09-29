@@ -1,7 +1,7 @@
 # Modular verification before elaboration
 
 **September 29, 2026**
-Status: Draft. Stages 1 to 4 are implemented; see
+Status: Draft. Stages 1 to 5 are implemented; see
 [Implementation status](#implementation-status).
 
 This document proposes moving static verification of contracts and bounds
@@ -354,6 +354,24 @@ Stage 4:
   needs a two-way pipe to z3 that LLVM's process API does not provide.
 - Each query still sees the whole function's encoding; before inlining the
   encodings are small enough that slicing per query has not been needed.
+
+Stage 5:
+
+- `comptime for` is a loop over an arbitrary iteration and `comptime if` a
+  join of its arms; `Mojo/test/kgen/verify-contracts/comptime.mojo` proves
+  all its `ok_*` functions and flags all its `bad_*` ones.
+- The parser folds comparisons on comptime values into parameter
+  expressions, so the pass evaluates those: operators, literals, `apply` of
+  `SIMD` integer operators, and `param.identical` of scalars. A parameter
+  itself, or a comptime computation such as indexing a comptime tuple, is
+  an unknown (one per expression).
+- `_test_copyinit_trivial_types` in test_list.mojo, 90% of the
+  post-elaboration pass's solver time over 7 instantiations and 10 unrolled
+  sizes, is analyzed once. Proving its accesses needs `List()`'s length
+  (stage 6).
+- Reporting a function as not verifiable generically, for the
+  post-elaboration pass to check its instances, is not done yet: nothing is
+  unanalyzed in the examples and test_list.mojo.
 
 ## Risks and open questions
 
