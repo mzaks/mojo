@@ -180,12 +180,22 @@ may use the index. A quantifier is proven through a fresh index in the range:
 (`bad_first_negative` cannot). Assumed, a quantifier only says its condition for
 one unknown index, which is sound but weak.
 
+`_same_elements(dst, src, count)` (from `std.builtin._verification`, a
+`kgen.contract.same_elements`) states that the `count` elements at `dst` on
+exit are those at `src` on entry (where `src` comes from `old`). `List.append`,
+`List.pop` and `List._realloc` state with it which elements they keep or move,
+so every inlined call proves it for the list at hand.
+
 `modular.mojo` is checked with `modular=contracts`, where a call to a callee
 with contracts uses them alone and the callee's body is not opened. After the
 call, a heap read the callee's postcondition describes with a quantifier of the
 form `all([p[i] == old(e) for i in range(lo, hi)])` is `e` for that index,
 evaluated before the call: `ok_index_after_reset` uses
 `ok_reset_first`'s promise that it keeps every element but the first.
+The same holds for a read of `dst[t]` with `t < count` after a callee whose
+postcondition has `_same_elements(dst, src, count)`: `ok_index_after_push`
+reads an element `ok_push_keep` keeps, and `bad_index_pushed_element` reads
+the one it adds. Only a conjunct the whole clause implies is used.
 `bad_index_reset_element` reads the one it changes, and
 `limit_index_after_length_only` calls a callee whose contract only states the
 length, so the element is unknown after the call.
