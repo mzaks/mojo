@@ -641,8 +641,13 @@ private:
       std::optional<Loc> base = placeOf(gep->getOperand(0));
       if (!base)
         return std::nullopt;
-      // `/` separates fields: printed field attributes contain no `/`.
-      base->path += "/" + printed(gep->getAttrDictionary());
+      // `/` separates fields: by name when the field has one (so the fields
+      // built-ins write, like a slice's `start`, are the same places),
+      // else by the printed attributes (which contain no `/`).
+      if (auto field = gep->getAttrOfType<StringAttr>("field"))
+        base->path += "/" + field.getValue().str();
+      else
+        base->path += "/" + printed(gep->getAttrDictionary());
       return base;
     }
     return std::nullopt;
@@ -1511,7 +1516,9 @@ private:
         havocAll(state);
       return;
     }
-    if (auto loadOp = dyn_cast<LIT::RefLoadOp>(op)) {
+    if (isa<LIT::RefLoadOp>(op) ||
+        op->getName().getStringRef() == "lit.load.consume") {
+      Operation *loadOp = op;
       Value ref = loadOp->getOperand(0), result = loadOp->getResult(0);
       if (auto it = elements.find(ref); it != elements.end()) {
         auto [list, index] = it->second;
@@ -1947,11 +1954,26 @@ private:
     }
     if (path.starts_with("std::builtin::len::len[") &&
         call.getNumOperands() == 1) {
+      // An `Array`'s length is its size parameter, in its type.
+      if (std::optional<Loc> loc = placeOf(call.getOperands()[0])) {
+        static llvm::Regex arrayRe(
+            "^!lit.struct<@std::@collections::@array::@Array<.*"
+            "\\{:scalar<index> (-?[0-9]+)\\}>>$");
+        SmallVector<StringRef> m;
+        std::string type = printed(placeType(*loc));
+        int64_t n;
+        if (arrayRe.match(type, &m) && !m[1].getAsInteger(10, n)) {
+          values[result] = bvConst(n, 64);
+          return true;
+        }
+      }
       values[result] = define(
           {false, 64, true}, lenOf(valueThrough(call.getOperands()[0], state)));
       return true;
     }
     if (evalRange(call, name, state))
+      return true;
+    if (evalOptional(call, name, state))
       return true;
     // `Int(literal)`: the literal's value.
     if (path.starts_with("std::simd::SIMD::__init__[!pop.int_literal](") &&
@@ -2040,6 +2062,97 @@ private:
       return true;
     }
     return false;
+  }
+
+  /// Writes a struct value with known fields to `loc`: the struct itself is
+  /// a fresh value, its fields the given terms.
+  void storeFields(const Loc &loc, State &state,
+                   ArrayRef<std::pair<std::string, std::string>> fields) {
+    store(loc, state, declare({false, 64, false}, "g"));
+    for (auto &[field, value] : fields)
+      state.env[Loc{loc.root, loc.path + field}] = value;
+  }
+
+  /// `Optional` (of an integer or Boolean) as the stdlib defines it: whether
+  /// it holds a value (`/has`) and the value (`/val`); its constructors from
+  /// a value, from `None` and by copy, `or_else` and `__bool__`. And
+  /// `ContiguousSlice`'s constructor from two optional bounds, into its
+  /// `start` and `end` fields. The results are out-result slots, the
+  /// callee's last operand.
+  bool evalOptional(LIT::CallOp call, const CalleeName &name, State &state) {
+    StringRef path = name.path;
+    const char *optional = "std::collections::optional::Optional::";
+    const char *slice = "std::builtin::builtin_slice::ContiguousSlice::";
+    bool isOptional = path.starts_with(optional);
+    bool isSlice = path.starts_with(slice);
+    if (!isOptional && !isSlice)
+      return false;
+    StringRef method = path.drop_front(strlen(isOptional ? optional : slice));
+    ValueRange ops = call.getOperands();
+    auto place = [&](Value v) { return placeOf(v); };
+    Sort flag{true, 1, false};
+    // The element sort, from `Optional[Int]`'s parameter.
+    Sort valueSort{false, 64, true};
+    if (!name.params.empty())
+      if (std::optional<Sort> sort = dtypeSort(name.params[0]))
+        valueSort = *sort;
+    auto has = [&](const Loc &opt) {
+      return load(Loc{opt.root, opt.path + "/has"}, state, flag);
+    };
+    auto val = [&](const Loc &opt) {
+      return load(Loc{opt.root, opt.path + "/val"}, state, valueSort);
+    };
+    if (isSlice) {
+      if (!method.starts_with("__init__(::Optional") || ops.size() < 3)
+        return false;
+      std::optional<Loc> start = place(ops[0]), end = place(ops[1]),
+                         out = place(ops.back());
+      if (!start || !end || !out)
+        return false;
+      storeFields(*out, state,
+                  {{"/start/has", has(*start)}, {"/start/val", val(*start)},
+                   {"/end/has", has(*end)}, {"/end/val", val(*end)}});
+      setResultsUnknown(call);
+      return true;
+    }
+    if (method.starts_with("__bool__(") && ops.size() == 1 &&
+        call->getNumResults() == 1) {
+      std::optional<Loc> self = place(ops[0]);
+      if (!self)
+        return false;
+      values[call->getResult(0)] = has(*self);
+      return true;
+    }
+    if (ops.size() < 2)
+      return false;
+    std::optional<Loc> out = place(ops.back());
+    if (!out)
+      return false;
+    if (method.starts_with("__init__(None)")) {
+      storeFields(*out, state, {{"/has", "false"}});
+    } else if (method.starts_with("__init__(copy:")) {
+      std::optional<Loc> src = place(ops[0]);
+      if (!src)
+        return false;
+      storeFields(*out, state, {{"/has", has(*src)}, {"/val", val(*src)}});
+    } else if (method.starts_with("__init__($0$)")) {
+      std::optional<Loc> value = place(ops[0]);
+      if (!value)
+        return false;
+      storeFields(*out, state,
+                  {{"/has", "true"}, {"/val", load(*value, state, valueSort)}});
+    } else if (method.starts_with("or_else(") && ops.size() == 3) {
+      std::optional<Loc> self = place(ops[0]), fallback = place(ops[1]);
+      if (!self || !fallback)
+        return false;
+      store(*out, state,
+            define(valueSort, "(ite " + has(*self) + " " + val(*self) + " " +
+                                  load(*fallback, state, valueSort) + ")"));
+    } else {
+      return false;
+    }
+    setResultsUnknown(call);
+    return true;
   }
 
   /// `range(end)` and `range(start, end)` over an integer dtype, and their
