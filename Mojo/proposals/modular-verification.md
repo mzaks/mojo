@@ -1,7 +1,7 @@
 # Modular verification before elaboration
 
 **September 29, 2026**
-Status: Draft. Stage 1 is implemented; see
+Status: Draft. Stages 1 and 2 are implemented; see
 [Implementation status](#implementation-status).
 
 This document proposes moving static verification of contracts and bounds
@@ -297,6 +297,24 @@ Differences from the design above, found while implementing it:
   no precondition yet; `test_list.mojo` indexes mostly that way, so only 24
   of its calls are checked so far.
 - `len(x)` is assumed non-negative, for every `Sized` type.
+
+Stage 2:
+
+- Loops (`hlcf.loop` with `continue` and `break`) and `lit.try` are
+  analyzed; `Mojo/test/kgen/verify-contracts/loops.mojo` proves all its
+  `ok_*` functions (including nested loops) and flags all its `bad_*` ones.
+- Loop invariants come from Houdini, not yet from an abstract domain: before
+  inlining, a loop body is a handful of calls, so the candidates are few
+  (only variables the loop's conditions depend on) and each round is one
+  small z3 script. `test_list.mojo` walks its 40 loops in 2.6 s in all. The
+  interval and difference domain stays the plan for when bodies or
+  candidate sets grow.
+- `range` iteration is built in (as the stdlib defines it) rather than
+  stated as contracts on the iterators, until the pass uses postconditions
+  (stage 3). `reversed(range(...))` is not modelled yet.
+- z3's `rlimit` counts resources across a script rather than per query, so
+  it cannot be a tight per-query budget. It stays as a deterministic cap on
+  runaway queries (100M by default), next to the wall-clock cap.
 
 ## Risks and open questions
 
