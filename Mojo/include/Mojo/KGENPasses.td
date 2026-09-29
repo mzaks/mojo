@@ -51,7 +51,7 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "Report proven obligations too, as remarks">,
     Option<"z3Path", "z3-path", "std::string", /*default=*/"\"\"",
            "Path to the z3 executable (default: search PATH)">,
-    Option<"rlimit", "rlimit", "unsigned", /*default=*/"2000000",
+    Option<"rlimit", "rlimit", "unsigned", /*default=*/"100000000",
            "Deterministic solver resource limit per query">,
     Option<"wallSeconds", "wall-seconds", "unsigned", /*default=*/"60",
            "Wall-clock cap on each z3 process, in seconds">,
