@@ -1,7 +1,7 @@
 # Modular verification before elaboration
 
 **September 29, 2026**
-Status: Draft. Stages 1 and 2 are implemented; see
+Status: Draft. Stages 1 to 3 are implemented; see
 [Implementation status](#implementation-status).
 
 This document proposes moving static verification of contracts and bounds
@@ -315,6 +315,23 @@ Stage 2:
 - z3's `rlimit` counts resources across a script rather than per query, so
   it cannot be a tight per-query budget. It stays as a deterministic cap on
   runaway queries (100M by default), next to the wall-clock cap.
+
+Stage 3:
+
+- Postconditions are proven at returns and assumed after calls, with
+  `kgen.old`, quantifiers, register `out` results and raising callees;
+  `Mojo/test/kgen/verify-contracts/postconditions.mojo` proves all its
+  `ok_*` functions and flags all its `bad_*` ones.
+- Elements need a model before inlining: `xs[i]` is `elem(xs, i)`, and a
+  write to it is a new list value with the same length and the other
+  elements unchanged. Without it, `xs[0] = 7` would make `xs`, and its
+  length, unknown.
+- `_same_elements(a._data, b._data, n)` works through the lists' `_data`
+  fields, so `List`'s contracts need no change for it.
+- Houdini also bounds the lengths of lists a loop appends to.
+- `test_list.mojo` proves 14 of the 24 calls the pass checks, in 4.5 s. The
+  rest need contracts the stdlib does not state yet: the lengths of `List()`
+  and list literals, and the value `append` adds (stage 6).
 
 ## Risks and open questions
 
