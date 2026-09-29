@@ -1,8 +1,8 @@
 # Modular verification before elaboration
 
 **September 29, 2026**
-Status: Draft. Stages 1 to 5 and `List`'s part of stage 6 are implemented;
-see
+Status: Draft. Stages 1 to 5 and the `List`, `Span` and slicing parts of
+stage 6 are implemented; see
 [Implementation status](#implementation-status).
 
 This document proposes moving static verification of contracts and bounds
@@ -401,6 +401,28 @@ Stage 6, `List`:
   (the value `append` adds, the length of a list that is an element of
   another), `Span` and slicing contracts (`test_list_span`, 23), and
   `reversed(range(...))`. Other collections come next.
+
+Stage 6, `Span` and contiguous slices:
+
+- `Span`'s index and slice access, and `List`'s slice access, state their
+  bounds and result lengths; `Span(list=)` states its length and that the
+  list keeps its own. `Mojo/test/kgen/verify-contracts/spans.mojo` proves
+  all its `ok_*` functions and flags all its `bad_*` ones.
+- The bounds are `Optional[Int]`s, so the pass models `Optional` and the
+  slice constructor as records of their fields. Postconditions on results
+  need named `out` results; callers do not change.
+- A reference argument whose origin may be mutable is unknown after the
+  call, even when the callee does not write it, unless its contract says
+  what it keeps: `Span(list=)` states `len(list) == old(len(list))`.
+- test_span.mojo: 57 of 101 calls proven (44 before), in 0.9 s. Not
+  covered yet: spans over `Array` (`len(array)` is not allowed in the
+  contract for arrays in other address spaces, and `array.length` is a
+  parameter the pass cannot relate to the caller's), strided slices, and
+  `List(span)` through the generic iterable constructor.
+- Two bugs found on the way: literals wider than their dtype's signed range
+  (`255` as `UInt8`) asserted, and places rooted at a callee's contract
+  temporaries were still ordered by address, so scripts, and answers near
+  the resource limit, could change between runs.
 
 ## Risks and open questions
 
