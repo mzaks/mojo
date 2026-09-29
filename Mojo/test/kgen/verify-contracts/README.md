@@ -87,9 +87,14 @@ The output must be exactly the `bad_*` functions.
   first `n` elements of two lists are equal, which is how `List.append`,
   `pop` and `_realloc` state what they keep.
 - Loop invariants also bound the lengths of lists a loop appends to.
+- Generic code is verified once, for every value of its parameters.
+  `comptime for` is a loop over an arbitrary iteration, `comptime if` joins
+  its arms, and parameter expressions are evaluated where they are
+  integer or Boolean operators (`n >= 0` on a parameter `n` is `n >= 0`);
+  anything else about a parameter is unknown.
 
-Not analyzed yet: comptime control flow, loops with loop-carried values,
-and `reversed(range(...))` (a strided range). The obligations inside
+Not analyzed yet: loops with loop-carried values, and
+`reversed(range(...))` (a strided range). The obligations inside
 unsupported control flow are reported as not analyzed. Constructors and
 literals do not state their lengths yet (`List()`, `[1, 2]`), nor does
 `append` state the value it adds.
@@ -101,3 +106,4 @@ literals do not state their lengths yet (`List()`, `[1, 2]`), nor does
 | `straight_line.mojo` | all `bad_*`        | all `ok_*`       |
 | `loops.mojo`         | all `bad_*`        | all `ok_*`       |
 | `postconditions.mojo`| all `bad_*`        | all `ok_*`       |
+| `comptime.mojo`      | all `bad_*`        | all `ok_*`       |
