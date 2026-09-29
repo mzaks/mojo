@@ -330,6 +330,8 @@ struct Candidate {
   std::string op;
   std::optional<Loc> rhsLoc;
   std::string rhsTerm;
+  /// The candidate is about `len(lhs)`, not `lhs`.
+  bool length = false;
 };
 
 class FunctionEncoder {
@@ -1081,7 +1083,7 @@ private:
         continue;
       places.push_back(loc);
     }
-    if (places.empty())
+    if (places.empty() && frame.lengths.empty())
       return;
     // Terms that do not change in the loop: values before it, and lengths
     // of lists it does not change.
@@ -1101,7 +1103,34 @@ private:
         fixed.push_back(length);
     std::sort(fixed.begin(), fixed.end());
     fixed.erase(std::unique(fixed.begin(), fixed.end()), fixed.end());
+    // Lists the loop changes and whose lengths it reads: their lengths are
+    // candidates too, against the same terms and the integer variables.
+    SmallVector<Loc> lists;
+    for (const Loc &loc : frame.loaded) {
+      if ((written && !written->count(loc.root)) || !loc.path.empty())
+        continue;
+      std::string h = load(loc, head, Sort{false, 64, false});
+      if (llvm::any_of(frame.lengths, [&](const std::string &length) {
+            return llvm::is_contained(namesIn(length), h);
+          }))
+        lists.push_back(loc);
+    }
+    for (const Loc &loc : lists) {
+      std::string before0 = load(loc, before, Sort{false, 64, false});
+      fixed.push_back(lenOf(before0));
+    }
+    std::sort(fixed.begin(), fixed.end());
+    fixed.erase(std::unique(fixed.begin(), fixed.end()), fixed.end());
     SmallVector<Candidate> candidates;
+    for (const Loc &loc : lists) {
+      candidates.push_back({loc, "bvsge", std::nullopt, bvConst(0, 64), true});
+      for (const std::string &t : fixed)
+        for (const char *op : {"bvsle", "bvsge"})
+          candidates.push_back({loc, op, std::nullopt, t, true});
+      for (const Loc &other : places)
+        for (const char *op : {"bvsle", "bvslt", "bvsge"})
+          candidates.push_back({loc, op, other, "", true});
+    }
     for (const Loc &loc : places) {
       candidates.push_back({loc, "bvsge", std::nullopt, bvConst(0, 64)});
       for (const std::string &t : fixed)
@@ -1114,6 +1143,8 @@ private:
     }
     auto render = [&](const Candidate &c, State &at) {
       std::string lhs = load(c.lhs, at, Sort{false, 64, true});
+      if (c.length)
+        lhs = lenOf(lhs);
       std::string rhs =
           c.rhsLoc ? load(*c.rhsLoc, at, Sort{false, 64, true}) : c.rhsTerm;
       return "(" + c.op + " " + lhs + " " + rhs + ")";
