@@ -240,6 +240,23 @@ LogicalResult OldOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// ForallOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult ForallOp::verify() {
+  Block &block = getBody().front();
+  if (block.getNumArguments() != 1 ||
+      block.getArgument(0).getType() != getHi().getType() ||
+      (getLo() && getLo().getType() != getHi().getType()))
+    return emitOpError("region must take one index of the bounds' type");
+  auto yield = dyn_cast<ContractYieldOp>(block.getTerminator());
+  if (!yield || yield.getValues().size() != 1 ||
+      yield.getValues().front().getType() != getValue().getType())
+    return emitOpError("region must yield the condition");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // ContractEntryOp
 //===----------------------------------------------------------------------===//
 

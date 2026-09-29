@@ -1113,6 +1113,18 @@ struct ConvertKGENOld : ConvertPOPToLLVMPattern<OldOp> {
   }
 };
 
+/// Quantifiers only appear in contracts, and are erased with them.
+struct ConvertKGENForall : ConvertPOPToLLVMPattern<ForallOp> {
+  using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(ForallOp op, ForallOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 /// The entry marker is only used by `kgen.old`s inside postconditions: erase
 /// the outermost contract op around each, then the marker.
 struct ConvertKGENContractEntry : ConvertPOPToLLVMPattern<ContractEntryOp> {
@@ -1296,6 +1308,7 @@ static void populateKGENToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
       ConvertKGENContractEntry,
       ConvertKGENCopyMarker,
       ConvertKGENEnsures,
+      ConvertKGENForall,
       ConvertKGENObligation,
       ConvertKGENOld,
       ConvertKGENRequires,

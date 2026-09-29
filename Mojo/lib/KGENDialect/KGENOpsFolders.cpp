@@ -812,6 +812,23 @@ OldOp::parametric_interpret(ArrayRef<Attribute> operands,
 }
 
 //===----------------------------------------------------------------------===//
+// ForallOp
+//===----------------------------------------------------------------------===//
+
+// Only in contract regions, which the interpreter never enters.
+ErrorTreeOrSuccess ForallOp::interpret(ArrayRef<Attribute> operands,
+                                       InterpreterState &state) {
+  return ErrorTree(getLoc(), Error("a quantifier in a contract cannot be "
+                                   "evaluated at compile time"));
+}
+
+ErrorTreeOrSuccess
+ForallOp::parametric_interpret(ArrayRef<Attribute> operands,
+                               ParametricInterpreterState &state) {
+  return interpret(operands, state);
+}
+
+//===----------------------------------------------------------------------===//
 // ContractEntryOp
 //===----------------------------------------------------------------------===//
 

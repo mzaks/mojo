@@ -1578,11 +1578,42 @@ def KGEN_OldOp : KGENOp<"old", [
 }
 
 //===----------------------------------------------------------------------===//
+// ForallOp
+//===----------------------------------------------------------------------===//
+
+def KGEN_ForallOp : KGENOp<"forall", [
+    Pure, DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
+  let summary = "a condition for every index in a range, in a contract";
+  let description = [{
+    The `kgen.forall` operation is `all([cond for i in range(lo, hi)])` in a
+    contract: whether the condition its region yields holds for every index
+    `i` with `lo <= i < hi` (`lo` is 0 when absent). The single block of `body`
+    has the index as its argument and yields the condition with a
+    `kgen.contract.yield`; the op's result is the value of the whole
+    quantifier, of the condition's type.
+
+    It only appears in the regions of contract ops, which are never
+    executed: static analyses read it, and lowering to LLVM erases it with the
+    op it is in.
+  }];
+
+  let arguments = (ins Optional<AnyType>:$lo, AnyType:$hi);
+  let results = (outs AnyType:$value);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = [{
+    `(` ($lo^ `:` type($lo) `,`)? $hi `:` type($hi) `)` `->` type($value)
+    attr-dict-with-keyword $body
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // ContractYieldOp
 //===----------------------------------------------------------------------===//
 
 def KGEN_ContractYieldOp : KGENOp<"contract.yield", [
-    Pure, Terminator, ParentOneOf<["RequiresOp", "EnsuresOp", "OldOp"]>,
+    Pure, Terminator,
+    ParentOneOf<["RequiresOp", "EnsuresOp", "OldOp", "ForallOp"]>,
     DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
   let summary = "yields the condition or values of a contract region";
   let description = [{
