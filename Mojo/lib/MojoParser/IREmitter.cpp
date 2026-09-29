@@ -1884,33 +1884,8 @@ void IREmitter::checkInferredErrorType(ASTType rvalueType, SMLoc loc) {
 
 AnyValue IREmitter::emitOldCall(const ExprNode *call, const ExprNode *operand,
                                 ExprDest &dest) {
-  if (oldCalls->mode == OldCalls::Replace) {
-    for (OldCalls::Call &old : oldCalls->values)
-      if (old.call == call)
-        return emitResult(old.value, call, dest);
-    emitError(call->getLoc(), "'old' value was not computed on entry");
-    return {};
-  }
-  if (oldCalls->mode == OldCalls::Plain) {
-    AnyValue value = emitExpr(operand, EC_OperatorOperandValue);
-    return value ? emitResult(value, call, dest) : AnyValue();
-  }
-  // Record: compute the value at the top of the block, where the region can
-  // yield it, and keep a copy for the postcondition. This comes first, so
-  // anything the emission below reuses is defined there too.
-  Value recorded;
-  {
-    OpBuilder::InsertionGuard guard(*builder);
-    builder->setInsertionPointToStart(oldCalls->topLevel);
-    AnyValue top = emitExpr(operand, EC_OperatorOperandValue);
-    if (!top)
-      return {};
-    recorded = emitSRValue({top, operand}, EC_OperatorOperandValue);
-    if (!recorded)
-      return {};
-  }
-  oldCalls->values.push_back({call, AnyValue(), recorded});
-  // The value where the call is, for the rest of the clause.
+  if (oldCalls->mode == OldCalls::Evaluate)
+    return getDeclResolver().emitOldValue(*this, call, operand, dest);
   AnyValue value = emitExpr(operand, EC_OperatorOperandValue);
   return value ? emitResult(value, call, dest) : AnyValue();
 }

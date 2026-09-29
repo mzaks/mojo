@@ -93,8 +93,9 @@ uint64_t getNumOperations(Operation *op);
 
 /// Whether `op` only exists for static verification and never becomes code:
 /// a contract op (`kgen.requires`, `kgen.ensures`, `kgen.old`, with their
-/// regions), or the snapshot of a slot a contract op reads (see
-/// `snapshotContractOperands`). Size estimates for inlining skip these.
+/// regions, and `kgen.contract.entry`), or the snapshot of a slot a contract op
+/// reads (see `snapshotContractOperands`). Size estimates for inlining skip
+/// these.
 bool isVerificationOnly(Operation *op);
 
 } // namespace M::KGEN

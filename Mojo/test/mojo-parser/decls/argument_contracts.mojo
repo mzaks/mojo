@@ -66,8 +66,7 @@ def no_clauses(a: Int):
 
 
 # Postconditions: a clause on an `out` argument becomes a `kgen.ensures` right
-# before every return, over the arguments, the named result and the values of
-# its `old(e)` calls, which a `kgen.old` computes on entry.
+# before every return, over the arguments and the named result.
 
 # CHECK-LABEL: lit.fn @"out_result
 # CHECK-NOT: kgen.requires
@@ -91,13 +90,14 @@ def two_returns(a: Int, out r: Int where r >= 0):
     r = 0
 
 
-# On a `mut` argument, `old(e)` is `e` on entry: a `kgen.old` computes it, and
-# its result is the last operand of the `kgen.ensures`.
+# On a `mut` argument, `old(e)` is `e` on entry: a `kgen.old` inside the
+# `kgen.ensures`, evaluated with memory as it is at the function's
+# `kgen.contract.entry`.
 # CHECK-LABEL: lit.fn @"mut_with_old
 # CHECK-NOT: kgen.requires
-# CHECK: %[[OLD:.*]] = kgen.old({{.*}}) -> !Int
-# CHECK: kgen.contract.yield
-# CHECK: kgen.ensures({{.*}}, %[[OLD]] : {{.*}})
+# CHECK: %[[ENTRY:.*]] = kgen.contract.entry
+# CHECK: kgen.ensures
+# CHECK: kgen.old(%[[ENTRY]], {{.*}}) -> !Int
 # CHECK: lit.return
 def mut_with_old(mut a: Int where a == old(a) + 1):
     a += 1
@@ -106,6 +106,7 @@ def mut_with_old(mut a: Int where a == old(a) + 1):
 # Without `old`, a `mut` clause holds on entry and on exit.
 # CHECK-LABEL: lit.fn @"mut_without_old
 # CHECK: kgen.requires
+# CHECK-NOT: kgen.contract.entry
 # CHECK-NOT: kgen.old
 # CHECK: kgen.ensures
 # CHECK: lit.return
@@ -116,6 +117,7 @@ def mut_without_old(mut a: Int where a >= 0):
 # Written only in terms of `old`, it is a precondition.
 # CHECK-LABEL: lit.fn @"mut_only_old
 # CHECK: kgen.requires
+# CHECK-NOT: kgen.contract.entry
 # CHECK-NOT: kgen.old
 # CHECK-NOT: kgen.ensures
 # CHECK: lit.end_fn

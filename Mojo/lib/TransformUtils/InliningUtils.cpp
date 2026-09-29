@@ -324,7 +324,8 @@ mlir::PassManager &PerThreadPassManagers::getPassManager() {
 bool KGEN::isVerificationOnly(Operation *op) {
   // Checked by name: TransformUtils cannot depend on the dialects.
   StringRef name = op->getName().getStringRef();
-  if (name == "kgen.requires" || name == "kgen.ensures" || name == "kgen.old")
+  if (name == "kgen.requires" || name == "kgen.ensures" || name == "kgen.old" ||
+      name == "kgen.contract.entry")
     return true;
   auto isSnapshot = [](Value ptr) {
     Operation *def = ptr.getDefiningOp();

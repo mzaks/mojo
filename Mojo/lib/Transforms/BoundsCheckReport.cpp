@@ -640,6 +640,8 @@ private:
     Operation *call = nullptr;
     /// Whether only the callee's contract is evaluated (see `isOpaque`).
     bool opaque = false;
+    /// Whether this evaluates a contract op's region (see `contractContext`).
+    bool contract = false;
     /// Results of calls inside this callee, backed by nested contexts.
     DenseMap<Value, std::pair<CallContext *, Value>> results;
     /// Contexts of calls inside this callee (see `contextFor`).
@@ -1085,9 +1087,10 @@ private:
       if (Operation *def = value.getDefiningOp()) {
         if (auto ifOp = dyn_cast<HLCF::IfOp>(def))
           encodeIfResultOnDemand(ifOp, cast<OpResult>(value));
-        else if (auto oldOp = dyn_cast<OldOp>(def))
-          encodeOld(oldOp);
-        else if (auto loop = dyn_cast<HLCF::LoopOp>(def)) {
+        else if (auto oldOp = dyn_cast<OldOp>(def)) {
+          if (MaybeTerm t = oldTerm(oldOp))
+            map[value] = *t;
+        } else if (auto loop = dyn_cast<HLCF::LoopOp>(def)) {
           OpResult result = cast<OpResult>(value);
           if (lazyHeap)
             map[value] =
@@ -2310,8 +2313,8 @@ private:
   static bool writesNothing(Operation *op) {
     StringRef name = op->getName().getStringRef();
     return isa<POP::LoadOp, POP::StackAllocationOp, ObligationOp, AssumeOp,
-               CopyMarkerOp, RequiresOp, EnsuresOp, OldOp, ContractYieldOp>(
-               op) ||
+               CopyMarkerOp, RequiresOp, EnsuresOp, OldOp, ContractEntryOp,
+               ContractYieldOp>(op) ||
            name == "pop.stack_alloc.lifetime.start" ||
            name == "pop.stack_alloc.lifetime.end" ||
            // Reading freed memory is undefined behavior, which the analysis
@@ -3306,24 +3309,26 @@ private:
       addAssumption(reachName(reach), cond);
       return reach;
     }
-    if (auto oldOp = dyn_cast<OldOp>(op)) {
-      std::string facts = encodeOld(oldOp);
-      if (facts != "true")
-        addAssumption(reachName(reach), facts);
+    // Values on entry are evaluated where postconditions use them.
+    if (isa<OldOp, ContractEntryOp>(op))
       return reach;
-    }
     if (auto ensuresOp = dyn_cast<EnsuresOp>(op)) {
       // A postcondition is checked where the function returns, whether it is
       // the function's own or an inlined callee's; reported at the clause.
       std::string r = reachName(reach);
+      std::string facts;
       std::string cond = contractCondition(ensuresOp, ensuresOp.getArgs(), ctx,
-                                           /*toAssume=*/false);
+                                           /*toAssume=*/false, &facts);
       obligations.push_back(
           {ObligationOp(), "ensures", locationOf(ensuresOp.getLoc()), r, cond,
            assumedLoops(),
            SmallVector<std::pair<std::string, std::string>>(activeObligations),
            assumed});
       activeObligations.push_back({r, cond});
+      // Its trusted facts (type invariants of the values it reads, on entry
+      // or on exit) hold for the code after it too.
+      if (facts != "true")
+        addAssumption(r, facts);
       return reach;
     }
     if (auto requiresOp = dyn_cast<RequiresOp>(op)) {
@@ -3331,12 +3336,15 @@ private:
       // checked, and reported at the call.
       std::string r = reachName(reach);
       bool own = isOwnRequires(requiresOp);
+      std::string facts;
       std::string cond = contractCondition(requiresOp, requiresOp.getArgs(),
-                                           ctx, /*toAssume=*/own);
+                                           ctx, /*toAssume=*/own, &facts);
       if (own) {
         addAssumption(r, cond);
         return reach;
       }
+      if (facts != "true")
+        addAssumption(r, facts);
       obligations.push_back(
           {ObligationOp(), "requires",
            constantLocation(requiresOp.getLine(), requiresOp.getCol(),
@@ -3383,6 +3391,7 @@ private:
                                CallContext *owner) {
     CallContext &context = contexts.emplace_back();
     context.callee = "contract";
+    context.contract = true;
     context.parent = owner;
     context.depth = owner ? owner->depth + 1 : 1;
     context.call = op;
@@ -3396,41 +3405,78 @@ private:
   /// of the accessors it calls, evaluated in its context.
   std::string contractFacts(Operation *op, CallContext &context) {
     std::string facts = "true";
-    op->getRegion(0).walk([&](AssumeOp assume) {
-      facts = mkAnd(facts, inContext(&context, [&] {
-                      return boolTerm(assume.getCond());
-                    }));
+    op->getRegion(0).walk<mlir::WalkOrder::PreOrder>([&](Operation *nested) {
+      // A `kgen.old`'s facts are collected when it is evaluated.
+      if (isa<OldOp>(nested))
+        return WalkResult::skip();
+      if (auto assume = dyn_cast<AssumeOp>(nested))
+        facts = mkAnd(facts, inContext(&context, [&] {
+                        return boolTerm(assume.getCond());
+                      }));
+      return WalkResult::advance();
     });
     return facts;
   }
 
+  /// The trusted facts of the `kgen.old`s evaluated for the contract being
+  /// evaluated (see `contractCondition`).
+  std::string pendingFacts = "true";
+
   /// The condition of a `kgen.requires` or `kgen.ensures`: to prove, the
   /// condition given its region's trusted facts; to assume, both.
   std::string contractCondition(Operation *op, ValueRange operands,
-                                CallContext *owner, bool toAssume) {
+                                CallContext *owner, bool toAssume,
+                                std::string *factsOut = nullptr) {
     CallContext &context = contractContext(op, operands, owner);
     auto yield =
         cast<ContractYieldOp>(op->getRegion(0).front().getTerminator());
+    std::string saved = std::exchange(pendingFacts, "true");
     std::string cond = inContext(
         &context, [&] { return boolTerm(yield.getValues().front()); });
-    std::string facts = contractFacts(op, context);
+    std::string facts = mkAnd(contractFacts(op, context), pendingFacts);
+    pendingFacts = saved;
+    if (factsOut)
+      *factsOut = facts;
     if (facts == "true")
       return cond;
     return toAssume ? mkAnd(facts, cond) : "(=> " + facts + " " + cond + ")";
   }
 
-  /// The values on entry of a `kgen.old`, as the terms of its results in the
-  /// current context. Returns the trusted facts of its region.
-  std::string encodeOld(OldOp op) {
-    CallContext &context = contractContext(op, op.getArgs(), ctx);
-    auto yield = cast<ContractYieldOp>(op.getBody().front().getTerminator());
-    for (auto [result, yielded] :
-         llvm::zip(op.getValues(), yield.getValues())) {
-      MaybeTerm t = inContext(&context, [&] { return term(yielded); });
-      if (t)
-        termMap()[result] = *t;
+  /// The value of a `kgen.old`: its region evaluated like a callee's, with
+  /// memory as it is at its `kgen.contract.entry`, in the function's (or the
+  /// callee's) own context. Operands from inside a contract region (the
+  /// indices of quantifiers) are passed as their terms. The region's trusted
+  /// facts join `pendingFacts`.
+  MaybeTerm oldTerm(OldOp op) {
+    Operation *entry = op.getEntry().getDefiningOp();
+    if (!entry)
+      return std::nullopt;
+    CallContext *owner = ctx;
+    while (owner && owner->contract)
+      owner = owner->parent;
+    CallContext &context = contexts.emplace_back();
+    context.callee = "old";
+    context.contract = true;
+    context.parent = owner;
+    context.depth = owner ? owner->depth + 1 : 1;
+    context.call = entry;
+    Block &block = op.getBody().front();
+    for (auto [arg, operand] : llvm::zip(block.getArguments(), op.getArgs())) {
+      Operation *where = operand.getDefiningOp();
+      if (!where)
+        where = cast<BlockArgument>(operand).getOwner()->getParentOp();
+      if (isContractOp(where) || isInContractRegion(where)) {
+        if (MaybeTerm t = term(operand))
+          context.terms[arg] = *t;
+      } else {
+        context.args[arg] = operand;
+      }
     }
-    return contractFacts(op, context);
+    auto yield = cast<ContractYieldOp>(block.getTerminator());
+    MaybeTerm t =
+        inContext(&context, [&] { return term(yield.getValues().front()); });
+    pendingFacts = mkAnd(pendingFacts, contractFacts(op, context));
+    return t;
   }
 
   /// Apply the contract of a (non-inlined) callee at a call to it: its
@@ -3539,16 +3585,6 @@ private:
       addAssumption(r, cond);
       ++contractsUsed;
     }
-    // The trusted facts of the values on entry they use hold too.
-    if (!guarantees.empty())
-      for (Operation &op : entry)
-        if (auto oldOp = dyn_cast<OldOp>(&op)) {
-          CallContext &oldContext =
-              contractContext(oldOp, oldOp.getArgs(), &context);
-          std::string facts = contractFacts(oldOp, oldContext);
-          if (facts != "true")
-            addAssumption(r, facts);
-        }
   }
 
   /// Bind `results` to the values yielded by the arms that fall through.

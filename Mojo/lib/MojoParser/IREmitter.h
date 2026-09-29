@@ -129,28 +129,22 @@ public:
   /// This is scope to resolve declaration references against.
   ASTDecl &declScope;
 
-  /// While emitting a `where` clause of a postcondition, how calls to
-  /// `old(e)` are handled (see `DeclResolver::emitArgumentContracts`).
+  /// While emitting a `where` clause, how calls to `old(e)` are handled (see
+  /// `DeclResolver::emitArgumentContracts`).
   struct OldCalls {
     enum Mode {
       /// `old(e)` is `e`: the clause is evaluated on entry.
       Plain,
-      /// Emit `e` and record its value, on entry.
-      Record,
-      /// Use the value recorded for the call.
-      Replace,
+      /// `old(e)` becomes a `kgen.old` where it is, evaluated at `entry`.
+      Evaluate,
     } mode;
-    struct Call {
-      const ExprNode *call;
-      AnyValue value;
-      /// The recorded value itself (Record mode).
-      Value recorded;
-    };
-    SmallVector<Call, 2> values;
-    /// Record mode: the block the values are computed in, at its top level,
-    /// so the region can yield them whatever arm of the condition a call is
-    /// in.
-    Block *topLevel = nullptr;
+    /// The `kgen.contract.entry` token (Evaluate mode).
+    Value entry;
+    /// The indices of the enclosing quantifiers, by name: a `kgen.old` takes
+    /// them as operands.
+    SmallVector<std::pair<StringAttr, Value>, 1> indices;
+    /// How many `kgen.old` ops were emitted.
+    unsigned count = 0;
   };
   OldCalls *oldCalls = nullptr;
 

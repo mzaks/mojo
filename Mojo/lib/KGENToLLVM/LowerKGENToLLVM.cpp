@@ -1101,23 +1101,38 @@ struct ConvertKGENEnsures : ConvertPOPToLLVMPattern<EnsuresOp> {
   }
 };
 
-/// And the values on entry that postconditions use: the `kgen.ensures` using
-/// them are erased with them.
+/// And the values on entry they use.
 struct ConvertKGENOld : ConvertPOPToLLVMPattern<OldOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
   LogicalResult
   matchAndRewrite(OldOp op, OldOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    SmallVector<Operation *> users(op->getUsers());
-    for (Operation *user : users) {
-      if (!isa<EnsuresOp>(user))
-        return rewriter.notifyMatchFailure(op, "used by other than ensures");
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// The entry marker is only used by `kgen.old`s inside postconditions: erase
+/// the outermost contract op around each, then the marker.
+struct ConvertKGENContractEntry : ConvertPOPToLLVMPattern<ContractEntryOp> {
+  using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(ContractEntryOp op, ContractEntryOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    llvm::SetVector<Operation *> contracts;
+    for (Operation *user : op->getUsers()) {
+      Operation *outer = nullptr;
+      for (Operation *parent = user; parent; parent = parent->getParentOp())
+        if (isa<RequiresOp, EnsuresOp>(parent))
+          outer = parent;
+      if (!outer)
+        return rewriter.notifyMatchFailure(op, "used outside a contract");
+      contracts.insert(outer);
     }
-    llvm::SmallPtrSet<Operation *, 4> erased;
-    for (Operation *user : users)
-      if (erased.insert(user).second)
-        rewriter.eraseOp(user);
+    for (Operation *contract : contracts)
+      rewriter.eraseOp(contract);
     rewriter.eraseOp(op);
     return success();
   }
@@ -1278,6 +1293,7 @@ static void populateKGENToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
       // clang-format off
       ConvertKGENAssume,
       ConvertKGENCall,
+      ConvertKGENContractEntry,
       ConvertKGENCopyMarker,
       ConvertKGENEnsures,
       ConvertKGENObligation,

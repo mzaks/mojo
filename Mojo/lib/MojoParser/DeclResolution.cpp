@@ -40,7 +40,6 @@
 
 #include "Mojo/HLCFDialect/HLCFOps.h"
 #include "Mojo/LITDialect/LITUtils.h"
-#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -2726,23 +2725,47 @@ static Value namedRegisterResult(FnOp funcOp, ASTDecl &decl) {
 
 /// The operands of a contract op, which its region's block arguments stand
 /// for: the function's arguments, then (for a postcondition) its named result
-/// in a register and the `kgen.old` values the clause uses.
+/// in a register.
 static SmallVector<Value> contractOperands(FnOp funcOp, ASTDecl &decl,
-                                           bool withResult,
-                                           ValueRange olds = {}) {
+                                           bool withResult) {
   SmallVector<Value> operands(funcOp.getBody()->getArguments());
   if (withResult)
     if (Value result = namedRegisterResult(funcOp, decl))
       operands.push_back(result);
-  llvm::append_range(operands, olds);
   return operands;
+}
+
+/// Bind the function's argument names in `scope` to the arguments of `block`,
+/// whose first ones stand for the function's arguments, like `resolveBody`
+/// binds them to the entry block's. The `out` argument's result slot is only
+/// bound if `withResultSlot`.
+static void bindFunctionArguments(DeclResolver &resolver, FnOp funcOp,
+                                  ASTDecl &scope, Block &block, SMLoc loc,
+                                  bool withResultSlot) {
+  FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
+  for (auto [argIdx, convention] :
+       llvm::enumerate(funcSignature.getArgConventions())) {
+    StringAttr argName = funcSignature.getArgName(argIdx);
+    if (!argName || argName.empty() || convention == ArgConvention::ByRefError)
+      continue;
+    if (convention == ArgConvention::ByRefResult && !withResultSlot)
+      continue;
+    BlockArgument arg = block.getArgument(argIdx);
+    if (convention == ArgConvention::ImmMem)
+      resolver.addFullyResolvedDecl(MBValue(arg), argName, loc, &scope);
+    else if (convention == ArgConvention::ImmReg)
+      resolver.addFullyResolvedDecl(SBValue(arg), argName, loc, &scope);
+    else
+      resolver.addFullyResolvedDecl(CValue::getMValueForRef(arg), argName, loc,
+                                    &scope);
+  }
 }
 
 /// Emit the condition of a `where` clause into the region of the contract op
 /// `op`, whose operands are `operands` (see `contractOperands`). A scope binds
 /// the function's argument names (and a named result) to the region's block
-/// arguments, like `resolveBody` binds them to the entry block's; `olds`
-/// handles the clause's `old(e)` calls. Returns the region's block.
+/// arguments; `olds` handles the clause's `old(e)` calls. Returns the region's
+/// block.
 static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
                                     ASTDecl &decl,
                                     const ParsedConstraint &clause,
@@ -2760,48 +2783,16 @@ static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
 
   ASTDecl &scope =
       resolver.addFullyResolvedDecl(nullptr, StringAttr(), clause.loc, &decl);
-  FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
-  unsigned numArgs = funcOp.getBody()->getNumArguments();
-  for (auto [argIdx, convention] :
-       llvm::enumerate(funcSignature.getArgConventions())) {
-    StringAttr argName = funcSignature.getArgName(argIdx);
-    // The result slot is the `out` argument; the error slot has no name.
-    if (!argName || argName.empty() || convention == ArgConvention::ByRefError)
-      continue;
-    BlockArgument regionArg = block->getArgument(argIdx);
-    if (convention == ArgConvention::ImmMem)
-      resolver.addFullyResolvedDecl(MBValue(regionArg), argName, clause.loc,
-                                    &scope);
-    else if (convention == ArgConvention::ImmReg)
-      resolver.addFullyResolvedDecl(SBValue(regionArg), argName, clause.loc,
-                                    &scope);
-    else
-      resolver.addFullyResolvedDecl(CValue::getMValueForRef(regionArg), argName,
-                                    clause.loc, &scope);
-  }
+  bindFunctionArguments(resolver, funcOp, scope, *block, clause.loc,
+                        /*withResultSlot=*/true);
   // A named result in a register follows the arguments.
-  unsigned next = numArgs;
-  if (withResult && namedRegisterResult(funcOp, decl)) {
+  unsigned numArgs = funcOp.getBody()->getNumArguments();
+  if (withResult && namedRegisterResult(funcOp, decl))
     resolver.addFullyResolvedDecl(
-        CValue::getMValueForRef(block->getArgument(next)),
+        CValue::getMValueForRef(block->getArgument(numArgs)),
         funcOp.getNamedResultAttr(), clause.loc, &scope);
-    ++next;
-  }
-  // Then the values on entry, standing for the `old(e)` calls.
-  IREmitter::OldCalls replaced{IREmitter::OldCalls::Replace, {}};
-  if (olds && olds->mode == IREmitter::OldCalls::Replace) {
-    for (IREmitter::OldCalls::Call &old : olds->values) {
-      if (next >= operands.size())
-        break;
-      BlockArgument value = block->getArgument(next++);
-      replaced.values.push_back({old.call, AnyValue(SBValue(value)), value});
-    }
-    olds = &replaced;
-  }
 
   IREmitter clauseEmitter(scope, regionBuilder);
-  if (olds && olds->mode == IREmitter::OldCalls::Record)
-    olds->topLevel = block;
   clauseEmitter.oldCalls = olds;
   RValue cond =
       clauseEmitter.emitExprScalarBool(clause.propExpr, EC_BoolCondition);
@@ -2811,6 +2802,52 @@ static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
     return nullptr;
   KGEN::ContractYieldOp::create(*clauseEmitter.builder, loc, condVal);
   return block;
+}
+
+AnyValue DeclResolver::emitOldValue(IREmitter &emitter, const ExprNode *call,
+                                    const ExprNode *operand, ExprDest &dest) {
+  IREmitter::OldCalls &olds = *emitter.oldCalls;
+  auto funcOp =
+      getBlockParentOfType<FnOp>(emitter.builder->getInsertionBlock());
+  ASTDecl *funcDecl = emitter.declScope.getNearestDeclOfType<FnOp>();
+  if (!funcOp || !funcDecl || !olds.entry)
+    return {};
+  Location loc = shared.translateLocation(call->getLoc());
+
+  // The value is computed in the op's region, from the function's arguments
+  // and the indices of the enclosing quantifiers.
+  SmallVector<Value> operands(funcOp.getBody()->getArguments());
+  for (auto &[name, index] : olds.indices)
+    operands.push_back(index);
+  auto *block = new Block();
+  for (Value operand : operands)
+    block->addArgument(operand.getType(), operand.getLoc());
+  ASTDecl &scope =
+      addFullyResolvedDecl(nullptr, StringAttr(), call->getLoc(), funcDecl);
+  bindFunctionArguments(*this, funcOp, scope, *block, call->getLoc(),
+                        /*withResultSlot=*/false);
+  unsigned numArgs = funcOp.getBody()->getNumArguments();
+  for (auto [i, name] : llvm::enumerate(llvm::make_first_range(olds.indices)))
+    addFullyResolvedDecl(SBValue(block->getArgument(numArgs + i)), name,
+                         call->getLoc(), &scope);
+
+  OpBuilder valueBuilder(getContext());
+  valueBuilder.setInsertionPointToEnd(block);
+  IREmitter valueEmitter(scope, valueBuilder);
+  AnyValue value = valueEmitter.emitExpr(operand, EC_OperatorOperandValue);
+  Value result = value ? valueEmitter.emitSRValue({value, operand},
+                                                  EC_OperatorOperandValue)
+                       : Value();
+  if (!result) {
+    delete block;
+    return {};
+  }
+  KGEN::ContractYieldOp::create(valueBuilder, loc, result);
+  auto oldOp = KGEN::OldOp::create(*emitter.builder, loc, result.getType(),
+                                   olds.entry, operands);
+  oldOp.getBody().push_back(block);
+  ++olds.count;
+  return emitter.emitResult(AnyValue(SBValue(oldOp.getValue())), call, dest);
 }
 
 /// The location of the call to the function: it only resolves once the
@@ -2829,8 +2866,8 @@ LogicalResult DeclResolver::emitArgumentContracts(FnOp funcOp, ASTDecl &decl,
   argumentContracts.erase(it);
 
   OpBuilder &builder = *emitter.builder;
-  auto callLoc =
-      emitCallLocation(builder, shared.translateLocation(decl.getLoc()));
+  Location funcLoc = shared.translateLocation(decl.getLoc());
+  auto callLoc = emitCallLocation(builder, funcLoc);
   auto emitRequires = [&](const ParsedConstraint &clause,
                           IREmitter::OldCalls *olds) -> LogicalResult {
     SmallVector<Value> operands =
@@ -2844,8 +2881,11 @@ LogicalResult DeclResolver::emitArgumentContracts(FnOp funcOp, ASTDecl &decl,
                                                /*withResult=*/false, olds));
   };
 
+  // The entry marker for `old(e)` in postconditions, made on demand.
+  KGEN::ContractEntryOp entry;
   FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
   SmallVector<PostconditionClause, 1> posts;
+  bool needsEntry = false;
   for (const ArgumentContract &contract : contracts) {
     const ParsedConstraint &clause = *contract.clause;
     // An input's clause is a precondition; `old` has no meaning there.
@@ -2855,61 +2895,22 @@ LogicalResult DeclResolver::emitArgumentContracts(FnOp funcOp, ASTDecl &decl,
       continue;
     }
 
-    // Compute the `old(e)` values of a `mut` or `out` clause on entry, in a
-    // `kgen.old` (the region yields them; the op's results are created once
-    // their types are known).
+    // Classify a `mut` or `out` clause by a trial postcondition: a clause on a
+    // `mut` argument without `old` holds on entry and on exit; one that uses
+    // no `mut` or `out` argument's value on exit is a precondition.
+    if (!entry)
+      entry = KGEN::ContractEntryOp::create(builder, funcLoc);
     Location loc = shared.translateLocation(clause.loc);
-    SmallVector<Value> entryOperands =
-        contractOperands(funcOp, decl, /*withResult=*/false);
-    auto probe = KGEN::OldOp::create(builder, loc, TypeRange(), entryOperands);
-    IREmitter::OldCalls recorded{IREmitter::OldCalls::Record, {}};
-    Block *oldBlock =
-        emitContractCondition(*this, funcOp, decl, clause, probe, entryOperands,
-                              /*withResult=*/false, &recorded);
-    if (!oldBlock)
-      return failure();
-    // The region computed the whole condition; it only needs the values.
-    Operation *terminator = oldBlock->getTerminator();
-    SmallVector<Value> yielded;
-    for (IREmitter::OldCalls::Call &old : recorded.values)
-      yielded.push_back(old.recorded);
-    OpBuilder yieldBuilder(terminator);
-    auto yield = KGEN::ContractYieldOp::create(yieldBuilder,
-                                               terminator->getLoc(), yielded);
-    terminator->erase();
-    // Drop the rest of the condition: the comptime interpreter evaluates the
-    // region when it runs the function, and should only compute the values.
-    llvm::SetVector<Operation *> needed;
-    mlir::BackwardSliceOptions sliceOptions;
-    sliceOptions.omitUsesFromAbove = false;
-    sliceOptions.inclusive = true;
-    for (Value value : yielded)
-      (void)mlir::getBackwardSlice(value, &needed, sliceOptions);
-    for (Operation &op : llvm::make_early_inc_range(llvm::reverse(*oldBlock)))
-      if (&op != yield && !needed.contains(&op))
-        op.erase();
-    KGEN::OldOp oldOp;
-    SmallVector<Value> oldValues;
-    if (!recorded.values.empty()) {
-      oldOp = KGEN::OldOp::create(builder, loc, ValueRange(yielded).getTypes(),
-                                  entryOperands);
-      oldOp.getBody().takeBody(probe.getBody());
-      llvm::append_range(oldValues, oldOp.getValues());
-    }
-    probe.erase();
-
-    // Classify the clause by a trial postcondition: a clause on a `mut`
-    // argument without `old` holds on entry and on exit; one that uses no
-    // `mut` or `out` argument's value on exit is a precondition.
-    IREmitter::OldCalls replace{IREmitter::OldCalls::Replace, recorded.values};
+    IREmitter::OldCalls olds{
+        IREmitter::OldCalls::Evaluate, entry.getToken(), {}, 0};
     SmallVector<Value> postOperands =
-        contractOperands(funcOp, decl, /*withResult=*/true, oldValues);
+        contractOperands(funcOp, decl, /*withResult=*/true);
     auto trial = KGEN::EnsuresOp::create(builder, loc, postOperands,
                                          callLoc.getLine(), callLoc.getCol(),
                                          callLoc.getFileName(), clause.message);
     Block *trialBlock =
         emitContractCondition(*this, funcOp, decl, clause, trial, postOperands,
-                              /*withResult=*/true, &replace);
+                              /*withResult=*/true, &olds);
     if (!trialBlock)
       return failure();
     bool usesExit = false;
@@ -2920,28 +2921,25 @@ LogicalResult DeclResolver::emitArgumentContracts(FnOp funcOp, ASTDecl &decl,
           convention == ArgConvention::ByRefResult)
         usesExit |= !trialBlock->getArgument(argIdx).use_empty();
     unsigned numArgs = funcOp.getBody()->getNumArguments();
-    if (postOperands.size() > numArgs + oldValues.size())
+    if (postOperands.size() > numArgs)
       usesExit |= !trialBlock->getArgument(numArgs).use_empty();
     trial.erase();
 
     bool isPost = usesExit || contract.kind == ArgumentContract::Out;
     bool isPre = contract.kind == ArgumentContract::Mut &&
-                 (recorded.values.empty() || !usesExit);
+                 (olds.count == 0 || !usesExit);
     if (isPre) {
-      IREmitter::OldCalls plain{IREmitter::OldCalls::Plain, {}};
+      IREmitter::OldCalls plain{IREmitter::OldCalls::Plain, {}, {}, 0};
       if (failed(emitRequires(clause, &plain)))
         return failure();
     }
-    if (!isPost) {
-      if (oldOp)
-        oldOp.erase();
+    if (!isPost)
       continue;
-    }
-    PostconditionClause post{&clause, {}};
-    for (auto [old, value] : llvm::zip(recorded.values, oldValues))
-      post.olds.push_back({old.call, value});
-    posts.push_back(std::move(post));
+    needsEntry |= olds.count != 0;
+    posts.push_back({&clause, entry.getToken()});
   }
+  if (entry && !needsEntry)
+    entry.erase();
   if (!posts.empty())
     postconditions[funcOp] = std::move(posts);
   return success();
@@ -2959,14 +2957,9 @@ LogicalResult DeclResolver::emitPostconditions(FnOp funcOp,
   auto callLoc =
       emitCallLocation(builder, shared.translateLocation(decl->getLoc()));
   for (const PostconditionClause &post : it->second) {
-    SmallVector<Value> oldValues;
-    IREmitter::OldCalls olds{IREmitter::OldCalls::Replace, {}};
-    for (auto &[call, value] : post.olds) {
-      oldValues.push_back(value);
-      olds.values.push_back({call, AnyValue(), value});
-    }
+    IREmitter::OldCalls olds{IREmitter::OldCalls::Evaluate, post.entry, {}, 0};
     SmallVector<Value> operands =
-        contractOperands(funcOp, *decl, /*withResult=*/true, oldValues);
+        contractOperands(funcOp, *decl, /*withResult=*/true);
     auto ensuresOp = KGEN::EnsuresOp::create(
         builder, shared.translateLocation(post.clause->loc), operands,
         callLoc.getLine(), callLoc.getCol(), callLoc.getFileName(),

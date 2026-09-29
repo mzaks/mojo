@@ -51,12 +51,33 @@ void M::KGEN::snapshotContractOperands(Operation *root) {
       contracts.push_back(op);
   });
   for (Operation *op : contracts) {
+    // A `kgen.old` reads memory as it is at its `kgen.contract.entry`: take
+    // its snapshots there, where the pointer must already be defined.
+    Operation *at = op;
+    if (auto oldOp = dyn_cast<OldOp>(op)) {
+      at = oldOp.getEntry().getDefiningOp();
+      if (!at)
+        continue;
+    }
     for (OpOperand &operand : op->getOpOperands()) {
       auto type = dyn_cast<PointerType>(operand.get().getType());
       POP::StackAllocationOp slot = stackSlotOf(operand.get());
       if (!type || !slot || slot->hasAttr(kSnapshotAttr))
         continue;
-      OpBuilder builder(op);
+      if (at != op) {
+        Value ptr = operand.get();
+        Operation *def = ptr.getDefiningOp();
+        bool available =
+            def ? (def->getBlock() == at->getBlock()
+                       ? def->isBeforeInBlock(at)
+                       : def->getParentRegion()->isAncestor(
+                             at->getParentRegion()))
+                : cast<BlockArgument>(ptr).getParentRegion()->isAncestor(
+                      at->getParentRegion());
+        if (!available)
+          continue;
+      }
+      OpBuilder builder(at);
       Location loc = op->getLoc();
       Value value = POP::LoadOp::create(builder, loc, operand.get());
       auto snapshot = POP::StackAllocationOp::create(builder, loc, type);

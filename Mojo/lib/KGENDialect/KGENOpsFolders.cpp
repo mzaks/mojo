@@ -798,11 +798,11 @@ EnsuresOp::parametric_interpret(ArrayRef<Attribute> operands,
 // OldOp
 //===----------------------------------------------------------------------===//
 
-// The values only feed postconditions, which the interpreter skips, but a
-// function it runs may compute them: evaluate the region, which only reads.
+// Only reached inside postconditions, which the interpreter skips; evaluate
+// the region, which only reads, should it ever be.
 ErrorTreeOrSuccess OldOp::interpret(ArrayRef<Attribute> operands,
                                     InterpreterState &state) {
-  return state.transferControlFlowTo(getBody(), operands);
+  return state.transferControlFlowTo(getBody(), operands.drop_front());
 }
 
 ErrorTreeOrSuccess
@@ -812,10 +812,27 @@ OldOp::parametric_interpret(ArrayRef<Attribute> operands,
 }
 
 //===----------------------------------------------------------------------===//
+// ContractEntryOp
+//===----------------------------------------------------------------------===//
+
+// The token only orders `kgen.old` evaluation for static analyses.
+ErrorTreeOrSuccess ContractEntryOp::interpret(ArrayRef<Attribute> operands,
+                                              InterpreterState &state) {
+  return state.mapResults({KGEN::NoneAttr::get(getContext())});
+}
+
+ErrorTreeOrSuccess
+ContractEntryOp::parametric_interpret(ArrayRef<Attribute> operands,
+                                      ParametricInterpreterState &state) {
+  return interpret(operands, state);
+}
+
+//===----------------------------------------------------------------------===//
 // ContractYieldOp
 //===----------------------------------------------------------------------===//
 
-// Only reached in a `kgen.old`: its values are the op's results.
+// Its values are the result of the op it ends (the interpreter only enters
+// `kgen.old` regions).
 ErrorTreeOrSuccess ContractYieldOp::interpret(ArrayRef<Attribute> operands,
                                               InterpreterState &state) {
   return state.transferControlFlowTo((*this)->getParentOp(), operands);

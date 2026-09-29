@@ -233,9 +233,21 @@ LogicalResult OldOp::verify() {
   if (failed(verifyContractRegion(*this, getBody(), getArgs())))
     return failure();
   auto yield = cast<ContractYieldOp>(getBody().front().getTerminator());
-  if (yield.getValues().getTypes() != getValues().getTypes())
-    return emitOpError("region must yield a value for each result");
+  if (yield.getValues().size() != 1 ||
+      yield.getValues().front().getType() != getValue().getType())
+    return emitOpError("region must yield the value");
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ContractEntryOp
+//===----------------------------------------------------------------------===//
+
+// Same effects as `kgen.obligation`.
+void ContractEntryOp::getEffects(
+    SmallVectorImpl<mlir::MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                       ObligationResource::get());
 }
 
 //===----------------------------------------------------------------------===//

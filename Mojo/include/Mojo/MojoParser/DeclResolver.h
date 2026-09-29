@@ -67,9 +67,8 @@ struct ArgumentContract {
 /// A postcondition to emit before each return of a function.
 struct PostconditionClause {
   const ParsedConstraint *clause;
-  /// The `old(e)` calls in the clause, and the `kgen.old` results computing
-  /// their values on entry.
-  SmallVector<std::pair<const ExprNode *, mlir::Value>, 1> olds;
+  /// The function's `kgen.contract.entry` token, if the clause uses `old`.
+  mlir::Value entry;
 };
 
 //===----------------------------------------------------------------------===//
@@ -239,6 +238,11 @@ public:
   /// Emit the postconditions of the function being emitted before one of its
   /// returns, at the emitter's insertion point.
   LogicalResult emitPostconditions(FnOp op, IREmitter &emitter);
+
+  /// Emit `old(operand)` in a postcondition as a `kgen.old` at the emitter's
+  /// insertion point (see `IREmitter::OldCalls`).
+  AnyValue emitOldValue(IREmitter &emitter, const ExprNode *call,
+                        const ExprNode *operand, ExprDest &dest);
 
   LogicalResult resolveBody(ASTDecl &decl, llvm::SMLoc loc) {
     return resolve(decl, DeclResolvedness::body, loc);

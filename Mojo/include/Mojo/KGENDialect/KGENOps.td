@@ -1525,32 +1525,53 @@ def KGEN_EnsuresOp : KGENOp<"ensures", [
 }
 
 //===----------------------------------------------------------------------===//
+// ContractEntryOp
+//===----------------------------------------------------------------------===//
+
+def KGEN_ContractEntryOp : KGENOp<"contract.entry", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
+  let summary = "marks the entry of a function for its postconditions";
+  let description = [{
+    The `kgen.contract.entry` operation sits at the start of a function whose
+    postconditions use `old(e)`. Its token is an operand of each `kgen.old`,
+    which is evaluated with memory as it is at this op. When the function is
+    inlined, the op moves with the inlined code, so it still marks the
+    callee's entry. It has no runtime semantics and is erased when lowering to
+    LLVM, with the contract ops that use it.
+  }];
+
+  let results = (outs KGEN_NoneType:$token);
+  let assemblyFormat = "attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
 // OldOp
 //===----------------------------------------------------------------------===//
 
 def KGEN_OldOp : KGENOp<"old", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
     DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
-  let summary = "values on entry for postconditions";
+  let summary = "a value on entry, for a postcondition";
   let description = [{
-    The `kgen.old` operation computes the values of the `old(e)` expressions
-    of a postcondition on entry to the function: it sits at the start of the
-    function, and its results are operands of the function's `kgen.ensures`.
-    `args` are the function's arguments; the single block of `body` has an
-    argument for each of them and yields the values with a
-    `kgen.contract.yield`. Memory the region reads is read as it is at the op.
+    The `kgen.old` operation is the value of an `old(e)` in a postcondition:
+    `e` evaluated with memory as it is at the `kgen.contract.entry` that
+    produced `entry`, i.e. on entry to the function. It sits where the value
+    is used, inside the region of a `kgen.ensures` (or of a `kgen.forall` in
+    it), so `e` may use the index of an enclosing quantifier. `args` are the
+    function's arguments and such indices; the single block of `body` has an
+    argument for each of them and yields the value with a
+    `kgen.contract.yield`.
 
-    It has no runtime semantics: static analyses evaluate it, and lowering to
-    LLVM erases it with the `kgen.ensures` using its results. The comptime
-    interpreter evaluates its region, since a function it runs may contain
-    one.
+    It has no runtime semantics: only static analyses evaluate it, and
+    lowering to LLVM erases it with the op it is in.
   }];
 
-  let arguments = (ins Variadic<AnyType>:$args);
-  let results = (outs Variadic<AnyType>:$values);
+  let arguments = (ins KGEN_NoneType:$entry, Variadic<AnyType>:$args);
+  let results = (outs AnyType:$value);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
-    `(` ($args^ `:` type($args))? `)` (`->` type($values)^)?
+    `(` $entry (`,` $args^ `:` type($args))? `)` `->` type($value)
     attr-dict-with-keyword $body
   }];
   let hasVerifier = 1;
