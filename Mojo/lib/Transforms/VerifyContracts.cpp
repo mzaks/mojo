@@ -159,8 +159,8 @@ struct CalleeName {
   SmallVector<std::string> params;
 };
 
-std::optional<CalleeName> calleeName(LIT::CallOp call) {
-  auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+std::optional<CalleeName> calleeName(Attribute callee) {
+  auto symbol = dyn_cast<SymbolConstantAttr>(callee);
   if (!symbol)
     return std::nullopt;
   CalleeName name;
@@ -377,6 +377,8 @@ struct Obligation {
 /// its body reads.
 struct LoopFrame {
   StringRef label;
+  /// A `comptime for`, which only its own `continue` and `break` target.
+  bool comptime = false;
   SmallVector<State> continues, breaks;
   std::set<Loc> loaded;
   SmallVector<std::string> lengths;
@@ -484,6 +486,7 @@ private:
   SmallVector<std::string> facts;
   std::map<std::string, Sort> sorts;
   std::map<std::string, SmallVector<std::string>> deps;
+  std::map<std::string, std::string> parameterValues;
   std::map<std::string, std::string> definitions;
   std::map<std::pair<std::string, std::string>, bool> dependsMemo;
   /// The state at the function's `kgen.contract.entry`, for its `old`s.
@@ -932,6 +935,16 @@ private:
     return nullptr;
   }
 
+  /// The innermost runtime loop (`comptime` false) or `comptime for` with
+  /// `label` (any, if empty).
+  LoopFrame *findLoop(StringRef label, bool comptime) {
+    for (LoopFrame *frame : llvm::reverse(loops))
+      if (frame->comptime == comptime &&
+          (label.empty() || frame->label == label))
+        return frame;
+    return nullptr;
+  }
+
   void walkOp(Operation *op, State &state) {
     if (isa<RequiresOp>(op))
       return; // Assumed at entry.
@@ -967,8 +980,38 @@ private:
         state.yields.push_back(term(operand, state));
       return;
     }
+    StringRef opName = op->getName().getStringRef();
+    if (opName == "hlcf.comptime.for.continue" ||
+        opName == "hlcf.comptime.for.break") {
+      LoopFrame *frame = findLoop("", /*comptime=*/true);
+      if (!frame) {
+        notAnalyzed(op, state);
+        state.alive = false;
+        return;
+      }
+      (opName.ends_with("continue") ? frame->continues : frame->breaks)
+          .push_back(state);
+      state.alive = false;
+      return;
+    }
+    if (opName == "hlcf.unreachable") {
+      state.alive = false;
+      return;
+    }
+    if (opName == "hlcf.comptime.yield") {
+      state.yields.clear();
+      return;
+    }
+    if (opName == "hlcf.comptime.if") {
+      walkComptimeIf(op, state);
+      return;
+    }
+    if (opName == "hlcf.comptime.for") {
+      walkComptimeFor(op, state);
+      return;
+    }
     if (isa<HLCF::ContinueOp, HLCF::BreakOp>(op)) {
-      LoopFrame *frame = findFrame(loops, labelOf(op));
+      LoopFrame *frame = findLoop(labelOf(op), /*comptime=*/false);
       if (!frame || op->getNumOperands()) {
         notAnalyzed(op, state);
         state.alive = false;
@@ -1027,6 +1070,57 @@ private:
     bindResults(ifOp, results);
     joined.yields = state.yields;
     state = std::move(joined);
+  }
+
+  /// `hlcf.comptime.if`: elaboration keeps the first arm whose condition (a
+  /// parameter expression in `conds`) is true, or the else arm (the last
+  /// region). A condition is one unknown per parameter expression, so the
+  /// same expression in two places is the same choice.
+  void walkComptimeIf(Operation *op, State &state) {
+    auto ifOp = dyn_cast<HLCF::ComptimeIfOp>(op);
+    if (!ifOp || op->getNumResults() ||
+        op->getNumRegions() != ifOp.getConds().size() + 1) {
+      notAnalyzed(op, state);
+      return;
+    }
+    SmallVector<State> arms;
+    std::string none = "true"; // No earlier condition held.
+    for (auto [i, condAttr] : llvm::enumerate(ifOp.getConds())) {
+      auto typed = dyn_cast<TypedAttr>(condAttr);
+      std::string cond = typed ? parameterValue(printed(typed), {true, 1, false})
+                               : declare({true, 1, false}, "p");
+      State arm = state;
+      arm.yields.clear();
+      arm.pc = "(and " + state.pc + " " + none + " " + cond + ")";
+      if (!op->getRegion(i).empty())
+        walkBlock(op->getRegion(i).front(), arm);
+      arms.push_back(std::move(arm));
+      none = "(and " + none + " (not " + cond + "))";
+    }
+    State elseArm = state;
+    elseArm.yields.clear();
+    elseArm.pc = "(and " + state.pc + " " + none + ")";
+    Region &elseRegion = op->getRegion(op->getNumRegions() - 1);
+    if (!elseRegion.empty())
+      walkBlock(elseRegion.front(), elseArm);
+    arms.push_back(std::move(elseArm));
+    State joined = merge(arms);
+    joined.yields = state.yields;
+    state = std::move(joined);
+  }
+
+  /// The value of a parameter expression (printed): one unknown per
+  /// expression in the function.
+  std::string parameterValue(const std::string &expr, Sort sort) {
+    auto [it, inserted] = parameterValues.try_emplace(expr + "|" + sort.str(),
+                                                      "");
+    if (inserted) {
+      it->second = declare(sort, "p");
+      // Name it in the script, for `dump-dir` debugging.
+      prelude += "; " + it->second + ": " +
+                 StringRef(expr).take_front(300).str() + "\n";
+    }
+    return it->second;
   }
 
   void walkTry(LIT::TryOp tryOp, State &state) {
@@ -1090,7 +1184,9 @@ private:
             addOrigin(origin);
       } else if (op->getNumRegions() &&
                  !isa<HLCF::IfOp, HLCF::LoopOp, LIT::TryOp, RequiresOp,
-                      EnsuresOp>(op)) {
+                      EnsuresOp, OldOp, ForallOp>(op) &&
+                 op->getName().getStringRef() != "hlcf.comptime.if" &&
+                 op->getName().getStringRef() != "hlcf.comptime.for") {
         all = true;
       }
     });
@@ -1107,6 +1203,26 @@ private:
       notAnalyzed(loop, state);
       return;
     }
+    walkLoopBody(loop, loop.getBody().front(), /*comptime=*/false, state);
+  }
+
+  /// `hlcf.comptime.for`: its body (region 0) runs once per value of the
+  /// comptime iterator, which elaboration unrolls. It is analyzed as a loop,
+  /// once, for an arbitrary iteration: what the body computes from the
+  /// iteration's parameter values is unknown, so what is proven holds for
+  /// every one of them.
+  void walkComptimeFor(Operation *loop, State &state) {
+    if (loop->getNumResults() || loop->getNumRegions() < 1 ||
+        loop->getRegion(0).empty() ||
+        loop->getRegion(0).front().getNumArguments()) {
+      notAnalyzed(loop, state);
+      return;
+    }
+    walkLoopBody(loop, loop->getRegion(0).front(), /*comptime=*/true, state);
+  }
+
+  void walkLoopBody(Operation *loop, Block &bodyBlock, bool comptime,
+                    State &state) {
     // The loop head: what the loop may write holds an unknown there, bound
     // by the invariants found below.
     std::optional<llvm::DenseSet<Value>> written = writtenRoots(loop);
@@ -1134,10 +1250,10 @@ private:
       havocAll(head);
     }
     State headAtEntry = head;
-    LoopFrame frame{labelOf(loop), {}, {}, {}, {}, {}};
+    LoopFrame frame{labelOf(loop), comptime, {}, {}, {}, {}, {}};
     loops.push_back(&frame);
     State body = head;
-    walkBlock(loop.getBody().front(), body);
+    walkBlock(bodyBlock, body);
     loops.pop_back();
     if (body.alive) // Falling off the body starts the next iteration.
       frame.continues.push_back(body);
@@ -1439,12 +1555,13 @@ private:
       if (!literal.getAsInteger(10, v))
         values[result] = bvConst(v, sort.width);
     }
+    // A parameter expression: the same unknown wherever it appears.
     if (!values.count(result))
-      values[result] = declare(sort);
+      values[result] = parameterValue(text, sort);
   }
 
   void evalCall(LIT::CallOp call, State &state) {
-    std::optional<CalleeName> name = calleeName(call);
+    std::optional<CalleeName> name = calleeName(call.getCallee());
     LIT::FnOp callee = lookup(call);
     bool hasBody = callee && !callee.getFunctionBody().empty();
     // A call to a function with preconditions: they are obligations here.
