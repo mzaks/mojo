@@ -124,10 +124,9 @@ def ok_keep(mut xs: List[Int] where len(xs) >= 1):
     xs[0] = 5
 
 
-# The loop's effect on the length is not followed, so the body does not prove
-# the postcondition; callers still get it from the contract.
+# A loop fills the result; the length follows from a loop invariant.
 @inline(.never)
-def limit_make(
+def ok_make_loop(
     n: Int where n >= 0, out result: List[Int] where len(result) == n
 ):
     result = List[Int](capacity=n)
@@ -153,7 +152,7 @@ def bad_shrink_unchecked(mut xs: List[Int]):
 
 @inline(.never)
 def bad_after_make() -> Int:
-    var xs = limit_make(3)
+    var xs = ok_make_loop(3)
     return xs[3]  # one past the end
 
 
@@ -166,8 +165,8 @@ def ok_after_make_two() -> Int:
 
 @inline(.never)
 def ok_after_make() -> Int:
-    var xs = limit_make(3)
-    return xs[2]  # from the contract alone
+    var xs = ok_make_loop(3)
+    return xs[2]  # from the contract
 
 
 @inline(.never)

@@ -128,7 +128,7 @@ the first, so each access counts once.
 | `memory.mojo`        | all `bad_*` and `limit_*` | all `ok_*`, `Bag.ok_get`                       |
 | `unrolling.mojo`     | all `bad_*` and `limit_*` | all `ok_*`                                     |
 | `tensor.mojo`        | all `bad_*` and `limit_*` | all `ok_*`, `Tensor2D.load`/`store`            |
-| `where_clauses.mojo` | all `bad_*` and `limit_*` | all `ok_*`                                     |
+| `where_clauses.mojo` | all `bad_*`               | all `ok_*`                                     |
 
 `adversarial.mojo` targets the SMT encoding itself. For example,
 `bad_overflow` must stay unproven because `i + 1` wraps for `Int.MAX`, which a
@@ -165,11 +165,10 @@ before every return, proven there (`ok_make_two`, `ok_next`, `ok_push`;
 `kgen.old` at the start of the function. On a `mut` argument, a clause without
 `old` holds on entry and on exit (`ok_keep`), and one written only in terms of
 `old` is a precondition (`ok_shrink`, whose `pop` needs `old(len(xs)) > 0`;
-`bad_shrink_unchecked` calls it without the check). `limit_make` fills its
-result in a loop whose effect on the length the analysis does not follow, so
-its own postcondition stays unproven, but callers still get it from the
-contract (`ok_after_make`, `bad_after_make`). Postconditions are only assumed
-after calls to callees with a single return.
+`bad_shrink_unchecked` calls it without the check). `ok_make_loop` fills its
+result in a loop, and callers get its length from the contract
+(`ok_after_make`, `bad_after_make`). Postconditions are only assumed after
+calls to callees with a single return.
 
 A caller's proofs are conditional on its callees' contracts: after a call to a
 callee that breaks its postcondition, the callee's body and its contract

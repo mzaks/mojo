@@ -17,6 +17,7 @@
 #include "Mojo/KGENDialect/KGENOps.h"
 #include "Mojo/POPDialect/POPOps.h"
 #include "Mojo/POPDialect/POPTypes.h"
+#include "Mojo/TransformUtils/ContractUtils.h"
 #include "Mojo/TransformUtils/ControlFlowUtils.h"
 #include "Support/DebugInfoDialect/IR/DebugInfoOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -585,6 +586,9 @@ struct Mem2RegPass : public M::KGEN::impl::Mem2RegBase<Mem2RegPass> {
 } // namespace
 
 void Mem2RegPass::runOnOperation() {
+  // Contract ops read slots through pointers; give them snapshots, so the
+  // slots stay promotable.
+  snapshotContractOperands(getOperation());
   auto &cfg = getAnalysis<HLCF::CFGAnalysis>();
   PassStats stats;
   PromotionState state;

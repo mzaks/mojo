@@ -17,6 +17,7 @@
 #include "Mojo/KGENDialect/KGENOps.h"
 #include "Mojo/POPDialect/POPOps.h"
 #include "Mojo/POPDialect/POPTypes.h"
+#include "Mojo/TransformUtils/ContractUtils.h"
 #include "Support/DebugInfoDialect/IR/DebugInfoOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
@@ -712,6 +713,9 @@ struct ReplaceStack : public Replacer<ReplaceStack, POP::StackAllocationOp> {
 } // namespace
 
 void SROAPass::runOnOperation() {
+  // Contract ops read slots through pointers; give them snapshots, so the
+  // slots stay splittable.
+  snapshotContractOperands(getOperation());
   OpBuilder builder{getOperation()->getContext()};
 
   SROALeafReplacer leafReplacer;
