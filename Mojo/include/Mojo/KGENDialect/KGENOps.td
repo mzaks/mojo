@@ -1608,6 +1608,33 @@ def KGEN_ForallOp : KGENOp<"forall", [
 }
 
 //===----------------------------------------------------------------------===//
+// SameElementsOp
+//===----------------------------------------------------------------------===//
+
+def KGEN_SameElementsOp : KGENOp<"contract.same_elements", [
+    Pure, DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
+  let summary = "elements a function keeps or moves, in a postcondition";
+  let description = [{
+    In a postcondition, `kgen.contract.same_elements` states that the `count`
+    elements at `dst` when the function returns are the elements that were at
+    `src` on entry, like a copy bracketed by `kgen.copy_marker`s. `dst` and
+    `src` are typed pointers; `src` is typically an `old(...)` value. It works
+    for any element type, which the element-wise `==` of a quantifier does not.
+
+    It only appears in the regions of contract ops, which are never executed:
+    static analyses read it, and lowering to LLVM erases it with the op it is
+    in.
+  }];
+
+  let arguments = (ins AnyType:$dst, AnyType:$src, AnyType:$count);
+  let results = (outs BoolScalar:$result);
+  let assemblyFormat = [{
+    `(` $dst `,` $src `,` $count `)` attr-dict `:` type($dst) `,` type($src)
+    `,` type($count)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // ContractYieldOp
 //===----------------------------------------------------------------------===//
 

@@ -829,6 +829,23 @@ ForallOp::parametric_interpret(ArrayRef<Attribute> operands,
 }
 
 //===----------------------------------------------------------------------===//
+// SameElementsOp
+//===----------------------------------------------------------------------===//
+
+// Only in contract regions, which the interpreter never enters.
+ErrorTreeOrSuccess SameElementsOp::interpret(ArrayRef<Attribute> operands,
+                                             InterpreterState &state) {
+  return ErrorTree(getLoc(), Error("a contract cannot be evaluated at compile "
+                                   "time"));
+}
+
+ErrorTreeOrSuccess
+SameElementsOp::parametric_interpret(ArrayRef<Attribute> operands,
+                                     ParametricInterpreterState &state) {
+  return interpret(operands, state);
+}
+
+//===----------------------------------------------------------------------===//
 // ContractEntryOp
 //===----------------------------------------------------------------------===//
 

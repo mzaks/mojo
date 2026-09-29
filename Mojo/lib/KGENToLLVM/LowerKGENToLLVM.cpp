@@ -1125,6 +1125,18 @@ struct ConvertKGENForall : ConvertPOPToLLVMPattern<ForallOp> {
   }
 };
 
+/// So are statements about elements in postconditions.
+struct ConvertKGENSameElements : ConvertPOPToLLVMPattern<SameElementsOp> {
+  using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(SameElementsOp op, SameElementsOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 /// The entry marker is only used by `kgen.old`s inside postconditions: erase
 /// the outermost contract op around each, then the marker.
 struct ConvertKGENContractEntry : ConvertPOPToLLVMPattern<ContractEntryOp> {
@@ -1312,6 +1324,7 @@ static void populateKGENToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
       ConvertKGENObligation,
       ConvertKGENOld,
       ConvertKGENRequires,
+      ConvertKGENSameElements,
       ConvertKGENSourceLoc,
       ConvertKGENStructCreate,
       ConvertKGENStructGEP,
