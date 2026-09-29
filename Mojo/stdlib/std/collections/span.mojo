@@ -326,7 +326,7 @@ struct Span[
     @inline(.always)
     @implicit
     def __init__(
-        out self,
+        out self where len(self) == array.length,
         ref[Self.origin, Self.address_space] array: Array[Self.T, _],
     ):
         """Construct a `Span` from an `Array`.
