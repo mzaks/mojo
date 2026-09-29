@@ -455,10 +455,17 @@ public:
       return false;
     if (modular == Modular::All)
       return true;
-    for (Operation &op : fn->getRegion(0).front())
+    for (Operation &op : fn->getRegion(0).front()) {
       if (auto ob = dyn_cast<ObligationOp>(&op))
         if (isOwnPrecondition(ob) || getObligationKind(ob) == "ensures")
           return true;
+      if (auto requiresOp = dyn_cast<RequiresOp>(&op);
+          requiresOp && isOwnRequires(requiresOp))
+        return true;
+      if (auto ensuresOp = dyn_cast<EnsuresOp>(&op);
+          ensuresOp && isOwnEnsures(ensuresOp))
+        return true;
+    }
     return false;
   }
 
@@ -1557,6 +1564,9 @@ private:
   MaybeTerm valueBefore(const Place &place, Operation *op, unsigned depth) {
     if (isImmutableArgument(place.loc.slot))
       return valueAtEntry(place, depth);
+    if (ctx && ctx->opaque && isa<EnsuresOp>(op))
+      if (MaybeTerm t = returnedValue(place, op))
+        return t;
     Operation *cur = op;
     while (true) {
       auto [kind, found] = searchBlock(place, *cur->getBlock(), cur, depth);
@@ -1582,6 +1592,40 @@ private:
       }
       cur = parent;
     }
+  }
+
+  /// In an opaque callee, the value a postcondition at `op` reads from a local
+  /// place, when the callee returns it: a returned value loaded from the
+  /// place, with nothing writing it in between, is the call's result (see
+  /// `instantiateContracts`). That is how `arg-promotion` returns `mut` and
+  /// `out` arguments, from local slots, after the postcondition.
+  MaybeTerm returnedValue(const Place &place, Operation *op) {
+    if (!place.slotDef || !isa<POP::StackAllocationOp>(place.slotDef))
+      return std::nullopt;
+    auto ret = dyn_cast<HLCF::ReturnOp>(op->getBlock()->getTerminator());
+    if (!ret)
+      return std::nullopt;
+    for (Operation *next = op->getNextNode(); next && next != ret;
+         next = next->getNextNode())
+      if (!isa<POP::LoadOp>(next) && !isContractOp(next) &&
+          mayWrite(next, place.loc, place.nonEscaping))
+        return std::nullopt;
+    for (Value returned : ret->getOperands()) {
+      auto load = returned.getDefiningOp<POP::LoadOp>();
+      std::optional<MemLoc> read =
+          load ? memLocation(load.getPtr()) : std::nullopt;
+      if (!read || read->slot != place.loc.slot ||
+          !isPrefix(read->path, place.loc.path))
+        continue;
+      SmallVector<int> path(place.loc.path.begin() + read->path.size(),
+                            place.loc.path.end());
+      path.append(place.access.begin(), place.access.end());
+      if (path.empty())
+        return sortOf(returned.getType()) == place.sort ? term(returned)
+                                                        : std::nullopt;
+      return resolveAccess(returned, path, place.sort);
+    }
+    return std::nullopt;
   }
 
   /// Reaching the entry of a callee evaluated for a call: a place in the
