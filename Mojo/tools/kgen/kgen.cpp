@@ -126,6 +126,14 @@ public:
       cl::desc("Run the bounds-check-report pass after elaboration, e.g. "
                "--bounds-check-report=\"verbose=true\"")};
 
+  // Runs verify-contracts on the checked LIT module of `-lsp`, right after
+  // the check pipeline (see Mojo/proposals/modular-verification.md).
+  M::cl::MOpt<std::string> verifyContracts{
+      "verify-contracts", llvm::cl::ValueOptional,
+      cl::value_desc("pass options"),
+      cl::desc("With -lsp, run the verify-contracts pass after the check "
+               "pipeline, e.g. --verify-contracts=\"verbose=true\"")};
+
   M::cl::MOpt<bool> ignoreFailures{
       "ignore-failure",
       cl::desc("Ignore execution failures. Any messages are still printed, but "
@@ -445,6 +453,15 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
       // checks. Pipeline failure is non-fatal (the server only debug-logs it).
       OwningOpRef<ModuleOp> clone = LIT::cloneDeclModuleForCompilation(*decl);
       (void)compiler.runCheckLITPipeline(*clone);
+
+      if (clOptions.verifyContracts.getNumOccurrences()) {
+        mlir::PassManager verifyPM(ctx);
+        if (failed(mlir::parsePassPipeline("verify-contracts{" +
+                                               clOptions.verifyContracts + "}",
+                                           verifyPM)) ||
+            failed(verifyPM.run(*clone)))
+          sawError = true;
+      }
 
       if (clOptions.cmd != "lsp=no-dump") {
         clone->print(llvm::outs());

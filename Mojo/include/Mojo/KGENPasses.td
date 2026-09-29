@@ -26,6 +26,41 @@ def FunctionStats : Pass<"function-stats", "ModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// VerifyContracts
+//===----------------------------------------------------------------------===//
+
+def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
+  let summary = "Verify `where` contracts on LIT functions, before elaboration";
+  let description = [{
+    The `verify-contracts` pass checks each `lit.fn` once, generically,
+    against the `kgen.requires` contracts of the functions it calls: the
+    function's own preconditions are assumed at its entry, and every call to
+    a function with preconditions is an obligation at the call. Integer and
+    Boolean operators are modelled directly, other calls only through their
+    contracts. Obligations are answered by an external `z3` process with a
+    deterministic resource limit, and reported as diagnostics on the calls.
+    The IR is not modified.
+
+    Designed to run right after `check-lifetimes`; see
+    Mojo/proposals/modular-verification.md.
+  }];
+  let options = [
+    Option<"includeStdlib", "include-stdlib", "bool", /*default=*/"false",
+           "Also verify functions from the `std` package">,
+    Option<"verbose", "verbose", "bool", /*default=*/"false",
+           "Report proven obligations too, as remarks">,
+    Option<"z3Path", "z3-path", "std::string", /*default=*/"\"\"",
+           "Path to the z3 executable (default: search PATH)">,
+    Option<"rlimit", "rlimit", "unsigned", /*default=*/"2000000",
+           "Deterministic solver resource limit per query">,
+    Option<"wallSeconds", "wall-seconds", "unsigned", /*default=*/"60",
+           "Wall-clock cap on each z3 process, in seconds">,
+    Option<"dumpDir", "dump-dir", "std::string", /*default=*/"\"\"",
+           "Directory to write the SMT-LIB scripts to">,
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // BoundsCheckReport
 //===----------------------------------------------------------------------===//
 

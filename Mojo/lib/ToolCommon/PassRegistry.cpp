@@ -34,6 +34,7 @@ void KGEN::registerDefaultKGENPasses(const std::string &cacheBaseExtra) {
   KGEN::registerApplyInliner();
   KGEN::registerArgPromotion();
   KGEN::registerBoundsCheckReport();
+  KGEN::registerVerifyContracts();
   KGEN::registerCanonicalizer();
   KGEN::registerCheckLifetimes();
   KGEN::registerEliminateDeadSymbols();
