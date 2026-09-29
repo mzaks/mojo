@@ -1566,12 +1566,18 @@ struct List[T: AnyType, /](
             and slice.start.or_else(0) <= slice.end.or_else(len(self))
             and slice.end.or_else(len(self)) <= len(self)
         ),
+        # `self` may be a mutable reference, so the clause also says its
+        # length is kept.
         out result: Span[
             Self.T, Self._InteriorOrigin[origin_of(self)]
         ] where len(result) == slice.end.or_else(
             len(self)
         ) - slice.start.or_else(
             0
+        ) and len(
+            self
+        ) == old(
+            len(self)
         ),
     ):
         """Gets the sequence of elements at the specified positions.
