@@ -847,6 +847,89 @@ private:
     return s.slice(start, pos);
   }
 
+  /// `a + b` (or `a - b` for `negate`) for 64-bit index terms, in a canonical
+  /// linear form: a sum of atoms (sorted, with coefficients) and a constant.
+  /// Heap reads are memoized by the text of their index, and the index of a
+  /// read remapped through copies (`src + (i - dst)`) would otherwise grow
+  /// and never meet the same address reached another way.
+  std::string linearSum(StringRef a, StringRef b, bool negate = false) {
+    std::map<std::string, APInt> atoms;
+    APInt constant(64, 0);
+    addLinear(a, APInt(64, 1), atoms, constant, 0);
+    addLinear(b, negate ? APInt::getAllOnes(64) : APInt(64, 1), atoms,
+              constant, 0);
+    std::string sum;
+    for (auto &[atom, coeff] : atoms) {
+      if (coeff.isZero())
+        continue;
+      std::string addend =
+          coeff.isOne() ? atom : "(bvmul " + bvConst(coeff) + " " + atom + ")";
+      sum = sum.empty() ? addend : "(bvadd " + sum + " " + addend + ")";
+    }
+    if (sum.empty())
+      return bvConst(constant);
+    return constant.isZero() ? sum
+                             : "(bvadd " + sum + " " + bvConst(constant) + ")";
+  }
+  void addLinear(StringRef t, const APInt &coeff,
+                 std::map<std::string, APInt> &atoms, APInt &constant,
+                 unsigned depth) {
+    t = t.trim();
+    auto atom = [&] {
+      auto [it, inserted] = atoms.try_emplace(t.str(), coeff);
+      if (!inserted)
+        it->second += coeff;
+    };
+    if (depth > 16)
+      return atom();
+    if (!t.starts_with("(")) {
+      // A named linear definition (e.g. `i + 1`) is expanded.
+      auto def = definitions.find(t.str());
+      if (def != definitions.end()) {
+        StringRef expr = def->second;
+        if (expr.starts_with("(bvadd ") || expr.starts_with("(bvsub ") ||
+            expr.starts_with("(bvmul ") || expr.starts_with("(_ bv"))
+          return addLinear(expr, coeff, atoms, constant, depth + 1);
+      }
+      return atom();
+    }
+    size_t pos = 1;
+    StringRef op = token(t, pos);
+    if (op == "_") {
+      std::optional<APInt> value = evalConst(t);
+      if (value && value->getBitWidth() == 64) {
+        constant += coeff * *value;
+        return;
+      }
+      return atom();
+    }
+    SmallVector<StringRef> args;
+    while (pos < t.size() && t[pos] != ')') {
+      while (pos < t.size() && t[pos] == ' ')
+        ++pos;
+      if (pos >= t.size() || t[pos] == ')')
+        break;
+      size_t start = pos;
+      skipTerm(t, pos);
+      args.push_back(t.slice(start, pos));
+    }
+    if ((op == "bvadd" || op == "bvsub") && args.size() >= 2) {
+      addLinear(args[0], coeff, atoms, constant, depth + 1);
+      for (StringRef arg : ArrayRef(args).drop_front())
+        addLinear(arg, op == "bvadd" ? coeff : -coeff, atoms, constant,
+                  depth + 1);
+      return;
+    }
+    if (op == "bvmul" && args.size() == 2) {
+      for (unsigned i = 0; i < 2; ++i)
+        if (std::optional<APInt> c = evalConst(args[i]);
+            c && c->getBitWidth() == 64)
+          return addLinear(args[1 - i], coeff * *c, atoms, constant,
+                           depth + 1);
+    }
+    atom();
+  }
+
   /// Skips one term starting at `pos`.
   static void skipTerm(StringRef s, size_t &pos) {
     while (pos < s.size() && s[pos] == ' ')
@@ -2245,7 +2328,8 @@ private:
         MaybeTerm i = term(offset.getIndex());
         if (!i)
           return std::nullopt;
-        index = zero ? *i : "(bvadd " + index + " " + *i + ")";
+        index = zero ? linearSum(*i, bvConst(APInt(64, 0)))
+                     : linearSum(index, *i);
         zero = false;
         ptr = offset.getPtr();
       } else {
@@ -2883,11 +2967,11 @@ private:
                                 heapUnknown(r, "possibly overwritten by", end) +
                                 " " + *before + ")");
     // Element `i` of the destination is element `i` of the source.
-    std::string offset = "(bvsub " + r.addr.index + " " + dest->index + ")";
+    std::string offset = linearSum(r.addr.index, dest->index, /*negate=*/true);
     HeapRead fromSrc = r;
     fromSrc.addr.base = src->base;
     fromSrc.addr.root = src->root;
-    fromSrc.addr.index = "(bvadd " + src->index + " " + offset + ")";
+    fromSrc.addr.index = linearSum(src->index, offset);
     MaybeTerm copied = heapValueBefore(fromSrc, begin, depth);
     if (!copied)
       copied = heapUnknown(r, "copied from unknown memory by", end);
