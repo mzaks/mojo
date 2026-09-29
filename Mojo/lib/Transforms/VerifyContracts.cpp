@@ -160,7 +160,9 @@ bool isScalar(Type type) {
 }
 
 std::string bvConst(int64_t value, unsigned width) {
-  APInt bits(width, static_cast<uint64_t>(value), /*isSigned=*/true);
+  // Truncated to the width: a literal like 255 is a valid `UInt8`, and
+  // wider values wrap as the dtype does.
+  APInt bits = APInt(64, static_cast<uint64_t>(value)).trunc(width);
   return "(_ bv" + llvm::toString(bits, 10, /*Signed=*/false) + " " +
          std::to_string(width) + ")";
 }
@@ -334,7 +336,7 @@ std::string query(ArrayRef<std::string> assumptions, StringRef goal,
 /// The position of each value of the function being encoded, in walk
 /// order: places are ordered by it, not by address, so the scripts (and the
 /// answers cached for them) are the same from run to run.
-thread_local const DenseMap<Value, unsigned> *valueOrder = nullptr;
+thread_local DenseMap<Value, unsigned> *valueOrder = nullptr;
 
 /// A place in memory: a root (a function argument or a local variable) and
 /// a path of fields, each `/` followed by the field's printed attributes.
@@ -343,10 +345,15 @@ struct Loc {
   std::string path;
   bool operator<(const Loc &other) const {
     if (root != other.root) {
+      // Values of other functions (a callee's contract region) get the next
+      // position when first compared, which the deterministic walk makes the
+      // same each run.
       if (valueOrder) {
-        auto a = valueOrder->find(root), b = valueOrder->find(other.root);
-        if (a != valueOrder->end() && b != valueOrder->end())
-          return a->second < b->second;
+        unsigned a = valueOrder->try_emplace(root, valueOrder->size())
+                         .first->second;
+        unsigned b = valueOrder->try_emplace(other.root, valueOrder->size())
+                         .first->second;
+        return a < b;
       }
       return root.getAsOpaquePointer() < other.root.getAsOpaquePointer();
     }
@@ -2191,13 +2198,14 @@ private:
     return result;
   }
 
+  /// Whether `formal`, an operand of the callee's contract, is its result: a
+  /// local of the callee (a named `out` result, `lit.var.decl "r" arg`, or a
+  /// constructor's `self`, `lit.var.decl "self" initoutarg`). A contract's
+  /// operands are the function's arguments and its result, so any local is
+  /// the result.
   static bool isNamedResult(LIT::FnOp callee, Value formal) {
     auto decl = formal.getDefiningOp<LIT::VarDeclOp>();
-    auto named = callee->getAttrOfType<StringAttr>("namedResult");
-    if (!decl || !named)
-      return false;
-    auto name = decl->getAttrOfType<StringAttr>("name");
-    return !name || name.getValue() == named.getValue();
+    return decl && decl->getParentOfType<LIT::FnOp>() == callee;
   }
 
   /// Binds a region's block argument to the caller's value `actual`: a
