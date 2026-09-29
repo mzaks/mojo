@@ -1540,9 +1540,10 @@ def KGEN_OldOp : KGENOp<"old", [
     argument for each of them and yields the values with a
     `kgen.contract.yield`. Memory the region reads is read as it is at the op.
 
-    It has no runtime semantics: only static analyses evaluate it, and
-    lowering to LLVM erases it with the `kgen.ensures` using its results. The
-    comptime interpreter cannot evaluate it.
+    It has no runtime semantics: static analyses evaluate it, and lowering to
+    LLVM erases it with the `kgen.ensures` using its results. The comptime
+    interpreter evaluates its region, since a function it runs may contain
+    one.
   }];
 
   let arguments = (ins Variadic<AnyType>:$args);
@@ -1560,7 +1561,8 @@ def KGEN_OldOp : KGENOp<"old", [
 //===----------------------------------------------------------------------===//
 
 def KGEN_ContractYieldOp : KGENOp<"contract.yield", [
-    Pure, Terminator, ParentOneOf<["RequiresOp", "EnsuresOp", "OldOp"]>]> {
+    Pure, Terminator, ParentOneOf<["RequiresOp", "EnsuresOp", "OldOp"]>,
+    DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
   let summary = "yields the condition or values of a contract region";
   let description = [{
     Terminates the region of a `kgen.requires` or `kgen.ensures` with the

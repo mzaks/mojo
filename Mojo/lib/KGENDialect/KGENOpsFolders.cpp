@@ -798,21 +798,33 @@ EnsuresOp::parametric_interpret(ArrayRef<Attribute> operands,
 // OldOp
 //===----------------------------------------------------------------------===//
 
-// The values only exist for static verification: computing them would mean
-// evaluating the region, which is not code the function runs.
+// The values only feed postconditions, which the interpreter skips, but a
+// function it runs may compute them: evaluate the region, which only reads.
 ErrorTreeOrSuccess OldOp::interpret(ArrayRef<Attribute> operands,
                                     InterpreterState &state) {
-  return ErrorTree(getLoc(), Error("a function whose postcondition uses "
-                                   "'old' cannot be evaluated at compile "
-                                   "time"));
+  return state.transferControlFlowTo(getBody(), operands);
 }
 
 ErrorTreeOrSuccess
 OldOp::parametric_interpret(ArrayRef<Attribute> operands,
                             ParametricInterpreterState &state) {
-  return ErrorTree(getLoc(), Error("a function whose postcondition uses "
-                                   "'old' cannot be evaluated at compile "
-                                   "time"));
+  return interpret(operands, state);
+}
+
+//===----------------------------------------------------------------------===//
+// ContractYieldOp
+//===----------------------------------------------------------------------===//
+
+// Only reached in a `kgen.old`: its values are the op's results.
+ErrorTreeOrSuccess ContractYieldOp::interpret(ArrayRef<Attribute> operands,
+                                              InterpreterState &state) {
+  return state.transferControlFlowTo((*this)->getParentOp(), operands);
+}
+
+ErrorTreeOrSuccess
+ContractYieldOp::parametric_interpret(ArrayRef<Attribute> operands,
+                                      ParametricInterpreterState &state) {
+  return interpret(operands, state);
 }
 
 //===----------------------------------------------------------------------===//
