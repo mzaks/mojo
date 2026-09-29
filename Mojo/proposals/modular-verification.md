@@ -424,6 +424,43 @@ Stage 6, `Span` and contiguous slices:
   temporaries were still ordered by address, so scripts, and answers near
   the resource limit, could change between runs.
 
+Stage 6, `Array` and `List(span)`:
+
+- `Array.__getitem__(Int)` requires its index in range, and `Span(array=)`
+  states that it is as long as the array. `len(array)` is the size
+  parameter in the array's type, evaluated as a parameter expression, so in
+  generic code it is the parameter (`i < n` proves `a[i]` for an
+  `Array[Int, n]`). Literal indices on an array are checked at compile time
+  (`__getitem_param__`) and are not obligations.
+- A callee's contract can name the callee's parameters (`array.length`,
+  inferred from `Array[Self.T, _]`). At a call they are the values the call
+  binds: its struct's parameters, then its own, in order. Unknown parameter
+  expressions of a callee are kept apart from the caller's, which could
+  otherwise share a name.
+- `List(span)` has an overload of its own that states its length; the
+  generic iterable constructor cannot, before elaboration. Slicing a list
+  states that the list keeps its length, like `Span(list=)`: the list is a
+  reference that may be mutable, so without it `List(vs[1:])` of a local
+  list lost `len(vs)`. `Mojo/test/kgen/verify-contracts/arrays.mojo` and
+  `spans.mojo` prove all their `ok_*` functions and flag all their `bad_*`
+  ones.
+- One run each, at load about 4:
+
+  | File            | Before       | Now          | Time  |
+  |-----------------|--------------|--------------|-------|
+  | test_list.mojo  | 153 of 225   | 160 of 225   | 1.6 s |
+  | test_span.mojo  | 57 of 101    | 84 of 110    | 0.8 s |
+  | test_array.mojo | 0 of 7       | 30 of 38     | 0.8 s |
+
+  test_span's two `Array` tests are fully proven. What stays unproven there
+  needs `enumerate` and `reversed` loops, element writes through a span
+  (they make the list's length unknown, since the span's origin names the
+  whole list), and span iterators. In test_list, `test_list_span`'s rest is
+  strided slices.
+- The post-elaboration pass proves the new clauses where it inlines them
+  (test_span.mojo 864 of 866, test_list.mojo 3010 of 3024, both short only
+  where they were before).
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
