@@ -355,7 +355,11 @@ Implemented, on the `mojo-bounds-verifier` branch:
   op that reads a stack slot a snapshot of it, so the slot stays promotable,
   and inlining leaves contract ops (and snapshots) out of its size estimates.
 - `List`'s contracts (`append`, `extend`, `pop`, `pop(i)`, `_realloc`) are
-  `where` clauses.
+  `where` clauses. Those of `append`, `pop`, `pop(i)` and `_realloc` also
+  state which elements they keep or move, with
+  `_same_elements(dst, src, count)` (a `kgen.contract.same_elements`): the
+  `count` elements at `dst` on exit are those at `src` on entry. It compares
+  bits, so it states nothing for element types whose move is not trivial.
 - The experimental `modular=contracts` mode of the pass checks a call to a
   callee with contracts against them alone, without opening its body.
 
@@ -398,12 +402,19 @@ Findings from using the contracts:
   (`len(self) == old(len(self)) and self._capacity == new_capacity`) makes it a
   postcondition only. A way to say "on exit" without `old` would read better.
 - Closing callee bodies (`modular=contracts`) on `test_list.mojo` proves 927
-  of 951 obligations instead of 977 of 977, in about the same time: `List`'s
-  methods are mostly inlined, and `_realloc` is small. The 24 lost proofs need
-  facts about elements, which `_realloc`'s contract cannot state: that it
-  keeps them. That takes quantified clauses (for every index below `len`, the
-  element is unchanged), which are not supported. Contracts only replace a
-  body when they say everything callers rely on.
+  of 950 obligations instead of 977 of 977, in about the same time: `List`'s
+  methods are mostly inlined, and `_realloc` is small. Stating that
+  `_realloc` keeps the elements (`_same_elements`) did not recover the lost
+  proofs: they are lengths of lists built from slices and spans, which the
+  closed callees' contracts do not state. Contracts only replace a body when
+  they say everything callers rely on.
+- Proving `_same_elements` for every inlined `append` made the analysis
+  treat an unknown memory state (at the function's entry, at the start of a
+  loop iteration, after a write it cannot follow) as one uninterpreted
+  function of the address, so that two reads of one address through
+  different pointer terms get the same value. Its first form, pairwise
+  equalities between such reads, grew quadratically and produced a 16 GB
+  solver script.
 
 
 ## Alternatives considered
