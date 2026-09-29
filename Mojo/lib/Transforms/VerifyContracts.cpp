@@ -47,6 +47,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/FileSystem.h"
@@ -200,12 +201,37 @@ struct SolverConfig {
   unsigned rlimit = 100000000;
   unsigned wallSeconds = 60;
   std::string dumpDir;
+  /// Where answers are cached by a hash of the script (empty: no cache).
+  std::string cacheDir;
 };
 
 /// Runs z3 on `script` with a wall-clock cap; returns one answer per query
 /// (queries are separated by `(echo "@@")`).
 std::optional<SmallVector<Answer>> runZ3(const SolverConfig &config,
                                          StringRef script, StringRef dumpName) {
+  // The answers to a script are a function of the script and the solver:
+  // the limits are deterministic, and runs stopped at the wall-clock cap are
+  // not cached.
+  size_t expected = script.count("(check-sat)");
+  SmallString<128> cachePath;
+  if (!config.cacheDir.empty()) {
+    uint64_t hash = llvm::xxh3_64bits(script);
+    uint64_t solverHash = llvm::xxh3_64bits(config.z3);
+    cachePath = config.cacheDir;
+    llvm::sys::path::append(cachePath, llvm::utohexstr(hash) + "-" +
+                                           llvm::utohexstr(solverHash) +
+                                           ".answers");
+    if (auto cached = llvm::MemoryBuffer::getFile(cachePath)) {
+      SmallVector<Answer> answers;
+      for (char c : (*cached)->getBuffer())
+        if (c == 'p' || c == 'u' || c == 'k')
+          answers.push_back(c == 'p'   ? Answer::Proven
+                            : c == 'u' ? Answer::Unproven
+                                       : Answer::Unknown);
+      if (answers.size() == expected)
+        return answers;
+    }
+  }
   SmallString<128> scriptPath, outPath;
   if (!config.dumpDir.empty()) {
     scriptPath = config.dumpDir;
@@ -225,8 +251,11 @@ std::optional<SmallVector<Answer>> runZ3(const SolverConfig &config,
   std::optional<StringRef> redirects[] = {StringRef(""), StringRef(outPath),
                                           StringRef("")};
   StringRef z3 = config.z3;
-  (void)llvm::sys::ExecuteAndWait(z3, {z3, "-smt2", scriptPath}, std::nullopt,
-                                  redirects, config.wallSeconds);
+  int rc = llvm::sys::ExecuteAndWait(z3, {z3, "-smt2", scriptPath},
+                                     std::nullopt, redirects,
+                                     config.wallSeconds);
+  if (rc != 0)
+    cachePath.clear(); // Stopped (e.g. at the cap): do not cache.
   auto buffer = llvm::MemoryBuffer::getFile(outPath);
   llvm::sys::fs::remove(outPath);
   if (config.dumpDir.empty())
@@ -243,6 +272,25 @@ std::optional<SmallVector<Answer>> runZ3(const SolverConfig &config,
     answers.push_back(answer == "unsat" ? Answer::Proven
                       : answer == "sat" ? Answer::Unproven
                                         : Answer::Unknown);
+  }
+  if (!cachePath.empty() && answers.size() == expected) {
+    std::string text;
+    for (Answer answer : answers)
+      text += answer == Answer::Proven     ? 'p'
+              : answer == Answer::Unproven ? 'u'
+                                           : 'k';
+    // Written to a temporary and renamed, so a parallel reader never sees a
+    // partial file.
+    SmallString<128> temp;
+    int fd;
+    if (!llvm::sys::fs::createUniqueFile(cachePath + ".%%%%%%", fd, temp)) {
+      {
+        llvm::raw_fd_ostream os(fd, /*shouldClose=*/true);
+        os << text;
+      }
+      if (llvm::sys::fs::rename(temp, cachePath))
+        llvm::sys::fs::remove(temp);
+    }
   }
   return answers;
 }
@@ -1994,7 +2042,9 @@ struct VerifyContractsPass
       getOperation().emitError("verify-contracts: z3 not found");
       return signalPassFailure();
     }
-    SolverConfig solver{z3, rlimit, wallSeconds, dumpDir};
+    SolverConfig solver{z3, rlimit, wallSeconds, dumpDir, cacheDir};
+    if (!cacheDir.empty())
+      (void)llvm::sys::fs::create_directories(cacheDir);
     // Functions are verified independently, in parallel; their results are
     // reported afterwards, in order.
     SmallVector<LIT::FnOp> fns;
