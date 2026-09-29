@@ -633,14 +633,15 @@ def unsafe_uninit_move_n[
     """
 
     comptime if IsTriviallyMovable[T]:
+        # Tells static verification that the byte copy copies `count`
+        # elements (read before any is written), so it need not follow the
+        # bytes.
+        _copy_marker["begin"](dest, src, count)
         comptime if overlapping:
             unsafe_memmove(dest=dest, src=src, count=count)
         else:
-            # Tells static verification that the byte copy copies `count`
-            # elements, so it need not follow the bytes.
-            _copy_marker["begin"](dest, src, count)
             unsafe_memcpy(dest=dest, src=src, count=count)
-            _copy_marker["end"](dest, src, count)
+        _copy_marker["end"](dest, src, count)
     else:
         if overlapping and Int(dest) > Int(src):
             for i in reversed(range(count)):
@@ -703,14 +704,15 @@ def unsafe_uninit_copy_n[
     """
 
     comptime if IsTriviallyCopyable[T]:
+        # Tells static verification that the byte copy copies `count`
+        # elements (read before any is written), so it need not follow the
+        # bytes.
+        _copy_marker["begin"](dest, src, count)
         comptime if overlapping:
             unsafe_memmove(dest=dest, src=src, count=count)
         else:
-            # Tells static verification that the byte copy copies `count`
-            # elements, so it need not follow the bytes.
-            _copy_marker["begin"](dest, src, count)
             unsafe_memcpy(dest=dest, src=src, count=count)
-            _copy_marker["end"](dest, src, count)
+        _copy_marker["end"](dest, src, count)
     else:
         if overlapping and Int(dest) > Int(src):
             for i in reversed(range(count)):
