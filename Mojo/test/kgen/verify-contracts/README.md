@@ -18,8 +18,15 @@ bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
 
 Options: `verbose=true` reports proven obligations as remarks,
 `include-stdlib=true` also checks `std`, `rlimit=` sets the solver's
-deterministic resource limit per query (default 100000000), `wall-seconds=` caps
-each z3 process (default 60), and `dump-dir=` writes the SMT-LIB scripts.
+deterministic resource limit (default 100000000; z3 counts it across a
+script, so it only stops runaway queries), `wall-seconds=` caps each z3
+process (default 60), `dump-dir=` writes the SMT-LIB scripts, and
+`cache-dir=` caches the solver's answers by a hash of each script.
+
+Functions are verified in parallel, and their scripts are the same from run
+to run, so with `cache-dir=` a function whose encoding did not change costs
+no solver time. Changing a callee's contract changes its callers' scripts,
+so they are verified again.
 
 An unproven precondition is a warning at the call, with a note at the clause:
 
