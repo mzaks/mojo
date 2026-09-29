@@ -47,6 +47,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -263,14 +264,25 @@ std::string query(ArrayRef<std::string> assumptions, StringRef goal,
 // Encoding
 //===----------------------------------------------------------------------===//
 
+/// The position of each value of the function being encoded, in walk
+/// order: places are ordered by it, not by address, so the scripts (and the
+/// answers cached for them) are the same from run to run.
+thread_local const DenseMap<Value, unsigned> *valueOrder = nullptr;
+
 /// A place in memory: a root (a function argument or a local variable) and
 /// a path of fields, each `/` followed by the field's printed attributes.
 struct Loc {
   Value root;
   std::string path;
   bool operator<(const Loc &other) const {
-    if (root.getAsOpaquePointer() != other.root.getAsOpaquePointer())
+    if (root != other.root) {
+      if (valueOrder) {
+        auto a = valueOrder->find(root), b = valueOrder->find(other.root);
+        if (a != valueOrder->end() && b != valueOrder->end())
+          return a->second < b->second;
+      }
       return root.getAsOpaquePointer() < other.root.getAsOpaquePointer();
+    }
     return path < other.path;
   }
   bool operator==(const Loc &other) const {
@@ -348,6 +360,16 @@ public:
     Region &body = fn.getFunctionBody();
     if (body.empty())
       return false;
+    fn->walk<mlir::WalkOrder::PreOrder>([&](Operation *op) {
+      for (Region &region : op->getRegions())
+        for (Block &block : region)
+          for (BlockArgument arg : block.getArguments())
+            order.try_emplace(arg, order.size());
+      for (Value result : op->getResults())
+        order.try_emplace(result, order.size());
+    });
+    valueOrder = &order;
+    llvm::scope_exit reset([] { valueOrder = nullptr; });
     Block &entry = body.front();
     // Arguments: integers and Booleans are unknowns of their sort; references
     // are places, whose values at entry are unknowns.
@@ -386,6 +408,7 @@ private:
   ModuleOp module;
   SymbolTableCollection &symbols;
   const SolverConfig &solver;
+  DenseMap<Value, unsigned> order;
   std::string dumpPrefix;
   unsigned houdiniRuns = 0;
 
@@ -1038,7 +1061,12 @@ private:
     head.pc = define({true, 1, false}, before.pc, "r");
     std::string headReach = head.pc;
     if (written) {
-      for (Value root : *written) {
+      // In the function's order, so the unknowns are named the same each run.
+      SmallVector<Value> sorted(written->begin(), written->end());
+      llvm::sort(sorted, [&](Value a, Value b) {
+        return order.lookup(a) < order.lookup(b);
+      });
+      for (Value root : sorted) {
         Loc loc{root, ""};
         head.env[loc] = declare(sortOf(placeType(loc)), "l");
         for (auto it = head.env.begin(); it != head.env.end();)
