@@ -2616,6 +2616,13 @@ private:
     MaybeTerm result;
     if (inner.yields.size() == 1)
       result = inner.yields.front();
+    // Calls inside the contract assumed their callees' postconditions into
+    // the path condition of `inner`: they belong to the clause, as facts
+    // when it is assumed and as premises when it is proven.
+    if (result && inner.pc != state.pc && sortOfTerm(*result).isBool)
+      result =
+          define({true, 1, false}, "(" + std::string(assumed ? "and" : "=>") +
+                                       " " + inner.pc + " " + *result + ")");
     restore();
     return result;
   }
