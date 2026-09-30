@@ -1922,13 +1922,20 @@ private:
                                         equal + "))");
   }
 
-  /// `List.__getitem__`: a reference to an element, the list's place and an
-  /// index. Reading it reads `elem(list, index)`; writing it makes a new list
-  /// with the same length and the other elements unchanged.
+  /// Element access that returns a reference to an element (`List`'s,
+  /// `Deque`'s and `Array`'s `__getitem__`, `LinkedList.get_nth`): the
+  /// collection's place and an index. Reading it reads `elem(xs, index)`;
+  /// writing it makes a new collection with the same length and the other
+  /// elements unchanged. These take `ref self` but do not write it, so the
+  /// collection is kept.
   bool evalElementAccess(LIT::CallOp call, const CalleeName &name,
                          State &state) {
     StringRef path = name.path;
-    if (!path.starts_with("std::collections::list::List::__getitem__[") ||
+    if (!(path.starts_with("std::collections::list::List::__getitem__[") ||
+          path.starts_with("std::collections::deque::Deque::__getitem__") ||
+          path.starts_with("std::collections::array::Array::__getitem__") ||
+          path.starts_with(
+              "std::collections::linked_list::LinkedList::get_nth[")) ||
         call->getNumResults() != 1 || call.getNumOperands() < 1 ||
         !isa<LIT::RefType>(call->getResult(0).getType()))
       return false;
@@ -1945,6 +1952,12 @@ private:
         !sortOf(call.getOperands()[1].getType()).isBool &&
         !path.contains("IntLiteral")) {
       index = term(call.getOperands()[1], state);
+    } else if (call.getNumOperands() == 2 &&
+               isa<LIT::RefType>(call.getOperands()[1].getType())) {
+      // `get_nth[I: Indexer]`: an `Int` index, by reference.
+      auto ref = cast<LIT::RefType>(call.getOperands()[1].getType());
+      if (isInt(ref.getElementType()))
+        index = valueThrough(call.getOperands()[1], state);
     } else if (call.getNumOperands() == 2) {
       // The literal's value is in the index's type (`IntLiteral[0]`).
       std::string type = printed(call.getOperands()[1].getType());
