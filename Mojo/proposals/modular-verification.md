@@ -903,6 +903,41 @@ Loop lengths and yielded values:
   thing to cut: the template could be limited to lists the loop changes
   by a known step.
 
+Cutting the template's cost:
+
+- The time did not go into the template's own queries. Split into single
+  queries, the slowest Houdini script of test_string_span.mojo took z3 at
+  most 0.02 s per query either way. Together they took 0.47 s instead of
+  0.12 s, because every inductiveness query assumed all kept candidates,
+  the template's included.
+- The template's candidates now come last in each Houdini script and are
+  assumed only in their own queries; the others assume only each other,
+  as before the template. It is still one z3 process per round. Running
+  the template as a second Houdini phase instead, after the others,
+  helped less: it costs a z3 process more per loop.
+- Candidates are also generated only for a list and a variable that the
+  iteration both changes: some end of the body holds another term for
+  them than the loop head. This replaces excluding `/end` and `/length`
+  by name.
+- Results are the same on every file. Verification time, interleaved (5 runs
+  each, medians); the load rose to 11.5 during the run, so the times are high,
+  but the order matches an earlier run that was disturbed the same way:
+
+  | File                  | No template | Committed template | Now    |
+  |-----------------------|-------------|--------------------|--------|
+  | test_list.mojo        | 0.92 s      | 1.02 s             | 0.98 s |
+  | test_span.mojo        | 0.62 s      | 0.63 s             | 0.63 s |
+  | test_deque.mojo       | 0.88 s      | 1.09 s             | 0.94 s |
+  | test_linked_list.mojo | 0.39 s      | 0.48 s             | 0.43 s |
+  | test_array.mojo       | 0.40 s      | 0.41 s             | 0.40 s |
+  | test_dict.mojo        | 1.15 s      | 1.51 s             | 1.27 s |
+  | test_bitset.mojo      | 0.27 s      | 0.27 s             | 0.28 s |
+  | test_string_span.mojo | 0.49 s      | 0.77 s             | 0.48 s |
+
+  The template now costs 0.04 to 0.12 s where it used to cost up to 0.36 s, and
+  nothing on test_string_span.mojo. test_dict.mojo still pays 0.12 s for no new
+  proof; which of its 94 loops that goes to is not measured.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
