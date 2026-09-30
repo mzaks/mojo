@@ -579,6 +579,24 @@ Stage 6, strided slices:
   is fully proven. The post-elaboration pass proves 3021 of 3036
   obligations, short only where it was before and on `String.as_bytes`.
 
+Stage 6, `reversed(range(...))`:
+
+- `reversed(range(n))` and `reversed(range(start, end))` over `Int` are
+  built in, like forward ranges. The stdlib walks from `end - 1` down to
+  `start` inclusive and flags exhaustion; the pass models the same
+  sequence as the forward range mirrored: a cursor starting at `end`,
+  exclusive, and the lower bound, so `__next__` raises when they meet and
+  otherwise steps down and yields. That keeps the loop invariants the
+  shape Houdini already finds for forward loops (the cursor between its
+  bounds). `loops.mojo` proves `ok_reversed*` and flags indexing one past
+  either end.
+- `reversed(...)` returns through an `out` slot, and calls with no single
+  result bypassed the built-in table; it is dispatched before it.
+- The test files do not index inside reversed loops, so their numbers do
+  not change. What test_range.mojo still misses needs facts from test
+  assertions (`assert_equal(len(a), len(b))`), which generic `assert_*`
+  functions cannot state before elaboration.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
