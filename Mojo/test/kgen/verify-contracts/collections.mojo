@@ -10,9 +10,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# `BitSet`, `Deque` and `LinkedList` for `verify-contracts`; see README.md.
+# `BitSet`, `Deque`, `LinkedList`, `Dict` and `Set` for `verify-contracts`;
+# see README.md.
 
-from std.collections import BitSet, Deque, LinkedList
+from std.collections import BitSet, Deque, LinkedList, Set
 
 
 # --- must be PROVEN ---
@@ -79,6 +80,30 @@ def ok_linked_list_pop() raises -> Int:
     return l.get_nth(1)
 
 
+def ok_dict_nonempty() -> Int:
+    var d = Dict[String, Int]()
+    d["a"] = 1
+    var l = List[Int](length=len(d), fill=0)  # at least one entry
+    return l[0]
+
+
+def ok_set_bounded() -> Int:
+    var s: Set[Int] = {1, 2, 3}
+    var l: List[Int] = [1, 2, 3]
+    if len(s) > 0:
+        return l[len(s) - 1]  # repeated elements collapse: at most 3
+    return 0
+
+
+def ok_set_add_then_pop() raises -> Int:
+    var s = Set[Int]()
+    s.add(4)
+    s.add(4)
+    _ = s.pop()
+    var l = List[Int](length=len(s) + 1, fill=0)
+    return l[0]
+
+
 # --- must stay UNPROVEN ---
 def bad_bitset(mut b: BitSet[64], i: Int):
     if 0 <= i and i <= 64:
@@ -113,3 +138,18 @@ def bad_linked_list_insert_past() -> Int:
 def bad_linked_list_get_past() -> Int:
     var l: LinkedList[Int] = [1, 2, 3]
     return l.get_nth(3)
+
+
+def bad_dict_exact() -> Int:
+    var d = Dict[String, Int]()
+    d["a"] = 1
+    d["a"] = 2
+    var l = List[Int](length=len(d), fill=0)
+    return l[1]  # the second assignment may not add an entry
+
+
+def bad_set_after_clear() -> Int:
+    var s: Set[Int] = {1, 2}
+    s.clear()
+    var l = List[Int](length=len(s), fill=0)
+    return l[0]

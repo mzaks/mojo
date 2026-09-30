@@ -128,6 +128,12 @@ The output must be exactly the `bad_*` functions.
   `extend`, `clear` and `reverse` state lengths. Indices are generic
   (`I: Indexer`): `index(i)` is `i` for an `Int` and the literal's value
   for an `IntLiteral`.
+- `Dict` and `Set` state only lengths (nothing about them is indexed):
+  empty constructors are empty, literals at most as long as their
+  elements (repeats collapse), copies as long as the original, `d[k] = v`,
+  `setdefault` and `add` at least 1 and at most one longer, `pop` and
+  `remove` one shorter (where they did not raise), `pop(k, default)` and
+  `discard` at most one shorter, and `clear` empty.
 - Strings: `s.byte_length()` of a `String` or `StringSlice` is `len` of its
   value, and of a literal the literal's length. `s[byte=i]` requires `i`
   in range, `s[byte=a:b]` requires `0 <= a <= b <= s.byte_length()` and has
