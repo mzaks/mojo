@@ -64,8 +64,11 @@ trait Sized:
 
     """
 
-    def __len__(self) -> Int:
+    def __len__(self, out result: Int where result >= 0):
         """Get the length of the type.
+
+        A length is never negative: every implementation must return a
+        non-negative value.
 
         Returns:
             The length of the type.

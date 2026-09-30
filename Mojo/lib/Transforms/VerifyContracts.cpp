@@ -718,7 +718,8 @@ private:
       lenDeclared = true;
     }
     std::string term = ("(len " + handle + ")").str();
-    // Assumption: every `Sized` type in the stdlib has a non-negative length.
+    // `Sized.__len__` states it; the refinement check holds implementations
+    // outside the stdlib to it (the stdlib's with `include-stdlib=true`).
     facts.push_back("(bvsge " + term + " " + bvConst(0, 64) + ")");
     for (LoopFrame *frame : loops)
       frame->lengths.push_back(term);
@@ -2252,6 +2253,13 @@ private:
       key += "|" + sortOfTerm(args.back()).str();
     }
     Sort sort = sortOf(call->getResult(0).getType());
+    // `Sized.__len__` is `len`: `x.__len__()` and `len(x)` agree.
+    if (StringRef(key).starts_with(
+            "#kgen.trait_symbol<@std::@builtin::@len::@Sized>|__len__(") &&
+        args.size() == 1 && sort.width == 64 && !sort.isBool) {
+      values[call->getResult(0)] = define(sort, lenOf(args[0]));
+      return;
+    }
     key += "|" + sort.str();
     auto [it, inserted] = traitQueries.try_emplace(key, "");
     if (inserted) {
