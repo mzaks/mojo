@@ -1608,6 +1608,24 @@ private:
     return dyn_cast_or_null<LIT::FnOp>(symbols.lookupSymbolIn(module, callee));
   }
 
+  /// The call a struct's wrapper for an inherited trait default
+  /// (`defaultFnRef`) forwards its arguments to, in order; null for any
+  /// other function.
+  static LIT::CallOp forwardedCall(LIT::FnOp fn) {
+    if (!fn || !fn.getDefaultFnRefAttr() || fn.getFunctionBody().empty())
+      return {};
+    Block &entry = fn.getFunctionBody().front();
+    LIT::CallOp call;
+    for (auto op : entry.getOps<LIT::CallOp>()) {
+      if (call)
+        return {};
+      call = op;
+    }
+    if (!call || call.getOperands() != ValueRange(entry.getArguments()))
+      return {};
+    return call;
+  }
+
   /// A generic call (`#kgen.get_witness<T, @Trait, "m($0)">`): the method's
   /// declaration in `trait` or the traits it refines, whose clauses every
   /// implementation provides.
@@ -1945,20 +1963,33 @@ private:
   void evalCall(LIT::CallOp call, State &state) {
     std::optional<CalleeName> name = calleeName(call.getCallee());
     LIT::FnOp callee = lookup(call);
-    bool hasBody = callee && !callee.getFunctionBody().empty();
     ParamFrame frame = paramFrame(call, callee);
+    // A struct's wrapper for an inherited default method has the default's
+    // contract, its parameters bound by the wrapper's forwarding call.
+    LIT::FnOp contract = callee;
+    ParamFrame *contractFrame = &frame;
+    ParamFrame forwarded;
+    if (LIT::CallOp inner = forwardedCall(callee))
+      if (LIT::FnOp target = lookup(inner)) {
+        params = &frame;
+        forwarded = paramFrame(inner, target);
+        params = frame.parent;
+        contract = target;
+        contractFrame = &forwarded;
+      }
+    bool hasBody = contract && !contract.getFunctionBody().empty();
     // A call to a function with preconditions: they are obligations here.
     if (hasBody && !inContract) {
-      for (Operation &calleeOp : callee.getFunctionBody().front()) {
+      for (Operation &calleeOp : contract.getFunctionBody().front()) {
         auto req = dyn_cast<RequiresOp>(&calleeOp);
         if (!req)
           continue;
         Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
-                      displayName(callee)};
-        params = &frame;
+                      displayName(contract)};
+        params = contractFrame;
         MaybeTerm cond =
             instantiate(req.getBody(), req.getArgs(), state, call.getOperands(),
-                        callee, nullptr, false);
+                        contract, nullptr, false);
         params = frame.parent;
         if (cond) {
           ob.cond = *cond;
@@ -2014,8 +2045,8 @@ private:
     }
     evalTraitQuery(call, state);
     if (hasBody) {
-      params = &frame;
-      assumeEnsures(call, callee, before, state);
+      params = contractFrame;
+      assumeEnsures(call, contract, before, state);
       params = frame.parent;
     }
     assumeAssertion(call, name, state);
@@ -2246,6 +2277,8 @@ private:
     SmallVector<ParamDeclAttr> decls;
     if (auto parent = callee->getParentOfType<LIT::StructDeclOp>())
       llvm::append_range(decls, parent.getParams());
+    else if (auto trait = callee->getParentOfType<LIT::TraitDeclOp>())
+      llvm::append_range(decls, trait.getParams());
     // The callee's implicit origin parameters come last; the call binds
     // them apart (`lit.call @f[mut *"x"]`).
     ArrayRef<ParamDeclAttr> own = callee.getParams();
@@ -3454,6 +3487,13 @@ bool isRequiredTraitMethod(LIT::FnOp fn) {
          !fn.isDefaultedTraitFn();
 }
 
+/// A struct's synthesized wrapper for an inherited trait default: it only
+/// forwards to the default, whose precondition is its own (callers are held
+/// to it), so there is nothing to verify of its own.
+bool isDefaultWrapper(LIT::FnOp fn) {
+  return fn.getDefaultFnRefAttr() != nullptr;
+}
+
 bool inStdlib(Operation *op) {
   for (Operation *parent = op->getParentOp(); parent;
        parent = parent->getParentOp())
@@ -3484,7 +3524,8 @@ struct VerifyContractsPass
     // reported afterwards, in order.
     SmallVector<LIT::FnOp> fns;
     getOperation().walk([&](LIT::FnOp fn) {
-      if ((includeStdlib || !inStdlib(fn)) && !isRequiredTraitMethod(fn))
+      if ((includeStdlib || !inStdlib(fn)) && !isRequiredTraitMethod(fn) &&
+          !isDefaultWrapper(fn))
         fns.push_back(fn);
     });
     struct Result {
