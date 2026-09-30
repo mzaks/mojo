@@ -740,14 +740,33 @@ Trait contracts:
   `Int.MAX` and the other integer bounds (`max_or_inf`, `min_or_neg_inf`)
   are now evaluated.
 - Limits: only structs without parameters link their implementations
-  (instantiations would otherwise share one function); conditional
-  conformances are checked as if unconditional; conformances in the
-  stdlib are only checked with `include-stdlib=true`. No stdlib trait has
-  clauses yet, so the stdlib numbers are unchanged (test_list.mojo 217 of
-  237, test_span.mojo 101 of 110), and the built-in models of `index(x)`,
-  `copy()` and the assertions stay until their traits state them.
-  traits.mojo: 12 of 20 obligations proven, the other 8 in `bad_*`
-  functions and in `BadCount`.
+  (instantiations would otherwise share one function); conditional conformances
+  are checked as if unconditional; conformances in the stdlib are only checked
+  with `include-stdlib=true`. No stdlib trait had clauses at this step, so the
+  stdlib numbers are unchanged (test_list.mojo 217 of 237, test_span.mojo 101 of
+  110), and the built-in models of `index(x)`, `copy()` and the assertions stay
+  until their traits state them. traits.mojo: 12 of 20 obligations proven, the
+  other 8 in `bad_*` functions and in `BadCount`.
+
+`Sized`:
+
+- The first stdlib trait with a contract: `__len__(self, out result: Int
+  where result >= 0)`. Implementations written `-> Int` still conform, and
+  the refinement check reads their returned value.
+- The trait's clauses never reached the pass for a stdlib trait: the
+  parser's symbol DCE after importing drops every trait method that no
+  symbol refers to, and generic calls name methods only through
+  witnesses. A live trait's methods that carry contract ops are now kept.
+- A generic `x.__len__()` is the same uninterpreted function as `len(x)`,
+  so the two agree, and `len`'s non-negativity, until now an assumption
+  of the pass, is the trait's contract: checked for every `Sized` struct
+  outside the stdlib (a `__len__` that returns an `Int` field as it is
+  does not prove), for the stdlib's own with `include-stdlib=true`.
+- Numbers unchanged: test_list.mojo 217 of 237, test_span.mojo 101 of 110
+  (their `len` was already non-negative by assumption); the
+  post-elaboration pass is unaffected (test_list.mojo 3438 of 3463). No
+  stdlib test defines a `Sized` struct. traits.mojo: 16 of 26, the other
+  10 in `bad_*` functions and in `BadCount` and `BadLen`.
 
 ## Risks and open questions
 
@@ -759,8 +778,8 @@ Trait contracts:
 - **Trait methods.** Calls through a witness (`T.__init__`, `T.__eq__`) have
   no body to look at before elaboration. A trait method's `where` clauses
   are now its contract, checked against every implementation, but a
-  trait's clauses can only use its own methods, and stdlib traits state
-  none yet. Contracts that are too strong break legitimate
+  trait's clauses can only use its own methods, and of the stdlib traits
+  only `Sized` states one yet. Contracts that are too strong break legitimate
   implementations (a `copy` that counts copies is not equal to its
   source), so they need to stay narrow.
 - **Unsafe code.** Pointer arithmetic inside `List` and `Span` is what their

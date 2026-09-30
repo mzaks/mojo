@@ -194,6 +194,11 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   of their values, one per method and type: calls on unchanged arguments
   agree, the same assumption as for `len(x)`. Implementations in the
   stdlib, and of structs with parameters, are not linked this way.
+- `Sized.__len__` states `result >= 0`, so a generic `x.__len__()` is not
+  negative, and it is `len(x)`: the same uninterpreted function. Every
+  `Sized` struct outside the stdlib is checked against it (a `__len__`
+  that returns an `Int` field as it is does not prove); the stdlib's own
+  implementations only with `include-stdlib=true`.
 - `Int.MAX`, `Int.MIN` and the bounds of the other integer dtypes
   (`max_or_inf`, `min_or_neg_inf`) are their values.
 

@@ -94,6 +94,30 @@ struct BadCount(Counter):
         self.n = 0
 
 
+# `Sized` states that a length is never negative, so `__len__` must not
+# return a negative field as it is.
+struct Window(Sized):
+    var n: Int
+
+    def __init__(out self, n: Int):
+        self.n = n
+
+    def __len__(self) -> Int:
+        if self.n < 0:
+            return 0
+        return self.n
+
+
+struct BadLen(Sized):
+    var n: Int
+
+    def __init__(out self, n: Int):
+        self.n = n
+
+    def __len__(self) -> Int:
+        return self.n  # may be negative
+
+
 # --- must be PROVEN ---
 def ok_bump_get[T: Counter](mut t: T) -> Int:
     if t.count() < 10:
@@ -123,7 +147,23 @@ def ok_default_direct(f: Tally) -> Int:
     return f.pick(2)  # the default's precondition, through `Tally`'s wrapper
 
 
+def ok_sized_index[T: Sized](x: T, xs: List[Int]) -> Int:
+    if x.__len__() < len(xs):
+        return xs[x.__len__()]  # not negative, by `Sized`
+    return 0
+
+
+def ok_len_is_dunder_len[T: Sized](x: T, xs: List[Int]) -> Int:
+    if len(x) < len(xs):
+        return xs[x.__len__()]  # `len(x)` is `x.__len__()`
+    return 0
+
+
 # --- must stay UNPROVEN ---
+def bad_sized_index[T: Sized](x: T, xs: List[Int]) -> Int:
+    return xs[x.__len__()]  # may be past the end
+
+
 def bad_bump[T: Counter](mut t: T):
     t.bump()  # `count()` may be `Int.MAX`
 
@@ -163,3 +203,9 @@ def main():
     )
     var b = BadCount(1)
     print(b.get(0))
+    var xs: List[Int] = [1, 2]
+    print(
+        ok_sized_index(Window(1), xs),
+        ok_len_is_dunder_len(Window(1), xs),
+        bad_sized_index(BadLen(1), xs),
+    )
