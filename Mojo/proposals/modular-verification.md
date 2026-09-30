@@ -496,6 +496,41 @@ Stage 6, `BitSet`, `Deque` and `LinkedList`:
   `Deque.insert`'s length (proven in 7 of 12 places) and the length of a
   `LinkedList` literal, built through a closure (5 of 40).
 
+Stage 6, strings:
+
+- `String` has no `__len__`, so its contracts are stated in
+  `byte_length()`, which the pass models as `len` of the string's value
+  (for `String` and `StringSlice`) and as the literal's length for a
+  `StringLiteral`, whose bytes are in its type. Byte indexing and
+  slicing state their bounds and result lengths, `as_bytes()` its length,
+  and `+=` the new length; `Mojo/test/kgen/verify-contracts/strings.mojo`
+  proves all its `ok_*` functions and flags all its `bad_*` ones.
+- `String(literal)` cannot state its length as a contract: naming
+  `String.byte_length()` in its signature makes the declaration depend on
+  itself (through `SIMD.cast`, which has a `String` default argument), and
+  the language server's lazy parse fails. The pass models that constructor
+  instead.
+- A callee's postcondition is one `kgen.ensures` per clause. The pass
+  assumed only the first, which dropped the rest of a contract with
+  clauses on several arguments (`unsafe_as_bytes_mut`'s `self` and
+  result); it now assumes all of them.
+- One run each:
+
+  | File                  | Before     | Now        |
+  |-----------------------|------------|------------|
+  | test_string.mojo      | 1 of 3     | 17 of 20   |
+  | test_string_span.mojo | 12 of 28   | 50 of 57   |
+
+  The rest are a comptime span (`comptime slc = "Hello".as_bytes()`, a
+  parameter value), the results of `split`, and `String(i)` of an `Int`.
+- The post-elaboration pass cannot check most of the string clauses
+  against their bodies: `String`'s length is read from an inline or a heap
+  representation, and it loses those fields across the pointer calls in
+  `as_bytes()` (its length is proven in 5 of 461 places), `+=` and
+  `StringSlice(String)`: test_string.mojo 1173 of 1661 obligations (580 of
+  606 before), test_string_span.mojo 1299 of 1469 (603 of 629). The string
+  contracts are stated from the bodies, not checked by a tool.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
