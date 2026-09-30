@@ -26,16 +26,16 @@ after elaboration and after the first optimization pipelines. It proves all
 (278 s of z3 CPU time spread over workers). A measurement of where that time
 goes:
 
-| Where the solver time goes (default mode) | z3 CPU  | Share |
-|-------------------------------------------|---------|-------|
-| `_test_copyinit_trivial_types`, 7 dtypes   | 249 s   | 90 %  |
-| `test_list_insert`                        | 16 s    | 6 %   |
-| everything else (47 functions)            | 13 s    | 4 %   |
+| Where the solver time goes (default mode) | z3 CPU | Share |
+|-------------------------------------------|--------|-------|
+| `_test_copyinit_trivial_types`, 7 dtypes  | 249 s  | 90 %  |
+| `test_list_insert`                        | 16 s   | 6 %   |
+| everything else (47 functions)            | 13 s   | 4 %   |
 
-| Kind of query                  | z3 CPU | Share | Queries |
-|--------------------------------|--------|-------|---------|
-| Loop invariant inference (Houdini) | 206 s | 74 % | 12,702 |
-| Obligations                    | 72 s   | 26 %  | 2,997   |
+| Kind of query                      | z3 CPU | Share | Queries |
+|------------------------------------|--------|-------|---------|
+| Loop invariant inference (Houdini) | 206 s  | 74 %  | 12,702  |
+| Obligations                        | 72 s   | 26 %  | 2,997   |
 
 `_test_copyinit_trivial_types[dt]` is one generic function. Elaboration
 makes seven copies of it, one per dtype, and in each copy a `comptime for`
@@ -539,13 +539,13 @@ Stage 6, `Dict` and `Set`:
 - test_dict.mojo: 1 of 32 calls proven (0 of 31 before). Its calls index
   lists built from a dictionary's contents (keys, values, items), which
   lengths of the dictionary do not reach. test_set.mojo checks no calls.
-- The post-elaboration pass checks some of the clauses against the
-  bodies: the empty constructors everywhere, `setdefault` and
-  `Set.discard` in most places, `clear` in half. It cannot follow the swiss table through
-  `d[k] = v` (unproven in 85 of 144 places) or the literal constructor (62
-  of 62), and reports nothing for `Set.add`. test_dict.mojo: 1519 of 1880
-  obligations (1394 of 1611 before); test_set.mojo: 513 of 557 (567 of
-  607), both short of before only on the new clauses.
+- The post-elaboration pass checks some of the clauses against the bodies: the
+  empty constructors everywhere, `setdefault` and `Set.discard` in most places,
+  `clear` in half. It cannot follow the swiss table through `d[k] = v` (unproven
+  in 85 of 144 places) or the literal constructor (62 of 62), and reports
+  nothing for `Set.add`. test_dict.mojo: 1519 of 1880 obligations (1394 of 1611
+  before); test_set.mojo: 513 of 557 (567 of 607), both short of before only on
+  the new clauses.
 
 Stage 6, strided slices:
 

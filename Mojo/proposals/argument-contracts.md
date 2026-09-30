@@ -416,7 +416,6 @@ Findings from using the contracts:
   equalities between such reads, grew quadratically and produced a 16 GB
   solver script.
 
-
 ## Alternatives considered
 
 ### Trailing `requires` and `ensures` clauses

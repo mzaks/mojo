@@ -1,8 +1,9 @@
 # verify-contracts examples
 
-Examples for the `verify-contracts` pass (`Mojo/lib/Transforms/VerifyContracts.cpp`),
-which checks `where` contracts right after lifetime checking, before
-elaboration and inlining. See `Mojo/proposals/modular-verification.md`.
+Examples for the `verify-contracts` pass
+(`Mojo/lib/Transforms/VerifyContracts.cpp`), which checks `where` contracts
+right after lifetime checking, before elaboration and inlining. See
+`Mojo/proposals/modular-verification.md`.
 
 ## Running
 
@@ -179,11 +180,11 @@ The output must be exactly the `bad_*` functions.
   mutable.
 
 Not analyzed yet: loops with loop-carried values, and ranges with a step
-(`range(a, b, c)`) or over other integer types. Lists built from other
-iterables (the generic constructor states no length) have no length
-contract. The obligations inside
-unsupported control flow are reported as not analyzed. `append` does not state the value it adds (a
-generic `T` has no `==` to state it with).
+(`range(a, b, c)`) or over other integer types. Lists built from other iterables
+(the generic constructor states no length) have no length contract. The
+obligations inside unsupported control flow are reported as not analyzed.
+`append` does not state the value it adds (a generic `T` has no `==` to state it
+with).
 
 ## Expected results
 
