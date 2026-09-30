@@ -1594,12 +1594,32 @@ private:
   }
 
   LIT::FnOp lookup(LIT::CallOp call) {
+    if (auto witness = dyn_cast<GetWitnessAttr>(call.getCallee()))
+      return traitMethod(witness.getTraitSymbol().getSymbol(),
+                         witness.getWitnessName());
     SymbolRefAttr callee = call.getDirectCallee();
     if (!callee)
       return {};
     // Symbols are absolute (`@std::@collections::...`): resolve them from the
     // module, since a `lit.fn` is a symbol table of its own.
     return dyn_cast_or_null<LIT::FnOp>(symbols.lookupSymbolIn(module, callee));
+  }
+
+  /// A generic call (`#kgen.get_witness<T, @Trait, "m($0)">`): the method's
+  /// declaration in `trait` or the traits it refines, whose clauses every
+  /// implementation provides.
+  LIT::FnOp traitMethod(SymbolRefAttr trait, StringAttr method) {
+    auto decl = dyn_cast_or_null<LIT::TraitDeclOp>(
+        symbols.lookupSymbolIn(module, trait));
+    if (!decl)
+      return {};
+    if (auto fn =
+            dyn_cast_or_null<LIT::FnOp>(symbols.lookupSymbolIn(decl, method)))
+      return fn;
+    for (TraitSymbolAttr parent : decl.getImmediateParents())
+      if (LIT::FnOp fn = traitMethod(parent.getSymbol(), method))
+        return fn;
+    return {};
   }
 
   //===--------------------------------------------------------------------===//
@@ -2162,6 +2182,18 @@ private:
   ParamFrame paramFrame(LIT::CallOp call, LIT::FnOp callee) {
     ParamFrame frame;
     frame.parent = params;
+    // A trait method: its trait's `Self` is the type the call is made on.
+    if (auto witness = dyn_cast<GetWitnessAttr>(call.getCallee())) {
+      auto trait = callee ? callee->getParentOfType<LIT::TraitDeclOp>()
+                          : LIT::TraitDeclOp();
+      if (!trait)
+        return frame;
+      frame.scope = printed(witness);
+      for (ParamDeclAttr decl : trait.getParams())
+        if (decl.getName().getValue().starts_with("_Self"))
+          frame.values[decl.getName()] = witness.getTypeValue();
+      return frame;
+    }
     auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
     if (!callee || !symbol)
       return frame;
