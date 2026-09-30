@@ -77,6 +77,19 @@ def ok_after_imm_call(xs: List[Int], i: Int) -> Int:
     return 0
 
 
+def ok_elif(xs: List[Int], i: Int) -> Int:
+    var j: Int
+    if i < 0:
+        j = 0
+    elif i >= len(xs):
+        j = len(xs) - 1
+    else:
+        j = i  # clamped into range
+    if len(xs) > 0:
+        return xs[j]
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_get(xs: List[Int], i: Int) -> Int:
     return xs[i]  # nothing is known about `i`
@@ -123,4 +136,17 @@ def bad_through_ref_variable(xs: List[Int]) -> Int:
     if len(xs) > 0:
         bump(r)  # changes `i` through `r`
         return xs[i]
+    return 0
+
+
+def bad_elif_gap(xs: List[Int], i: Int) -> Int:
+    var j: Int
+    if i < 0:
+        j = 0
+    elif i > len(xs):
+        j = len(xs) - 1
+    else:
+        j = i  # `i` may be `len(xs)`
+    if len(xs) > 0:
+        return xs[j]
     return 0

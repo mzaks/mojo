@@ -63,6 +63,31 @@ def ok_list_of_local_slice() -> Int:
     return es[1]
 
 
+def ok_reversed_copy() -> Int:
+    var vs: List[Int] = [1, 2, 3]
+    var rs = vs[::-1]  # a strided slice copies: as many elements
+    return rs[2]
+
+
+def ok_every_other(vs: List[Int]) -> Int:
+    if len(vs) >= 5:
+        var es = vs[::2]  # ceil(len / 2)
+        return es[2]
+    return 0
+
+
+def ok_negative_bounds() -> Int:
+    var vs: List[Int] = [1, 2, 3, 4]
+    var es = vs[1:-1:1]  # negative bounds count from the end
+    return es[1]
+
+
+def ok_backwards(vs: List[Int]) -> Int:
+    if len(vs) >= 3:
+        return vs[2:0:-1][1]
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_slice_tail_past(vs: List[Int]) -> Int:
     if len(vs) > 0:
@@ -91,3 +116,13 @@ def bad_list_of_slice_past() -> Int:
     var vs: List[Int] = [1, 2, 3]
     var es = List(vs[1:])
     return es[2]  # the copy is one shorter
+
+
+def bad_every_other_past() -> Int:
+    var vs: List[Int] = [1, 2, 3, 4]
+    return vs[::2][2]  # two elements
+
+
+def bad_zero_step() -> Int:
+    var vs: List[Int] = [1, 2, 3]
+    return vs[::0][0]  # a zero step selects nothing

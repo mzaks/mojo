@@ -75,7 +75,7 @@ The output must be exactly the `bad_*` functions.
 - A call changes only what it can write: memory reachable through its `mut`
   references is unknown after it (`bad_after_mut_call`), and memory passed by
   immutable reference is kept (`ok_after_imm_call`). Its results are unknown.
-- Control flow: `if`, `return`, `try`, and loops (`for` over `range(n)` and
+- Control flow: `if` (with `elif`), `return`, `try`, and loops (`for` over `range(n)` and
   `range(start, end)`, `while`, `break`). `range` iteration follows the
   stdlib's definition. At each loop head, what the loop may write is unknown,
   bound by invariants found with Houdini over small templates: bounds
@@ -111,6 +111,14 @@ The output must be exactly the `bad_*` functions.
   bounds meaning 0 and `len(xs)`. The pass models `Optional` (its
   constructors, `or_else`, `__bool__`) to read the bounds. `List(span)`
   copies a span and is as long as it.
+- Strided slices (`xs[a:b:c]`, `xs[::-1]`) copy into a new list whose
+  length is that of `range(*slice.indices(len(xs)))`: bounds are
+  normalized as `indices` does (negative ones count from the end, out of
+  range ones are clamped) and a zero step selects nothing. The stdlib
+  states this through two small helpers, `_normalize_bound` and
+  `_strided_count`, whose bodies the pass verifies against their
+  contracts (`include-stdlib=true`). Integer `//` and `%` round towards
+  negative infinity, as Mojo defines them.
 
 - `Array`: `len(a)` is the size parameter in `a`'s type (a number, or a
   parameter such as `n` in generic code), `a[i]` requires `i` in range, and
@@ -147,9 +155,8 @@ The output must be exactly the `bad_*` functions.
   mutable.
 
 Not analyzed yet: loops with loop-carried values, and
-`reversed(range(...))` (a strided range). Strided slices (`xs[::2]`) and
-lists built from other iterables (the generic constructor states no length)
-have no length contracts yet. The obligations inside
+`reversed(range(...))` (a strided range). Lists built from other iterables
+(the generic constructor states no length) have no length contract. The obligations inside
 unsupported control flow are reported as not analyzed. `append` does not state the value it adds (a
 generic `T` has no `==` to state it with).
 
