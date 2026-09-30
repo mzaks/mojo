@@ -90,6 +90,12 @@ def ok_elif(xs: List[Int], i: Int) -> Int:
     return 0
 
 
+def ok_unsigned_index(xs: List[Int], n: UInt8) -> Int:
+    if Int(n) < len(xs):
+        return xs[Int(n)]  # a zero-extended `UInt8` is not negative
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_get(xs: List[Int], i: Int) -> Int:
     return xs[i]  # nothing is known about `i`
@@ -149,4 +155,10 @@ def bad_elif_gap(xs: List[Int], i: Int) -> Int:
         j = i  # `i` may be `len(xs)`
     if len(xs) > 0:
         return xs[j]
+    return 0
+
+
+def bad_signed_index(xs: List[Int], n: Int8) -> Int:
+    if Int(n) < len(xs):
+        return xs[Int(n)]  # a sign-extended `Int8` may be negative
     return 0

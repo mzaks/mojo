@@ -67,6 +67,13 @@ The output must be exactly the `bad_*` functions.
 - At every call to a function with preconditions, they are obligations,
   instantiated with the call's arguments. `xs[i]` is such a call: `List`'s
   `__getitem__(idx: Int)` states `0 <= idx and idx < len(self)`.
+- After `assert_true(c)`, `assert_false(c)`, `assert_equal(a, b)` and
+  `assert_not_equal(a, b)` from `std.testing`, what they checked holds
+  where they did not raise: for `Bool` conditions, and for `Int`, `Bool`
+  and integer scalar operands (a type's own `__eq__` is not equality of
+  its value, so other types give no fact).
+- Integer conversions (`Int(n)` of a `UInt8`, `UInt8(i)`) extend by the
+  source's signedness or truncate.
 - Integer and Boolean operators are bit-vector and Boolean operations, and
   `len(x)` is an uninterpreted function of `x`'s value (assumed
   non-negative).
@@ -175,3 +182,4 @@ generic `T` has no `==` to state it with).
 | `arrays.mojo`        | all `bad_*`        | all `ok_*`       |
 | `collections.mojo`   | all `bad_*`        | all `ok_*`       |
 | `strings.mojo`       | all `bad_*`        | all `ok_*`       |
+| `assertions.mojo`    | all `bad_*`        | all `ok_*`       |
