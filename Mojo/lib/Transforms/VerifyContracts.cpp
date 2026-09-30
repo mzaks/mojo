@@ -1085,22 +1085,50 @@ private:
     evalOp(op, state);
   }
 
+  /// `hlcf.if`, with `elif` arms: those are pairs of regions, a condition
+  /// (ending in `hlcf.if.elifcond.yield`) evaluated where every earlier
+  /// condition was false, and its arm.
   void walkIf(HLCF::IfOp ifOp, State &state) {
-    if (!ifOp.getElifRegions().empty()) {
+    auto elifs = ifOp.getElifRegions();
+    if (elifs.size() % 2) {
       notAnalyzed(ifOp, state);
       return;
     }
+    SmallVector<State> arms;
+    auto arm = [&](Block &block, const State &from, StringRef cond) {
+      State taken = from;
+      taken.pc = ("(and " + from.pc + " " + cond + ")").str();
+      taken.yields.clear();
+      walkBlock(block, taken);
+      arms.push_back(std::move(taken));
+    };
     std::string cond = term(ifOp.getCond(), state);
     noteCondition(cond);
-    State thenState = state, elseState = state;
-    thenState.pc = "(and " + state.pc + " " + cond + ")";
-    elseState.pc = "(and " + state.pc + " (not " + cond + "))";
-    thenState.yields.clear();
-    elseState.yields.clear();
-    walkBlock(ifOp.getThenBlock(), thenState);
-    walkBlock(ifOp.getElseBlock(), elseState);
+    arm(ifOp.getThenBlock(), state, cond);
+    // Where no condition so far held.
+    State rest = state;
+    rest.pc = "(and " + state.pc + " (not " + cond + "))";
+    rest.yields.clear();
+    for (size_t i = 0; i < elifs.size(); i += 2) {
+      Block &condBlock = elifs[i].front();
+      for (Operation &op : condBlock.without_terminator()) {
+        if (!rest.alive)
+          break;
+        walkOp(&op, rest);
+      }
+      auto yield = dyn_cast<HLCF::IfElifCondYieldOp>(condBlock.getTerminator());
+      if (!rest.alive || !yield || yield->getNumOperands() != 1) {
+        notAnalyzed(ifOp, state);
+        return;
+      }
+      std::string elifCond = term(yield->getOperand(0), rest);
+      noteCondition(elifCond);
+      arm(elifs[i + 1].front(), rest, elifCond);
+      rest.pc = "(and " + rest.pc + " (not " + elifCond + "))";
+    }
+    arm(ifOp.getElseBlock(), rest, "true");
     SmallVector<std::string> results;
-    State joined = merge({thenState, elseState}, &results);
+    State joined = merge(arms, &results);
     bindResults(ifOp, results);
     joined.yields = state.yields;
     state = std::move(joined);
