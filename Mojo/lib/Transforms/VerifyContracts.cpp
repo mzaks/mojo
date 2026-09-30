@@ -424,6 +424,10 @@ struct Candidate {
   std::string rhsTerm;
   /// The candidate is about `len(lhs)`, not `lhs`.
   bool length = false;
+  /// `bvadd` or `bvsub`: the candidate is instead that `lhs` combined with
+  /// `rhsLoc` keeps its value on entry (`len(xs) + i` when each iteration
+  /// pops once and increments `i`).
+  std::string combine = "";
 };
 
 /// A function's postcondition: its `kgen.ensures` clauses, which are
@@ -1579,9 +1583,16 @@ private:
       for (const std::string &t : fixed)
         for (const char *op : {"bvsle", "bvsge"})
           candidates.push_back({loc, op, std::nullopt, t, true});
-      for (const Loc &other : places)
+      for (const Loc &other : places) {
         for (const char *op : {"bvsle", "bvslt", "bvsge"})
           candidates.push_back({loc, op, other, "", true});
+        // Not against an iterator's end or length, which the loop does not
+        // change: that is a bound on the length, already a candidate.
+        if (!StringRef(other.path).ends_with("/end") &&
+            !StringRef(other.path).ends_with("/length"))
+          for (const char *combine : {"bvadd", "bvsub"})
+            candidates.push_back({loc, "=", other, "", true, combine});
+      }
     }
     for (const Loc &loc : places) {
       candidates.push_back({loc, "bvsge", std::nullopt, bvConst(0, 64)});
@@ -1594,6 +1605,16 @@ private:
             candidates.push_back({loc, op, other, ""});
     }
     auto render = [&](const Candidate &c, State &at) {
+      if (!c.combine.empty()) {
+        auto value = [&](State &in) {
+          std::string lhs = load(c.lhs, in, Sort{false, 64, true});
+          if (c.length)
+            lhs = lenOf(lhs);
+          return "(" + c.combine + " " + lhs + " " +
+                 load(*c.rhsLoc, in, Sort{false, 64, true}) + ")";
+        };
+        return "(= " + value(at) + " " + value(before) + ")";
+      }
       std::string lhs = load(c.lhs, at, Sort{false, 64, true});
       if (c.length)
         lhs = lenOf(lhs);
