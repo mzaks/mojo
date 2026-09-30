@@ -622,6 +622,11 @@ private:
   /// index.
   DenseMap<Value, std::pair<Loc, std::string>> elements;
   std::set<std::string> elementFunctions;
+  /// The collection an iterator (by its place's root) iterates.
+  DenseMap<Value, Loc> iterSources;
+  /// The types of places named by a value of another type (an element an
+  /// iterator yields, named by its `__next__` call).
+  DenseMap<Value, Type> elementTypes;
   /// The functions standing for read-only trait method calls, by trait,
   /// method, type and signature (see `evalTraitQuery`).
   std::map<std::string, std::string> traitQueries;
@@ -771,6 +776,8 @@ private:
   }
 
   Type placeType(const Loc &loc) {
+    if (auto it = elementTypes.find(loc.root); it != elementTypes.end())
+      return it->second;
     if (auto ref = dyn_cast<LIT::RefType>(loc.root.getType()))
       return ref.getElementType();
     return loc.root.getType();
@@ -2370,7 +2377,7 @@ private:
     }
   }
 
-  /// A list literal (`[a, b, c]`): its elements are the values it is given,
+  /// A list or array literal (`[a, b, c]`): its elements are the values it is given,
   /// as they were before the call (the stdlib moves them in, in order). Its
   /// contract states only its length; a generic element type has no `==`
   /// for a contract to state more with.
@@ -2378,8 +2385,10 @@ private:
                          const std::optional<CalleeName> &name, State &before,
                          State &state) {
     if (!name ||
-        !StringRef(name->path)
-             .starts_with("std::collections::list::List::__init__[") ||
+        !(StringRef(name->path)
+              .starts_with("std::collections::list::List::__init__[") ||
+          StringRef(name->path)
+              .starts_with("std::collections::array::Array::__init__[")) ||
         !StringRef(name->path).contains("__list_literal__") ||
         call.getNumOperands() < 2)
       return;
@@ -2588,16 +2597,22 @@ private:
         "std::collections::list::List::__iter__[",
         "std::collections::span::Span::__iter__[",
         "std::collections::array::Array::__iter__[",
-        "std::collections::deque::Deque::__iter__["};
+        "std::collections::deque::Deque::__iter__[",
+        // Owned iteration (`for x in xs^`, a literal).
+        "std::collections::list::List::__iter__(::List[$0]$)",
+        "std::collections::array::Array::__iter__(::Array[$0, $1]$)"};
     static const char *collectionTypes[] = {
         "@std::@collections::@list::@List<",
         "@std::@collections::@span::@Span<",
         "@std::@collections::@array::@Array<",
         "@std::@collections::@deque::@Deque<"};
-    static const char *iterators[] = {"std::collections::list::_ListIter::",
-                                      "std::collections::span::_SpanIter::",
-                                      "std::collections::array::_ArrayIter::",
-                                      "std::collections::deque::_DequeIter::"};
+    static const char *iterators[] = {
+        "std::collections::list::_ListIter::",
+        "std::collections::span::_SpanIter::",
+        "std::collections::array::_ArrayIter::",
+        "std::collections::deque::_DequeIter::",
+        "std::collections::list::_ListIterOwned::",
+        "std::collections::array::_ArrayIterOwned::"};
     // The length of the collection at `v`, a reference.
     auto lengthOf = [&](Value v) -> MaybeTerm {
       std::optional<Loc> loc = placeOf(v);
@@ -2629,8 +2644,14 @@ private:
       if (path.starts_with(prefix) && call.getNumOperands() >= 1 &&
           isa<LIT::RefType>(call.getOperands()[0].getType()) &&
           (call->getNumResults() == 1 || call.getNumOperands() == 2))
-        if (MaybeTerm n = lengthOf(call.getOperands()[0]))
+        if (MaybeTerm n = lengthOf(call.getOperands()[0])) {
+          // The iterator's elements are the collection's (see `__next__`).
+          if (call.getNumOperands() == 2)
+            if (std::optional<Loc> src = placeOf(call.getOperands()[0]))
+              if (std::optional<Loc> out = placeOf(call.getOperands()[1]))
+                iterSources[out->root] = *src;
           return produce({{"/index", bvConst(0, 64)}, {"/length", *n}});
+        }
     // `enumerate(xs, start=)` of such a collection.
     if (path.starts_with("std::iter::__init__::enumerate[") &&
         call.getNumOperands() >= 2 && !name.params.empty() &&
@@ -2664,13 +2685,15 @@ private:
     Loc index{self->root, self->path + inner + "/index"},
         length{self->root, self->path + inner + "/length"},
         count{self->root, self->path + "/_count"};
-    if (isIterator) {
+    // An owned iterator (`_ListIterOwned`) only goes forward.
+    bool owned = path.contains("IterOwned::");
+    if (isIterator && !owned) {
       ParamFrame frame = paramFrame(call, callee);
       auto forward = frame.values.find("forward");
       if (forward == frame.values.end() ||
           !StringRef(printed(forward->second)).contains("true"))
         return false;
-    } else if (!llvm::any_of(iterators, [&](const char *prefix) {
+    } else if (isEnumerate && !llvm::any_of(iterators, [&](const char *prefix) {
                  StringRef type = StringRef(prefix).drop_back(2);
                  return !name.params.empty() &&
                         StringRef(name.params[0])
@@ -2705,9 +2728,24 @@ private:
     std::string c = isEnumerate ? load(count, state, sort) : "";
     step(index, i);
     state.env[length] = n;
+    auto source = iterSources.find(self->root);
     if (isEnumerate) {
       step(count, c);
       storeFields(*out, state, {{"/0", c}});
+    } else if (source != iterSources.end() && owned) {
+      // An owned iterator yields element `i` itself...
+      std::string collection =
+          load(source->second, state, placeType(source->second));
+      store(*out, state, elem(collection, i, sortOf(placeType(*out))));
+    } else if (auto ref = dyn_cast<LIT::RefType>(placeType(*out));
+               ref && source != iterSources.end()) {
+      // ... a borrowing one a reference to it, the element's place (named
+      // by the call, with the element's type).
+      havoc(*out, state, placeType(*out));
+      Value element = call->getResult(0);
+      elements[element] = {source->second, i};
+      elementTypes[element] = ref.getElementType();
+      state.refs[*out] = Loc{element, ""};
     } else {
       havoc(*out, state, placeType(*out));
     }
