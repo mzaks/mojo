@@ -98,6 +98,13 @@ def ok_nested_append() -> Int:
     return xs[0][1] + xs[1][0]
 
 
+def ok_copy(xs: List[Int]) -> Int:
+    var ys = xs.copy()  # as long as the original
+    if len(xs) > 0:
+        return ys[len(xs) - 1]
+    return 0
+
+
 def ok_grow_rows(mut xs: List[List[Int]]):
     for i in range(len(xs)):
         xs[i].append(0)  # growing a row keeps the number of rows
@@ -147,3 +154,10 @@ def bad_nested_other_row(xs: List[List[Int]], j: Int) -> Int:
     if len(xs) > 1 and 0 <= j and j < len(xs[0]):
         return xs[1][j]  # bounded by the first row, not the second
     return 0
+
+
+def bad_copy_then_grow(xs: List[Int]) -> Int:
+    var ys = xs.copy()
+    var zs = xs.copy()
+    zs.append(1)
+    return ys[len(zs) - 1]  # `ys` did not grow

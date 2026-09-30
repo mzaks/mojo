@@ -658,6 +658,16 @@ Nested collections:
   row (each row grew in a loop over them) needs a quantified invariant,
   which Houdini's templates do not include.
 
+`copy()`:
+
+- `x.copy()` goes through `Copyable`'s default, `Self(copy=self)`, a call
+  through the trait that the pass cannot follow. After a call to such a
+  default (a `copy` whose `defaultFnRef` is `Copyable.copy`), the pass
+  assumes the postcondition of the struct's own `__init__(copy:)`, whose
+  arguments are laid out as the wrapper's. test_deque.mojo: 95 of 105
+  calls proven (89), test_linked_list.mojo 153 of 173 (152),
+  test_list.mojo 199 of 225 (198).
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through

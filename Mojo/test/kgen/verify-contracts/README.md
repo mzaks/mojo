@@ -164,6 +164,9 @@ The output must be exactly the `bad_*` functions.
   which keeps its length. A list literal's elements are the values it is
   given. A call given an interior origin (`xs["element"]`) may change the
   collection's elements but not its length.
+- `x.copy()` (the `Copyable` default, `Self(copy=self)`) states what the
+  struct's copy constructor states: a copied list, deque, linked list or
+  dictionary is as long as the original.
 - Element access through `ref self` (`List`, `Deque` and `Array`
   `__getitem__`, `LinkedList.get_nth`) keeps the collection: it reads an
   element and does not write the collection, although its origin may be
