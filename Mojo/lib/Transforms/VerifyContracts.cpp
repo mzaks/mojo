@@ -1992,6 +1992,8 @@ private:
     }
     assumeAssertion(call, name, state);
     assumeListLiteral(call, name, before, state);
+    if (callee)
+      assumeCopy(call, callee, before, state);
     // `String(literal)`: as long as the literal. Its own contract cannot say
     // so: naming `String.byte_length()` there makes the declaration depend
     // on itself (through a `String` default argument in `SIMD.cast`).
@@ -2062,6 +2064,35 @@ private:
                       "(and " + state.pc + " (=> (not " +
                           values[call->getResult(0)] + ") " + fact + "))",
                       "r");
+  }
+
+  /// `x.copy()` through `Copyable`'s default (`Self(copy=self)`, a call
+  /// through the trait the pass cannot follow): what the struct's own copy
+  /// constructor states. Its arguments (`copy`, `out self`) are laid out as
+  /// the wrapper's (`self`, `out result`).
+  void assumeCopy(LIT::CallOp call, LIT::FnOp callee, State &before,
+                  State &state) {
+    auto fallback = callee->getAttrOfType<SymbolRefAttr>("defaultFnRef");
+    if (!fallback ||
+        !StringRef(printed(fallback))
+             .starts_with("@std::@traits::@copyable::@Copyable::@\"copy("))
+      return;
+    auto parent = callee->getParentOfType<LIT::StructDeclOp>();
+    if (!parent)
+      return;
+    for (auto ctor : parent.getBody()->getOps<LIT::FnOp>()) {
+      if (!ctor.getSymName() ||
+          !ctor.getSymName()->starts_with("__init__(copy:") ||
+          ctor.getFunctionBody().empty() ||
+          ctor.getFunctionBody().front().getNumArguments() !=
+              call.getNumOperands())
+        continue;
+      ParamFrame frame = paramFrame(call, ctor);
+      params = &frame;
+      assumeEnsures(call, ctor, before, state);
+      params = frame.parent;
+      return;
+    }
   }
 
   /// A list literal (`[a, b, c]`): its elements are the values it is given,
