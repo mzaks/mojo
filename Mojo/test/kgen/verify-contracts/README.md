@@ -199,6 +199,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `Sized` struct outside the stdlib is checked against it (a `__len__`
   that returns an `Int` field as it is does not prove); the stdlib's own
   implementations only with `include-stdlib=true`.
+- `Iterator.bounds()` states `lower >= 0` and, with an upper bound,
+  `lower <= upper`; `Iterator.nth(n)` requires `n >= 0`. A tuple literal
+  (`(n, None)`) is modelled field by field, and a value a modelled
+  constructor built keeps its fields when it is moved (returned, stored).
+  Nothing is stated about when `__next__` raises: `bounds()` is only a
+  hint.
 - `Int.MAX`, `Int.MIN` and the bounds of the other integer dtypes
   (`max_or_inf`, `min_or_neg_inf`) are their values.
 

@@ -118,6 +118,41 @@ struct BadLen(Sized):
         return self.n  # may be negative
 
 
+# `Iterator.bounds()` states `lower >= 0` and, with an upper bound,
+# `lower <= upper`; `nth(n)` requires `n >= 0`.
+struct Countdown(Iterator):
+    comptime Element = Int
+    var n: Int
+
+    def __init__(out self, n: Int):
+        self.n = n
+
+    def __next__(mut self) raises StopIteration -> Int:
+        if self.n <= 0:
+            raise StopIteration()
+        self.n -= 1
+        return self.n
+
+    def bounds(self) -> Tuple[Int, Optional[Int]]:
+        if self.n < 0:
+            return (0, 0)
+        return (self.n, self.n)
+
+
+struct BadBounds(Iterator):
+    comptime Element = Int
+    var n: Int
+
+    def __init__(out self, n: Int):
+        self.n = n
+
+    def __next__(mut self) raises StopIteration -> Int:
+        raise StopIteration()
+
+    def bounds(self) -> Tuple[Int, Optional[Int]]:
+        return (self.n, 0)  # `n` may be negative, or above 0
+
+
 # --- must be PROVEN ---
 def ok_bump_get[T: Counter](mut t: T) -> Int:
     if t.count() < 10:
@@ -159,7 +194,27 @@ def ok_len_is_dunder_len[T: Sized](x: T, xs: List[Int]) -> Int:
     return 0
 
 
+def ok_nth(var it: Countdown) -> Bool:
+    return Bool(it^.nth(2))
+
+
+def ok_lower_bound[I: Iterator](it: I, xs: List[Int]) -> Int:
+    var b = it.bounds()
+    if b[0] < len(xs):
+        return xs[b[0]]  # not negative, by `Iterator`
+    return 0
+
+
 # --- must stay UNPROVEN ---
+def bad_nth(var it: Countdown, k: Int) -> Bool:
+    return Bool(it^.nth(k))  # `k` may be negative
+
+
+def bad_lower_bound[I: Iterator](it: I, xs: List[Int]) -> Int:
+    var b = it.bounds()
+    return xs[b[0]]  # may be past the end
+
+
 def bad_sized_index[T: Sized](x: T, xs: List[Int]) -> Int:
     return xs[x.__len__()]  # may be past the end
 
@@ -208,4 +263,10 @@ def main():
         ok_sized_index(Window(1), xs),
         ok_len_is_dunder_len(Window(1), xs),
         bad_sized_index(BadLen(1), xs),
+    )
+    print(
+        ok_nth(Countdown(3)),
+        ok_lower_bound(Countdown(1), xs),
+        bad_nth(Countdown(3), 1),
+        bad_lower_bound(BadBounds(1), xs),
     )

@@ -801,6 +801,40 @@ Performance after `Sized` (2026-09-30):
   test_list.mojo was 1.8 s before them, test_span.mojo 1.4 s (at load
   14).
 
+`Iterator`:
+
+- `bounds()` now states what its docstring asked of implementations,
+  plus that a lower bound on a length is not negative: `result[0] >= 0
+  and result[1].or_else(result[0]) >= result[0]`. `nth(n)` requires
+  `n >= 0`, which its docstring states and a `debug_assert` checks.
+  Contracts are erased when lowering to LLVM, so nothing changes at run
+  time.
+- Nothing is stated about `__next__`: the docstring calls `bounds()` a
+  hint that iterators may not comply with, so the trait has no vocabulary
+  for when `__next__` raises.
+- Proving an implementation's `bounds()` needed the tuple it returns:
+  `Tuple(*pack)` (a tuple literal) is now modelled field by field from
+  the references in its `VariadicPack`, and a value a modelled
+  constructor built keeps its fields wherever it is moved, including the
+  returned value that the postcondition reads (`result[1].or_else(...)`
+  goes through the tuple's field `/1` to the `Optional`'s `/has` and
+  `/val`). Following nested fields only through such built values
+  matters: following them through any field read first made test_span.mojo
+  drop from 101 to 94 and two loops examples fail, because the same field
+  then got two unrelated names depending on the order of reads.
+- With `include-stdlib=true`, the trait's default `bounds()` and
+  `_SpanIter.bounds` prove; the `List`, `Array`, `Dict` and `Optional`
+  iterators do not. They return `length - index`, which is not negative
+  only because the iterator keeps `index <= length`: an invariant of the
+  struct that the language cannot state. A test iterator in
+  test_zip.mojo (`TestIter`, whose `bounds()` returns its fields) is now
+  flagged; its 10 other obligations were unproven before.
+- Numbers unchanged (test_list.mojo 217 of 237, test_span.mojo 101 of 110,
+  test_nth.mojo 13 of 13); the post-elaboration pass is unaffected
+  (test_list.mojo 3438 of 3463, test_span.mojo 884 of 886).
+  traits.mojo: 20 of 33, the other 13 in `bad_*` functions and `Bad*`
+  structs.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
@@ -808,13 +842,13 @@ Performance after `Sized` (2026-09-30):
   about its result are lost, and proofs that the post-elaboration pass finds
   by looking into bodies fail. Stage 6 is where this shows. The fallback tier
   keeps those functions checked meanwhile.
-- **Trait methods.** Calls through a witness (`T.__init__`, `T.__eq__`) have
-  no body to look at before elaboration. A trait method's `where` clauses
-  are now its contract, checked against every implementation, but a
-  trait's clauses can only use its own methods, and of the stdlib traits
-  only `Sized` states one yet. Contracts that are too strong break legitimate
-  implementations (a `copy` that counts copies is not equal to its
-  source), so they need to stay narrow.
+- **Trait methods.** Calls through a witness (`T.__init__`, `T.__eq__`) have no
+  body to look at before elaboration. A trait method's `where` clauses are now
+  its contract, checked against every implementation, but a trait's clauses can
+  only use its own methods, and of the stdlib traits only `Sized` and `Iterator`
+  state any yet. Contracts that are too strong break legitimate implementations
+  (a `copy` that counts copies is not equal to its source), so they need to stay
+  narrow.
 - **Unsafe code.** Pointer arithmetic inside `List` and `Span` is what their
   contracts abstract. Verifying those implementations against their contracts
   needs the heap model of the current pass at the LIT level, or stays with the
