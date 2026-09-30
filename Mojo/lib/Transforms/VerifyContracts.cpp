@@ -1906,6 +1906,8 @@ private:
         obligations.push_back(ob);
       }
     }
+    if (name && evalReversedRange(call, *name, state))
+      return;
     if (name && evalBuiltin(call, *name, state))
       return;
     if (name && evalElementAccess(call, *name, state))
@@ -2606,6 +2608,83 @@ private:
       store(*out, state, c);
       havoc(*error, state, placeType(*error));
       values[result] = raised;
+      return true;
+    }
+    return false;
+  }
+
+  /// `reversed(range(...))` over `Int`, and the reversed iterator's
+  /// `__iter__` and `__next__`. The stdlib walks from `end - 1` down to the
+  /// range's start, inclusive, flagging exhaustion; this models the same
+  /// sequence mirrored from the forward range, with an exclusive cursor
+  /// (`/curr`, starting at the forward range's end) and the lower bound
+  /// (`/end`, its start): `__next__` raises when they are equal, and
+  /// otherwise decrements the cursor and returns it.
+  bool evalReversedRange(LIT::CallOp call, const CalleeName &name,
+                         State &state) {
+    StringRef path = name.path;
+    Sort sort{false, 64, true};
+    if (path.starts_with(
+            "std::builtin::reversed::reversed[::ReversibleRange")) {
+      StringRef type = name.params.empty() ? "" : StringRef(name.params[0]);
+      if (call.getNumOperands() != 2 || name.params.size() != 1 ||
+          !(type.contains("@std::@builtin::@range::@_ZeroStartingRange<") ||
+            type.contains("@std::@builtin::@range::@_SequentialRange<")) ||
+          !type.contains("{:dtype index}>"))
+        return false;
+      std::optional<Loc> range = placeOf(call.getOperands()[0]);
+      std::optional<Loc> out = placeOf(call.getOperands()[1]);
+      if (!range || !out)
+        return false;
+      std::string start =
+          load(Loc{range->root, range->path + "/curr"}, state, sort);
+      std::string end =
+          load(Loc{range->root, range->path + "/end"}, state, sort);
+      storeFields(*out, state, {{"/curr", end}, {"/end", start}});
+      setResultsUnknown(call);
+      return true;
+    }
+    const char *strided = "std::builtin::range::_StridedRange::";
+    if (!path.starts_with(strided) || name.params.size() < 2)
+      return false;
+    std::optional<Sort> dtype = dtypeSort(name.params[0]);
+    if (!dtype || dtype->isBool || dtype->width != 64 || !dtype->isSigned ||
+        !StringRef(name.params[1]).contains("= false") ||
+        call.getNumOperands() < 1)
+      return false;
+    StringRef method = path.drop_front(strlen(strided));
+    std::optional<Loc> self = placeOf(call.getOperands()[0]);
+    if (!self)
+      return false;
+    Loc curr{self->root, self->path + "/curr"},
+        end{self->root, self->path + "/end"};
+    if (method.starts_with("__iter__") && call.getNumOperands() == 1 &&
+        call->getNumResults() == 1) {
+      Value result = call->getResult(0);
+      values[result] = declare({false, 64, false}, "g");
+      records[result] = {{"/curr", load(curr, state, sort)},
+                         {"/end", load(end, state, sort)}};
+      return true;
+    }
+    if (method.starts_with("__next__") && call.getNumOperands() == 3 &&
+        call->getNumResults() == 1) {
+      std::optional<Loc> error = placeOf(call.getOperands()[1]);
+      std::optional<Loc> out = placeOf(call.getOperands()[2]);
+      if (!error || !out)
+        return false;
+      std::string c = load(curr, state, sort);
+      std::string e = load(end, state, sort);
+      std::string raised = define({true, 1, false}, "(= " + c + " " + e + ")");
+      noteCondition(raised);
+      std::string next =
+          define(sort, "(ite " + raised + " " + c + " (bvsub " + c + " " +
+                           bvConst(1, sort.width) + "))");
+      store(curr, state, next);
+      // `store` makes the range itself unknown, not its other field.
+      state.env[end] = e;
+      store(*out, state, next);
+      havoc(*error, state, placeType(*error));
+      values[call->getResult(0)] = raised;
       return true;
     }
     return false;
