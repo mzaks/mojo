@@ -2260,6 +2260,28 @@ private:
                                     term(call.getOperands()[2], state));
       return true;
     }
+    // An integer conversion (`Int(u8)`, `UInt8(i)`): extended by the
+    // source's signedness, or truncated, as integer `cast` does.
+    if (path.starts_with("std::simd::SIMD::__init__[::DType](::SIMD[") &&
+        call.getNumOperands() == 1 && name.params.size() == 3 &&
+        isWidthOne(name.params[1]))
+      if (std::optional<Sort> to = dtypeSort(name.params[0]),
+          from = dtypeSort(name.params[2]);
+          to && from && sortOfTerm(operand(0)).width == from->width &&
+          !sortOfTerm(operand(0)).isBool) {
+        std::string v = operand(0);
+        std::string w;
+        if (to->width > from->width)
+          w = "((_ " + std::string(from->isSigned ? "sign" : "zero") +
+              "_extend " + std::to_string(to->width - from->width) + ") " + v +
+              ")";
+        else if (to->width < from->width)
+          w = "((_ extract " + std::to_string(to->width - 1) + " 0) " + v + ")";
+        else
+          w = v;
+        values[result] = define(*to, w);
+        return true;
+      }
     if (!path.starts_with("std::simd::SIMD::__") || name.params.size() < 2)
       return false;
     std::optional<Sort> sort = dtypeSort(name.params[0]);
