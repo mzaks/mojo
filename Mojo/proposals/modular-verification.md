@@ -461,6 +461,41 @@ Stage 6, `Array` and `List(span)`:
   (test_span.mojo 864 of 866, test_list.mojo 3010 of 3024, both short only
   where they were before).
 
+Stage 6, `BitSet`, `Deque` and `LinkedList`:
+
+- `BitSet`'s bit operations require `0 <= idx < size` (a struct
+  parameter). `Deque` and `LinkedList` state their index bounds and the
+  lengths their constructors and mutators produce;
+  `Mojo/test/kgen/verify-contracts/collections.mojo` proves all its `ok_*`
+  functions and flags all its `bad_*` ones.
+- A bounded deque evicts when full, so its length clauses name `_maxlen`,
+  a private field, which its constructors state and its mutators keep. A
+  public `maxlen` accessor would read better; the contracts can switch to
+  it.
+- Binding callee parameters missed callees with implicit origin
+  parameters: those are listed with the function's parameters but bound by
+  the call's origin list. They are skipped now.
+- `LinkedList`'s index methods take `I: Indexer`; `index(i)` is modelled
+  for `Int` and `IntLiteral`, looking through the `upcast` a trait-bounded
+  parameter is passed as.
+- Element reads through `ref self` (`Deque`, `Array`, `LinkedList`, like
+  `List` before) no longer make the collection unknown. Without it, every
+  `d[0]` lost `len(d)` for the next access.
+- One run each:
+
+  | File                  | Before     | Now          |
+  |-----------------------|------------|--------------|
+  | test_bitset.mojo      | 0 of 0     | 266 of 271   |
+  | test_linked_list.mojo | 3 of 10    | 124 of 173   |
+  | test_deque.mojo       | 3 of 10    | 82 of 105    |
+
+  The rest need `with assert_raises()` blocks (not analyzed), `.copy()`
+  through the `Copyable` trait, loops over literals, and iterators.
+- The post-elaboration pass proves the new clauses where it inlines them,
+  except two it cannot follow through loops over heap memory:
+  `Deque.insert`'s length (proven in 7 of 12 places) and the length of a
+  `LinkedList` literal, built through a closure (5 of 40).
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
