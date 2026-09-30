@@ -157,31 +157,17 @@ struct Slice(
             A tuple containing three integers for start, end, and step.
         """
         var step = self.step.or_else(1)
-
-        var start = self.start
-        var end = self.end
-
         var positive_step = step > 0
-
-        if not start:
-            start = 0 if positive_step else length - 1
-        elif start.value() < 0:
-            start = start.value() + length
-            if start.value() < 0:
-                start = 0 if positive_step else -1
-        elif start.value() >= length:
-            start = length if positive_step else length - 1
-
-        if not end:
-            end = length if positive_step else -1
-        elif end.value() < 0:
-            end = end.value() + length
-            if end.value() < 0:
-                end = 0 if positive_step else -1
-        elif end.value() >= length:
-            end = length if positive_step else length - 1
-
-        return (start.value(), end.value(), step)
+        var start = _normalize_bound(
+            self.start,
+            0 if positive_step else length - 1,
+            length,
+            positive_step,
+        )
+        var end = _normalize_bound(
+            self.end, length if positive_step else -1, length, positive_step
+        )
+        return (start, end, step)
 
 
 struct StridedSlice(ImplicitlyCopyable, Writable):
@@ -253,6 +239,44 @@ struct StridedSlice(ImplicitlyCopyable, Writable):
             A tuple containing three integers for start, end, and step.
         """
         return self._inner.indices(length)
+
+    def _length(
+        self,
+        length: Int,
+        out result: Int where result == _strided_count(
+            _normalize_bound(
+                self._inner.start,
+                0 if self._inner.step.or_else(1) > 0 else length - 1,
+                length,
+                self._inner.step.or_else(1) > 0,
+            ),
+            _normalize_bound(
+                self._inner.end,
+                length if self._inner.step.or_else(1) > 0 else -1,
+                length,
+                self._inner.step.or_else(1) > 0,
+            ),
+            self._inner.step.or_else(1),
+        ),
+    ):
+        # The number of positions the slice selects in a container of
+        # `length` elements: `len(range(*self.indices(length)))`, spelled out
+        # so that contracts can state it.
+        var step = self._inner.step.or_else(1)
+        var positive_step = step > 0
+        var start = _normalize_bound(
+            self._inner.start,
+            0 if positive_step else length - 1,
+            length,
+            positive_step,
+        )
+        var end = _normalize_bound(
+            self._inner.end,
+            length if positive_step else -1,
+            length,
+            positive_step,
+        )
+        result = _strided_count(start, end, step)
 
 
 struct ContiguousSlice(ImplicitlyCopyable, Writable):
@@ -339,6 +363,63 @@ struct ContiguousSlice(ImplicitlyCopyable, Writable):
 
 
 @inline(.always)
+def _normalize_bound(
+    bound: Optional[Int],
+    default: Int,
+    length: Int,
+    positive_step: Bool,
+    out result: Int where result == (
+        (
+            (
+                bound.or_else(0) + length if bound.or_else(0) + length
+                >= 0 else (0 if positive_step else -1)
+            ) if bound.or_else(0)
+            < 0 else (
+                (length if positive_step else length - 1) if bound.or_else(0)
+                >= length else bound.or_else(0)
+            )
+        ) if bound.__bool__() else default
+    ),
+):
+    # A slice bound as `Slice.indices` normalizes it: absent is `default`,
+    # negative counts from the end, and out of range is clamped (to `length`
+    # or `length - 1`, depending on the step's direction).
+    var value = bound.or_else(0)
+    if not bound:
+        result = default
+    elif value < 0:
+        result = value + length
+        if result < 0:
+            result = 0 if positive_step else -1
+    elif value >= length:
+        result = length if positive_step else length - 1
+    else:
+        result = value
+
+
+def _strided_count(
+    start: Int,
+    end: Int,
+    step: Int,
+    out result: Int where result == (
+        0 if step == 0
+        or (step > 0 and start > end)
+        or (step < 0 and start < end) else (
+            -((start - end) // step) if step > 0 else -((end - start) // -step)
+        )
+    ),
+):
+    # The number of elements of `range(start, end, step)`: empty for a zero
+    # step or one pointing away from `end`, else `ceildiv(|end - start|,
+    # |step|)`.
+    if step == 0 or (step > 0 and start > end) or (step < 0 and start < end):
+        result = 0
+    elif step > 0:
+        result = -((start - end) // step)
+    else:
+        result = -((end - start) // -step)
+
+
 def slice(end: Int) -> Slice:
     """Construct slice given the end value.
 
