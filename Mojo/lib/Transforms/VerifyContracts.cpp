@@ -1663,11 +1663,38 @@ private:
         return method == "__eq__" ? eq : "(not " + eq + ")";
       }
     }
+    if (args.size() == 2 && (method == "__floordiv__" || method == "__mod__")) {
+      resultSort = sort;
+      return floorDivision(method == "__mod__", sort, args[0], args[1]);
+    }
     if (args.size() == 1 && method == "__neg__") {
       resultSort = sort;
       return "(bvneg " + args[0] + ")";
     }
     return std::nullopt;
+  }
+
+  /// `a // b` or `a % b` as Mojo defines them for integers: rounding towards
+  /// negative infinity, so the remainder has the divisor's sign. SMT-LIB's
+  /// signed division truncates, so a nonzero remainder of the other sign is
+  /// corrected. Division by zero is whatever SMT-LIB makes it.
+  static std::string floorDivision(bool remainder, Sort sort, StringRef a,
+                                   StringRef b) {
+    if (!sort.isSigned)
+      return ("(" + Twine(remainder ? "bvurem" : "bvudiv") + " " + a + " " + b +
+              ")")
+          .str();
+    std::string w = std::to_string(sort.width);
+    std::string q = ("(bvsdiv " + a + " " + b + ")").str();
+    std::string r = ("(bvsrem " + a + " " + b + ")").str();
+    std::string zero = "(_ bv0 " + w + ")";
+    std::string adjust =
+        ("(and (not (= " + r + " " + zero + ")) (not (= (bvslt " + a + " " +
+         zero + ") (bvslt " + b + " " + zero + "))))")
+            .str();
+    if (remainder)
+      return "(ite " + adjust + " (bvadd " + r + " " + b.str() + ") " + r + ")";
+    return "(ite " + adjust + " (bvsub " + q + " (_ bv1 " + w + ")) " + q + ")";
   }
 
   /// A parameter expression's value: literals, and the integer and Boolean
@@ -2242,6 +2269,12 @@ private:
                                 method == "__eq__" ? eq : "(not " + eq + ")");
         return true;
       }
+    }
+    if (call.getNumOperands() == 2 &&
+        (method == "__floordiv__" || method == "__mod__")) {
+      values[result] = define(*sort, floorDivision(method == "__mod__", *sort,
+                                                   operand(0), operand(1)));
+      return true;
     }
     if (call.getNumOperands() == 1 && method == "__neg__") {
       values[result] = define(*sort, "(bvneg " + operand(0) + ")");
