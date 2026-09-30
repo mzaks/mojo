@@ -442,6 +442,27 @@ SmallVector<EnsuresOp> postconditionClauses(LIT::FnOp fn) {
   return clauses;
 }
 
+/// Which struct methods implement which trait methods, from the structs'
+/// conformance tables (structs without parameters only): by
+/// `trait|method|struct`, and that key by implementation.
+struct TraitImpls {
+  std::map<std::string, LIT::FnOp> byKey;
+  DenseMap<Operation *, std::string> keyOf;
+};
+
+std::string implKey(TraitSymbolAttr trait, StringRef method,
+                    StringRef structSymbol) {
+  return printed(trait) + "|" + method.str() + "|" + structSymbol.str();
+}
+
+/// The symbol of the struct `fn` is a method of, if it has no parameters.
+std::string plainStructOf(LIT::FnOp fn) {
+  auto parent = fn->getParentOfType<LIT::StructDeclOp>();
+  if (!parent || !parent.getParams().empty())
+    return "";
+  return printed(LIT::getFullyResolvedSymbolRef(parent));
+}
+
 class FunctionEncoder {
 public:
   /// With `refines`, checks instead that `fn` implements the trait method
@@ -449,9 +470,11 @@ public:
   /// establishes the trait's postcondition where it returns.
   FunctionEncoder(LIT::FnOp fn, ModuleOp module,
                   SymbolTableCollection &symbols, const SolverConfig &solver,
-                  std::string dumpPrefix, LIT::FnOp refines = {})
+                  std::string dumpPrefix, const TraitImpls &impls,
+                  LIT::FnOp refines = {})
       : fn(fn), module(module), symbols(symbols), solver(solver),
-        dumpPrefix(std::move(dumpPrefix)), refines(refines) {}
+        dumpPrefix(std::move(dumpPrefix)), impls(impls), refines(refines),
+        selfStruct(refines ? plainStructOf(fn) : "") {}
 
   /// Encodes the function; returns false if it has no body.
   bool encode() {
@@ -542,7 +565,11 @@ private:
   const SolverConfig &solver;
   DenseMap<Value, unsigned> order;
   std::string dumpPrefix;
+  const TraitImpls &impls;
   LIT::FnOp refines;
+  /// When refining a method of a struct without parameters: the struct,
+  /// which the trait's `Self` is.
+  std::string selfStruct;
   unsigned houdiniRuns = 0;
 
   DenseMap<Value, std::string> values;
@@ -1678,9 +1705,12 @@ private:
   }
 
   LIT::FnOp lookup(LIT::CallOp call) {
-    if (auto witness = dyn_cast<GetWitnessAttr>(call.getCallee()))
+    if (auto witness = dyn_cast<GetWitnessAttr>(call.getCallee())) {
+      if (LIT::FnOp impl = selfImpl(witness))
+        return impl;
       return traitMethod(witness.getTraitSymbol().getSymbol(),
                          witness.getWitnessName());
+    }
     SymbolRefAttr callee = call.getDirectCallee();
     if (!callee)
       return {};
@@ -1705,6 +1735,20 @@ private:
     if (!call || call.getOperands() != ValueRange(entry.getArguments()))
       return {};
     return call;
+  }
+
+  /// When refining for a struct, a call of a trait method on `Self` (in the
+  /// trait's clauses): the struct's own implementation, whose clauses then
+  /// hold.
+  LIT::FnOp selfImpl(GetWitnessAttr witness) {
+    if (selfStruct.empty())
+      return {};
+    auto ref = dyn_cast<ParamDeclRefAttr>(resolveParam(witness.getTypeValue()));
+    if (!ref || !ref.getName().getValue().starts_with("_Self"))
+      return {};
+    auto it = impls.byKey.find(implKey(witness.getTraitSymbol(),
+                                       witness.getWitnessName(), selfStruct));
+    return it == impls.byKey.end() ? LIT::FnOp() : it->second;
   }
 
   /// A generic call (`#kgen.get_witness<T, @Trait, "m($0)">`): the method's
@@ -2145,7 +2189,7 @@ private:
       else
         havocOrigin(printed(ref.getOrigin()), state);
     }
-    evalTraitQuery(call, state);
+    evalTraitQuery(call, callee, state);
     if (hasBody) {
       params = contractFrame;
       assumeEnsures(call, contract, before, state);
@@ -2176,21 +2220,29 @@ private:
         }
   }
 
-  /// A generic call of a trait method that only reads its arguments and
-  /// returns an integer or a Boolean (`t.count()`): a function of the
-  /// arguments' values, one per method and type, so that equal arguments
-  /// give equal results and the trait's clauses about it connect.
-  /// Assumption: an implementation's result depends only on the values it
-  /// is given, as `len(x)` is assumed to.
-  void evalTraitQuery(LIT::CallOp call, State &state) {
-    auto witness = dyn_cast<GetWitnessAttr>(call.getCallee());
-    if (!witness || call->getNumResults() != 1 ||
-        !isScalar(call->getResult(0).getType()) ||
+  /// A call of a trait method that only reads its arguments and returns an
+  /// integer or a Boolean (`t.count()` on a generic `t`, or a struct's own
+  /// implementation): a function of the arguments' values, one per method
+  /// and type, so that equal arguments give equal results and the trait's
+  /// clauses about it connect with the implementation's. Assumption: an
+  /// implementation's result depends only on the values it is given, as
+  /// `len(x)` is assumed to.
+  void evalTraitQuery(LIT::CallOp call, LIT::FnOp callee, State &state) {
+    if (call->getNumResults() != 1 || !isScalar(call->getResult(0).getType()) ||
         StringRef(printed(call.getCallee().getType())).contains(" throws"))
       return;
-    std::string key = printed(witness.getTraitSymbol()) + "|" +
-                      witness.getWitnessName().str() + "|" +
-                      printed(resolveParam(witness.getTypeValue()));
+    std::string key;
+    if (auto witness = dyn_cast<GetWitnessAttr>(call.getCallee()))
+      key = selfImpl(witness)
+                ? implKey(witness.getTraitSymbol(), witness.getWitnessName(),
+                          selfStruct)
+                : implKey(witness.getTraitSymbol(), witness.getWitnessName(),
+                          printed(resolveParam(witness.getTypeValue())));
+    else if (auto it = callee ? impls.keyOf.find(callee) : impls.keyOf.end();
+             it != impls.keyOf.end())
+      key = it->second;
+    else
+      return;
     SmallVector<std::string> args;
     for (Value operand : call.getOperands()) {
       auto ref = dyn_cast<LIT::RefType>(operand.getType());
@@ -3625,6 +3677,7 @@ struct VerifyContractsPass
         fns.push_back({fn, {}});
     });
     ModuleOp module = getOperation();
+    TraitImpls impls;
     {
       SymbolTableCollection symbols;
       getOperation().walk([&](ConformanceOp conformance) {
@@ -3642,6 +3695,13 @@ struct VerifyContractsPass
             continue;
           auto impl = dyn_cast_or_null<LIT::FnOp>(
               symbols.lookupSymbolIn(module, value.getSymbol()));
+          if (std::string owner = impl ? plainStructOf(impl) : "";
+              !owner.empty()) {
+            std::string key = implKey(conformance.getTraitSymbol(),
+                                      witness.getSymName(), owner);
+            impls.byKey[key] = impl;
+            impls.keyOf[impl] = key;
+          }
           bool hasClauses = !method.getFunctionBody()
                                  .getOps<RequiresOp>()
                                  .empty() ||
@@ -3662,7 +3722,7 @@ struct VerifyContractsPass
       pool.async([&, i] {
       SymbolTableCollection symbols;
       std::string name = "f" + std::to_string(i);
-      FunctionEncoder enc(fns[i].fn, module, symbols, solver, name,
+      FunctionEncoder enc(fns[i].fn, module, symbols, solver, name, impls,
                           fns[i].refines);
       if (!enc.encode())
         return;
