@@ -507,6 +507,8 @@ private:
   std::map<std::string, SmallVector<std::string>> deps;
   std::map<std::string, std::string> parameterValues;
   std::map<std::string, std::string> definitions;
+  /// Defined expressions (with their sort), to their names.
+  std::map<std::string, std::string> defined;
   std::map<std::pair<std::string, std::string>, bool> dependsMemo;
   /// The state at the function's `kgen.contract.entry`, for its `old`s.
   std::optional<State> entryState;
@@ -555,7 +557,14 @@ private:
   }
 
   std::string define(Sort sort, StringRef expr, StringRef prefix = "t") {
+    // The same expression is the same term: equal computations (a callee's
+    // contract and its body evaluating the same helper calls) then share
+    // names, which the solver sees without reasoning about them.
+    std::string key = sort.str() + " " + expr.str();
+    if (auto it = defined.find(key); it != defined.end())
+      return it->second;
     std::string name = (prefix + Twine(counter++)).str();
+    defined[key] = name;
     prelude += ("(define-fun " + name + " () " + sort.str() + " " + expr +
                 ")\n")
                    .str();
@@ -1095,12 +1104,22 @@ private:
       return;
     }
     SmallVector<State> arms;
+    // Each arm's own condition, relative to the path before the `if`.
+    SmallVector<std::string> local;
+    std::string none = "true"; // No condition so far held.
+    // Whether every arm ends where it started: alive, with no fact added to
+    // its path condition.
+    bool plain = true;
     auto arm = [&](Block &block, const State &from, StringRef cond) {
       State taken = from;
       taken.pc = ("(and " + from.pc + " " + cond + ")").str();
+      std::string entry = taken.pc;
       taken.yields.clear();
       walkBlock(block, taken);
+      plain &= taken.alive && taken.pc == entry;
       arms.push_back(std::move(taken));
+      local.push_back(("(and " + none + " " + cond + ")").str());
+      none = ("(and " + none + " (not " + cond + "))").str();
     };
     std::string cond = term(ifOp.getCond(), state);
     noteCondition(cond);
@@ -1127,9 +1146,30 @@ private:
       rest.pc = "(and " + rest.pc + " (not " + elifCond + "))";
     }
     arm(ifOp.getElseBlock(), rest, "true");
+    // Values are chosen by the arms' own conditions rather than their whole
+    // paths, so the same choice made in two places is the same term. That is
+    // sound: the path after the `if` excludes the arms that did not reach it.
+    SmallVector<std::string> paths;
+    for (auto [taken, cond] : llvm::zip(arms, local)) {
+      paths.push_back(taken.pc);
+      taken.pc = cond;
+    }
     SmallVector<std::string> results;
     State joined = merge(arms, &results);
     bindResults(ifOp, results);
+    // The arms' conditions cover every case, so where no arm added a fact
+    // (a value chosen by a condition, `x if c else y`), the path condition
+    // after the `if` is the one before it. Keeping it so keeps later facts
+    // out of needless disjunctions.
+    if (plain) {
+      joined.pc = state.pc;
+    } else {
+      std::string pc = "(or";
+      for (auto [taken, path] : llvm::zip(arms, paths))
+        if (taken.alive)
+          pc += " " + path;
+      joined.pc = define({true, 1, false}, pc + ")", "r");
+    }
     joined.yields = state.yields;
     state = std::move(joined);
   }
