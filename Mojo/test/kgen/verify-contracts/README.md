@@ -48,7 +48,8 @@ list.mojo:1572:34: note: precondition declared here
 ```
 
 To compare a file against its expected results (every call in a `bad_*`
-function warned about, none in an `ok_*` one):
+function warned about, none in an `ok_*` one; in `traits.mojo`, also every
+`Bad*` struct):
 
 ```bash
 f=Mojo/test/kgen/verify-contracts/straight_line.mojo
@@ -56,11 +57,12 @@ bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std $f -elaborate \
     --verify-contracts 2>&1 | grep "warning:" |
   grep -oE "^[^ ]*$(basename $f):[0-9]+" |
   cut -d: -f2 | while read l; do
-    awk -v L=$l 'NR<=L && /^def /{n=$2} NR==L{print n}' $f | cut -d'(' -f1
+    awk -v L=$l 'NR<=L && /^(def|struct) /{n=$2} NR==L{print n}' $f |
+      cut -d'(' -f1 | cut -d'[' -f1
   done | sort -u
 ```
 
-The output must be exactly the `bad_*` functions.
+The output must be exactly the `bad_*` functions (and `Bad*` structs).
 
 ## What is checked
 
@@ -179,6 +181,22 @@ The output must be exactly the `bad_*` functions.
   element and does not write the collection, although its origin may be
   mutable.
 
+- Traits: a trait method's `where` clauses (on a required method, `...`,
+  as on a default) are its contract. A generic call (`t.get(i)` on a
+  `T: Counter`) is held to the trait's precondition and assumes its
+  postcondition, and so is a call of an inherited default through a
+  struct (`f.pick(i)`). Every implementation is checked against the trait:
+  the trait's precondition must imply the implementation's own, and the
+  implementation must establish the trait's postcondition where it
+  returns (with the trait's other methods on `Self` being the struct's
+  own, and their own clauses). A trait method that only reads its
+  arguments and returns an integer or a Boolean (`count()`) is a function
+  of their values, one per method and type: calls on unchanged arguments
+  agree, the same assumption as for `len(x)`. Implementations in the
+  stdlib, and of structs with parameters, are not linked this way.
+- `Int.MAX`, `Int.MIN` and the bounds of the other integer dtypes
+  (`max_or_inf`, `min_or_neg_inf`) are their values.
+
 Not analyzed yet: loops with loop-carried values, and ranges with a step
 (`range(a, b, c)`) or over other integer types. Lists built from other iterables
 (the generic constructor states no length) have no length contract. The
@@ -200,3 +218,4 @@ with).
 | `collections.mojo`   | all `bad_*`        | all `ok_*`       |
 | `strings.mojo`       | all `bad_*`        | all `ok_*`       |
 | `assertions.mojo`    | all `bad_*`        | all `ok_*`       |
+| `traits.mojo`        | all `bad_*`, `Bad*`| all `ok_*`       |

@@ -698,6 +698,57 @@ Iterating collections and `enumerate`:
   1.4 s instead of 0.9 s (254 invariants instead of 143; both measured
   back to back at load 14), test_list.mojo is unchanged at 1.8 s.
 
+Trait contracts:
+
+- The parser accepted `where` clauses on a required trait method (body
+  `...`) and dropped them: only a default kept its contract ops. A
+  required method with clauses now has them as its body, followed by
+  `hlcf.unreachable`, so the trait declaration carries the contract.
+  Required methods are declarations; the pass does not verify them.
+- A generic call (`#kgen.get_witness<T, @Counter, "get($0,...)">`)
+  resolves to the method's declaration in the trait, or in a trait it
+  refines. Its preconditions are obligations at the call and its
+  postconditions are assumed after it, with the trait's `Self` bound to
+  the call's type.
+- A struct gets a wrapper for each default it inherits, which only
+  forwards to the default. A call to the wrapper has the default's
+  contract, its parameters bound by the forwarding call. The wrapper
+  itself is not verified: its only obligation is its own precondition.
+  That removes a false warning at `struct X(Trait):`, which the
+  default's precondition caused at the wrapper's forwarding call.
+- A trait method that only reads its arguments and returns an integer
+  or a Boolean (`t.count()`) is an uninterpreted function of their
+  values, one per trait, method and type. So calls on unchanged
+  arguments agree, and `count() == old(count()) + 1` after `bump()`
+  relates the two. This assumes an implementation's result depends only
+  on the values it is given, as `len(x)` does. `old(e)` now keeps the
+  facts of the calls in `e` (`count() >= 0` from `count`'s
+  postcondition); it dropped them before.
+- Assuming a trait's contract is only sound if every implementation meets
+  it. Each implementation of a trait method with clauses is verified a
+  second time against the trait: the trait's precondition is assumed at
+  entry and must imply the implementation's own, and the trait's
+  postcondition must hold at every return. Inside the trait's clauses,
+  its methods on `Self` are the struct's implementations with their own
+  clauses, and a direct call to an implementation is the same function
+  as a generic call on that type. A failure is a warning at the
+  implementation ("cannot prove that 'BadCount.count' establishes the
+  postcondition of 'Counter.count'"). It found a real bug in the first
+  version of the example: `bump` as `n += 1` breaks `count() ==
+  old(count()) + 1` at `Int.MAX`, where `n` wraps. The trait now also
+  requires `old(self.count()) < Int.MAX`, a second clause on `self`.
+  `Int.MAX` and the other integer bounds (`max_or_inf`, `min_or_neg_inf`)
+  are now evaluated.
+- Limits: only structs without parameters link their implementations
+  (instantiations would otherwise share one function); conditional
+  conformances are checked as if unconditional; conformances in the
+  stdlib are only checked with `include-stdlib=true`. No stdlib trait has
+  clauses yet, so the stdlib numbers are unchanged (test_list.mojo 217 of
+  237, test_span.mojo 101 of 110), and the built-in models of `index(x)`,
+  `copy()` and the assertions stay until their traits state them.
+  traits.mojo: 12 of 20 obligations proven, the other 8 in `bad_*`
+  functions and in `BadCount`.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
@@ -706,8 +757,12 @@ Iterating collections and `enumerate`:
   by looking into bodies fail. Stage 6 is where this shows. The fallback tier
   keeps those functions checked meanwhile.
 - **Trait methods.** Calls through a witness (`T.__init__`, `T.__eq__`) have
-  no body to look at before elaboration. They need contracts on the trait
-  method, which the language cannot express yet. Until then they are opaque.
+  no body to look at before elaboration. A trait method's `where` clauses
+  are now its contract, checked against every implementation, but a
+  trait's clauses can only use its own methods, and stdlib traits state
+  none yet. Contracts that are too strong break legitimate
+  implementations (a `copy` that counts copies is not equal to its
+  source), so they need to stay narrow.
 - **Unsafe code.** Pointer arithmetic inside `List` and `Span` is what their
   contracts abstract. Verifying those implementations against their contracts
   needs the heap model of the current pass at the LIT level, or stays with the
