@@ -236,6 +236,16 @@ static void eraseUnreachableDecls(Operation *declOp, ModuleOp module,
       }
     }
 
+    // A trait's methods with contracts: generic calls name them only through
+    // witnesses, but analyses of those calls need the trait's clauses.
+    if (auto traitOp = dyn_cast<LIT::TraitDeclOp>(cur))
+      for (auto fn : traitOp.getFields().getOps<FnOp>())
+        if (!fn.getFunctionBody().empty() &&
+            llvm::any_of(fn.getFunctionBody().front(), [](Operation &op) {
+              return isa<KGEN::RequiresOp, KGEN::EnsuresOp>(op);
+            }))
+          markLive(fn);
+
     // Collect symbol references between this symbol table and any child symbol
     // tables. Nested `lit.fn` operations are trickier, however.
     cur->walk<mlir::WalkOrder::PreOrder>([&](Operation *op) {
