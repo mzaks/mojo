@@ -547,6 +547,38 @@ Stage 6, `Dict` and `Set`:
   obligations (1394 of 1611 before); test_set.mojo: 513 of 557 (567 of
   607), both short of before only on the new clauses.
 
+Stage 6, strided slices:
+
+- `List.__getitem__(StridedSlice)` states its result's length as
+  `slice._length(len(self))`, whose contract composes two helpers of
+  `Slice.indices`: `_normalize_bound` (a bound as `indices` normalizes it)
+  and `_strided_count` (the length of `range(start, end, step)`: 0 for a
+  zero step or one pointing away from `end`, else a ceiling division).
+  `indices` itself now calls the helpers, so there is one definition. The
+  pass verifies all three helpers against their bodies
+  (`include-stdlib=true`); the post-elaboration pass creates no obligation
+  for the new clause.
+- The pass records `StridedSlice(start, end, stride)` like
+  `ContiguousSlice`, and models integer `//` and `%` with Mojo's rounding
+  towards negative infinity (SMT-LIB's signed division truncates).
+- Four pass fixes the helpers needed, all general:
+  - A call inside a contract assumes its callee's postcondition, but did so
+    in a copy of the state that was then dropped, so nested helper results
+    were unknown. The facts now belong to the clause (conjoined where it
+    is assumed, premises where it is proven).
+  - `if` with `elif` arms was not analyzed at all.
+  - `Bool`'s operators (`not` is `__invert__`) were unknown.
+  - Encoding: equal expressions are one term (hash-consed definitions);
+    values after an `if` are chosen by the arms' own conditions rather
+    than their whole paths; and an `if` whose arms add no facts keeps the
+    path condition it started with. Without these, `_length`'s body and
+    contract evaluated the same nested helper calls into different terms
+    and the proof did not finish in 120 s; with them it is proven within
+    the default limits. test_list.mojo still takes 1.7 s.
+- test_list.mojo: 176 of 225 calls proven (160 before); `test_list_span`
+  is fully proven. The post-elaboration pass proves 3021 of 3036
+  obligations, short only where it was before and on `String.as_bytes`.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
