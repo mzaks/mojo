@@ -86,17 +86,22 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   references is unknown after it (`bad_after_mut_call`), and memory passed by
   immutable reference is kept (`ok_after_imm_call`). Its results are unknown.
 - Iterating a `List`, `Span`, `Array` or `Deque` (`for x in xs`, and
-  `for i, x in enumerate(xs)`) yields exactly `len(xs)` times: the
-  iterator holds a cursor and the length it started with, and
-  `enumerate`'s count is the cursor (plus `start`). The elements it yields
-  are unknown; reversed iteration over collections is not modelled.
+  `for i, x in enumerate(xs)`), or consuming a `List` or `Array`
+  (`for x in xs^`, `for x in [1, 2, 3]`), yields exactly `len(xs)` times:
+  the iterator holds a cursor and the length it started with, and
+  `enumerate`'s count is the cursor (plus `start`). It yields element
+  `cursor` of the collection: a reference to its place when borrowing, its
+  value when consuming. The elements `enumerate` yields are unknown, and
+  reversed iteration over collections is not modelled.
 - Control flow: `if` (with `elif`), `return`, `try`, and loops (`for` over
   `reversed(range(n))`, `reversed(range(start, end))`, `range(n)` and
   `range(start, end)`, `while`, `break`). `range` iteration follows the
   stdlib's definition. At each loop head, what the loop may write is unknown,
   bound by invariants found with Houdini over small templates: bounds
   against 0, against the values before the loop and lengths, and between the
-  loop's variables. Only variables the loop's conditions depend on are
+  loop's variables, and for a list the loop changes, that its length plus or
+  minus a loop variable keeps its value on entry (`len(xs) + i` when each
+  step pops once). Only variables the loop's conditions depend on are
   considered. The invariants hold only where the loop is reached.
 
 - Postconditions: a function's own clauses on `out` and `mut` arguments are
@@ -166,13 +171,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `t.byte_length()`, and `String()`, `String(literal)` and the
   `StringSlice` constructors state their lengths. That `s[byte=i]` must
   also fall on a codepoint boundary is not stated.
-- Nested collections (`xs[i][j]`, `xs[i].append(v)`,
-  `l.get_nth(i).get_nth(j)`): a reference to an element is a place whose
-  value is the element; writing it (directly, through a field, or by a
-  call that takes it `mut`) writes the element back into the collection,
-  which keeps its length. A list literal's elements are the values it is
-  given. A call given an interior origin (`xs["element"]`) may change the
-  collection's elements but not its length.
+- Nested collections (`xs[i][j]`, `xs[i].append(v)`, `l.get_nth(i).get_nth(j)`):
+  a reference to an element is a place whose value is the element; writing it
+  (directly, through a field, or by a call that takes it `mut`) writes the
+  element back into the collection, which keeps its length. A list or array
+  literal's elements are the values it is given. A call given an interior origin
+  (`xs["element"]`) may change the collection's elements but not its length.
 - `x.copy()` (the `Copyable` default, `Self(copy=self)`) states what the
   struct's copy constructor states: a copied list, deque, linked list or
   dictionary is as long as the original.

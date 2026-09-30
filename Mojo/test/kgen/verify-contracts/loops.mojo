@@ -113,6 +113,45 @@ def ok_enumerate_span(s: Span[Int, _]) -> Int:
     return t
 
 
+def ok_pop_in_loop() -> Int:
+    var xs = List[Int]()
+    for i in range(6):
+        xs.append(i)
+    var t = 0
+    for _ in range(3, 6):
+        t += xs.pop(3)  # `len(xs) + i` stays 9: at least 4 left
+    return t
+
+
+def ok_filled_then_read(n: Int) -> Int:
+    var xs = List[Int]()
+    for i in range(n):
+        xs.append(i)  # `len(xs) - i` stays 0
+    var t = 0
+    for i in range(n):
+        t += xs[i]
+    return t
+
+
+def small(x: Int where 0 <= x and x < 64) -> Int:
+    return x
+
+
+def ok_literal_elements() -> Int:
+    var t = 0
+    for x in [1, 10, 63]:
+        t += small(x)  # each element of the literal
+    return t
+
+
+def ok_list_elements() -> Int:
+    var xs: List[Int] = [4, 5, 6]
+    var t = 0
+    for x in xs:
+        t += small(x)  # a reference to each element
+    return t
+
+
 # --- must stay UNPROVEN ---
 def bad_one_past(xs: List[Int]) -> Int:
     var s = 0
@@ -177,4 +216,29 @@ def bad_enumerate_other(xs: List[Int], ys: List[Int]) -> Int:
     var t = 0
     for i, x in enumerate(xs):
         t += x + ys[i]  # `ys` may be shorter
+    return t
+
+
+def bad_pop_in_loop() -> Int:
+    var xs = List[Int]()
+    for i in range(6):
+        xs.append(i)
+    var t = 0
+    for _ in range(2, 6):
+        t += xs.pop(3)  # the fourth pop leaves only 3
+    return t
+
+
+def bad_list_elements() -> Int:
+    var xs: List[Int] = [4, 64]
+    var t = 0
+    for x in xs:
+        t += small(x)  # 64 is out of range
+    return t
+
+
+def bad_unknown_elements(xs: List[Int]) -> Int:
+    var t = 0
+    for x in xs:
+        t += small(x)  # nothing is known about the elements
     return t

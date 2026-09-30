@@ -835,6 +835,74 @@ Performance after `Sized` (2026-09-30):
   traits.mojo: 20 of 33, the other 13 in `bad_*` functions and `Bad*`
   structs.
 
+Loop lengths and yielded values:
+
+- Houdini has a new template: for a list the loop changes and an integer
+  place its conditions depend on, `len(xs) + v` and `len(xs) - v` keeping
+  their values on entry. `for _ in range(3, 6): xs.pop(3)` then keeps at
+  least 4 elements, and `for i in range(n): xs.append(i)` leaves
+  `len(xs) == n`. An iterator's `/end` and `/length` never change in the
+  loop, so they are left out: against them the template only restates a
+  bound on the length.
+- Iteration yields element `cursor` of the collection, as a reference to
+  the element's place when borrowing and as the element's value when
+  consuming (`for x in xs^`, `for x in [1, 2, 3]`, now modelled for `List`
+  and `Array`). An array literal's elements are known, as a list
+  literal's were. A borrowed element's place is named by the `__next__`
+  call, whose result is the raised flag, so the place carries the
+  element's type explicitly: without it, test_deque.mojo's scripts
+  applied `len` and `elem` to a Boolean, which z3 rejects, silently
+  reading as unproven (and never cached). A scan of every stdlib test's
+  and example's scripts with z3 now finds no errors.
+- Proven: test_list.mojo 220 of 237 (217), test_deque.mojo 100 of 105
+  (97), test_linked_list.mojo 155 of 173 (153), test_bitset.mojo 271 of
+  271 (266); the others unchanged. loops.mojo: 19 of 31, the rest in
+  `bad_*` functions.
+- Timings after this step, measured as after `Sized` (median of 5, load average
+  3.2 falling to 2.7), with the earlier verification times in parentheses:
+
+  | File                  | Proven  | Verify, cold    | Verify, warm | Total, cold |
+  |-----------------------|---------|-----------------|--------------|-------------|
+  | test_list.mojo        | 220/237 | 0.88 s (0.83 s) | 0.13 s       | 1.82 s      |
+  | test_span.mojo        | 101/110 | 0.59 s (0.61 s) | 0.03 s       | 1.27 s      |
+  | test_deque.mojo       | 100/105 | 1.01 s (0.51 s) | 0.04 s       | 1.83 s      |
+  | test_linked_list.mojo | 155/173 | 0.40 s (0.32 s) | 0.03 s       | 0.97 s      |
+  | test_array.mojo       | 38/38   | 0.31 s (0.31 s) | 0.02 s       | 0.97 s      |
+  | test_dict.mojo        | 15/32   | 1.12 s (0.89 s) | 0.06 s       | 2.31 s      |
+  | test_bitset.mojo      | 271/271 | 0.17 s (0.19 s) | 0.03 s       | 0.65 s      |
+  | test_string_span.mojo | 55/57   | 0.67 s (0.42 s) | 0.04 s       | 1.65 s      |
+
+  Warm-cache times are unchanged, so the increase is solver time.
+- Which change costs what, from builds interleaved file by file (5 runs
+  each, medians, load average 1.5 rising to 4.7): the iteration model
+  alone, then with the template.
+
+  | File                  | Iteration only    | With the template |
+  |-----------------------|-------------------|-------------------|
+  | test_list.mojo        | 0.84 s (217/237)  | 0.93 s (220/237)  |
+  | test_span.mojo        | 0.61 s (101/110)  | 0.62 s (101/110)  |
+  | test_deque.mojo       | 0.85 s (100/105)  | 1.07 s (100/105)  |
+  | test_linked_list.mojo | 0.32 s (153/173)  | 0.41 s (155/173)  |
+  | test_array.mojo       | 0.33 s (38/38)    | 0.36 s (38/38)    |
+  | test_dict.mojo        | 0.89 s (15/32)    | 1.16 s (15/32)    |
+  | test_bitset.mojo      | 0.18 s (271/271)  | 0.18 s (271/271)  |
+  | test_string_span.mojo | 0.43 s (55/57)    | 0.69 s (55/57)    |
+
+  The iteration model costs test_deque.mojo 0.34 s and brings its 3 new
+  proofs and test_bitset.mojo's 5; elsewhere it is within noise. The
+  template brings test_list.mojo's 3 and test_linked_list.mojo's 2 for
+  0.09 s each, and costs test_deque.mojo, test_dict.mojo and
+  test_string_span.mojo 0.22 to 0.27 s for nothing. Restricting it as
+  above (interleaved against the unrestricted template, same results):
+  test_list.mojo 0.93 s instead of 1.05 s, test_linked_list.mojo 0.41 s
+  instead of 0.47 s, test_dict.mojo 1.17 s instead of 1.25 s,
+  test_deque.mojo 1.07 s and 1.08 s; test_string_span.mojo 0.69 s instead
+  of 0.56 s, the exception: one Houdini script there (in `test_upper`)
+  takes z3 0.35 s instead of 0.20 s although it has fewer candidates, and
+  why is not explained. Candidates that only cost time are the next
+  thing to cut: the template could be limited to lists the loop changes
+  by a known step.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
