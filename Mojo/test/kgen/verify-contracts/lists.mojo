@@ -82,6 +82,34 @@ def ok_pop_index(mut xs: List[Int]) -> Int:
     return 0
 
 
+def ok_literal_values() -> Int:
+    var xs: List[Int] = [1, 2, 3]
+    return xs[xs[0]]  # a literal's elements are its values
+
+
+def ok_nested_literal() -> Int:
+    var xs: List[List[Int]] = [[1, 2, 3], [4, 5]]
+    return xs[0][2] + xs[1][1]
+
+
+def ok_nested_append() -> Int:
+    var xs: List[List[Int]] = [[1], [2]]
+    xs[0].append(7)  # the inner list grows, the outer keeps its length
+    return xs[0][1] + xs[1][0]
+
+
+def ok_grow_rows(mut xs: List[List[Int]]):
+    for i in range(len(xs)):
+        xs[i].append(0)  # growing a row keeps the number of rows
+
+
+def ok_nested_param(xs: List[List[Int]], i: Int, j: Int) -> Int:
+    if 0 <= i and i < len(xs):
+        if 0 <= j and j < len(xs[i]):
+            return xs[i][j]
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_literal_past_end() -> Int:
     var xs: List[Int] = [1, 2, 3]
@@ -106,4 +134,16 @@ def bad_negative_length() -> Int:
 def bad_pop_index_past_end(mut xs: List[Int]) -> Int:
     if len(xs) > 1:
         return xs.pop(len(xs))
+    return 0
+
+
+def bad_nested_after_pop() -> Int:
+    var xs: List[List[Int]] = [[1, 2], [3]]
+    _ = xs[0].pop()
+    return xs[0][1]  # the inner list shrank
+
+
+def bad_nested_other_row(xs: List[List[Int]], j: Int) -> Int:
+    if len(xs) > 1 and 0 <= j and j < len(xs[0]):
+        return xs[1][j]  # bounded by the first row, not the second
     return 0

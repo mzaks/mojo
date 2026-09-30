@@ -157,6 +157,13 @@ The output must be exactly the `bad_*` functions.
   `t.byte_length()`, and `String()`, `String(literal)` and the
   `StringSlice` constructors state their lengths. That `s[byte=i]` must
   also fall on a codepoint boundary is not stated.
+- Nested collections (`xs[i][j]`, `xs[i].append(v)`,
+  `l.get_nth(i).get_nth(j)`): a reference to an element is a place whose
+  value is the element; writing it (directly, through a field, or by a
+  call that takes it `mut`) writes the element back into the collection,
+  which keeps its length. A list literal's elements are the values it is
+  given. A call given an interior origin (`xs["element"]`) may change the
+  collection's elements but not its length.
 - Element access through `ref self` (`List`, `Deque` and `Array`
   `__getitem__`, `LinkedList.get_nth`) keeps the collection: it reads an
   element and does not write the collection, although its origin may be
