@@ -68,6 +68,28 @@ def ok_early_break(xs: List[Int], stop: Int) -> Int:
     return i
 
 
+def ok_reversed(xs: List[Int]) -> Int:
+    var t = 0
+    for i in reversed(range(len(xs))):
+        t += xs[i]  # from `len(xs) - 1` down to 0
+    return t
+
+
+def ok_reversed_from(xs: List[Int], start: Int) -> Int:
+    var t = 0
+    if 0 <= start:
+        for i in reversed(range(start, len(xs))):
+            t += xs[i]  # down to `start`, inclusive
+    return t
+
+
+def ok_reversed_pairs(xs: List[Int]) -> Int:
+    var t = 0
+    for i in reversed(range(1, len(xs))):
+        t += xs[i] - xs[i - 1]  # `i` never reaches 0
+    return t
+
+
 # --- must stay UNPROVEN ---
 def bad_one_past(xs: List[Int]) -> Int:
     var s = 0
@@ -105,3 +127,17 @@ def bad_after_loop(xs: List[Int]) -> Int:
     while i < len(xs):
         i += 1
     return xs[i]  # `i == len(xs)` after the loop
+
+
+def bad_reversed_one_past(xs: List[Int]) -> Int:
+    var t = 0
+    for i in reversed(range(len(xs))):
+        t += xs[i + 1]  # `i + 1` is `len(xs)` on the first step
+    return t
+
+
+def bad_reversed_below(xs: List[Int]) -> Int:
+    var t = 0
+    for i in reversed(range(len(xs))):
+        t += xs[i - 1]  # `i` reaches 0
+    return t

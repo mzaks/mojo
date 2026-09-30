@@ -75,7 +75,8 @@ The output must be exactly the `bad_*` functions.
 - A call changes only what it can write: memory reachable through its `mut`
   references is unknown after it (`bad_after_mut_call`), and memory passed by
   immutable reference is kept (`ok_after_imm_call`). Its results are unknown.
-- Control flow: `if` (with `elif`), `return`, `try`, and loops (`for` over `range(n)` and
+- Control flow: `if` (with `elif`), `return`, `try`, and loops (`for` over
+  `reversed(range(n))`, `reversed(range(start, end))`, `range(n)` and
   `range(start, end)`, `while`, `break`). `range` iteration follows the
   stdlib's definition. At each loop head, what the loop may write is unknown,
   bound by invariants found with Houdini over small templates: bounds
@@ -154,9 +155,10 @@ The output must be exactly the `bad_*` functions.
   element and does not write the collection, although its origin may be
   mutable.
 
-Not analyzed yet: loops with loop-carried values, and
-`reversed(range(...))` (a strided range). Lists built from other iterables
-(the generic constructor states no length) have no length contract. The obligations inside
+Not analyzed yet: loops with loop-carried values, and ranges with a step
+(`range(a, b, c)`) or over other integer types. Lists built from other
+iterables (the generic constructor states no length) have no length
+contract. The obligations inside
 unsupported control flow are reported as not analyzed. `append` does not state the value it adds (a
 generic `T` has no `==` to state it with).
 
