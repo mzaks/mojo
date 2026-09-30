@@ -768,6 +768,39 @@ Trait contracts:
   stdlib test defines a `Sized` struct. traits.mojo: 16 of 26, the other
   10 in `bad_*` functions and in `BadCount` and `BadLen`.
 
+Performance after `Sized` (2026-09-30):
+
+- Measured with `--mlir-timing`, where verify-contracts appears as "Rest" (it
+  runs after the pass manager). Median of 5 runs, one run per process, 16 cores
+  at load average about 4 (an unrelated compiler at full load on one core).
+  "Cold" solves every query; "warm" answers them from a primed `cache-dir=`, so
+  it is the encoding alone and the difference is solver time. CPU counts kgen
+  and its z3 processes.
+
+  | File                  | Proven  | Import | Verify, cold | Verify, warm | CPU, cold | Total, cold |
+  |-----------------------|---------|--------|--------------|--------------|-----------|-------------|
+  | test_list.mojo        | 217/237 | 0.93 s | 0.83 s       | 0.13 s       | 7.4 s     | 1.82 s      |
+  | test_span.mojo        | 101/110 | 0.63 s | 0.61 s       | 0.03 s       | 3.0 s     | 1.29 s      |
+  | test_deque.mojo       | 97/105  | 0.80 s | 0.51 s       | 0.04 s       | 3.5 s     | 1.37 s      |
+  | test_linked_list.mojo | 153/173 | 0.54 s | 0.32 s       | 0.03 s       | 2.6 s     | 0.92 s      |
+  | test_array.mojo       | 38/38   | 0.64 s | 0.31 s       | 0.02 s       | 2.7 s     | 1.00 s      |
+  | test_dict.mojo        | 15/32   | 1.16 s | 0.89 s       | 0.06 s       | 8.9 s     | 2.11 s      |
+  | test_bitset.mojo      | 266/271 | 0.45 s | 0.19 s       | 0.03 s       | 1.7 s     | 0.70 s      |
+  | test_string_span.mojo | 55/57   | 0.95 s | 0.42 s       | 0.05 s       | 2.1 s     | 1.43 s      |
+
+  Spreads were small (test_list cold 0.82 to 0.85 s). Verification now costs
+  about as much as importing the file, and with a warm cache at most 0.13 s.
+- The post-elaboration pass on the same files: test_list.mojo 84 and 88 s
+  wall, about 470 s CPU (3438 of 3463 obligations); test_span.mojo 1.6 s
+  (884 of 886). The earlier 70 s for test_list.mojo was measured at a
+  different load; these runs raised the load average to about 12
+  themselves, and the difference is not explained. Its obligations are
+  not the pass's: it checks every inlined call, stdlib bodies included,
+  and verify-contracts each call once against its contract.
+- The trait contract steps did not change these times measurably:
+  test_list.mojo was 1.8 s before them, test_span.mojo 1.4 s (at load
+  14).
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
