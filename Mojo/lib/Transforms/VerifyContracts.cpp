@@ -1950,6 +1950,8 @@ private:
       return;
     if (name && evalElementWrite(call, *name, state))
       return;
+    if (name && callee && evalIteration(call, *name, callee, state))
+      return;
     if (name && evalBuiltin(call, *name, state))
       return;
     if (name && evalElementAccess(call, *name, state))
@@ -2293,6 +2295,183 @@ private:
     Value result = call->getResult(0);
     values[result] = declare({false, 64, false}, "g");
     elements[result] = {*list, index};
+    return true;
+  }
+
+  /// Iterating a `List`, `Span`, `Array` or `Deque` forward, directly or
+  /// through `enumerate`, as their iterators define it: an iterator holds a
+  /// cursor (`/index`, from 0) and the collection's length when it was made
+  /// (`/length`); `__next__` raises when the cursor reaches the length, and
+  /// otherwise advances it (the element it yields is unknown). `enumerate`
+  /// wraps one (`/_inner`) with a count (`/_count`, from `start`), and
+  /// yields a tuple whose field `/0` is the count; a tuple's
+  /// `__getitem_param__[k]` refers to its field `/k`.
+  bool evalIteration(LIT::CallOp call, const CalleeName &name, LIT::FnOp callee,
+                     State &state) {
+    StringRef path = name.path;
+    Sort sort{false, 64, true};
+    static const char *collections[] = {
+        "std::collections::list::List::__iter__[",
+        "std::collections::span::Span::__iter__[",
+        "std::collections::array::Array::__iter__[",
+        "std::collections::deque::Deque::__iter__["};
+    static const char *collectionTypes[] = {
+        "@std::@collections::@list::@List<",
+        "@std::@collections::@span::@Span<",
+        "@std::@collections::@array::@Array<",
+        "@std::@collections::@deque::@Deque<"};
+    static const char *iterators[] = {"std::collections::list::_ListIter::",
+                                      "std::collections::span::_SpanIter::",
+                                      "std::collections::array::_ArrayIter::",
+                                      "std::collections::deque::_DequeIter::"};
+    // The length of the collection at `v`, a reference.
+    auto lengthOf = [&](Value v) -> MaybeTerm {
+      std::optional<Loc> loc = placeOf(v);
+      if (!loc)
+        return std::nullopt;
+      if (MaybeTerm n = loc->path.empty() ? arrayLength(*loc) : std::nullopt)
+        return n;
+      return define(sort, lenOf(load(*loc, state, placeType(*loc))));
+    };
+    // The result of a call: its register result or its `out` slot.
+    auto produce = [&](std::map<std::string, std::string> fields) {
+      if (call->getNumResults() == 1 &&
+          !sortOf(call->getResult(0).getType()).isBool &&
+          printed(call->getResult(0).getType()) != "!kgen.none") {
+        values[call->getResult(0)] = declare({false, 64, false}, "g");
+        records[call->getResult(0)] = std::move(fields);
+        return true;
+      }
+      std::optional<Loc> out = placeOf(call.getOperands().back());
+      if (!out)
+        return false;
+      storeFields(*out, state,
+                  SmallVector<std::pair<std::string, std::string>>(
+                      fields.begin(), fields.end()));
+      setResultsUnknown(call);
+      return true;
+    };
+    for (const char *prefix : collections)
+      if (path.starts_with(prefix) && call.getNumOperands() >= 1 &&
+          isa<LIT::RefType>(call.getOperands()[0].getType()) &&
+          (call->getNumResults() == 1 || call.getNumOperands() == 2))
+        if (MaybeTerm n = lengthOf(call.getOperands()[0]))
+          return produce({{"/index", bvConst(0, 64)}, {"/length", *n}});
+    // `enumerate(xs, start=)` of such a collection.
+    if (path.starts_with("std::iter::__init__::enumerate[") &&
+        call.getNumOperands() >= 2 && !name.params.empty() &&
+        llvm::any_of(collectionTypes, [&](const char *type) {
+          return StringRef(name.params[0]).contains(type);
+        }))
+      if (MaybeTerm n = lengthOf(call.getOperands()[0]))
+        return produce({{"/_inner/index", bvConst(0, 64)},
+                        {"/_inner/length", *n},
+                        {"/_count", term(call.getOperands()[1], state)}});
+    // An iterator's next element, forward only.
+    bool isIterator = llvm::any_of(iterators, [&](const char *prefix) {
+      return path.starts_with(prefix);
+    });
+    bool isEnumerate = path.starts_with("std::iter::__init__::_Enumerate::");
+    if (!isIterator && !isEnumerate)
+      return tupleField(call, name, state);
+    // The method, after its struct's name (its mangled signature may itself
+    // contain `::`).
+    StringRef method = path;
+    for (const char *prefix : iterators)
+      if (path.starts_with(prefix))
+        method = path.drop_front(strlen(prefix));
+    if (isEnumerate)
+      method = path.drop_front(strlen("std::iter::__init__::_Enumerate::"));
+    std::optional<Loc> self =
+        call.getNumOperands() ? placeOf(call.getOperands()[0]) : std::nullopt;
+    if (!self)
+      return false;
+    std::string inner = isEnumerate ? "/_inner" : "";
+    Loc index{self->root, self->path + inner + "/index"},
+        length{self->root, self->path + inner + "/length"},
+        count{self->root, self->path + "/_count"};
+    if (isIterator) {
+      ParamFrame frame = paramFrame(call, callee);
+      auto forward = frame.values.find("forward");
+      if (forward == frame.values.end() ||
+          !StringRef(printed(forward->second)).contains("true"))
+        return false;
+    } else if (!llvm::any_of(iterators, [&](const char *prefix) {
+                 StringRef type = StringRef(prefix).drop_back(2);
+                 return !name.params.empty() &&
+                        StringRef(name.params[0])
+                            .contains(type.rsplit("::").second);
+               })) {
+      return false;
+    }
+    if (method.starts_with("__iter__")) {
+      std::map<std::string, std::string> fields = {
+          {inner + "/index", load(index, state, sort)},
+          {inner + "/length", load(length, state, sort)}};
+      if (isEnumerate)
+        fields["/_count"] = load(count, state, sort);
+      return produce(std::move(fields));
+    }
+    if (!method.starts_with("__next__") || call.getNumOperands() != 3 ||
+        call->getNumResults() != 1)
+      return false;
+    std::optional<Loc> error = placeOf(call.getOperands()[1]);
+    std::optional<Loc> out = placeOf(call.getOperands()[2]);
+    if (!error || !out)
+      return false;
+    std::string i = load(index, state, sort), n = load(length, state, sort);
+    std::string raised =
+        define({true, 1, false}, "(bvsge " + i + " " + n + ")");
+    noteCondition(raised);
+    auto step = [&](const Loc &loc, const std::string &value) {
+      store(loc, state,
+            define(sort, "(ite " + raised + " " + value + " (bvadd " + value +
+                             " " + bvConst(1, 64) + "))"));
+    };
+    std::string c = isEnumerate ? load(count, state, sort) : "";
+    step(index, i);
+    state.env[length] = n;
+    if (isEnumerate) {
+      step(count, c);
+      storeFields(*out, state, {{"/0", c}});
+    } else {
+      havoc(*out, state, placeType(*out));
+    }
+    havoc(*error, state, placeType(*error));
+    values[call->getResult(0)] = raised;
+    return true;
+  }
+
+  /// `tuple[k]` (`Tuple.__getitem_param__[k]`): a reference to field `/k` of
+  /// the tuple's place.
+  bool tupleField(LIT::CallOp call, const CalleeName &name, State &state) {
+    if (!StringRef(name.path).starts_with(
+            "std::builtin::tuple::Tuple::__getitem_param__[") ||
+        call.getNumOperands() != 1 || call->getNumResults() != 1 ||
+        !isa<LIT::RefType>(call->getResult(0).getType()))
+      return false;
+    std::optional<Loc> tuple = placeOf(call.getOperands()[0]);
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!tuple || !symbol)
+      return false;
+    // The index is the callee's own first parameter, after the tuple's.
+    std::optional<int64_t> k;
+    for (TypedAttr param : symbol.getParamValues()) {
+      static llvm::Regex indexRe("^#lit.struct<\\{_mlir_value: scalar<index> "
+                                 "= ([0-9]+)\\}>");
+      SmallVector<StringRef> m;
+      int64_t v;
+      if (indexRe.match(printed(param), &m) && !m[1].getAsInteger(10, v)) {
+        k = v;
+        break;
+      }
+    }
+    if (!k)
+      return false;
+    Value result = call->getResult(0);
+    values[result] = declare({false, 64, false}, "g");
+    derivedPlaces[result] =
+        Loc{tuple->root, tuple->path + "/" + std::to_string(*k)};
     return true;
   }
 
