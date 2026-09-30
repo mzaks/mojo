@@ -1675,7 +1675,7 @@ struct List[T: AnyType, /](
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def unsafe_get(
-        ref self, idx: Int
+        ref self, idx: Int where 0 <= idx and idx < len(self)
     ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T:
         """Get a reference to an element of self without checking index bounds.
 
@@ -1700,7 +1700,9 @@ struct List[T: AnyType, /](
 
     @inline(.always)
     def unsafe_set(
-        mut self, idx: Int, var value: Self.T
+        mut self where len(self) == old(len(self)),
+        idx: Int where 0 <= idx and idx < len(self),
+        var value: Self.T,
     ) where conforms_to(Self.T, Deinitable & Movable):
         """Write a value to a given location without checking index bounds.
 
