@@ -210,7 +210,10 @@ struct StringSpan[origin: ImmOrigin](
 
     @inline(.always)
     @implicit
-    def __init__(out self: StaticString, lit: StringLiteral):
+    def __init__(
+        out self: StaticString where self.byte_length() == lit.byte_length(),
+        lit: StringLiteral,
+    ):
         """Construct a new `StringSpan` from a `StringLiteral`.
 
         Args:
@@ -270,7 +273,11 @@ struct StringSpan[origin: ImmOrigin](
         """
         self._slice = unsafe_from_utf8.as_bytes()
 
-    def __init__(out self, *, from_utf8: ImmSpan[Byte, Self.origin]) raises:
+    def __init__(
+        out self where self.byte_length() == len(from_utf8),
+        *,
+        from_utf8: ImmSpan[Byte, Self.origin],
+    ) raises:
         """Construct a new `StringSpan` from a buffer containing UTF-8 encoded
         data.
 
@@ -287,7 +294,14 @@ struct StringSpan[origin: ImmOrigin](
         self = Self(unsafe_from_utf8=from_utf8)
 
     @implicit
-    def __init__(out self, ref[Self.origin] value: String):
+    def __init__(
+        # `value` is a reference the span's origin may make mutable, so the
+        # clause also says its length is kept.
+        out self where self.byte_length() == old(
+            value.byte_length()
+        ) and value.byte_length() == old(value.byte_length()),
+        ref[Self.origin] value: String,
+    ):
         """Construct a StringSpan from a String.
 
         Args:
@@ -379,7 +393,18 @@ struct StringSpan[origin: ImmOrigin](
         return String(self)
 
     @inline(.always)
-    def __getitem__(self, *, byte: ContiguousSlice) -> Self:
+    def __getitem__(
+        self,
+        *,
+        byte: ContiguousSlice where (
+            0 <= byte.start.or_else(0)
+            and byte.start.or_else(0) <= byte.end.or_else(self.byte_length())
+            and byte.end.or_else(self.byte_length()) <= self.byte_length()
+        ),
+        out result: Self where result.byte_length() == byte.end.or_else(
+            self.byte_length()
+        ) - byte.start.or_else(0),
+    ):
         """Gets a substring at the specified byte positions.
 
         This performs byte-level slicing, not character (codepoint) slicing.
@@ -413,7 +438,7 @@ struct StringSpan[origin: ImmOrigin](
             end,
             " which is not a codepoint boundary.",
         )
-        return Self(unsafe_from_utf8=self._slice[byte])
+        result = Self(unsafe_from_utf8=self._slice[byte])
 
     def _codepoint_byte_offset(self, count: Int) -> Int:
         # Byte offset of the boundary before the `count`-th codepoint.
@@ -739,7 +764,13 @@ struct StringSpan[origin: ImmOrigin](
         return self.graphemes_reversed()
 
     @inline(.always)
-    def __getitem__[I: Indexer, //](self, *, byte: I) -> Self:
+    def __getitem__[
+        I: Indexer, //
+    ](
+        self,
+        *,
+        byte: I where 0 <= index(byte) and index(byte) < self.byte_length(),
+    ) -> Self:
         """Gets a single byte at the specified byte index.
 
         This performs byte-level indexing, not character (codepoint) indexing.
@@ -762,7 +793,9 @@ struct StringSpan[origin: ImmOrigin](
         return self._unchecked_get_byte(idx)
 
     @inline(.always)
-    def __getitem__(self, *, byte: IntLiteral) -> Self:
+    def __getitem__(
+        self, *, byte: IntLiteral where Int(byte) < self.byte_length()
+    ) -> Self:
         """Gets a single byte at the specified byte index.
 
         This performs byte-level indexing, not character (codepoint) indexing.
@@ -1506,13 +1539,18 @@ struct StringSpan[origin: ImmOrigin](
         return len(self.graphemes())
 
     @inline(.always)
-    def as_bytes(self) -> Span[Byte, Self.origin]:
+    def as_bytes(
+        self,
+        out result: Span[Byte, Self.origin] where (
+            len(result) == self.byte_length()
+        ),
+    ):
         """Get the sequence of encoded bytes of the underlying string.
 
         Returns:
             A slice containing the underlying sequence of encoded bytes.
         """
-        return self._slice
+        result = self._slice
 
     @inline(.always)
     def unsafe_ptr(self) -> Pointer[Byte, Self.origin]:

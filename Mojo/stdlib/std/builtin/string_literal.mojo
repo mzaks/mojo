@@ -386,7 +386,12 @@ struct StringLiteral[value: __mlir_type.`!kgen.string`](
         )
 
     @inline(.nodebug)
-    def as_bytes(self) -> Span[Byte, ImmStaticOrigin]:
+    def as_bytes(
+        self,
+        out result: Span[Byte, ImmStaticOrigin] where (
+            len(result) == self.byte_length()
+        ),
+    ):
         """
         Returns a contiguous Span of the bytes owned by this string.
 
@@ -394,7 +399,7 @@ struct StringLiteral[value: __mlir_type.`!kgen.string`](
             A contiguous slice pointing to the bytes owned by this string.
         """
 
-        return Span[Byte, ImmStaticOrigin](
+        result = Span[Byte, ImmStaticOrigin](
             unsafe_ptr=self.ptr(), length=self.byte_length()
         )
 
