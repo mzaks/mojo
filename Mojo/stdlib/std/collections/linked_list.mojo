@@ -271,7 +271,7 @@ struct LinkedList[ElementType: Movable](
     var _size: Int
     """The number of elements in the list."""
 
-    def __init__(out self):
+    def __init__(out self where len(self) == 0):
         """Initialize an empty linked list.
 
         Notes:
@@ -282,7 +282,7 @@ struct LinkedList[ElementType: Movable](
         self._size = 0
 
     def __init__(
-        out self,
+        out self where len(self) == old(len(elements)),
         var *elements: Self.ElementType,
         __list_literal__: NoneType = None,
     ):
@@ -304,7 +304,7 @@ struct LinkedList[ElementType: Movable](
         elements^.consume_elements(init_elt)
 
     def __init__(
-        out self, *, copy: Self
+        out self where len(self) == len(copy), *, copy: Self
     ) where conforms_to(Self.ElementType, Copyable):
         """Initialize this list as a copy of another list.
 
@@ -375,7 +375,10 @@ struct LinkedList[ElementType: Movable](
         """
         self._delete_list_elements(deinit_func)
 
-    def append(mut self, var value: Self.ElementType):
+    def append(
+        mut self where len(self) == old(len(self)) + 1,
+        var value: Self.ElementType,
+    ):
         """Add an element to the end of the list.
 
         Args:
@@ -398,7 +401,10 @@ struct LinkedList[ElementType: Movable](
         self._tail = addr
         self._size += 1
 
-    def prepend(mut self, var value: Self.ElementType):
+    def prepend(
+        mut self where len(self) == old(len(self)) + 1,
+        var value: Self.ElementType,
+    ):
         """Add an element to the beginning of the list.
 
         Args:
@@ -419,7 +425,7 @@ struct LinkedList[ElementType: Movable](
         self._head = addr
         self._size += 1
 
-    def reverse(mut self):
+    def reverse(mut self where len(self) == old(len(self))):
         """Reverse the order of elements in the list.
 
         Notes:
@@ -437,7 +443,9 @@ struct LinkedList[ElementType: Movable](
         self._tail = self._head
         self._head = prev
 
-    def pop(mut self) raises -> Self.ElementType:
+    def pop(
+        mut self where len(self) == old(len(self)) - 1,
+    ) raises -> Self.ElementType:
         """Remove and return the last element of the list.
 
         Returns:
@@ -468,7 +476,10 @@ struct LinkedList[ElementType: Movable](
     @inline(.always)
     def pop[
         I: Indexer & Deinitable, //
-    ](mut self, var i: I) raises -> Self.ElementType:
+    ](
+        mut self where len(self) == old(len(self)) - 1,
+        var i: I where 0 <= index(i) and index(i) < len(self),
+    ) raises -> Self.ElementType:
         """Remove the ith element of the list, counting from the tail if
         given a negative index.
 
@@ -580,7 +591,9 @@ struct LinkedList[ElementType: Movable](
             return Optional[Self.ElementType](node^._into_value())
 
     def clear(
-        mut self,
+        # The `old` makes the clause a postcondition only (a `mut` clause
+        # without one holds on entry too); lengths are never negative.
+        mut self where len(self) == 0 and old(len(self)) >= 0,
     ) where conforms_to(Self.ElementType, Deinitable):
         """Removes all elements from the list.
 
@@ -603,7 +616,13 @@ struct LinkedList[ElementType: Movable](
         self._size = 0
 
     @inline(.always)
-    def insert[I: Indexer](mut self, idx: I, var elem: Self.ElementType):
+    def insert[
+        I: Indexer
+    ](
+        mut self where len(self) == old(len(self)) + 1,
+        idx: I where 0 <= index(idx) and index(idx) <= len(self),
+        var elem: Self.ElementType,
+    ):
         """Insert an element `elem` into the list at index `idx`.
 
         Parameters:
@@ -666,7 +685,10 @@ struct LinkedList[ElementType: Movable](
             self._head = node
         self._size += 1
 
-    def extend(mut self, deinit other: Self):
+    def extend(
+        mut self where len(self) == old(len(self)) + old(len(other)),
+        deinit other: Self,
+    ):
         """Extends the list with another.
 
         Args:
@@ -812,7 +834,7 @@ struct LinkedList[ElementType: Movable](
     @inline(.always)
     def get_nth[
         I: Indexer
-    ](ref self, idx: I) -> ref[
+    ](ref self, idx: I where 0 <= index(idx) and index(idx) < len(self)) -> ref[
         origin_of(self)._get_owned_interior["element"]
     ] Self.ElementType:
         """Get the element at the specified index.
