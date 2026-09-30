@@ -2073,6 +2073,36 @@ private:
       values[result] = operand(0);
       return true;
     }
+    // `Bool`'s operators (`not x` is `__invert__`).
+    if (path.starts_with("std::builtin::bool::Bool::__") &&
+        sortOf(result.getType()).isBool) {
+      StringRef method = path.drop_front(strlen("std::builtin::bool::Bool::"))
+                             .take_until([](char c) { return c == '('; });
+      static const std::pair<const char *, const char *> binary[] = {
+          {"__and__", "and"},
+          {"__or__", "or"},
+          {"__xor__", "xor"},
+          {"__eq__", "="}};
+      if (call.getNumOperands() == 1 && method == "__invert__") {
+        values[result] = define({true, 1, false}, "(not " + operand(0) + ")");
+        return true;
+      }
+      if (call.getNumOperands() == 2) {
+        for (auto &[m, smt] : binary)
+          if (method == m) {
+            values[result] = define({true, 1, false},
+                                    "(" + std::string(smt) + " " + operand(0) +
+                                        " " + operand(1) + ")");
+            return true;
+          }
+        if (method == "__ne__") {
+          values[result] =
+              define({true, 1, false},
+                     "(not (= " + operand(0) + " " + operand(1) + "))");
+          return true;
+        }
+      }
+    }
     if (path.starts_with("std::builtin::len::len[") &&
         call.getNumOperands() == 1) {
       // An `Array`'s length is its size parameter, in its type (an
