@@ -844,8 +844,25 @@ private:
   /// Memory a mutable origin (printed) may reach becomes unknown.
   void havocOrigin(StringRef origin, State &state) {
     if (std::optional<SmallVector<Value>> named = rootsNamedBy(origin)) {
-      for (Value root : *named)
-        havoc(Loc{root, ""}, state, placeType(Loc{root, ""}));
+      for (Value root : *named) {
+        Loc loc{root, ""};
+        // An interior origin (`xs["element"]` in source,
+        // `#lit.interior.origin<xs, "element">` here) reaches what the root
+        // owns (a collection's elements), not the root's own fields: its
+        // length is kept.
+        std::string name = quotedOriginName(root);
+        size_t at = origin.find(name);
+        if (at != StringRef::npos &&
+            origin.take_front(at).ends_with(
+                "#lit.interior.origin<#kgen.param.decl.ref<")) {
+          std::string old = load(loc, state, placeType(loc));
+          std::string fresh = declare({false, 64, false}, "h");
+          facts.push_back("(= " + lenOf(fresh) + " " + lenOf(old) + ")");
+          store(loc, state, fresh);
+          continue;
+        }
+        havoc(loc, state, placeType(loc));
+      }
       return;
     }
     havocAll(state);
@@ -1941,6 +1958,24 @@ private:
     State before = state;
     before.yields.clear();
     setResultsUnknown(call);
+    // Origins first: a mutable element reference argument (`xs[0]` in
+    // `xs[0].append(v)`, given origin `xs["element"]`) then writes its new
+    // value back into the collection as the origin left it.
+    // Keep the printed list alive while its elements are used.
+    std::string origins = printed(call.getImplicitOriginsAttr());
+    // The origin of a mutable reference argument whose place is known is
+    // covered by that argument's own havoc below: what the callee reaches
+    // through a reference to one element (or field) is that element, not
+    // its neighbours.
+    std::set<std::string> covered;
+    for (Value operand : call.getOperands())
+      if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
+          ref && !ref.isMutableKnown(false) && placeOf(operand))
+        covered.insert(printed(ref.getOrigin()));
+    for (StringRef origin : topLevelElements(origins))
+      if (!origin.ends_with(": !lit.origin<false>") &&
+          !covered.count(origin.str()))
+        havocOrigin(origin, state);
     for (Value operand : call.getOperands()) {
       auto ref = dyn_cast<LIT::RefType>(operand.getType());
       if (!ref || ref.isMutableKnown(false))
@@ -1950,11 +1985,6 @@ private:
       else
         havocOrigin(printed(ref.getOrigin()), state);
     }
-    // Keep the printed list alive while its elements are used.
-    std::string origins = printed(call.getImplicitOriginsAttr());
-    for (StringRef origin : topLevelElements(origins))
-      if (!origin.ends_with(": !lit.origin<false>"))
-        havocOrigin(origin, state);
     if (hasBody) {
       params = &frame;
       assumeEnsures(call, callee, before, state);
