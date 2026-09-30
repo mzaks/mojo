@@ -531,6 +531,22 @@ Stage 6, strings:
   606 before), test_string_span.mojo 1299 of 1469 (603 of 629). The string
   contracts are stated from the bodies, not checked by a tool.
 
+Stage 6, `Dict` and `Set`:
+
+- Nothing in them is indexed, so their contracts are lengths, most of them
+  bounds rather than values: an insertion may or may not add an entry.
+  `collections.mojo` gains cases for both.
+- test_dict.mojo: 1 of 32 calls proven (0 of 31 before). Its calls index
+  lists built from a dictionary's contents (keys, values, items), which
+  lengths of the dictionary do not reach. test_set.mojo checks no calls.
+- The post-elaboration pass checks some of the clauses against the
+  bodies: the empty constructors everywhere, `setdefault` and
+  `Set.discard` in most places, `clear` in half. It cannot follow the swiss table through
+  `d[k] = v` (unproven in 85 of 144 places) or the literal constructor (62
+  of 62), and reports nothing for `Set.add`. test_dict.mojo: 1519 of 1880
+  obligations (1394 of 1611 before); test_set.mojo: 513 of 557 (567 of
+  607), both short of before only on the new clauses.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
