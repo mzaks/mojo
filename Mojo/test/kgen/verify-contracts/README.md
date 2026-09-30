@@ -117,6 +117,22 @@ The output must be exactly the `bad_*` functions.
   `Span(array=)` is as long as the array. A callee's contract that names its
   parameters (`array.length`, `Self.size`) sees the values the call binds.
 
+- `BitSet`: `set`, `clear`, `toggle` and `test` require `0 <= idx < size`.
+- `Deque`: `d[i]` requires `i` in range; constructors, `append`,
+  `appendleft`, `pop`, `popleft`, `insert`, `remove`, `extend`,
+  `extendleft`, `clear`, `reverse` and `rotate` state lengths. A bounded
+  deque (`maxlen=`) evicts when full, so these clauses go through its
+  `_maxlen`, which constructors state and mutators keep.
+- `LinkedList`: `get_nth(i)`, `pop(i)` and `insert(i, ...)` require their
+  index in range; constructors, `append`, `prepend`, `pop`, `insert`,
+  `extend`, `clear` and `reverse` state lengths. Indices are generic
+  (`I: Indexer`): `index(i)` is `i` for an `Int` and the literal's value
+  for an `IntLiteral`.
+- Element access through `ref self` (`List`, `Deque` and `Array`
+  `__getitem__`, `LinkedList.get_nth`) keeps the collection: it reads an
+  element and does not write the collection, although its origin may be
+  mutable.
+
 Not analyzed yet: loops with loop-carried values, and
 `reversed(range(...))` (a strided range). Strided slices (`xs[::2]`) and
 lists built from other iterables (the generic constructor states no length)
@@ -135,3 +151,4 @@ generic `T` has no `==` to state it with).
 | `lists.mojo`         | all `bad_*`        | all `ok_*`       |
 | `spans.mojo`         | all `bad_*`        | all `ok_*`       |
 | `arrays.mojo`        | all `bad_*`        | all `ok_*`       |
+| `collections.mojo`   | all `bad_*`        | all `ok_*`       |
