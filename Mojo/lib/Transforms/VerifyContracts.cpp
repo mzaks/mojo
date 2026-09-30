@@ -1843,7 +1843,8 @@ private:
   }
 
   /// The parameters `call` binds for `callee`: the callee's struct's
-  /// parameters, then its own, in order. None when they do not line up.
+  /// parameters, then its own but its implicit origins, in order. None when
+  /// they do not line up.
   ParamFrame paramFrame(LIT::CallOp call, LIT::FnOp callee) {
     ParamFrame frame;
     frame.parent = params;
@@ -1854,7 +1855,12 @@ private:
     SmallVector<ParamDeclAttr> decls;
     if (auto parent = callee->getParentOfType<LIT::StructDeclOp>())
       llvm::append_range(decls, parent.getParams());
-    llvm::append_range(decls, callee.getParams());
+    // The callee's implicit origin parameters come last; the call binds
+    // them apart (`lit.call @f[mut *"x"]`).
+    ArrayRef<ParamDeclAttr> own = callee.getParams();
+    size_t implicit = call.getImplicitOrigins().size();
+    if (implicit <= own.size())
+      llvm::append_range(decls, own.drop_back(implicit));
     ArrayRef<TypedAttr> values = symbol.getParamValues();
     if (decls.size() == values.size())
       for (auto [decl, value] : llvm::zip(decls, values))
