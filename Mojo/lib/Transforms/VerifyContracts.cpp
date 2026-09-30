@@ -536,6 +536,9 @@ private:
   /// index.
   DenseMap<Value, std::pair<Loc, std::string>> elements;
   std::set<std::string> elementFunctions;
+  /// The functions standing for read-only trait method calls, by trait,
+  /// method, type and signature (see `evalTraitQuery`).
+  std::map<std::string, std::string> traitQueries;
   unsigned counter = 0;
   bool lenDeclared = false;
   /// Inside a contract region: calls there are evaluated, not checked.
@@ -2009,6 +2012,7 @@ private:
       else
         havocOrigin(printed(ref.getOrigin()), state);
     }
+    evalTraitQuery(call, state);
     if (hasBody) {
       params = &frame;
       assumeEnsures(call, callee, before, state);
@@ -2037,6 +2041,47 @@ private:
                                 bvConst(*n, 64) + "))",
                             "r");
         }
+  }
+
+  /// A generic call of a trait method that only reads its arguments and
+  /// returns an integer or a Boolean (`t.count()`): a function of the
+  /// arguments' values, one per method and type, so that equal arguments
+  /// give equal results and the trait's clauses about it connect.
+  /// Assumption: an implementation's result depends only on the values it
+  /// is given, as `len(x)` is assumed to.
+  void evalTraitQuery(LIT::CallOp call, State &state) {
+    auto witness = dyn_cast<GetWitnessAttr>(call.getCallee());
+    if (!witness || call->getNumResults() != 1 ||
+        !isScalar(call->getResult(0).getType()) ||
+        StringRef(printed(call.getCallee().getType())).contains(" throws"))
+      return;
+    std::string key = printed(witness.getTraitSymbol()) + "|" +
+                      witness.getWitnessName().str() + "|" +
+                      printed(resolveParam(witness.getTypeValue()));
+    SmallVector<std::string> args;
+    for (Value operand : call.getOperands()) {
+      auto ref = dyn_cast<LIT::RefType>(operand.getType());
+      if (ref && !ref.isMutableKnown(false))
+        return;
+      args.push_back(ref ? valueThrough(operand, state) : term(operand, state));
+      key += "|" + sortOfTerm(args.back()).str();
+    }
+    Sort sort = sortOf(call->getResult(0).getType());
+    key += "|" + sort.str();
+    auto [it, inserted] = traitQueries.try_emplace(key, "");
+    if (inserted) {
+      it->second = "w" + std::to_string(counter++);
+      prelude += "(declare-fun " + it->second + " (";
+      for (const std::string &arg : args)
+        prelude += sortOfTerm(arg).str() + " ";
+      prelude += ") " + sort.str() + ")\n; " + it->second + ": " +
+                 StringRef(key).take_front(300).str() + "\n";
+    }
+    std::string application = "(" + it->second;
+    for (const std::string &arg : args)
+      application += " " + arg;
+    values[call->getResult(0)] =
+        args.empty() ? it->second : define(sort, application + ")");
   }
 
   /// After `assert_true(c)`, `assert_false(c)`, `assert_equal(a, b)` or
