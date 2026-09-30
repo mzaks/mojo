@@ -1871,23 +1871,30 @@ private:
   /// After a call, the callee's postcondition: its arguments as they are
   /// now, its `old`s as they were before the call. A raising callee's holds
   /// only where it did not raise (its first result is the raised flag).
+  /// Each clause is a `kgen.ensures` of its own, repeated before every
+  /// return; the ones before the first return are the postcondition.
   void assumeEnsures(LIT::CallOp call, LIT::FnOp callee, State &before,
                      State &state) {
-    EnsuresOp ensures;
+    EnsuresOp first;
     callee.getFunctionBody().walk([&](EnsuresOp op) {
-      if (!ensures)
-        ensures = op;
+      if (!first)
+        first = op;
     });
-    if (!ensures)
+    if (!first)
       return;
+    SmallVector<EnsuresOp> clauses;
+    for (Operation *op = first; op && !op->hasTrait<OpTrait::IsTerminator>();
+         op = op->getNextNode())
+      if (auto ensures = dyn_cast<EnsuresOp>(op))
+        clauses.push_back(ensures);
     callResult = call->getNumResults() == 1 ? call->getResult(0) : Value();
-    MaybeTerm cond =
-        instantiate(ensures.getBody(), ensures.getArgs(), state,
-                    call.getOperands(), callee, &before, /*assumed=*/true);
+    std::string holds = "true";
+    for (EnsuresOp ensures : clauses)
+      if (MaybeTerm cond = instantiate(ensures.getBody(), ensures.getArgs(),
+                                       state, call.getOperands(), callee,
+                                       &before, /*assumed=*/true))
+        holds = "(and " + holds + " " + *cond + ")";
     callResult = {};
-    if (!cond)
-      return;
-    std::string holds = *cond;
     std::string type = printed(call.getCallee().getType());
     if (StringRef(type).contains(" throws") && call->getNumResults() >= 1 &&
         sortOf(call->getResult(0).getType()).isBool)
