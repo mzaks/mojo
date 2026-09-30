@@ -110,8 +110,9 @@ The output must be exactly the `bad_*` functions.
 
 - `List` states its lengths: its constructors (empty, `capacity=`,
   `length=`, literals, `copy=`) and `append`, `pop`, `insert`, `clear`,
-  `extend`, `reverse` and `resize`; element access (`xs[i]`, `xs[0]`),
-  `pop(i)` and `insert(i, ...)` state their index bounds.
+  `extend`, `reverse` and `resize`; element access (`xs[i]`, `xs[0]`, and
+  the unchecked `unsafe_get` and `unsafe_set`), `pop(i)` and
+  `insert(i, ...)` state their index bounds.
 
 - `Span` and contiguous slices: `Span(list=)` is as long as the list,
   `span[i]` requires `i` in range, and `xs[a:b]` (on a list or a span)

@@ -98,6 +98,12 @@ def ok_nested_append() -> Int:
     return xs[0][1] + xs[1][0]
 
 
+def ok_unsafe_access() -> Int:
+    var xs: List[Int] = [1, 2, 3]
+    xs.unsafe_set(0, 5)  # checked like `xs[0] = 5`, and keeps the length
+    return xs.unsafe_get(2)
+
+
 def ok_copy(xs: List[Int]) -> Int:
     var ys = xs.copy()  # as long as the original
     if len(xs) > 0:
@@ -161,3 +167,8 @@ def bad_copy_then_grow(xs: List[Int]) -> Int:
     var zs = xs.copy()
     zs.append(1)
     return ys[len(zs) - 1]  # `ys` did not grow
+
+
+def bad_unsafe_get_past() -> Int:
+    var xs: List[Int] = [1, 2, 3]
+    return xs.unsafe_get(3)  # unchecked at run time, not statically

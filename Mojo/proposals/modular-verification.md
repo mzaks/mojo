@@ -668,6 +668,18 @@ Nested collections:
   calls proven (89), test_linked_list.mojo 153 of 173 (152),
   test_list.mojo 199 of 225 (198).
 
+`unsafe_get` and `unsafe_set`:
+
+- `List.unsafe_get(i)` and `unsafe_set(i, v)` skip the run-time bound
+  check (out of range is undefined behaviour). They now state it as a
+  precondition, so the unchecked accesses are the ones checked
+  statically, at no run-time cost; `unsafe_set` keeps the length. The pass
+  models them as an element read and an element write. test_list.mojo:
+  217 of 237 calls proven (199 of 225). `List.__getitem__(IntLiteral)`
+  calls `unsafe_get`, so the post-elaboration pass sees the new clause in
+  336 places; it cannot prove it in the same 10 list-of-lists places where
+  it cannot prove the outer bound (3438 of 3463 obligations).
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
