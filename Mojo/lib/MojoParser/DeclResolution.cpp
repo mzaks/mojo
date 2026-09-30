@@ -2998,15 +2998,22 @@ ParseResult DeclResolver::resolveBody(FnOp funcOp, Lexer &lexer,
   // "..." as the body. If it's a trait method this must mean it's not
   // defaulted so we can early exit the function here as well.
   bool isUnavailableFn = funcOp.isUnavailable();
-  if (isa_and_nonnull<TraitDeclOp>(decl.getParentDecl()->getIfOperation()) ||
-      funcOp.isExternal() || isUnavailableFn) {
+  bool isTraitFn =
+      isa_and_nonnull<TraitDeclOp>(decl.getParentDecl()->getIfOperation());
+  // A required trait method with `where` clauses keeps them: its body is the
+  // contract ops, then `hlcf.unreachable`.
+  bool contractOnly = false;
+  if (isTraitFn || funcOp.isExternal() || isUnavailableFn) {
     // Skip any docstring's that might be present.
     ParserBase p(shared, lexer);
     p.parseDocString(decl);
 
     // If we see an ellipsis, the function member is well formed: don't emit
     // arguments or any other setup logic.
-    if (p.consumeIf(Token::dot_dot_dot)) {
+    bool ellipsis = p.consumeIf(Token::dot_dot_dot);
+    contractOnly = ellipsis && isTraitFn && !isUnavailableFn &&
+                   argumentContracts.count(funcOp);
+    if (ellipsis && !contractOnly) {
       body.front().erase(); // Remove the lit.endfn op to replace it.
       auto builder = OpBuilder::atBlockEnd(&body);
       UnreachableOp::create(builder, funcOp.getLoc());
@@ -3140,6 +3147,18 @@ ParseResult DeclResolver::resolveBody(FnOp funcOp, Lexer &lexer,
       llvm::scope_exit([&] { postconditions.erase(funcOp); });
   if (failed(emitArgumentContracts(funcOp, decl, emitter)))
     return failure();
+
+  // A required trait method has no return: its postconditions follow the
+  // preconditions directly, as the contract every implementation provides.
+  if (contractOnly) {
+    if (failed(emitPostconditions(funcOp, emitter)))
+      return failure();
+    endFn.erase();
+    auto builder = OpBuilder::atBlockEnd(&body);
+    UnreachableOp::create(builder, funcOp.getLoc());
+    Decorators(decl).applyBodyDecorators();
+    return success();
+  }
 
   // With all the argument declarations set up, we can resolve the body of the
   // function.

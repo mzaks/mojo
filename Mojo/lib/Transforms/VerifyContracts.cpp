@@ -3370,6 +3370,13 @@ private:
   }
 };
 
+/// A required trait method: a declaration, whose clauses every
+/// implementation provides, with nothing to verify of its own.
+bool isRequiredTraitMethod(LIT::FnOp fn) {
+  return isa_and_nonnull<LIT::TraitDeclOp>(fn->getParentOp()) &&
+         !fn.isDefaultedTraitFn();
+}
+
 bool inStdlib(Operation *op) {
   for (Operation *parent = op->getParentOp(); parent;
        parent = parent->getParentOp())
@@ -3400,7 +3407,7 @@ struct VerifyContractsPass
     // reported afterwards, in order.
     SmallVector<LIT::FnOp> fns;
     getOperation().walk([&](LIT::FnOp fn) {
-      if (includeStdlib || !inStdlib(fn))
+      if ((includeStdlib || !inStdlib(fn)) && !isRequiredTraitMethod(fn))
         fns.push_back(fn);
     });
     struct Result {
