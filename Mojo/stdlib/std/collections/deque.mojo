@@ -126,7 +126,11 @@ struct Deque[ElementType: Movable](
     # ===-------------------------------------------------------------------===#
 
     def __init__(
-        out self,
+        # Lengths depend on `_maxlen` (a bounded deque evicts), so the
+        # constructors state it and the mutators keep it.
+        out self where self._maxlen == (maxlen if maxlen > 0 else -1) and (
+            old(elements.__bool__()) or len(self) == 0
+        ),
         *,
         var elements: Optional[List[Self.ElementType]] = None,
         capacity: Int = Self.default_capacity,
@@ -185,7 +189,7 @@ struct Deque[ElementType: Movable](
             self.extend(elements.take())
 
     def __init__(
-        out self,
+        out self where len(self) == old(len(values)) and self._maxlen == -1,
         var *values: Self.ElementType,
         __list_literal__: NoneType = None,
     ):
@@ -227,7 +231,9 @@ struct Deque[ElementType: Movable](
         self._tail = args_length
 
     def __init__(
-        out self, *, copy: Self
+        out self where len(self) == len(copy) and self._maxlen == copy._maxlen,
+        *,
+        copy: Self,
     ) where conforms_to(Self.ElementType, Copyable):
         """Creates a deep copy of the given deque.
 
@@ -500,7 +506,7 @@ struct Deque[ElementType: Movable](
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
-        ref self, idx: IntLiteral
+        ref self, idx: IntLiteral where Int(idx) < len(self)
     ) -> ref[self._unchecked_get(idx)] Self.ElementType:
         """Gets the deque element at the given index.
 
@@ -519,7 +525,7 @@ struct Deque[ElementType: Movable](
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
-        ref self, idx: Int
+        ref self, idx: Int where 0 <= idx and idx < len(self)
     ) -> ref[self._unchecked_get(idx)] Self.ElementType:
         """Gets the deque element at the given index.
 
@@ -590,7 +596,12 @@ struct Deque[ElementType: Movable](
     # ===-------------------------------------------------------------------===#
 
     def append(
-        mut self, var value: Self.ElementType
+        # A full bounded deque evicts from the other end.
+        mut self where self._maxlen == old(self._maxlen) and len(self) == (
+            old(len(self)) if old(self._maxlen) > 0
+            and old(len(self)) == old(self._maxlen) else old(len(self)) + 1
+        ),
+        var value: Self.ElementType,
     ) where conforms_to(Self.ElementType, Deinitable):
         """Appends a value to the right side of the deque.
 
@@ -613,7 +624,12 @@ struct Deque[ElementType: Movable](
             self._realloc(self._capacity << 1)
 
     def appendleft(
-        mut self, var value: Self.ElementType
+        # A full bounded deque evicts from the other end.
+        mut self where self._maxlen == old(self._maxlen) and len(self) == (
+            old(len(self)) if old(self._maxlen) > 0
+            and old(len(self)) == old(self._maxlen) else old(len(self)) + 1
+        ),
+        var value: Self.ElementType,
     ) where conforms_to(Self.ElementType, Deinitable):
         """Appends a value to the left side of the deque.
 
@@ -636,7 +652,7 @@ struct Deque[ElementType: Movable](
             self._realloc(self._capacity << 1)
 
     def clear(
-        mut self,
+        mut self where len(self) == 0 and self._maxlen == old(self._maxlen),
     ) where conforms_to(Self.ElementType, Deinitable):
         """Removes all elements from the deque leaving it with length 0.
 
@@ -676,7 +692,11 @@ struct Deque[ElementType: Movable](
         return count
 
     def extend(
-        mut self, var values: List[Self.ElementType]
+        # A bounded deque keeps only the last `maxlen` elements.
+        mut self where self._maxlen == old(self._maxlen) and (
+            self._maxlen > 0 or len(self) == old(len(self)) + old(len(values))
+        ),
+        var values: List[Self.ElementType],
     ) where conforms_to(Self.ElementType, Deinitable):
         """Extends the right side of the deque by consuming elements of the list argument.
 
@@ -716,7 +736,11 @@ struct Deque[ElementType: Movable](
         dealloc(values_alloc^)
 
     def extendleft(
-        mut self, var values: List[Self.ElementType]
+        # A bounded deque keeps only the last `maxlen` elements.
+        mut self where self._maxlen == old(self._maxlen) and (
+            self._maxlen > 0 or len(self) == old(len(self)) + old(len(values))
+        ),
+        var values: List[Self.ElementType],
     ) where conforms_to(Self.ElementType, Deinitable):
         """Extends the left side of the deque by consuming elements from the list argument.
 
@@ -798,7 +822,11 @@ struct Deque[ElementType: Movable](
 
     @inline(.always)
     def insert(
-        mut self, idx: Int, var value: Self.ElementType
+        mut self where len(self) == old(len(self)) + 1 and self._maxlen == old(
+            self._maxlen
+        ),
+        idx: Int where 0 <= idx and idx <= len(self),
+        var value: Self.ElementType,
     ) raises where conforms_to(Self.ElementType, Deinitable):
         """Inserts the `value` into the deque at position `idx`.
 
@@ -840,7 +868,10 @@ struct Deque[ElementType: Movable](
             self._realloc(self._capacity << 1)
 
     def remove(
-        mut self, value: Self.ElementType
+        mut self where len(self) == old(len(self)) - 1 and self._maxlen == old(
+            self._maxlen
+        ),
+        value: Self.ElementType,
     ) raises where conforms_to(Self.ElementType, Equatable & Deinitable):
         """Removes the first occurrence of the `value`.
 
@@ -918,7 +949,11 @@ struct Deque[ElementType: Movable](
 
         return (self._data.unsafe_offset(self._head))[].copy()
 
-    def pop(mut self) raises -> Self.ElementType:
+    def pop(
+        mut self where len(self) == old(len(self)) - 1 and self._maxlen == old(
+            self._maxlen
+        ),
+    ) raises -> Self.ElementType:
         """Removes and returns the element from the right side of the deque.
 
         Returns:
@@ -944,7 +979,11 @@ struct Deque[ElementType: Movable](
 
         return element^
 
-    def popleft(mut self) raises -> Self.ElementType:
+    def popleft(
+        mut self where len(self) == old(len(self)) - 1 and self._maxlen == old(
+            self._maxlen
+        ),
+    ) raises -> Self.ElementType:
         """Removes and returns the element from the left side of the deque.
 
         Returns:
@@ -970,7 +1009,11 @@ struct Deque[ElementType: Movable](
 
         return element^
 
-    def reverse(mut self):
+    def reverse(
+        mut self where len(self) == old(len(self)) and self._maxlen == old(
+            self._maxlen
+        ),
+    ):
         """Reverses the elements of the deque in-place."""
         var last = self._head + len(self) - 1
         for i in range(len(self) // 2):
@@ -982,7 +1025,12 @@ struct Deque[ElementType: Movable](
             )
             (self._data.unsafe_offset(src)).unsafe_write(tmp^)
 
-    def rotate(mut self, n: Int = 1):
+    def rotate(
+        mut self where len(self) == old(len(self)) and self._maxlen == old(
+            self._maxlen
+        ),
+        n: Int = 1,
+    ):
         """Rotates the deque by `n` steps.
 
         If `n` is positive, rotates to the right.
