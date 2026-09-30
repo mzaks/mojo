@@ -3253,6 +3253,13 @@ private:
     std::string value = ok && inner.yields.size() == 1
                             ? inner.yields.front()
                             : declare(sortOf(result.getType()));
+    // What the region's calls guarantee about the entry values (`count() >=
+    // 0` in `old(self.count())`) holds here too; like the facts of calls in
+    // the clause itself, it becomes a fact or premise of the clause.
+    if (ok && inner.pc != oldState->pc)
+      state.pc =
+          define({true, 1, false}, "(and " + state.pc + " " + inner.pc + ")",
+                 "r");
     values = std::move(saved);
     values[result] = value;
   }
