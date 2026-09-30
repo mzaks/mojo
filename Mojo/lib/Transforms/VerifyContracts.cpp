@@ -646,6 +646,11 @@ private:
   std::optional<Loc> placeOf(Value ref) {
     if (auto it = refArgs.find(ref); it != refArgs.end())
       return it->second;
+    // A reference to an element (`xs[i]`, used as a place itself, as in
+    // `xs[i][j]` or `xs[i].append(v)`): a place of its own, rooted at the
+    // reference, whose value is the element (see `load` and `store`).
+    if (elements.count(ref))
+      return Loc{ref, ""};
     if (auto it = derivedPlaces.find(ref); it != derivedPlaces.end())
       return it->second;
     if (isa<BlockArgument>(ref)) {
@@ -686,6 +691,12 @@ private:
       frame->loaded.insert(loc);
     if (auto it = state.env.find(loc); it != state.env.end())
       return it->second;
+    // An element's place: the element, as the collection holds it now.
+    if (loc.path.empty())
+      if (auto it = elements.find(loc.root); it != elements.end()) {
+        auto [list, index] = it->second;
+        return elem(load(list, state, placeType(list)), index, sort);
+      }
     // A field of a place whose value is known: a function of that value.
     StringRef path(loc.path);
     while (!path.empty()) {
@@ -729,10 +740,13 @@ private:
 
   void store(const Loc &loc, State &state, std::string value,
              Value stored = {}) {
-    // Writing a place replaces the values of its fields...
+    // Writing a place replaces the values of its fields, and of the places
+    // of its elements, which are read from it again...
     for (auto it = state.env.begin(); it != state.env.end();) {
-      if (it->first.root == loc.root &&
-          StringRef(it->first.path).starts_with(loc.path + "/"))
+      auto element = elements.find(it->first.root);
+      if ((it->first.root == loc.root &&
+           StringRef(it->first.path).starts_with(loc.path + "/")) ||
+          (element != elements.end() && element->second.first.root == loc.root))
         it = state.env.erase(it);
       else
         ++it;
@@ -753,6 +767,12 @@ private:
       if (isa<LIT::RefType>(stored.getType()))
         if (std::optional<Loc> target = placeOf(stored))
           state.refs[loc] = *target;
+    }
+    // Writing an element's place writes the element: the collection gets
+    // the element's new value (and keeps its length).
+    if (auto it = elements.find(loc.root); it != elements.end()) {
+      auto [list, index] = it->second;
+      storeElement(list, index, state.env[Loc{loc.root, ""}], state);
     }
   }
 
