@@ -2024,6 +2024,23 @@ private:
       return true;
     if (evalOptional(call, name, state))
       return true;
+    // `index(x)` of an `Int` (passed by reference): `x`; of an
+    // `IntLiteral`: its value, in its type.
+    if (path.starts_with("std::builtin::int::index[") &&
+        call.getNumOperands() == 1 &&
+        isa<LIT::RefType>(call.getOperands()[0].getType()))
+      if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+          symbol && symbol.getParamValues().size() == 1) {
+        TypedAttr type = resolveParam(symbol.getParamValues()[0]);
+        if (isIntType(type)) {
+          values[result] = valueThrough(call.getOperands()[0], state);
+          return true;
+        }
+        if (std::optional<int64_t> v = intLiteralType(type)) {
+          values[result] = bvConst(*v, 64);
+          return true;
+        }
+      }
     // `Int(literal)`: the literal's value.
     if (path.starts_with("std::simd::SIMD::__init__[!pop.int_literal](") &&
         call.getNumOperands() == 1) {
@@ -2111,6 +2128,61 @@ private:
       return true;
     }
     return false;
+  }
+
+  /// A parameter value with the callee parameters it names replaced by the
+  /// values their calls bind, as far as they are known.
+  TypedAttr resolveParam(TypedAttr attr) {
+    // A type passed where a wider trait is expected: the type itself.
+    while (auto upcast = dyn_cast<UpcastAttr>(attr))
+      attr = upcast.getInputTypeValue();
+    for (ParamFrame *frame = params; frame; frame = frame->parent) {
+      while (auto upcast = dyn_cast<UpcastAttr>(attr))
+        attr = upcast.getInputTypeValue();
+      auto ref = dyn_cast<ParamDeclRefAttr>(attr);
+      if (!ref)
+        break;
+      auto it = frame->values.find(ref.getName());
+      if (it == frame->values.end())
+        break;
+      attr = it->second;
+    }
+    while (auto upcast = dyn_cast<UpcastAttr>(attr))
+      attr = upcast.getInputTypeValue();
+    return attr;
+  }
+
+  /// Whether a type parameter's value is `Int`.
+  static bool isIntType(TypedAttr attr) {
+    if (auto sugar = dyn_cast<SugarAttr>(attr))
+      attr = sugar.getCanonical();
+    auto type = dyn_cast<TypeParamAttr>(attr);
+    return type && isInt(type.getTypeValue());
+  }
+
+  /// The value of an `IntLiteral` type parameter's literal.
+  static std::optional<int64_t> intLiteralType(TypedAttr attr) {
+    if (auto sugar = dyn_cast<SugarAttr>(attr))
+      attr = sugar.getCanonical();
+    auto type = dyn_cast<TypeParamAttr>(attr);
+    if (!type)
+      return std::nullopt;
+    static llvm::Regex literalRe(
+        "^!lit.struct<@std::@builtin::@int_literal::@IntLiteral"
+        "<:!pop.int_literal (-?[0-9]+)>>$");
+    SmallVector<StringRef> m;
+    int64_t v;
+    if (!literalRe.match(printed(type.getTypeValue()), &m) ||
+        m[1].getAsInteger(10, v))
+      return std::nullopt;
+    return v;
+  }
+
+  /// Whether `type` is `Int` (possibly through an alias).
+  static bool isInt(Type type) {
+    static llvm::Regex intRe("^!lit.struct<@std::@simd::@SIMD<:[^ ]* "
+                             "\\{:dtype index\\}, :[^ ]* \\{1\\}>>$");
+    return intRe.match(printed(type));
   }
 
   /// The length of the `Array` at `loc`, from its type.
