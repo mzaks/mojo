@@ -530,6 +530,8 @@ private:
     std::string scope;
   };
   ParamFrame *params = nullptr;
+  /// The references a variadic pack holds, by the pack's term.
+  std::map<std::string, SmallVector<Value>> packRefs;
   /// Element references `__getitem__` returned: the list's place and the
   /// index.
   DenseMap<Value, std::pair<Loc, std::string>> elements;
@@ -1939,6 +1941,7 @@ private:
       params = frame.parent;
     }
     assumeAssertion(call, name, state);
+    assumeListLiteral(call, name, before, state);
     // `String(literal)`: as long as the literal. Its own contract cannot say
     // so: naming `String.byte_length()` there makes the declaration depend
     // on itself (through a `String` default argument in `SIMD.cast`).
@@ -2009,6 +2012,41 @@ private:
                       "(and " + state.pc + " (=> (not " +
                           values[call->getResult(0)] + ") " + fact + "))",
                       "r");
+  }
+
+  /// A list literal (`[a, b, c]`): its elements are the values it is given,
+  /// as they were before the call (the stdlib moves them in, in order). Its
+  /// contract states only its length; a generic element type has no `==`
+  /// for a contract to state more with.
+  void assumeListLiteral(LIT::CallOp call,
+                         const std::optional<CalleeName> &name, State &before,
+                         State &state) {
+    if (!name ||
+        !StringRef(name->path)
+             .starts_with("std::collections::list::List::__init__[") ||
+        !StringRef(name->path).contains("__list_literal__") ||
+        call.getNumOperands() < 2)
+      return;
+    std::optional<Loc> packPlace = placeOf(call.getOperands()[0]);
+    std::optional<Loc> out = placeOf(call.getOperands().back());
+    if (!packPlace || !out)
+      return;
+    auto it = packRefs.find(load(*packPlace, before, placeType(*packPlace)));
+    if (it == packRefs.end())
+      return;
+    std::string list = load(*out, state, placeType(*out));
+    std::string holds = "true";
+    for (auto [k, ref] : llvm::enumerate(it->second)) {
+      std::optional<Loc> place = placeOf(ref);
+      if (!place)
+        return;
+      std::string value = load(*place, before, placeType(*place));
+      holds = "(and " + holds +
+              " (= " + elem(list, bvConst(k, 64), sortOfTerm(value)) + " " +
+              value + "))";
+    }
+    state.pc =
+        define({true, 1, false}, "(and " + state.pc + " " + holds + ")", "r");
   }
 
   /// Whether a type parameter's value is `Bool`.
@@ -2325,6 +2363,18 @@ private:
         std::string pack = declare({false, 64, false}, "g");
         facts.push_back("(= " + lenOf(pack) + " " + bvConst(n, 64) + ")");
         values[result] = pack;
+        // The references the pack holds, from the array stored into the
+        // variable it is built from (`pop.array.create [%a, %b]`).
+        if (std::optional<Loc> array = placeOf(call.getOperands()[0]);
+            array && array->path.empty())
+          for (Operation *user : array->root.getUsers())
+            if (auto store = dyn_cast<LIT::RefStoreOp>(user);
+                store && store->getOperand(1) == array->root)
+              if (Operation *create = store->getOperand(0).getDefiningOp();
+                  create &&
+                  create->getName().getStringRef() == "pop.array.create" &&
+                  create->getNumOperands() == (unsigned)n)
+                packRefs[pack] = SmallVector<Value>(create->getOperands());
         return true;
       }
     }
