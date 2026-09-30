@@ -1934,6 +1934,27 @@ private:
           return sub(0, sort);
         break;
       case POC::Apply:
+        // `max_or_inf[dtype]()` and `min_or_neg_inf[dtype]()` of an integer
+        // dtype (`Int.MAX`, `UInt8.MIN`): its bounds.
+        if (ops.size() == 1)
+          if (std::optional<CalleeName> name = calleeName(ops[0]);
+              name && name->params.size() == 1)
+            if (std::optional<Sort> intSort = dtypeSort(name->params[0]);
+                intSort && !sort.isBool && intSort->width == sort.width) {
+              StringRef path = name->path;
+              bool max = path.starts_with("std::utils::numerics::max_or_inf[");
+              if (max ||
+                  path.starts_with("std::utils::numerics::min_or_neg_inf[")) {
+                unsigned w = intSort->width;
+                APInt bound = intSort->isSigned
+                                  ? (max ? APInt::getSignedMaxValue(w)
+                                         : APInt::getSignedMinValue(w))
+                                  : (max ? APInt::getMaxValue(w)
+                                         : APInt::getMinValue(w));
+                return "(_ bv" + llvm::toString(bound, 10, /*Signed=*/false) +
+                       " " + std::to_string(w) + ")";
+              }
+            }
         if (ops.size() >= 2)
           if (std::optional<CalleeName> name = calleeName(ops[0]);
               name && name->params.size() >= 2 &&
