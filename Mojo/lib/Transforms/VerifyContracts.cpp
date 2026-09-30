@@ -1840,6 +1840,25 @@ private:
       assumeEnsures(call, callee, before, state);
       params = frame.parent;
     }
+    // `String(literal)`: as long as the literal. Its own contract cannot say
+    // so: naming `String.byte_length()` there makes the declaration depend
+    // on itself (through a `String` default argument in `SIMD.cast`).
+    if (name &&
+        StringRef(name->path)
+            .starts_with("std::collections::string::string::String::__init__["
+                         "!kgen.string](::StringLiteral[") &&
+        call.getNumOperands() == 2 &&
+        isa<LIT::RefType>(call.getOperands()[1].getType()))
+      if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+          symbol && symbol.getParamValues().size() == 1)
+        if (std::optional<int64_t> n =
+                stringLength(resolveParam(symbol.getParamValues()[0]))) {
+          std::string string = valueThrough(call.getOperands()[1], state);
+          state.pc = define({true, 1, false},
+                            "(and " + state.pc + " (= " + lenOf(string) + " " +
+                                bvConst(*n, 64) + "))",
+                            "r");
+        }
   }
 
   /// The parameters `call` binds for `callee`: the callee's struct's
@@ -2044,6 +2063,29 @@ private:
       return true;
     if (evalOptional(call, name, state))
       return true;
+    // A string's length in bytes: `len` of its value (`String` has no
+    // `__len__` of its own); a literal's, from its type.
+    if ((path.starts_with(
+             "std::collections::string::string::String::byte_length(") ||
+         path.starts_with("std::collections::string::string_span::StringSpan::"
+                          "byte_length(")) &&
+        call.getNumOperands() == 1) {
+      Value self = call.getOperands()[0];
+      std::string value = isa<LIT::RefType>(self.getType())
+                              ? valueThrough(self, state)
+                              : term(self, state);
+      values[result] = define({false, 64, true}, lenOf(value));
+      return true;
+    }
+    if (path.starts_with(
+            "std::builtin::string_literal::StringLiteral::byte_length("))
+      if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+          symbol && symbol.getParamValues().size() == 1)
+        if (std::optional<int64_t> n =
+                stringLength(resolveParam(symbol.getParamValues()[0]))) {
+          values[result] = bvConst(*n, 64);
+          return true;
+        }
     // `index(x)` of an `Int` (passed by reference): `x`; of an
     // `IntLiteral`: its value, in its type.
     if (path.starts_with("std::builtin::int::index[") &&
@@ -2196,6 +2238,15 @@ private:
         m[1].getAsInteger(10, v))
       return std::nullopt;
     return v;
+  }
+
+  /// The length in bytes of a `!kgen.string` parameter value.
+  static std::optional<int64_t> stringLength(TypedAttr attr) {
+    if (auto sugar = dyn_cast<SugarAttr>(attr))
+      attr = sugar.getCanonical();
+    if (auto str = dyn_cast<StringAttr>(attr))
+      return str.getValue().size();
+    return std::nullopt;
   }
 
   /// Whether `type` is `Int` (possibly through an alias).
