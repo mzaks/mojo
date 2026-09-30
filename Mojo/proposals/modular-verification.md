@@ -597,6 +597,36 @@ Stage 6, `reversed(range(...))`:
   assertions (`assert_equal(len(a), len(b))`), which generic `assert_*`
   functions cannot state before elaboration.
 
+Test assertions and integer conversions:
+
+- Much of what the tests index is set up by assertions:
+  `assert_equal(len(backward), len(forward))` before a loop over both.
+  The generic `assert_*` functions cannot state before elaboration what
+  they check (`T.__eq__` is a trait method), so the pass builds in their
+  definitions: after `assert_true(c)`, `assert_false(c)`,
+  `assert_equal(a, b)` or `assert_not_equal(a, b)`, the check holds where
+  the call did not raise. Only for `Bool` conditions and for `Int`, `Bool`
+  and integer scalar operands, whose `==` is equality of the terms; for
+  other types a user-defined `__eq__` need not be.
+- Integer conversions between `SIMD` integer types (`Int(n)` of a
+  `UInt8`) extend by the source's signedness or truncate, as integer
+  `cast` does. Terms of different widths meeting in one fact make the
+  script ill-sorted, which z3 rejects and the pass reports as unproven;
+  both additions check widths, and no script from the examples and test
+  files has a sort error.
+- One run each:
+
+  | File                  | Before     | Now        |
+  |-----------------------|------------|------------|
+  | test_range.mojo       | 4 of 15    | 15 of 15   |
+  | test_dict.mojo        | 1 of 32    | 15 of 32   |
+  | test_linked_list.mojo | 124 of 173 | 139 of 173 |
+  | test_list.mojo        | 176 of 225 | 185 of 225 |
+  | test_span.mojo        | 84 of 110  | 93 of 110  |
+  | test_array.mojo       | 30 of 38   | 37 of 38   |
+  | test_deque.mojo       | 82 of 105  | 89 of 105  |
+  | test_string_span.mojo | 50 of 57   | 55 of 57   |
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
