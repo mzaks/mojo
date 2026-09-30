@@ -580,6 +580,8 @@ private:
   std::map<Loc, std::string> entryValues;
   std::map<std::pair<Loc, unsigned>, std::string> epochValues;
   std::map<std::pair<std::string, std::string>, std::string> fieldValues;
+  /// The fields of values modelled constructors built (`storeFields`).
+  std::map<std::pair<std::string, std::string>, std::string> builtFields;
   /// The struct value and field path each field value belongs to.
   std::map<std::string, std::pair<std::string, std::string>> fieldOwners;
   DenseMap<Value, Loc> refArgs; // Contract block arguments bound to places.
@@ -814,6 +816,15 @@ private:
   /// The value of field path `rest` of the struct value `value`.
   std::string fieldOf(const std::string &value, const std::string &rest,
                       Sort sort) {
+    if (auto it = fieldValues.find({value, rest}); it != fieldValues.end())
+      return it->second;
+    // Through a field a constructor built it with (`/1` of a tuple literal,
+    // for `/1/has`).
+    for (size_t cut = rest.rfind('/'); cut != 0 && cut != std::string::npos;
+         cut = rest.rfind('/', cut - 1))
+      if (auto it = builtFields.find({value, rest.substr(0, cut)});
+          it != builtFields.end())
+        return fieldOf(it->second, rest.substr(cut), sort);
     auto [field, inserted] = fieldValues.try_emplace({value, rest}, "");
     if (inserted) {
       field->second = declare(sort, "f");
@@ -2151,6 +2162,8 @@ private:
       return;
     if (name && evalElementWrite(call, *name, state))
       return;
+    if (name && evalTupleLiteral(call, *name, state))
+      return;
     if (name && callee && evalIteration(call, *name, callee, state))
       return;
     if (name && evalBuiltin(call, *name, state))
@@ -2736,6 +2749,33 @@ private:
     return true;
   }
 
+  /// `Tuple(*pack)`, as a tuple literal builds it (`(n, None)`): field `/k`
+  /// is the value the pack's `k`th reference refers to.
+  bool evalTupleLiteral(LIT::CallOp call, const CalleeName &name,
+                        State &state) {
+    if (!StringRef(name.path).starts_with("std::builtin::tuple::Tuple::__init__[") ||
+        !StringRef(name.path).contains("](*$0)") || call.getNumOperands() != 2)
+      return false;
+    std::optional<Loc> packPlace = placeOf(call.getOperands()[0]);
+    std::optional<Loc> out = placeOf(call.getOperands()[1]);
+    if (!packPlace || !out)
+      return false;
+    auto it = packRefs.find(load(*packPlace, state, placeType(*packPlace)));
+    if (it == packRefs.end())
+      return false;
+    SmallVector<std::pair<std::string, std::string>> fields;
+    for (auto [k, ref] : llvm::enumerate(it->second)) {
+      std::optional<Loc> place = placeOf(ref);
+      if (!place)
+        return false;
+      fields.push_back({"/" + std::to_string(k),
+                        load(*place, state, placeType(*place))});
+    }
+    storeFields(*out, state, fields);
+    setResultsUnknown(call);
+    return true;
+  }
+
   /// `List.unsafe_set(i, v)`: writing element `i`, as `xs[i] = v` does.
   bool evalElementWrite(LIT::CallOp call, const CalleeName &name,
                         State &state) {
@@ -2891,6 +2931,17 @@ private:
       values[result] = term(call.getOperands()[0], state);
       return true;
     }
+    // The pack of a heterogeneous variadic call (a tuple literal): the
+    // references it is built from (`lit.ref.pack.create`).
+    if (path.starts_with("std::builtin::variadics::VariadicPack::__init__(") &&
+        call.getNumOperands() == 1)
+      if (Operation *create = call.getOperands()[0].getDefiningOp();
+          create && create->getName().getStringRef() == "lit.ref.pack.create") {
+        std::string pack = declare({false, 64, false}, "g");
+        packRefs[pack] = SmallVector<Value>(create->getOperands());
+        values[result] = pack;
+        return true;
+      }
     // The pack of a variadic call (`[1, 2, 3]`): as long as the array of
     // references it is built from (`array<3, ...>`).
     if ((path.starts_with("std::builtin::variadics::VariadicList::__init__[") ||
@@ -3108,9 +3159,14 @@ private:
   /// a fresh value, its fields the given terms.
   void storeFields(const Loc &loc, State &state,
                    ArrayRef<std::pair<std::string, std::string>> fields) {
-    store(loc, state, declare({false, 64, false}, "g"));
-    for (auto &[field, value] : fields)
+    std::string built = declare({false, 64, false}, "g");
+    store(loc, state, built);
+    // The value keeps its fields wherever it is moved or copied to.
+    for (auto &[field, value] : fields) {
       state.env[Loc{loc.root, loc.path + field}] = value;
+      fieldValues[{built, field}] = value;
+      builtFields[{built, field}] = value;
+    }
   }
 
   /// `Optional` (of an integer or Boolean) as the stdlib defines it: whether
