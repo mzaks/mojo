@@ -2432,11 +2432,15 @@ private:
     StringRef path = name.path;
     const char *optional = "std::collections::optional::Optional::";
     const char *slice = "std::builtin::builtin_slice::ContiguousSlice::";
+    const char *strided = "std::builtin::builtin_slice::StridedSlice::";
     bool isOptional = path.starts_with(optional);
     bool isSlice = path.starts_with(slice);
-    if (!isOptional && !isSlice)
+    bool isStrided = path.starts_with(strided);
+    if (!isOptional && !isSlice && !isStrided)
       return false;
-    StringRef method = path.drop_front(strlen(isOptional ? optional : slice));
+    StringRef method = path.drop_front(strlen(isOptional ? optional
+                                              : isSlice  ? slice
+                                                         : strided));
     ValueRange ops = call.getOperands();
     auto place = [&](Value v) { return placeOf(v); };
     Sort flag{true, 1, false};
@@ -2461,6 +2465,26 @@ private:
       storeFields(*out, state,
                   {{"/start/has", has(*start)}, {"/start/val", val(*start)},
                    {"/end/has", has(*end)}, {"/end/val", val(*end)}});
+      setResultsUnknown(call);
+      return true;
+    }
+    // `StridedSlice(start, end, stride)`: its inner `Slice`'s fields, with a
+    // step that is always present.
+    if (isStrided) {
+      if (!method.starts_with("__init__(::Optional") || ops.size() < 4)
+        return false;
+      std::optional<Loc> start = place(ops[0]), end = place(ops[1]),
+                         out = place(ops.back());
+      if (!start || !end || !out || sortOf(ops[2].getType()).width != 64 ||
+          sortOf(ops[2].getType()).isBool)
+        return false;
+      storeFields(*out, state,
+                  {{"/_inner/start/has", has(*start)},
+                   {"/_inner/start/val", val(*start)},
+                   {"/_inner/end/has", has(*end)},
+                   {"/_inner/end/val", val(*end)},
+                   {"/_inner/step/has", "true"},
+                   {"/_inner/step/val", term(ops[2], state)}});
       setResultsUnknown(call);
       return true;
     }
