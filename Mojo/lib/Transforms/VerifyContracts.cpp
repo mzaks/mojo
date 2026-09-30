@@ -390,6 +390,9 @@ struct Obligation {
   bool analyzed = true;
   /// The function's own postcondition, at a return (`callLoc`).
   bool postcondition = false;
+  /// For a refinement check, the implementation of the trait method
+  /// `callee` that is held to its clauses.
+  std::string implementation;
 };
 
 /// A loop being walked: where its iterations continue and exit, and what
@@ -423,13 +426,32 @@ struct Candidate {
   bool length = false;
 };
 
+/// A function's postcondition: its `kgen.ensures` clauses, which are
+/// repeated before every return; the ones before the first return.
+SmallVector<EnsuresOp> postconditionClauses(LIT::FnOp fn) {
+  EnsuresOp first;
+  fn.getFunctionBody().walk([&](EnsuresOp op) {
+    if (!first)
+      first = op;
+  });
+  SmallVector<EnsuresOp> clauses;
+  for (Operation *op = first.getOperation();
+       op && !op->hasTrait<OpTrait::IsTerminator>(); op = op->getNextNode())
+    if (auto ensures = dyn_cast<EnsuresOp>(op))
+      clauses.push_back(ensures);
+  return clauses;
+}
+
 class FunctionEncoder {
 public:
+  /// With `refines`, checks instead that `fn` implements the trait method
+  /// `refines`: that the trait's precondition implies `fn`'s, and that `fn`
+  /// establishes the trait's postcondition where it returns.
   FunctionEncoder(LIT::FnOp fn, ModuleOp module,
                   SymbolTableCollection &symbols, const SolverConfig &solver,
-                  std::string dumpPrefix)
+                  std::string dumpPrefix, LIT::FnOp refines = {})
       : fn(fn), module(module), symbols(symbols), solver(solver),
-        dumpPrefix(std::move(dumpPrefix)) {}
+        dumpPrefix(std::move(dumpPrefix)), refines(refines) {}
 
   /// Encodes the function; returns false if it has no body.
   bool encode() {
@@ -457,14 +479,48 @@ public:
     }
     fn.walk([&](LIT::VarDeclOp decl) { roots.push_back(decl->getResult(0)); });
     State state;
-    // The function's own preconditions hold at its entry.
+    // A caller through the trait establishes only the trait's precondition,
+    // which must imply the implementation's own.
+    if (refines) {
+      for (Operation &op : refines.getFunctionBody().front())
+        if (auto req = dyn_cast<RequiresOp>(&op))
+          if (MaybeTerm cond =
+                  instantiate(req.getBody(), req.getArgs(), state,
+                              entry.getArguments(), refines, nullptr,
+                              /*assumed=*/true))
+            facts.push_back(*cond);
+      for (Operation &op : entry)
+        if (auto req = dyn_cast<RequiresOp>(&op)) {
+          Obligation ob{state.pc, "false", fn.getLoc(), req.getLoc(),
+                        displayName(refines)};
+          ob.implementation = displayName(fn);
+          if (MaybeTerm cond = instantiate(req.getBody(), req.getArgs(), state,
+                                           {}, {}, nullptr, false))
+            ob.cond = *cond;
+          else
+            ob.analyzed = false;
+          obligations.push_back(ob);
+        }
+    }
+    // The function's own preconditions hold at its entry (when refining,
+    // after they are proven there: on the path, not as global facts).
     for (Operation &op : entry)
       if (auto req = dyn_cast<RequiresOp>(&op))
         if (MaybeTerm cond = instantiate(req.getBody(), req.getArgs(), state,
-                                         {}, {}, nullptr, /*assumed=*/true))
-          facts.push_back(*cond);
+                                         {}, {}, nullptr, /*assumed=*/true)) {
+          if (refines)
+            state.pc = define({true, 1, false},
+                              "(and " + state.pc + " " + *cond + ")", "r");
+          else
+            facts.push_back(*cond);
+        }
     entryState = state;
     walkBlock(entry, state);
+    // The body's own obligations are checked by the function's own run.
+    if (refines)
+      llvm::erase_if(obligations, [](const Obligation &ob) {
+        return ob.implementation.empty();
+      });
     return true;
   }
 
@@ -486,6 +542,7 @@ private:
   const SolverConfig &solver;
   DenseMap<Value, unsigned> order;
   std::string dumpPrefix;
+  LIT::FnOp refines;
   unsigned houdiniRuns = 0;
 
   DenseMap<Value, std::string> values;
@@ -1057,6 +1114,8 @@ private:
       return;
     }
     if (isa<HLCF::ReturnOp>(op)) {
+      if (refines && !inContract)
+        proveTraitEnsures(op, state);
       state.alive = false;
       return;
     }
@@ -1576,6 +1635,28 @@ private:
     else
       ob.analyzed = false;
     obligations.push_back(ob);
+  }
+
+  /// Where the implementation returns, the trait method's postcondition, on
+  /// its arguments and the returned value (for a named result).
+  void proveTraitEnsures(Operation *ret, State &state) {
+    Block &entry = fn.getFunctionBody().front();
+    callResult = ret->getNumOperands() == 1 ? ret->getOperand(0) : Value();
+    State *old = entryState ? &*entryState : nullptr;
+    for (EnsuresOp ensures : postconditionClauses(refines)) {
+      Obligation ob{state.pc, "false", ret->getLoc(), ensures.getLoc(),
+                    displayName(refines)};
+      ob.postcondition = true;
+      ob.implementation = displayName(fn);
+      if (MaybeTerm cond =
+              instantiate(ensures.getBody(), ensures.getArgs(), state,
+                          entry.getArguments(), refines, old, false))
+        ob.cond = *cond;
+      else
+        ob.analyzed = false;
+      obligations.push_back(ob);
+    }
+    callResult = {};
   }
 
   /// Code the encoder does not follow: memory is unknown after it, and its
@@ -2316,22 +2397,11 @@ private:
   /// After a call, the callee's postcondition: its arguments as they are
   /// now, its `old`s as they were before the call. A raising callee's holds
   /// only where it did not raise (its first result is the raised flag).
-  /// Each clause is a `kgen.ensures` of its own, repeated before every
-  /// return; the ones before the first return are the postcondition.
   void assumeEnsures(LIT::CallOp call, LIT::FnOp callee, State &before,
                      State &state) {
-    EnsuresOp first;
-    callee.getFunctionBody().walk([&](EnsuresOp op) {
-      if (!first)
-        first = op;
-    });
-    if (!first)
+    SmallVector<EnsuresOp> clauses = postconditionClauses(callee);
+    if (clauses.empty())
       return;
-    SmallVector<EnsuresOp> clauses;
-    for (Operation *op = first; op && !op->hasTrait<OpTrait::IsTerminator>();
-         op = op->getNextNode())
-      if (auto ensures = dyn_cast<EnsuresOp>(op))
-        clauses.push_back(ensures);
     callResult = call->getNumResults() == 1 ? call->getResult(0) : Value();
     std::string holds = "true";
     for (EnsuresOp ensures : clauses)
@@ -3543,25 +3613,57 @@ struct VerifyContractsPass
       (void)llvm::sys::fs::create_directories(cacheDir);
     // Functions are verified independently, in parallel; their results are
     // reported afterwards, in order.
-    SmallVector<LIT::FnOp> fns;
+    // Each function, and each implementation of a trait method with
+    // clauses against them (`refines`).
+    struct Job {
+      LIT::FnOp fn, refines;
+    };
+    SmallVector<Job> fns;
     getOperation().walk([&](LIT::FnOp fn) {
       if ((includeStdlib || !inStdlib(fn)) && !isRequiredTraitMethod(fn) &&
           !isDefaultWrapper(fn))
-        fns.push_back(fn);
+        fns.push_back({fn, {}});
     });
+    ModuleOp module = getOperation();
+    {
+      SymbolTableCollection symbols;
+      getOperation().walk([&](ConformanceOp conformance) {
+        if (!includeStdlib && inStdlib(conformance))
+          return;
+        auto trait = dyn_cast_or_null<LIT::TraitDeclOp>(symbols.lookupSymbolIn(
+            module, conformance.getTraitSymbol().getSymbol()));
+        if (!trait)
+          return;
+        for (auto witness : conformance.getBody().getOps<WitnessOp>()) {
+          auto method = dyn_cast_or_null<LIT::FnOp>(
+              symbols.lookupSymbolIn(trait, witness.getSymNameAttr()));
+          auto value = dyn_cast<SymbolConstantAttr>(witness.getValue());
+          if (!method || !value || method.getFunctionBody().empty())
+            continue;
+          auto impl = dyn_cast_or_null<LIT::FnOp>(
+              symbols.lookupSymbolIn(module, value.getSymbol()));
+          bool hasClauses = !method.getFunctionBody()
+                                 .getOps<RequiresOp>()
+                                 .empty() ||
+                            !postconditionClauses(method).empty();
+          if (impl && hasClauses && !isDefaultWrapper(impl))
+            fns.push_back({impl, method});
+        }
+      });
+    }
     struct Result {
       SmallVector<Obligation> obligations;
       SmallVector<Answer> answers;
       unsigned loops = 0, invariants = 0;
     };
     std::vector<Result> results(fns.size());
-    ModuleOp module = getOperation();
     llvm::DefaultThreadPool pool(llvm::hardware_concurrency());
     for (size_t i = 0; i < fns.size(); ++i)
       pool.async([&, i] {
       SymbolTableCollection symbols;
       std::string name = "f" + std::to_string(i);
-      FunctionEncoder enc(fns[i], module, symbols, solver, name);
+      FunctionEncoder enc(fns[i].fn, module, symbols, solver, name,
+                          fns[i].refines);
       if (!enc.encode())
         return;
       Result &result = results[i];
@@ -3591,9 +3693,21 @@ struct VerifyContractsPass
       for (auto [ob, answer] : llvm::zip(result.obligations, result.answers)) {
         ++total;
         StringRef what = ob.postcondition ? "postcondition" : "precondition";
+        // A refinement: `Box.get`'s precondition follows from
+        // `Counter.get`'s; `Box.bump` establishes `Counter.bump`'s
+        // postcondition.
+        std::string claim =
+            ob.implementation.empty() ? ""
+            : ob.postcondition
+                ? "that '" + ob.implementation + "' establishes the " +
+                      what.str() + " of '" + ob.callee + "'"
+                : "that the precondition of '" + ob.implementation +
+                      "' follows from that of '" + ob.callee + "'";
         if (answer == Answer::Proven) {
           ++proven;
-          if (verbose)
+          if (verbose && !claim.empty())
+            mlir::emitRemark(ob.callLoc) << "proven " << claim;
+          else if (verbose)
             mlir::emitRemark(ob.callLoc)
                 << what << " of '" << ob.callee << "' proven";
           continue;
@@ -3601,7 +3715,10 @@ struct VerifyContractsPass
         auto diag = mlir::emitWarning(ob.callLoc);
         switch (answer) {
         case Answer::Unproven:
-          diag << "cannot prove the " << what << " of '" << ob.callee << "'";
+          if (!claim.empty())
+            diag << "cannot prove " << claim;
+          else
+            diag << "cannot prove the " << what << " of '" << ob.callee << "'";
           break;
         case Answer::Unknown:
           diag << "the " << what << " of '" << ob.callee
