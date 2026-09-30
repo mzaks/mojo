@@ -289,7 +289,7 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
     # --------------------------------------------------------------------- #
 
     @inline(.always)
-    def set(mut self, idx: Int):
+    def set(mut self, idx: Int where 0 <= idx and idx < Self.size):
         """Sets the bit at the specified index `idx` to 1.
 
         If `idx` is greater than or equal to the current logical size,
@@ -304,7 +304,7 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
         self._words.unsafe_get(w) |= Int64(_bit_mask(idx))
 
     @inline(.always)
-    def clear(mut self, idx: Int):
+    def clear(mut self, idx: Int where 0 <= idx and idx < Self.size):
         """Clears the bit at the specified index `idx` (sets it to 0).
 
         Aborts if `idx` is negative or greater than or equal to the
@@ -318,7 +318,7 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
         self._words.unsafe_get(w) &= Int64(~_bit_mask(idx))
 
     @inline(.always)
-    def toggle(mut self, idx: Int):
+    def toggle(mut self, idx: Int where 0 <= idx and idx < Self.size):
         """Toggles (inverts) the bit at the specified index `idx`.
 
         If the bit becomes 1 and `idx` is greater than or equal to the
@@ -333,7 +333,7 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
         self._words.unsafe_get(w) ^= Int64(_bit_mask(idx))
 
     @inline(.always)
-    def test(self, idx: Int) -> Bool:
+    def test(self, idx: Int where 0 <= idx and idx < Self.size) -> Bool:
         """Tests if the bit at the specified index `idx` is set (is 1).
 
         Aborts if `idx` is negative or greater than or equal to the
