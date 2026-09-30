@@ -128,6 +128,13 @@ The output must be exactly the `bad_*` functions.
   `extend`, `clear` and `reverse` state lengths. Indices are generic
   (`I: Indexer`): `index(i)` is `i` for an `Int` and the literal's value
   for an `IntLiteral`.
+- Strings: `s.byte_length()` of a `String` or `StringSlice` is `len` of its
+  value, and of a literal the literal's length. `s[byte=i]` requires `i`
+  in range, `s[byte=a:b]` requires `0 <= a <= b <= s.byte_length()` and has
+  `b - a` bytes, `as_bytes()` is as long as the string, `s += t` adds
+  `t.byte_length()`, and `String()`, `String(literal)` and the
+  `StringSlice` constructors state their lengths. That `s[byte=i]` must
+  also fall on a codepoint boundary is not stated.
 - Element access through `ref self` (`List`, `Deque` and `Array`
   `__getitem__`, `LinkedList.get_nth`) keeps the collection: it reads an
   element and does not write the collection, although its origin may be
@@ -152,3 +159,4 @@ generic `T` has no `==` to state it with).
 | `spans.mojo`         | all `bad_*`        | all `ok_*`       |
 | `arrays.mojo`        | all `bad_*`        | all `ok_*`       |
 | `collections.mojo`   | all `bad_*`        | all `ok_*`       |
+| `strings.mojo`       | all `bad_*`        | all `ok_*`       |
