@@ -90,6 +90,29 @@ def ok_reversed_pairs(xs: List[Int]) -> Int:
     return t
 
 
+def ok_enumerate(xs: List[Int]) -> Int:
+    var t = 0
+    for i, x in enumerate(xs):
+        t += x + xs[i]  # the count stays below the length
+    return t
+
+
+def ok_iterate_with_counter(xs: List[Int]) -> Int:
+    var t = 0
+    var i = 0
+    for x in xs:
+        t += x + xs[i]  # one element per step
+        i += 1
+    return t
+
+
+def ok_enumerate_span(s: Span[Int, _]) -> Int:
+    var t = 0
+    for i, x in enumerate(s):
+        t += x + s[i]
+    return t
+
+
 # --- must stay UNPROVEN ---
 def bad_one_past(xs: List[Int]) -> Int:
     var s = 0
@@ -140,4 +163,18 @@ def bad_reversed_below(xs: List[Int]) -> Int:
     var t = 0
     for i in reversed(range(len(xs))):
         t += xs[i - 1]  # `i` reaches 0
+    return t
+
+
+def bad_enumerate_next(xs: List[Int]) -> Int:
+    var t = 0
+    for i, x in enumerate(xs):
+        t += x + xs[i + 1]  # past the end on the last step
+    return t
+
+
+def bad_enumerate_other(xs: List[Int], ys: List[Int]) -> Int:
+    var t = 0
+    for i, x in enumerate(xs):
+        t += x + ys[i]  # `ys` may be shorter
     return t

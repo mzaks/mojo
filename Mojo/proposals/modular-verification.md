@@ -680,6 +680,24 @@ Nested collections:
   336 places; it cannot prove it in the same 10 list-of-lists places where
   it cannot prove the outer bound (3438 of 3463 obligations).
 
+Iterating collections and `enumerate`:
+
+- `for x in xs` and `for i, x in enumerate(xs)` over a `List`, `Span`,
+  `Array` or `Deque` are built in, as their iterators define them: an
+  iterator holds a cursor from 0 and the collection's length when it was
+  made; `__next__` raises at the length and otherwise advances.
+  `enumerate` wraps one with a count from `start` and yields a tuple
+  whose first field is the count; a tuple's `__getitem_param__[k]` is its
+  field `k`. The yielded elements are unknown, and reversed iteration over
+  collections is not modelled.
+- A counter the loop increments next to the iterator is related to the
+  cursor by the invariants Houdini already tries (`i` between the
+  cursor's bounds), so `for x in xs: ... xs[i]; i += 1` proves too.
+- test_span.mojo: 101 of 110 calls proven (93), test_deque.mojo 97 of 105
+  (95). Iterator loops now have invariants to find: test_span.mojo takes
+  1.4 s instead of 0.9 s (254 invariants instead of 143; both measured
+  back to back at load 14), test_list.mojo is unchanged at 1.8 s.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through

@@ -82,6 +82,11 @@ The output must be exactly the `bad_*` functions.
 - A call changes only what it can write: memory reachable through its `mut`
   references is unknown after it (`bad_after_mut_call`), and memory passed by
   immutable reference is kept (`ok_after_imm_call`). Its results are unknown.
+- Iterating a `List`, `Span`, `Array` or `Deque` (`for x in xs`, and
+  `for i, x in enumerate(xs)`) yields exactly `len(xs)` times: the
+  iterator holds a cursor and the length it started with, and
+  `enumerate`'s count is the cursor (plus `start`). The elements it yields
+  are unknown; reversed iteration over collections is not modelled.
 - Control flow: `if` (with `elif`), `return`, `try`, and loops (`for` over
   `reversed(range(n))`, `reversed(range(start, end))`, `range(n)` and
   `range(start, end)`, `while`, `break`). `range` iteration follows the
