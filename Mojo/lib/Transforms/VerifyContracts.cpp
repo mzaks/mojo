@@ -1577,8 +1577,18 @@ private:
     }
     std::sort(fixed.begin(), fixed.end());
     fixed.erase(std::unique(fixed.begin(), fixed.end()), fixed.end());
+    // Whether an iteration may change the value at `loc`: some end of the
+    // body holds another term for it than the loop head.
+    auto changes = [&](const Loc &loc) {
+      std::string h = load(loc, head, Sort{false, 64, false});
+      return llvm::any_of(frame.continues, [&](const State &end) {
+        return load(loc, const_cast<State &>(end), Sort{false, 64, false}) !=
+               h;
+      });
+    };
     SmallVector<Candidate> candidates;
     for (const Loc &loc : lists) {
+      bool resized = changes(loc);
       candidates.push_back({loc, "bvsge", std::nullopt, bvConst(0, 64), true});
       for (const std::string &t : fixed)
         for (const char *op : {"bvsle", "bvsge"})
@@ -1586,10 +1596,10 @@ private:
       for (const Loc &other : places) {
         for (const char *op : {"bvsle", "bvslt", "bvsge"})
           candidates.push_back({loc, op, other, "", true});
-        // Not against an iterator's end or length, which the loop does not
-        // change: that is a bound on the length, already a candidate.
-        if (!StringRef(other.path).ends_with("/end") &&
-            !StringRef(other.path).ends_with("/length"))
+        // Only a list and a variable the iteration both change: against
+        // one it does not (an iterator's end, a bound), the template
+        // restates a bound on the length.
+        if (resized && changes(other))
           for (const char *combine : {"bvadd", "bvsub"})
             candidates.push_back({loc, "=", other, "", true, combine});
       }
@@ -1625,35 +1635,42 @@ private:
     SmallVector<State *> ends;
     for (const State &s : frame.continues)
       ends.push_back(const_cast<State *>(&s));
-    std::vector<bool> kept(candidates.size(), true);
-    for (unsigned round = 0; round < 8; ++round) {
-      // The queries, in the order `rebuild` emits them.
-      SmallVector<size_t> asked;
-      for (size_t i = 0; i < candidates.size(); ++i)
-        if (kept[i])
-          asked.append(1 + ends.size(), i);
-      std::string text = rebuild(candidates, kept, before, head, ends, render);
-      std::optional<SmallVector<Answer>> answers = runZ3(
-          solver, text, dumpPrefix + ".houdini" + std::to_string(houdiniRuns++));
-      bool changed = false;
-      for (auto [k, i] : llvm::enumerate(asked)) {
-        bool proven = answers && k < answers->size() &&
-                      (*answers)[k] == Answer::Proven;
-        if (!proven && kept[i]) {
-          kept[i] = false;
-          changed = true;
+    auto houdini = [&](ArrayRef<Candidate> set) {
+      std::vector<bool> kept(set.size(), true);
+      for (unsigned round = 0; round < 8; ++round) {
+        // The queries, in the order `rebuild` emits them.
+        SmallVector<size_t> asked;
+        for (size_t i = 0; i < set.size(); ++i)
+          if (kept[i])
+            asked.append(1 + ends.size(), i);
+        std::string text = rebuild(set, kept, before, head, ends, render);
+        std::optional<SmallVector<Answer>> answers = runZ3(
+            solver, text, dumpPrefix + ".houdini" + std::to_string(houdiniRuns++));
+        bool changed = false;
+        for (auto [k, i] : llvm::enumerate(asked)) {
+          bool proven = answers && k < answers->size() &&
+                        (*answers)[k] == Answer::Proven;
+          if (!proven && kept[i]) {
+            kept[i] = false;
+            changed = true;
+          }
         }
+        if (!changed)
+          break;
       }
-      if (!changed)
-        break;
-    }
-    for (size_t i = 0; i < candidates.size(); ++i)
-      if (kept[i]) {
-        facts.push_back(
-            ("(=> " + headReach + " " + render(candidates[i], head) + ")")
-                .str());
-        ++invariantsFound;
-      }
+      for (size_t i = 0; i < set.size(); ++i)
+        if (kept[i]) {
+          facts.push_back(
+              ("(=> " + headReach + " " + render(set[i], head) + ")")
+                  .str());
+          ++invariantsFound;
+        }
+    };
+    // The templates relating a length to a loop variable last, so that
+    // `rebuild` can keep them out of the others' assumptions.
+    std::stable_partition(candidates.begin(), candidates.end(),
+                          [](const Candidate &c) { return c.combine.empty(); });
+    houdini(candidates);
   }
 
   /// The Houdini script for the kept candidates: rendering first (which may
@@ -1662,21 +1679,32 @@ private:
   std::string rebuild(ArrayRef<Candidate> candidates,
                       const std::vector<bool> &kept, State &before,
                       State &head, ArrayRef<State *> ends, Render &render) {
+    // The templates relating a length to a loop variable (`combine`, last)
+    // are assumed only in their own queries: assumed in every query, they
+    // made z3 much slower on the whole script, although each query alone
+    // stayed quick.
     SmallVector<std::string> assumed;
+    size_t plain = 0;
     for (size_t i = 0; i < candidates.size(); ++i)
-      if (kept[i])
+      if (kept[i]) {
         assumed.push_back(render(candidates[i], head));
+        if (candidates[i].combine.empty())
+          plain = assumed.size();
+      }
     std::string queries;
     for (size_t i = 0; i < candidates.size(); ++i) {
       if (!kept[i])
         continue;
+      ArrayRef<std::string> premises(assumed);
+      if (candidates[i].combine.empty())
+        premises = premises.take_front(plain);
       // A candidate the solver cannot decide quickly is dropped, which is
       // sound: it is only not assumed.
       unsigned limit = std::max(1u, solver.rlimit / 20);
       queries += query({before.pc}, render(candidates[i], before), limit);
       for (State *end : ends) {
         SmallVector<std::string> assumptions{end->pc};
-        assumptions.append(assumed.begin(), assumed.end());
+        assumptions.append(premises.begin(), premises.end());
         queries += query(assumptions, render(candidates[i], *end), limit);
       }
     }
