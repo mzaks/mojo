@@ -1544,8 +1544,10 @@ struct List[T: AnyType, /](
         return ThinAllocation(unsafe_owned_ptr=ptr).unsafe_with_layout(layout)
 
     def __getitem__(
-        self, slice: StridedSlice
-    ) -> Self where conforms_to(Self.T, Copyable):
+        self,
+        slice: StridedSlice,
+        out result: Self where len(result) == slice._length(len(self)),
+    ) where conforms_to(Self.T, Copyable):
         """Gets the sequence of elements at the specified positions.
 
         Args:
@@ -1557,8 +1559,6 @@ struct List[T: AnyType, /](
         var start, end, step = slice.indices(len(self))
         var r = range(start, end, step)
 
-        # A single return, so the postcondition covers every exit.
-        var result: Self
         if not len(r):
             result = Self()
         else:
@@ -1569,7 +1569,6 @@ struct List[T: AnyType, /](
                 ].copy(),
             )
         _ensures(len(result) == len(r))
-        return result^
 
     @__unsafe_nested_origins_read_only
     @stable(since="1.0")
