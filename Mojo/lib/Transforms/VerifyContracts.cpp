@@ -654,7 +654,8 @@ private:
     Operation *def = ref.getDefiningOp();
     if (isa<LIT::VarDeclOp>(def))
       return Loc{ref, ""};
-    if (isa<LIT::RefImmutOp>(def) || isa<RebindOp>(def))
+    // The same place, seen as immutable, rebound, or with a wider origin.
+    if (isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp>(def))
       return placeOf(def->getOperand(0));
     if (auto gep = dyn_cast<LIT::RefStructGEROp>(def)) {
       std::optional<Loc> base = placeOf(gep->getOperand(0));
