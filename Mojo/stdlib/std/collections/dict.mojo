@@ -720,13 +720,13 @@ struct Dict[
     # ===-------------------------------------------------------------------===#
 
     @inline(.always)
-    def __init__(out self):
+    def __init__(out self where len(self) == 0):
         """Initialize an empty dictionary."""
         self._table = SwissTable[Self.K, Self.V, Self.H]()
         self._order = List[Int32]()
 
     @inline(.always)
-    def __init__(out self, *, capacity: Int):
+    def __init__(out self where len(self) == 0, *, capacity: Int):
         """Initialize an empty dictionary with a pre-reserved capacity.
 
         The capacity is defined by `next_power_of_two(ceildiv(capacity * 8, 7))`
@@ -748,7 +748,8 @@ struct Dict[
 
     @inline(.always)
     def __init__(
-        out self,
+        # Repeated keys collapse.
+        out self where len(self) <= old(len(keys)),
         var keys: List[Self.K],
         var values: List[Self.V],
         __dict_literal__: NoneType,
@@ -860,7 +861,7 @@ struct Dict[
         return my_dict^
 
     def __init__(
-        out self, *, copy: Self
+        out self where len(self) == len(copy), *, copy: Self
     ) where conforms_to(Self.K, Copyable) and conforms_to(Self.V, Copyable):
         """Copy an existing dictionary.
 
@@ -909,7 +910,14 @@ struct Dict[
 
     @inline(.always)
     def __setitem__(
-        mut self, var key: Self.K, var value: Self.V
+        # One longer for a new key, as long for an existing one.
+        mut self where (
+            len(self) >= 1
+            and len(self) - old(len(self)) >= 0
+            and len(self) - old(len(self)) <= 1
+        ),
+        var key: Self.K,
+        var value: Self.V,
     ) where conforms_to(Self.K, Deinitable) and conforms_to(Self.V, Deinitable):
         """Set a value in the dictionary by key.
 
@@ -1390,7 +1398,12 @@ struct Dict[
         return (self._table._slots.unsafe_offset(slot_idx))[].value.copy()
 
     def pop(
-        mut self, key: Self.K, var default: Self.V
+        # One shorter if the key was there.
+        mut self where (
+            old(len(self)) - len(self) >= 0 and old(len(self)) - len(self) <= 1
+        ),
+        key: Self.K,
+        var default: Self.V,
     ) -> Self.V where conforms_to(Self.K, Deinitable) and conforms_to(
         Self.V, Deinitable
     ):
@@ -1439,7 +1452,7 @@ struct Dict[
         return entry^.reap_value()
 
     def pop(
-        mut self, ref key: Self.K
+        mut self where len(self) == old(len(self)) - 1, ref key: Self.K
     ) raises DictKeyError[Self.K] -> Self.V where conforms_to(
         Self.K, Deinitable
     ):
@@ -1487,7 +1500,7 @@ struct Dict[
         raise DictKeyError[Self.K]()
 
     def popitem(
-        mut self,
+        mut self where len(self) == old(len(self)) - 1,
     ) raises EmptyDictError -> DictEntry[Self.K, Self.V, Self.H]:
         """Remove and return a (key, value) pair from the dictionary.
 
@@ -1710,7 +1723,9 @@ struct Dict[
             )
 
     def clear(
-        mut self,
+        # The `old` makes the clause a postcondition only (a `mut` clause
+        # without one holds on entry too); lengths are never negative.
+        mut self where len(self) == 0 and old(len(self)) >= 0,
     ) where conforms_to(Self.K, Deinitable) and conforms_to(Self.V, Deinitable):
         """Remove all elements from the dictionary.
 
@@ -1769,7 +1784,13 @@ struct Dict[
 
     @inline(.always)
     def setdefault(
-        mut self, var key: Self.K, var default: Self.V
+        mut self where (
+            len(self) >= 1
+            and len(self) - old(len(self)) >= 0
+            and len(self) - old(len(self)) <= 1
+        ),
+        var key: Self.K,
+        var default: Self.V,
     ) -> ref[
         origin_of(self)._get_owned_interior["value"]
     ] Self.V where conforms_to(Self.K, Deinitable) and conforms_to(
