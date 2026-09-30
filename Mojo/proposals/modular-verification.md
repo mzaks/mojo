@@ -627,6 +627,37 @@ Test assertions and integer conversions:
   | test_deque.mojo       | 82 of 105  | 89 of 105  |
   | test_string_span.mojo | 50 of 57   | 55 of 57   |
 
+Nested collections:
+
+- Almost every call the pass reported as not analyzed was an access to a
+  nested collection (`list[0][1]`, `list.get_nth(0).get_nth(1)`): the
+  inner access's `self` is the reference the outer one returned, which was
+  not a place. A reference to an element is now a place of its own whose
+  value is `elem(collection, index)`; any write to it (a store, a field
+  store, the havoc of a call that takes it `mut`) writes the element's new
+  value back into the collection, which keeps its length, and writing a
+  collection makes its element places read from it again. So `xs[0].pop()`
+  shortens `xs[0]` as seen through `xs`, and the pass does not keep the
+  old, longer length.
+- A call on an element carries the collection's interior origin
+  (`#lit.interior.origin<xs, "element">`). That origin reaches the
+  elements, not the collection's own fields, so it keeps the collection's
+  length instead of making the whole collection unknown. When it is the
+  origin of a mutable reference argument whose place is known, the
+  argument's own havoc covers it: a reference to one element does not
+  reach its neighbours (without unsafe code). Origins are applied before
+  arguments, so the element's write-back lands on the collection the
+  origin left.
+- A list literal's elements are the values it is given (read before the
+  call, which moves them in); its contract can only state its length. So
+  `[[1, 2, 3], [4, 5]]` has rows of known lengths, and `[1, 2, 3][0]` is 1.
+  References passed through `lit.ref.upcast` (as the variadic pack's are)
+  are the same places.
+- test_list.mojo: 198 of 225 calls proven (185); test_linked_list.mojo:
+  152 of 173 (139); test_array.mojo: 38 of 38 (37). A property of every
+  row (each row grew in a loop over them) needs a quantified invariant,
+  which Houdini's templates do not include.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
