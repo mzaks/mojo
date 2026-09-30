@@ -1937,6 +1937,7 @@ private:
       assumeEnsures(call, callee, before, state);
       params = frame.parent;
     }
+    assumeAssertion(call, name, state);
     // `String(literal)`: as long as the literal. Its own contract cannot say
     // so: naming `String.byte_length()` there makes the declaration depend
     // on itself (through a `String` default argument in `SIMD.cast`).
@@ -1956,6 +1957,79 @@ private:
                                 bvConst(*n, 64) + "))",
                             "r");
         }
+  }
+
+  /// After `assert_true(c)`, `assert_false(c)`, `assert_equal(a, b)` or
+  /// `assert_not_equal(a, b)` from `std.testing`, what it checked holds
+  /// where it did not raise (each raises exactly when its check fails).
+  /// Only for `Bool` conditions and for `Int`, `Bool` and integer scalar
+  /// operands, whose equality is the terms': a type's own `__eq__` is not
+  /// equality of its value.
+  void assumeAssertion(LIT::CallOp call, const std::optional<CalleeName> &name,
+                       State &state) {
+    const char *prefix = "std::testing::testing::assert_";
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!name || !StringRef(name->path).starts_with(prefix) || !symbol ||
+        symbol.getParamValues().empty() || call->getNumResults() < 1 ||
+        !sortOf(call->getResult(0).getType()).isBool)
+      return;
+    StringRef kind =
+        StringRef(name->path).drop_front(strlen(prefix)).take_until([](char c) {
+          return c == '[' || c == '(';
+        });
+    TypedAttr type = resolveParam(symbol.getParamValues()[0]);
+    auto value = [&](Value v) {
+      return isa<LIT::RefType>(v.getType()) ? valueThrough(v, state)
+                                            : term(v, state);
+    };
+    std::string fact;
+    ValueRange ops = call.getOperands();
+    if ((kind == "true" || kind == "false") && isBoolType(type) &&
+        ops.size() >= 1) {
+      std::string v = value(ops[0]);
+      if (!sortOfTerm(v).isBool)
+        return;
+      fact = kind == "true" ? v : "(not " + v + ")";
+    } else if ((kind == "equal" || kind == "not_equal") &&
+               (isIntType(type) || isBoolType(type) || isIntegerScalar(type)) &&
+               ops.size() >= 2) {
+      std::string a = value(ops[0]), b = value(ops[1]);
+      // A place whose value is unknown loads as a 64-bit term whatever its
+      // type; terms of different sorts say nothing to each other.
+      Sort sa = sortOfTerm(a), sb = sortOfTerm(b);
+      if (sa.isBool != sb.isBool || sa.width != sb.width)
+        return;
+      std::string eq = "(= " + a + " " + b + ")";
+      fact = kind == "equal" ? eq : "(not " + eq + ")";
+    }
+    if (fact.empty())
+      return;
+    state.pc = define({true, 1, false},
+                      "(and " + state.pc + " (=> (not " +
+                          values[call->getResult(0)] + ") " + fact + "))",
+                      "r");
+  }
+
+  /// Whether a type parameter's value is `Bool`.
+  static bool isBoolType(TypedAttr attr) {
+    if (auto sugar = dyn_cast<SugarAttr>(attr))
+      attr = sugar.getCanonical();
+    auto type = dyn_cast<TypeParamAttr>(attr);
+    return type && printed(type.getTypeValue()) ==
+                       "!lit.struct<@std::@builtin::@bool::@Bool>";
+  }
+
+  /// Whether a type parameter's value is a width-1 integer `SIMD`
+  /// (`UInt8`, `Int32`, ...).
+  static bool isIntegerScalar(TypedAttr attr) {
+    if (auto sugar = dyn_cast<SugarAttr>(attr))
+      attr = sugar.getCanonical();
+    auto type = dyn_cast<TypeParamAttr>(attr);
+    if (!type)
+      return false;
+    std::string text = printed(type.getTypeValue());
+    return StringRef(text).starts_with("!lit.struct<@std::@simd::@SIMD<") &&
+           isWidthOne(text) && dtypeSort(text).has_value();
   }
 
   /// The parameters `call` binds for `callee`: the callee's struct's
