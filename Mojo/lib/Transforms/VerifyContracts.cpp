@@ -1948,6 +1948,8 @@ private:
     }
     if (name && evalReversedRange(call, *name, state))
       return;
+    if (name && evalElementWrite(call, *name, state))
+      return;
     if (name && evalBuiltin(call, *name, state))
       return;
     if (name && evalElementAccess(call, *name, state))
@@ -2249,6 +2251,7 @@ private:
                          State &state) {
     StringRef path = name.path;
     if (!(path.starts_with("std::collections::list::List::__getitem__[") ||
+          path.starts_with("std::collections::list::List::unsafe_get") ||
           path.starts_with("std::collections::deque::Deque::__getitem__") ||
           path.starts_with("std::collections::array::Array::__getitem__") ||
           path.starts_with(
@@ -2290,6 +2293,24 @@ private:
     Value result = call->getResult(0);
     values[result] = declare({false, 64, false}, "g");
     elements[result] = {*list, index};
+    return true;
+  }
+
+  /// `List.unsafe_set(i, v)`: writing element `i`, as `xs[i] = v` does.
+  bool evalElementWrite(LIT::CallOp call, const CalleeName &name,
+                        State &state) {
+    if (!StringRef(name.path).starts_with(
+            "std::collections::list::List::unsafe_set(") ||
+        call.getNumOperands() != 3 || call->getNumResults() != 0)
+      return false;
+    std::optional<Loc> list = placeOf(call.getOperands()[0]);
+    Value idx = call.getOperands()[1], value = call.getOperands()[2];
+    if (!list || sortOfTerm(term(idx, state)).width != 64)
+      return false;
+    storeElement(*list, term(idx, state),
+                 isa<LIT::RefType>(value.getType()) ? valueThrough(value, state)
+                                                    : term(value, state),
+                 state);
     return true;
   }
 
