@@ -3892,31 +3892,46 @@ private:
     if (!kernel || kernel.getFunctionBody().empty() ||
         kernel.getFunctionBody().front().getOps<RequiresOp>().empty())
       return;
-    // The arguments: the references of the pack.
+    // The arguments: the references of the pack, the first operand that is
+    // one (after `self`, and after the compiled function `f` in
+    // `enqueue_function(f, *args, ...)`).
+    auto valueOf = [&](Value v) {
+      return isa<LIT::RefType>(v.getType()) ? valueThrough(v, state)
+                                            : term(v, state);
+    };
     SmallVector<Value> refs;
     bool known = false;
-    Value pack = call.getOperands()[1];
-    std::string packValue = isa<LIT::RefType>(pack.getType())
-                                ? valueThrough(pack, state)
-                                : term(pack, state);
-    if (auto it = packRefs.find(packValue); it != packRefs.end()) {
-      refs = it->second;
-      known = true;
+    size_t next = call.getNumOperands();
+    for (size_t i = 1; i < call.getNumOperands(); ++i)
+      if (auto it = packRefs.find(valueOf(call.getOperands()[i]));
+          it != packRefs.end()) {
+        refs = it->second;
+        known = true;
+        next = i + 1;
+        break;
+      }
+    // The dimensions: the first two `Dim`s after it, as `Dim` built them.
+    SmallVector<Value, 2> dimOperands;
+    for (size_t i = next; i < call.getNumOperands() && dimOperands.size() < 2;
+         ++i) {
+      Type type = call.getOperands()[i].getType();
+      if (auto ref = dyn_cast<LIT::RefType>(type))
+        type = ref.getElementType();
+      if (StringRef(printed(type)).contains("@max::@gpu::@host::@dim::@Dim"))
+        dimOperands.push_back(call.getOperands()[i]);
     }
-    // The dimensions, as `Dim` built them.
+    if (dimOperands.size() != 2)
+      known = false;
     std::map<std::string, std::string> dims;
     const char *kinds[] = {"grid_dim_", "block_dim_"};
-    for (auto [k, kind] : llvm::enumerate(kinds)) {
-      Value dim = call.getOperands()[2 + k];
-      std::string value = isa<LIT::RefType>(dim.getType())
-                              ? valueThrough(dim, state)
-                              : term(dim, state);
+    for (auto [k, dim] : llvm::enumerate(dimOperands)) {
+      std::string value = valueOf(dim);
       for (char axis : {'x', 'y', 'z'}) {
         auto it = builtFields.find({value, std::string("/") + axis});
         if (it == builtFields.end())
           known = false;
         else
-          dims[std::string(kind) + axis] = it->second;
+          dims[std::string(kinds[k]) + axis] = it->second;
       }
     }
     ParamFrame frame = paramFrame(kernelSymbol, kernel, 0, ParamFrame{});
