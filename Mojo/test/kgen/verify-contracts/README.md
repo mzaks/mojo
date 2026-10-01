@@ -148,7 +148,10 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `comptime for` is a loop over an arbitrary iteration, `comptime if` joins
   its arms, and parameter expressions are evaluated where they are
   integer or Boolean operators (`n >= 0` on a parameter `n` is `n >= 0`);
-  anything else about a parameter is unknown.
+  anything else about a parameter is unknown. A function's own `where`
+  constraints on its parameters (`def f[n: Int](...) where n < 8`) hold
+  in its body, since the compiler rejects any instantiation that breaks
+  them; a `comptime for k in range(n)` has `0 <= k < n`.
 
 - `List` states its lengths: its constructors (empty, `capacity=`,
   `length=`, literals, `copy=`) and `append`, `pop`, `insert`, `clear`,

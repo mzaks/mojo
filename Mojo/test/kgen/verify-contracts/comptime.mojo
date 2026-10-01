@@ -65,6 +65,28 @@ def ok_dtype_branches[dt: DType](xs: List[Int], i: Int) -> Int:
     return 0
 
 
+def ok_where_constraint[n: Int](xs: List[Int]) -> Int where 0 <= n and n < 8:
+    if len(xs) >= 8:
+        return xs[n]  # the function's `where` holds wherever it is instantiated
+    return 0
+
+
+def ok_where_second[
+    m: Int, n: Int
+](xs: List[Int]) -> Int where 0 <= n and n < 8:
+    if len(xs) >= 8:
+        return xs[n]
+    return 0
+
+
+def ok_where_range[n: Int](xs: List[Int]) -> Int where n <= 8:
+    var sum = 0
+    if len(xs) >= 8:
+        comptime for k in range(n):
+            sum += xs[k]
+    return sum
+
+
 # --- must stay UNPROVEN ---
 def bad_param_no_lower[n: Int](xs: List[Int]) -> Int:
     if n < len(xs):
@@ -95,4 +117,18 @@ def bad_dtype_branch[dt: DType](xs: List[Int], i: Int) -> Int:
     else:
         if 0 <= i and i < len(xs):
             return xs[i + 1]  # one past the end
+    return 0
+
+
+def bad_where_bound[n: Int](xs: List[Int]) -> Int where 0 <= n and n <= 8:
+    if len(xs) >= 8:
+        return xs[n]  # `n` may be 8
+    return 0
+
+
+def bad_where_other[
+    m: Int, n: Int
+](xs: List[Int]) -> Int where 0 <= m and m < 8:
+    if len(xs) >= 8:
+        return xs[n]  # the constraint is on `m`
     return 0

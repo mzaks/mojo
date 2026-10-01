@@ -1206,8 +1206,20 @@ Tensors and GPU kernels:
   that view, so destructuring (`var v, coords, offset = ...`) and `r[0]`
   give it; the thread's coordinates and offset stay unknown.
   tensors.mojo: 75 of 99, the other 24 in `bad_*` functions.
-- Not covered yet: a runtime last stride, function-level `where`
-  constraints on parameters (`where N <= 8`) as assumptions, launches through
+- A function's own `where` constraints on its parameters (`def f[N:
+  Int](...) where N <= 8`) are now facts in its body: the compiler rejects
+  any instantiation that breaks them. They live in the function's
+  signature (`getBodyConstraints` of its parameter list) and name its
+  parameters by position (`#kgen.param.index.ref<0, i>`) where the body
+  names them (`#kgen.param.decl.ref<"N">`); read as two unknowns the fact
+  said nothing about the body's `N`, so a position is now read as the
+  function's own `i`th parameter declaration. A constraint the parameter
+  model cannot read is an unknown, which is harmless to assume. With
+  `comptime for k in range(N)`, `t[0, k]` on 8 columns is now proven under
+  `where N <= 8`. comptime.mojo: 11 of 17, the other 6 in `bad_*`
+  functions, one of them a constraint on another parameter than the one
+  indexed.
+- Not covered yet: a runtime last stride, launches through
   the other `enqueue_function` overloads, tensors whose runtime size comes from
   a scalar (`row_major(n)`: `dim` is not related to `n`), raw pointers, and
   kernels in MAX's own packages, which are now skipped as imported code unless
