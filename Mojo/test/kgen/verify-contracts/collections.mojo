@@ -129,6 +129,22 @@ def ok_dict_reversed_items(d: Dict[Int, Int]) -> Int:
     return 0
 
 
+def ok_linked_list_iterate(l: LinkedList[Int]) -> Int:
+    var t = 0
+    var i = 0
+    for el in l:
+        t += el + l.get_nth(i)  # once per node, `i` counting along
+        i += 1
+    return t
+
+
+def ok_linked_list_enumerate(l: LinkedList[Int]) -> Int:
+    var t = 0
+    for i, el in enumerate(l):
+        t += el + l.get_nth(i)
+    return t
+
+
 # --- must stay UNPROVEN ---
 def bad_bitset(mut b: BitSet[64], i: Int):
     if 0 <= i and i <= 64:
@@ -190,3 +206,13 @@ def bad_dict_keys_past(d: Dict[Int, Int]) -> Int:
 def bad_dict_keys_unchecked(d: Dict[Int, Int]) -> Int:
     var keys = List(d.keys())
     return keys[0]  # `d` may be empty
+
+
+
+def bad_linked_list_iterate_next(l: LinkedList[Int]) -> Int:
+    var t = 0
+    var i = 0
+    for el in l:
+        t += el + l.get_nth(i + 1)  # past the last node
+        i += 1
+    return t

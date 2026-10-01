@@ -1023,6 +1023,26 @@ Fewer Houdini candidates:
   loops of about 100 candidates, four rounds each, one after the other.
   Each query takes z3 about 0.6 ms; the time is their number.
 
+Linked list iteration:
+
+- `for x in l`, `l.__reversed__()`, `enumerate(l)` and consuming
+  iteration (`for x in l^`) yield `len(l)` times, element `cursor` (from
+  the end when reversed), the element `l.get_nth(i)` reads. The consuming
+  iterator pops while the size is positive, a real count; the borrowing
+  one follows the nodes until there are none, so the model assumes the
+  nodes are as many as the size, as `LinkedList`'s methods keep them.
+- test_linked_list.mojo: 157 of 173 calls proven (155): a forward loop
+  with a counter beside it, and `enumerate`. Cost, interleaved against
+  the previous build: 0.38 s against 0.30 s (load 6 to 10; test_list.mojo
+  and test_deque.mojo unchanged).
+- Two loop shapes stay unproven, and not because of the linked list: a
+  reversed loop with a counter counting down (`i = len - 1`, `i -= 1`)
+  needs `i + cursor` to stay constant, a template between two integer
+  variables that Houdini does not have; and a counter used only after
+  the loop (`for _ in l: i += 1`, then `xs[i]`) is not one of the
+  variables the loop's conditions depend on, so nothing relates it to
+  the cursor. Both fail for `List` and `range` too.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through

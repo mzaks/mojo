@@ -93,6 +93,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `cursor` of the collection: a reference to its place when borrowing, its
   value when consuming. The elements `enumerate` yields are unknown, and
   reversed iteration over collections is not modelled.
+- Iterating a `LinkedList` (`for x in l`, `l.__reversed__()`,
+  `enumerate(l)`, and consuming it with `for x in l^`) yields exactly
+  `len(l)` times, element `cursor` (from the end when reversed), as
+  `l.get_nth(i)` reads it. The borrowing iterator follows the nodes until
+  there are none, so this assumes the nodes are as many as the list's
+  size, which its methods keep.
 - Iterating a `Dict` (`for k in d`, `d.keys()`, `d.values()`,
   `d.items()`, and `reversed` of `d` or of its values or items) yields
   exactly `len(d)` times: its iterators count the entries they have seen,
