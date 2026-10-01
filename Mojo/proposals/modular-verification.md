@@ -1043,6 +1043,44 @@ Linked list iteration:
   variables the loop's conditions depend on, so nothing relates it to
   the cursor. Both fail for `List` and `range` too.
 
+Tensors and GPU kernels:
+
+- A survey of `max/kernels/src` (675 functions that read GPU ids; the
+  split is a regex classifier's, checked by hand on about 40 kernels):
+  a guarded flat index (`if tid < n: t[tid]`) is about 5% of kernels and
+  3% of indexing sites, mostly naive and reference kernels. Tiled views
+  are 24% of sites, vectorized access 9%, raw pointers 29%, shared memory
+  16%, and 29% of kernels only call tensor-core or copy intrinsics. Guards
+  compare against scalar arguments more often than against `dim`.
+- The post-elaboration pass cannot see kernels: they are compiled through
+  `kgen.compile_offload`, a separate pipeline per target (a temporary
+  hook running the pass there worked on a CPU offload), the open-source
+  build has no GPU target at all, and tensor indexing recorded no
+  obligations. So kernels are checked here, before elaboration, on the
+  host, where they are ordinary functions.
+- `TileTensor` (MAX's `layout` package) now states indexing bounds as
+  contracts: `t[i]` (rank 1) and `t[i, j]` require each scalar
+  coordinate in `[0, dim[k])` through `_coord_in_bounds`, and writes
+  require every flat index in range through `_indices_in_bounds(*items)`.
+  Contract regions are compiled for every instantiation, and `value()`
+  of a tuple coordinate is a compile-time error, hence the helpers:
+  tuple coordinates and nested layouts are not checked. The `layout`,
+  `nn` and `linalg` kernel tests pass with them.
+- The pass reads `dim[k]()` as the layout's static size where its shape
+  says `ComptimeInt[n]`, and otherwise as `tdim(tensor, k)`, and models
+  the helpers. GPU ids are one value per axis in a function with the
+  launch limits every supported GPU has, as assumptions:
+  `0 <= thread_idx < block_dim <= 1024`, `0 <= block_idx < grid_dim <
+  2^31`; `global_idx` is `block_idx * block_dim + thread_idx`.
+- Functions from every imported package are now skipped like the
+  stdlib's: a file importing `layout` verified its 27 loops before.
+- max/examples/gpu-intro's `vector_addition` kernel verifies unchanged
+  (3 of 3). tensors.mojo: 11 of 16, the other 5 in `bad_*` functions.
+- Not covered yet: tiled and vectorized views, tensors whose runtime size
+  comes from a scalar (`row_major(n)`: `dim` is not related to `n`),
+  raw pointers, and kernels in MAX's own packages, which are now skipped
+  as imported code unless `include-stdlib=true`.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through

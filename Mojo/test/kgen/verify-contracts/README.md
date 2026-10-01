@@ -19,6 +19,20 @@ bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
     -elaborate --verify-contracts="verbose=true"
 ```
 
+`tensors.mojo` imports the `max` and `layout` packages: build them and add
+them to the import path.
+
+```bash
+./bazelw build --config=build-mojo //max/kernels/src/layout:layout
+bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
+    -I bazel-bin/max/mojo/max -I bazel-bin/max/kernels/src/layout \
+    Mojo/test/kgen/verify-contracts/tensors.mojo \
+    -elaborate --verify-contracts="verbose=true"
+```
+
+Functions from imported packages (the stdlib, `layout`, ...) are not
+verified unless `include-stdlib=true`.
+
 With `-lsp=no-dump` instead of `-elaborate`, it runs on the module the
 language server checks. That parse is lazy: a stdlib function whose body
 was not needed has no body there, and so no contracts, and calls to it are
@@ -222,6 +236,19 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   constructor built keeps its fields when it is moved (returned, stored).
   Nothing is stated about when `__next__` raises: `bounds()` is only a
   hint.
+- `TileTensor` (from MAX's `layout` package): `t[i]` (rank 1), `t[i, j]`
+  and writes `t[i, ...] = v` require each index in `[0, dim[k])`.
+  `dim[k]()` is the layout's static size where its shape says
+  `ComptimeInt[n]`, and otherwise one non-negative unknown per tensor and
+  dimension. Tuple coordinates and nested layouts are not checked. Tiled
+  and vectorized views (`tile`, `vectorize`, `load[width]`) have no
+  contracts yet.
+- GPU kernels: `thread_idx`, `block_idx`, `block_dim` and `grid_dim` are
+  one value per axis in a function, with the launch limits every
+  supported GPU has (assumptions): `0 <= thread_idx < block_dim <= 1024`
+  and `0 <= block_idx < grid_dim < 2^31`; `global_idx` is
+  `block_idx * block_dim + thread_idx`. Kernels are verified like any
+  function, on the host, before they are compiled for a GPU.
 - `Int.MAX`, `Int.MIN` and the bounds of the other integer dtypes
   (`max_or_inf`, `min_or_neg_inf`) are their values.
 
@@ -247,3 +274,4 @@ with).
 | `strings.mojo`       | all `bad_*`        | all `ok_*`       |
 | `assertions.mojo`    | all `bad_*`        | all `ok_*`       |
 | `traits.mojo`        | all `bad_*`, `Bad*`| all `ok_*`       |
+| `tensors.mojo`       | all `bad_*`        | all `ok_*`       |
