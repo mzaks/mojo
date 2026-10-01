@@ -626,8 +626,11 @@ private:
   /// index.
   DenseMap<Value, std::pair<Loc, std::string>> elements;
   std::set<std::string> elementFunctions;
+  bool tensorDimDeclared = false;
   /// The GPU id constants declared (see `evalGpuId`).
   std::set<std::string> gpuIds;
+  /// The results of `TileTensor.dim` (see `evalTileTensor`).
+  llvm::DenseSet<Value> tensorDims;
   /// The collection an iterator (by its place's root) iterates.
   DenseMap<Value, Loc> iterSources;
   /// The types of places named by a value of another type (an element an
@@ -2249,6 +2252,8 @@ private:
       return;
     if (name && evalListFromIterator(call, *name, state))
       return;
+    if (name && evalTileTensor(call, *name, state))
+      return;
     if (name && evalGpuId(call, *name))
       return;
     if (name && callee && evalIteration(call, *name, callee, state))
@@ -2972,6 +2977,172 @@ private:
     storeFields(*out, state, fields);
     setResultsUnknown(call);
     return true;
+  }
+
+  /// Dimension `k` of the `TileTensor` `tensor`, whose type parameters are
+  /// `params` (its layout is the fourth): the static size where the layout's
+  /// shape says `ComptimeInt[n]`, otherwise `tdim(tensor, k)`, not negative.
+  MaybeTerm tensorDim(ArrayRef<TypedAttr> params, Value tensor, int64_t k,
+                      State &state) {
+    if (params.size() < 4 || k < 0)
+      return std::nullopt;
+    static llvm::Regex intValue(
+        "(\\{:scalar<index> |scalar<index> = )(-?[0-9]+)\\}");
+    // The shape is the first list of the layout type's parameters.
+    std::string layout = printed(resolveParam(params[3]));
+    StringRef rest(layout);
+    size_t at = rest.find("@layout::@tile_layout::@Layout<");
+    if (at != StringRef::npos) {
+      rest = rest.drop_front(at);
+      size_t open = rest.find('[');
+      if (open != StringRef::npos) {
+        rest = rest.drop_front(open + 1);
+        // Its elements at depth 0, up to the closing bracket.
+        SmallVector<StringRef> elements;
+        int depth = 0;
+        size_t start = 0;
+        for (size_t c = 0; c < rest.size(); ++c) {
+          char ch = rest[c];
+          if (ch == '<' || ch == '[' || ch == '(' || ch == '{')
+            ++depth;
+          else if ((ch == '>' || ch == ')' || ch == '}') ||
+                   (ch == ']' && depth > 0))
+            --depth;
+          else if (ch == ']' && depth == 0) {
+            elements.push_back(rest.slice(start, c).trim());
+            break;
+          } else if (ch == ',' && depth == 0) {
+            elements.push_back(rest.slice(start, c).trim());
+            start = c + 1;
+          }
+        }
+        SmallVector<StringRef> m;
+        int64_t n;
+        if ((size_t)k < elements.size() &&
+            elements[k].starts_with("@std::@utils::@coord::@ComptimeInt<") &&
+            intValue.match(elements[k], &m) && !m[2].getAsInteger(10, n))
+          return bvConst(n, 64);
+      }
+    }
+    std::string value = isa<LIT::RefType>(tensor.getType())
+                            ? valueThrough(tensor, state)
+                            : term(tensor, state);
+    if (sortOfTerm(value).width != 64 || sortOfTerm(value).isBool)
+      return std::nullopt;
+    if (!tensorDimDeclared) {
+      prelude += "(declare-fun tdim ((_ BitVec 64) (_ BitVec 64)) "
+                 "(_ BitVec 64))\n";
+      tensorDimDeclared = true;
+    }
+    std::string d = "(tdim " + value + " " + bvConst(k, 64) + ")";
+    facts.push_back("(bvsge " + d + " " + bvConst(0, 64) + ")");
+    return define(Sort{false, 64, true}, d);
+  }
+
+  /// `TileTensor` from the `layout` package: `dim[k]()`, the extent of
+  /// dimension `k`, is the static size where the layout's shape says
+  /// `ComptimeInt[n]`, and otherwise a function of the tensor's value (one
+  /// per dimension, not negative). `_coord_in_bounds(i, n)`, the clause of
+  /// its indexing, is `0 <= i < n` for an `Int` or `ComptimeInt` coordinate
+  /// and true for a tuple one.
+  bool evalTileTensor(LIT::CallOp call, const CalleeName &name, State &state) {
+    StringRef path = name.path;
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!symbol || call->getNumResults() != 1)
+      return false;
+    Value result = call->getResult(0);
+    Sort sort{false, 64, true};
+    // An integer parameter, as a type argument (`{:scalar<index> 8}`) or a
+    // value (`{_mlir_value: scalar<index> = 0}`); the number is group 2.
+    static llvm::Regex intValue(
+        "(\\{:scalar<index> |scalar<index> = )(-?[0-9]+)\\}");
+    // `Int(t.dim[k]())`: the extent, whatever the tensor's index dtype (an
+    // extent is not negative and fits).
+    if (path.starts_with("std::simd::SIMD::__init__[::DType](::SIMD[") &&
+        call.getNumOperands() == 1 && tensorDims.count(call.getOperands()[0])) {
+      Sort target = sortOf(result.getType());
+      if (target.isBool || target.width != 64)
+        return false;
+      values[result] = term(call.getOperands()[0], state);
+      return true;
+    }
+    if (path.starts_with("layout::tile_tensor::_coord_in_bounds[") &&
+        call.getNumOperands() == 2 && !symbol.getParamValues().empty()) {
+      std::string type = printed(resolveParam(symbol.getParamValues()[0]));
+      SmallVector<StringRef> m;
+      std::string bound = term(call.getOperands()[1], state), v;
+      if (StringRef(type).contains("@std::@utils::@coord::@Coord<")) {
+        values[result] = "true";
+        return true;
+      }
+      if (StringRef(type).contains("@std::@utils::@coord::@ComptimeInt<") &&
+          intValue.match(type, &m)) {
+        int64_t n;
+        if (m[2].getAsInteger(10, n))
+          return false;
+        v = bvConst(n, 64);
+      } else if (isIntType(resolveParam(symbol.getParamValues()[0]))) {
+        v = term(call.getOperands()[0], state);
+      } else {
+        return false;
+      }
+      if (sortOfTerm(v).width != 64 || sortOfTerm(bound).width != 64)
+        return false;
+      values[result] = define({true, 1, false},
+                              "(and (bvsle " + bvConst(0, 64) + " " + v +
+                                  ") (bvslt " + v + " " + bound + "))");
+      return true;
+    }
+    if (path.starts_with(
+            "layout::tile_tensor::TileTensor::dim[::SIMD[DType.int, 1]](") &&
+        call.getNumOperands() == 1) {
+      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      SmallVector<StringRef> m;
+      int64_t k;
+      std::string last =
+          params.empty() ? "" : printed(resolveParam(params.back()));
+      if (!intValue.match(last, &m) || m[2].getAsInteger(10, k))
+        return false;
+      MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
+      if (!d)
+        return false;
+      tensorDims.insert(result);
+      values[result] = *d;
+      return true;
+    }
+    // `t._indices_in_bounds(*items)`, the clause of writing an element:
+    // every index `i` of the pack in `[0, dim[i])`.
+    if (path.starts_with(
+            "layout::tile_tensor::TileTensor::_indices_in_bounds[") &&
+        call.getNumOperands() == 2) {
+      Value pack = call.getOperands()[1];
+      while (auto rebind = pack.getDefiningOp<RebindOp>())
+        pack = rebind->getOperand(0);
+      if (!isa<LIT::RefType>(pack.getType()))
+        return false;
+      auto refs = packRefs.find(valueThrough(pack, state));
+      if (refs == packRefs.end())
+        return false;
+      std::string all = "true";
+      for (auto [k, ref] : llvm::enumerate(refs->second)) {
+        std::optional<Loc> place = placeOf(ref);
+        // An `Int` (possibly behind an alias), as `index` takes it.
+        if (!place || !isScalar(placeType(*place)) ||
+            sortOf(placeType(*place)).isBool ||
+            sortOf(placeType(*place)).width != 64)
+          return false;
+        std::string v = load(*place, state, sort);
+        MaybeTerm d =
+            tensorDim(symbol.getParamValues(), call.getOperands()[0], k, state);
+        if (!d)
+          return false;
+        all = "(and " + all + " (bvsle " + bvConst(0, 64) + " " + v +
+              ") (bvslt " + v + " " + *d + "))";
+      }
+      values[result] = define({true, 1, false}, all);
+      return true;
+    }
+    return false;
   }
 
   /// GPU ids (`thread_idx.x`, `block_idx.y`, `block_dim.z`, `grid_dim.x`,
