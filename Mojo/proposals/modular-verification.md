@@ -1076,10 +1076,29 @@ Tensors and GPU kernels:
   stdlib's: a file importing `layout` verified its 27 loops before.
 - max/examples/gpu-intro's `vector_addition` kernel verifies unchanged
   (3 of 3). tensors.mojo: 11 of 16, the other 5 in `bad_*` functions.
-- Not covered yet: tiled and vectorized views, tensors whose runtime size
-  comes from a scalar (`row_major(n)`: `dim` is not related to `n`),
-  raw pointers, and kernels in MAX's own packages, which are now skipped
-  as imported code unless `include-stdlib=true`.
+- Tiled and vectorized views: `tile[*sizes](*coords)` requires
+  `0 <= c < dim // size` per dimension through `_tile_in_bounds` (a tile
+  has exactly `sizes` elements, and `(c + 1) * size <= dim` would wrap
+  for a large `c`); the tile's own dimensions are static in its type, so
+  indexing it needed nothing new. `vectorize[*sizes]()` requires each
+  dimension a multiple of its size through `_vectorize_in_bounds`, a
+  clause on `self`: the view's shape is `ceildiv(dim, size)`, so a
+  ragged dimension's last vector reads past the tensor. The pass models
+  the view's dimensions at the call as `ceildiv` of the parent's (its
+  layout type holds them unevaluated, `ComptimeInt[apply(floordiv, 9,
+  4)]`; the static parse now refuses that explicitly, where before it
+  only failed because the `->` of the generator's type broke its bracket
+  count, and would otherwise have read the operand 9 as the extent).
+  tensors.mojo: 46 of 58, the other 12 in `bad_*` functions,
+  among them a guard `j * 4 < dim` that does not prove `j < dim / 4`
+  because the product wraps. The `layout`, `nn` and `linalg` kernel
+  tests still compile and pass with both clauses.
+- Not covered yet: `tile` with `Coord` arguments, `distribute`,
+  `load[width]`/`store[width]` (a `Coord` argument, and a width that only stays
+  inside the row when the last stride is 1), tensors whose runtime size comes
+  from a scalar (`row_major(n)`: `dim` is not related to `n`), raw pointers, and
+  kernels in MAX's own packages, which are now skipped as imported code unless
+  `include-stdlib=true`.
 
 ## Risks and open questions
 

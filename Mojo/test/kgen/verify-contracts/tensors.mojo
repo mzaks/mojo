@@ -22,6 +22,9 @@ comptime L24 = type_of(row_major[2, 4]())
 comptime L512 = type_of(row_major[512]())
 comptime L1000 = type_of(row_major[1000]())
 comptime L1024 = type_of(row_major[1024]())
+comptime L88 = type_of(row_major[8, 8]())
+comptime L86 = type_of(row_major[8, 6]())
+comptime LD = type_of(row_major(1, 1))  # dimensions known at run time
 
 
 # --- must be PROVEN ---
@@ -75,6 +78,58 @@ def ok_thread_only(a: TileTensor[DType.float32, L1024, MutAnyOrigin]) -> Float32
     return a[thread_idx.x]  # a block has at most 1024 threads
 
 
+def ok_tile(t: TileTensor[DType.float32, L88, MutAnyOrigin]) -> Float32:
+    var x = t.tile[2, 4](3, 1)  # rows 6..7, columns 4..7
+    return x[1, 3]  # the tile's dimensions are 2 and 4
+
+
+def ok_tile_guard(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int, j: Int
+) -> Float32:
+    if 0 <= i and i < Int(t.dim[0]()) // 16:
+        if 0 <= j and j < Int(t.dim[1]()) // 16:
+            return t.tile[16, 16](i, j)[15, 15]
+    return 0
+
+
+def ok_tile_of_tile(t: TileTensor[DType.float32, L88, MutAnyOrigin]) -> Float32:
+    var x = t.tile[4, 4](1, 1)
+    return x.tile[2, 2](1, 0)[1, 1]
+
+
+def ok_block_tile(t: TileTensor[DType.float32, LD, MutAnyOrigin]):
+    if block_idx.y < Int(t.dim[0]()) // 16:
+        if block_idx.x < Int(t.dim[1]()) // 16:
+            var x = t.tile[16, 16](block_idx.y, block_idx.x)
+            if thread_idx.y < 16 and thread_idx.x < 16:
+                x[thread_idx.y, thread_idx.x] = 0
+
+
+def ok_vectorize(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) -> SIMD[DType.float32, 4]:
+    var v = t.vectorize[1, 4]()  # 8 x 2 vectors of 4
+    return v[7, 1]
+
+
+def ok_vectorize_dynamic(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], j: Int
+) -> SIMD[DType.float32, 4]:
+    if Int(t.dim[1]()) % 4 == 0 and 0 < Int(t.dim[0]()):
+        var v = t.vectorize[1, 4]()
+        if 0 <= j and j < Int(t.dim[1]()) // 4:
+            return v[0, j]  # `v` has `dim / 4` vectors per row
+    return 0
+
+
+def ok_tile_vectorize(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int
+) -> SIMD[DType.float32, 4]:
+    if 0 <= i and i < Int(t.dim[0]()) // 4 and Int(t.dim[1]()) >= 8:
+        return t.tile[4, 8](i, 0).vectorize[1, 4]()[3, 1]
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_static(t: TileTensor[DType.float32, L8, MutAnyOrigin]) -> Float32:
     return t[8]  # one past the end
@@ -102,3 +157,49 @@ def bad_kernel_write(dst: TileTensor[DType.float32, L1000, MutAnyOrigin]):
 
 def bad_thread_only(a: TileTensor[DType.float32, L512, MutAnyOrigin]) -> Float32:
     return a[thread_idx.x]  # a block may have more than 512 threads
+
+
+def bad_tile_coord(t: TileTensor[DType.float32, L88, MutAnyOrigin]) -> Float32:
+    return t.tile[2, 4](4, 0)[0, 0]  # 4 tiles per column
+
+
+def bad_tile_element(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) -> Float32:
+    return t.tile[2, 4](3, 1)[2, 0]  # the tile has 2 rows
+
+
+def bad_partial_tile(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int
+) -> Float32:
+    if 0 <= i and i * 16 < Int(t.dim[0]()) and Int(t.dim[1]()) >= 16:
+        return t.tile[16, 16](i, 0)[0, 0]  # the last tile may be partial
+    return 0
+
+
+def bad_block_tile(t: TileTensor[DType.float32, LD, MutAnyOrigin]):
+    var x = t.tile[16, 16](block_idx.y, block_idx.x)  # the grid may be larger
+    if thread_idx.y < 16 and thread_idx.x < 16:
+        x[thread_idx.y, thread_idx.x] = 0
+
+
+def bad_vectorize_ragged(
+    t: TileTensor[DType.float32, L86, MutAnyOrigin]
+) -> SIMD[DType.float32, 4]:
+    return t.vectorize[1, 4]()[0, 0]  # 6 is not a multiple of 4
+
+
+def bad_vectorize_index(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) -> SIMD[DType.float32, 4]:
+    return t.vectorize[1, 4]()[7, 2]  # 2 vectors per row
+
+
+def bad_vectorize_overflow(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], j: Int
+) -> SIMD[DType.float32, 4]:
+    if Int(t.dim[1]()) % 4 == 0 and 0 < Int(t.dim[0]()):
+        var v = t.vectorize[1, 4]()
+        if 0 <= j and j * 4 < Int(t.dim[1]()):
+            return v[0, j]  # `j * 4` wraps for a large `j`
+    return 0

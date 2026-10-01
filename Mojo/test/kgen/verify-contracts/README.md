@@ -240,9 +240,15 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   and writes `t[i, ...] = v` require each index in `[0, dim[k])`.
   `dim[k]()` is the layout's static size where its shape says
   `ComptimeInt[n]`, and otherwise one non-negative unknown per tensor and
-  dimension. Tuple coordinates and nested layouts are not checked. Tiled
-  and vectorized views (`tile`, `vectorize`, `load[width]`) have no
-  contracts yet.
+  dimension. Tuple coordinates and nested layouts are not checked.
+- `t.tile[*sizes](*coords)` requires the whole tile inside the tensor
+  (tiles are not clipped): `0 <= c < dim // size` per dimension. The
+  tile's dimensions are its static sizes. `t.vectorize[*sizes]()`
+  requires every dimension a multiple of its size (the view has
+  `ceildiv(dim, size)` vectors, so the last one would reach past the
+  tensor), and the view's `dim[k]()` is `ceildiv(dim[k], size)` of its
+  parent. `tile` with `Coord` arguments, `distribute` and
+  `load[width]`/`store[width]` have no contracts yet.
 - GPU kernels: `thread_idx`, `block_idx`, `block_dim` and `grid_dim` are
   one value per axis in a function, with the launch limits every
   supported GPU has (assumptions): `0 <= thread_idx < block_dim <= 1024`
