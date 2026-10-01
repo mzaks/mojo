@@ -776,6 +776,15 @@ Performance after `Sized` (2026-09-30):
   "Cold" solves every query; "warm" answers them from a primed `cache-dir=`, so
   it is the encoding alone and the difference is solver time. CPU counts kgen
   and its z3 processes.
+- "Verify" is the pass's own wall-clock time, and nothing else: timing the pass
+  directly (a temporary build) gave the same values as "Rest" to the hundredth
+  of a second (test_list.mojo 0.88 s cold and 0.13 s warm, test_deque.mojo 0.91
+  s, test_dict.mojo 0.99 s, test_bitset.mojo 0.18 s, at load about 3). It covers
+  encoding every function, the loop-invariant search and waiting for z3, with
+  functions verified in parallel. It does not cover importing the file with the
+  stdlib ("Import", 0.4 to 1.1 s) or the check pipeline before the pass (0.03
+  s); printing the warnings and exiting add 0.02 to 0.03 s to the process. The
+  same holds for the later tables, which were measured the same way.
 
   | File                  | Proven  | Import | Verify, cold | Verify, warm | CPU, cold | Total, cold |
   |-----------------------|---------|--------|--------------|--------------|-----------|-------------|
