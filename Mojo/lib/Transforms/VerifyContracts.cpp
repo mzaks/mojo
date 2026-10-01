@@ -1677,6 +1677,14 @@ private:
           ++invariantsFound;
         }
     };
+    // The same candidate from two templates (`len(xs) >= 0` from the bound
+    // against 0 and from a fixed 0) is asked once.
+    {
+      std::set<std::string> seen;
+      llvm::erase_if(candidates, [&](const Candidate &c) {
+        return !seen.insert(render(c, head)).second;
+      });
+    }
     // The templates relating a length to a loop variable last, so that
     // `rebuild` can keep them out of the others' assumptions.
     std::stable_partition(candidates.begin(), candidates.end(),
