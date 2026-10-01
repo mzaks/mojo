@@ -973,6 +973,28 @@ Dictionary iteration:
   search of about 388 queries in its first round and six or seven
   rounds in all, one after the other (1.76 s of z3 time).
 
+Lists as Houdini variables:
+
+- A loop that appends to a list reads the list's length, and the list
+  itself counted as one of the loop's integer variables: its value is a
+  handle, so Houdini tried bounds between it, the lengths and the counters
+  (`keys <= len(vals)`), none of which mean anything. Only one fact about
+  a handle does: that the list still holds its value on entry, which
+  the elements a loop reads depend on (`ok_list_elements` failed without
+  it). A whole variable that is not an integer or a Boolean now only gets
+  that equality candidate; fields are kept as before, as their types are
+  not tracked.
+- In `test_reversed_items` of test_dict.mojo this takes a loop from 194
+  candidates to 104. Results are the same on every file. Verification
+  time, interleaved against the previous build (5 runs each, medians;
+  the load was between 4 and 12, so only the ratios hold): test_dict.mojo
+  1.60 s against 2.05 s (and 1.55 s against 1.99 s in a second run),
+  test_deque.mojo 0.83 s against 1.02 s (0.72 s against 0.91 s),
+  test_list.mojo 0.82 s against 0.90 s (0.85 s against 0.88 s),
+  test_linked_list.mojo 0.38 s against 0.40 s (0.33 s against 0.38 s);
+  the other files within noise. Dictionary iteration still makes
+  test_dict.mojo slower than before it, by about half instead of double.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
