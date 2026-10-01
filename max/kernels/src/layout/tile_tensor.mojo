@@ -2203,10 +2203,93 @@ struct TileTensor[
 
         _pretty_print_elementwise(self, w)
 
+    @always_inline
+    def _tile_coords_in_bounds[
+        *tile_sizes: Int
+    ](self, coordinates: Coord) -> Bool:
+        """Whether the tile of `tile_sizes` at `coordinates` lies within the
+        tensor, the precondition of `tile[*tile_sizes](coordinates)`.
+
+        As for `_tile_in_bounds`: `0 <= c < dim // size` per dimension, for
+        a positive size. A nested layout, coordinates of another rank, and a
+        tuple coordinate are not checked: this returns `True` for them.
+
+        Parameters:
+            tile_sizes: The dimensions of the tile along each axis.
+
+        Args:
+            coordinates: The coordinates of the tile.
+
+        Returns:
+            Whether the whole tile is within the tensor, or `True` where it
+            is not checked.
+        """
+        comptime if (
+            Self.flat_rank != Self.rank
+            or tile_sizes.size != Self.rank
+            or coordinates.rank != Self.rank
+        ):
+            return True
+        else:
+            comptime for i in range(Self.rank):
+                comptime size = tile_sizes[i]
+                comptime if size > 0 and not coordinates.element_types[
+                    i
+                ].is_tuple:
+                    var c = Int(coordinates[i].value())
+                    if c < 0 or c >= Int(self.dim[i]()) // size:
+                        return False
+            return True
+
+    @always_inline
+    def _tile_shape_in_bounds(
+        self, tile_shape: Coord, coordinates: Coord
+    ) -> Bool:
+        """Whether the tile of shape `tile_shape` at `coordinates` lies within
+        the tensor, the precondition of `tile(tile_shape, coordinates)`.
+
+        As for `_tile_in_bounds`: `0 <= c < dim // size` per dimension, for
+        a positive size. A nested layout, a shape or coordinates of another
+        rank, and a tuple element are not checked: this returns `True` for
+        them.
+
+        Args:
+            tile_shape: The dimensions of the tile.
+            coordinates: The coordinates of the tile.
+
+        Returns:
+            Whether the whole tile is within the tensor, or `True` where it
+            is not checked.
+        """
+        comptime if (
+            Self.flat_rank != Self.rank
+            or tile_shape.rank != Self.rank
+            or coordinates.rank != Self.rank
+        ):
+            return True
+        else:
+            comptime for i in range(Self.rank):
+                comptime if not (
+                    tile_shape.element_types[i].is_tuple
+                    or coordinates.element_types[i].is_tuple
+                ):
+                    var size = Int(tile_shape[i].value())
+                    var c = Int(coordinates[i].value())
+                    if size > 0 and (
+                        c < 0 or c >= Int(self.dim[i]()) // size
+                    ):
+                        return False
+            return True
+
     @inline(.nodebug)
     def tile[
         *tile_sizes: Int
-    ](self, coordinates: Coord) -> Self.TileResultType[
+    ](
+        self,
+        coordinates: Coord where self._tile_coords_in_bounds[*tile_sizes](
+            coordinates
+        ),
+    ) -> Self.TileResultType[
         _IntToComptimeInt[*tile_sizes], linear_idx_type=Self.linear_idx_type
     ]:
         """Extract a sub-tile (CuTe `local_tile`). Works on both flat
@@ -2237,7 +2320,12 @@ struct TileTensor[
     @inline(.nodebug)
     def tile[
         *tile_sizes: Int, stride_layout: TensorLayout
-    ](self, coordinates: Coord) -> Self.OffsetViewType[
+    ](
+        self,
+        coordinates: Coord where self._tile_coords_in_bounds[*tile_sizes](
+            coordinates
+        ),
+    ) -> Self.OffsetViewType[
         TypeList.of[Scalar[Self.linear_idx_type]](),
         Layout[
             shape_types=_IntToComptimeInt[*tile_sizes],
@@ -2281,7 +2369,11 @@ struct TileTensor[
         tile_shape_types: TypeList[Trait=CoordLike, ...],
         //,
     ](
-        self, tile_shape: Coord[*tile_shape_types], coordinates: Coord
+        self,
+        tile_shape: Coord[*tile_shape_types],
+        coordinates: Coord where self._tile_shape_in_bounds(
+            tile_shape, coordinates
+        ),
     ) -> Self.TileResultType[
         tile_shape_types, linear_idx_type=Self.linear_idx_type
     ]:
@@ -2324,7 +2416,12 @@ struct TileTensor[
     @inline(.nodebug)
     def tile_with_offset[
         *tile_sizes: Int
-    ](self, coordinates: Coord) -> Tuple[
+    ](
+        self,
+        coordinates: Coord where self._tile_coords_in_bounds[*tile_sizes](
+            coordinates
+        ),
+    ) -> Tuple[
         Self.OffsetViewType[
             TypeList.of[Int](),
             Layout[
@@ -2356,7 +2453,12 @@ struct TileTensor[
     @inline(.nodebug)
     def tile_with_offset[
         *tile_sizes: Int, stride_layout: TensorLayout
-    ](self, coordinates: Coord) -> Tuple[
+    ](
+        self,
+        coordinates: Coord where self._tile_coords_in_bounds[*tile_sizes](
+            coordinates
+        ),
+    ) -> Tuple[
         Self.OffsetViewType[
             TypeList.of[Int](),
             Layout[
