@@ -723,7 +723,14 @@ struct Pointer[
     @doc_hidden
     @inline(.nodebug)
     @deprecated(use=unsafe_offset)
-    def __add__[I: Indexer, //](self, offset: I) -> Self:
+    def __add__[
+        I: Indexer, //
+    ](
+        self,
+        offset: I,
+        out result: Self where index(offset) < 0
+        or result._extent() == self._extent() - index(offset),
+    ):
         """Return a pointer at an offset from the current one.
 
         Parameters:
@@ -740,7 +747,14 @@ struct Pointer[
     @doc_hidden
     @inline(.always)
     @deprecated(use=unsafe_offset)
-    def __sub__[I: Indexer, //](self, offset: I) -> Self:
+    def __sub__[
+        I: Indexer, //
+    ](
+        self,
+        offset: I,
+        out result: Self where index(offset) > 0
+        or result._extent() == self._extent() + index(offset),
+    ):
         """Return a pointer at an offset from the current one.
 
         Parameters:
@@ -757,7 +771,13 @@ struct Pointer[
     @doc_hidden
     @inline(.always)
     @deprecated(use=unsafe_offset)
-    def __iadd__[I: Indexer, //](mut self, offset: I):
+    def __iadd__[
+        I: Indexer, //
+    ](
+        mut self where index(offset) < 0
+        or self._extent() == old(self._extent()) - index(offset),
+        offset: I,
+    ):
         """Add an offset to this pointer.
 
         Parameters:
@@ -771,7 +791,13 @@ struct Pointer[
     @doc_hidden
     @inline(.always)
     @deprecated(use=unsafe_offset)
-    def __isub__[I: Indexer, //](mut self, offset: I):
+    def __isub__[
+        I: Indexer, //
+    ](
+        mut self where index(offset) > 0
+        or self._extent() == old(self._extent()) + index(offset),
+        offset: I,
+    ):
         """Subtract an offset from this pointer.
 
         Parameters:
@@ -1172,7 +1198,15 @@ struct Pointer[
         return 0 <= offset and offset <= self._extent() - width
 
     @inline(.nodebug)
-    def unsafe_offset[I: Indexer](self, offset: I, /) -> Self:
+    def unsafe_offset[
+        I: Indexer
+    ](
+        self,
+        offset: I,
+        /,
+        out result: Self where index(offset) < 0
+        or result._extent() == self._extent() - index(offset),
+    ):
         """Return a pointer at an offset from the current one.
 
         Parameters:
