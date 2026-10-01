@@ -2683,12 +2683,17 @@ private:
         "std::collections::dict::Dict::keys[",
         "std::collections::dict::Dict::values[",
         "std::collections::dict::Dict::items[",
-        "std::collections::dict::Dict::__reversed__["};
+        "std::collections::dict::Dict::__reversed__[",
+        // A linked list's nodes, from the head or (reversed) the tail.
+        "std::collections::linked_list::LinkedList::__iter__[",
+        "std::collections::linked_list::LinkedList::__iter__(::LinkedList[$0]$)",
+        "std::collections::linked_list::LinkedList::__reversed__["};
     static const char *collectionTypes[] = {
         "@std::@collections::@list::@List<",
         "@std::@collections::@span::@Span<",
         "@std::@collections::@array::@Array<",
-        "@std::@collections::@deque::@Deque<"};
+        "@std::@collections::@deque::@Deque<",
+        "@std::@collections::@linked_list::@LinkedList<"};
     static const char *iterators[] = {
         "std::collections::list::_ListIter::",
         "std::collections::span::_SpanIter::",
@@ -2698,7 +2703,9 @@ private:
         "std::collections::array::_ArrayIterOwned::",
         "std::collections::dict::_DictKeyIter::",
         "std::collections::dict::_DictValueIter::",
-        "std::collections::dict::_DictEntryIter::"};
+        "std::collections::dict::_DictEntryIter::",
+        "std::collections::linked_list::_LinkedListIter::",
+        "std::collections::linked_list::_LinkedListIterOwned::"};
     // The length of the collection at `v`, a reference.
     auto lengthOf = [&](Value v) -> MaybeTerm {
       std::optional<Loc> loc = placeOf(v);
@@ -2794,11 +2801,18 @@ private:
     // counts the entries it has seen in either direction.
     bool owned = path.contains("IterOwned::");
     bool dict = path.starts_with("std::collections::dict::");
+    // A linked list's walks its nodes, from the tail when reversed: it
+    // yields `len(l)` elements as long as its nodes are as many as its
+    // size, which its methods keep (an assumption about the stdlib).
+    bool linked = path.starts_with("std::collections::linked_list::");
+    bool backward = false;
     if (isIterator && !owned && !dict) {
       ParamFrame frame = paramFrame(call, callee);
       auto forward = frame.values.find("forward");
-      if (forward == frame.values.end() ||
-          !StringRef(printed(forward->second)).contains("true"))
+      if (forward == frame.values.end())
+        return false;
+      backward = !StringRef(printed(forward->second)).contains("true");
+      if (backward && !linked)
         return false;
     } else if (isEnumerate && !llvm::any_of(iterators, [&](const char *prefix) {
                  StringRef type = StringRef(prefix).drop_back(2);
@@ -2836,6 +2850,11 @@ private:
     step(index, i);
     state.env[length] = n;
     auto source = iterSources.find(self->root);
+    // The element at the cursor, counted from the end when going backward.
+    std::string position =
+        backward ? define(sort, "(bvsub (bvsub " + n + " " + bvConst(1, 64) +
+                                    ") " + i + ")")
+                 : i;
     if (isEnumerate) {
       step(count, c);
       storeFields(*out, state, {{"/0", c}});
@@ -2843,14 +2862,14 @@ private:
       // An owned iterator yields element `i` itself...
       std::string collection =
           load(source->second, state, placeType(source->second));
-      store(*out, state, elem(collection, i, sortOf(placeType(*out))));
+      store(*out, state, elem(collection, position, sortOf(placeType(*out))));
     } else if (auto ref = dyn_cast<LIT::RefType>(placeType(*out));
                ref && source != iterSources.end()) {
       // ... a borrowing one a reference to it, the element's place (named
       // by the call, with the element's type).
       havoc(*out, state, placeType(*out));
       Value element = call->getResult(0);
-      elements[element] = {source->second, i};
+      elements[element] = {source->second, position};
       elementTypes[element] = ref.getElementType();
       state.refs[*out] = Loc{element, ""};
     } else {
