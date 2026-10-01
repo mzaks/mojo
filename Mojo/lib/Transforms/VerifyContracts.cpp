@@ -2345,6 +2345,8 @@ private:
     }
     if (name && evalReversedRange(call, *name, state))
       return;
+    if (name && evalDivmod(call, *name, state))
+      return;
     if (name && evalElementWrite(call, *name, state))
       return;
     if (name && evalTupleLiteral(call, *name, state))
@@ -3411,8 +3413,8 @@ private:
         if (!place || !isScalar(placeType(*place)) ||
             sortOf(placeType(*place)).isBool)
           continue;
-        builtFields[{built, "/" + std::to_string(k)}] =
-            load(*place, state, sortOf(placeType(*place)));
+        setBuiltField(built, "/" + std::to_string(k),
+                      load(*place, state, sortOf(placeType(*place))));
       }
       values[result] = built;
       return true;
@@ -3431,7 +3433,7 @@ private:
         fields.push_back({it->first.second, it->second});
       std::string built = declare({false, 64, false}, "g");
       for (auto &[field, value] : fields)
-        builtFields[{built, field}] = value;
+        setBuiltField(built, field, value);
       values[result] = built;
       return true;
     }
@@ -3491,6 +3493,51 @@ private:
       return true;
     }
     return false;
+  }
+
+  /// `divmod(a, b)` of two `Int`s and `udivmod(a, b)` (and its unchecked
+  /// form): a tuple of the quotient and the remainder (fields `/0`, `/1`),
+  /// rounding toward negative infinity, or for `udivmod` of the arguments
+  /// as unsigned. Division by zero is as for `//` and `%`.
+  bool evalDivmod(LIT::CallOp call, const CalleeName &name, State &state) {
+    StringRef path = name.path;
+    bool isUnsigned =
+        path == "std::math::uutils::udivmod(::SIMD[DType.int, 1],::SIMD[DType."
+                "int, 1])" ||
+        path == "std::math::uutils::udivmod_unchecked(::SIMD[DType.int, 1],::"
+                "SIMD[DType.int, 1])";
+    bool isSigned = false;
+    if (!isUnsigned && path.starts_with("std::math::math::divmod[")) {
+      auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+      isSigned = symbol && symbol.getParamValues().size() == 1 &&
+                 isIntType(resolveParam(symbol.getParamValues()[0]));
+    }
+    if ((!isUnsigned && !isSigned) || call.getNumOperands() != 2 ||
+        call->getNumResults() != 1)
+      return false;
+    SmallVector<std::string, 2> args;
+    for (Value v : call.getOperands())
+      args.push_back(isa<LIT::RefType>(v.getType()) ? valueThrough(v, state)
+                                                    : term(v, state));
+    Sort sort{false, 64, true};
+    for (const std::string &a : args)
+      if (sortOfTerm(a).isBool || sortOfTerm(a).width != 64)
+        return false;
+    Sort as{false, 64, !isUnsigned};
+    std::string built = declare({false, 64, false}, "g");
+    std::string q = define(sort, floorDivision(false, as, args[0], args[1]));
+    std::string r = define(sort, floorDivision(true, as, args[0], args[1]));
+    setBuiltField(built, "/0", q);
+    setBuiltField(built, "/1", r);
+    // What a solver needs to bound them (division by a symbolic divisor is
+    // nonlinear): unsigned, `q * b + r == a` and `r < b` for `b != 0`.
+    if (isUnsigned)
+      facts.push_back("(=> (distinct " + args[1] + " " + bvConst(0, 64) +
+                      ") (and (= (bvadd (bvmul " + q + " " + args[1] + ") " +
+                      r + ") " + args[0] + ") (bvult " + r + " " + args[1] +
+                      ") (bvule " + q + " " + args[0] + ")))");
+    values[call->getResult(0)] = built;
+    return true;
   }
 
   /// GPU ids (`thread_idx.x`, `block_idx.y`, `block_dim.z`, `grid_dim.x`,
@@ -3957,6 +4004,14 @@ private:
     std::string n = paramTerm(size, sort);
     params = saved;
     return n;
+  }
+
+  /// Field `field` of the struct value `built`, which a modelled
+  /// constructor made: it keeps it wherever the value is moved or copied.
+  void setBuiltField(const std::string &built, const std::string &field,
+                     const std::string &value) {
+    fieldValues[{built, field}] = value;
+    builtFields[{built, field}] = value;
   }
 
   /// Writes a struct value with known fields to `loc`: the struct itself is
