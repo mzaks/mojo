@@ -3662,7 +3662,12 @@ private:
     // thread's coordinate `(tid // s) % threads`, so within the tensor for
     // any `tid`). Its layout type may hold them unevaluated, or computed at
     // run time; `threads` is the thread layout's shape, the ninth parameter.
-    if (path.starts_with("layout::tile_tensor::TileTensor::distribute[") &&
+    // `distribute_with_offset` returns the same view as the first of a
+    // tuple (with the thread's coordinates and offset, unknown here).
+    bool withOffset = path.starts_with(
+        "layout::tile_tensor::TileTensor::distribute_with_offset[");
+    if ((withOffset ||
+         path.starts_with("layout::tile_tensor::TileTensor::distribute[")) &&
         call.getNumOperands() == 2) {
       ArrayRef<TypedAttr> params = symbol.getParamValues();
       if (params.size() < 9)
@@ -3695,10 +3700,14 @@ private:
           return false;
         dims.push_back("(bvsdiv " + *d + " " + counts[k] + ")");
       }
-      setResultsUnknown(call);
-      std::string view = values[result];
-      if (sortOfTerm(view).width != 64 || sortOfTerm(view).isBool)
-        return false;
+      std::string view = declare({false, 64, false}, "g");
+      if (withOffset) {
+        std::string tuple = declare({false, 64, false}, "g");
+        setBuiltField(tuple, "/0", view);
+        values[result] = tuple;
+      } else {
+        values[result] = view;
+      }
       if (!tensorDimDeclared) {
         prelude += "(declare-fun tdim ((_ BitVec 64) (_ BitVec 64)) "
                    "(_ BitVec 64))\n";
