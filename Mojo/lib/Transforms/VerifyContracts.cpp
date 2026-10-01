@@ -3054,6 +3054,8 @@ private:
     if ((size_t)k < shape.size())
       if (std::optional<int64_t> n = comptimeIntValue(shape[k]))
         return bvConst(*n, 64);
+    if (MaybeTerm n = comptimeShape(params[3], k))
+      return n;
     std::string value = isa<LIT::RefType>(tensor.getType())
                             ? valueThrough(tensor, state)
                             : term(tensor, state);
@@ -3069,24 +3071,57 @@ private:
     return define(Sort{false, 64, true}, d);
   }
 
-  /// The integers of a parameter list (`#kgen.param_list<{:scalar<index>
-  /// 2}, {:scalar<index> 4}>`), such as a `*sizes: Int` parameter.
-  std::optional<SmallVector<int64_t>> intList(TypedAttr param) {
-    std::string list = printed(resolveParam(param));
-    StringRef rest(list);
-    if (!rest.consume_front("#kgen.param_list<"))
+  /// Extent `k` of a `TileTensor` layout type parameter whose shape says
+  /// `ComptimeInt[v]` for a parameter expression `v` (`BM` in a function
+  /// generic over it), as a term in the scope the layout came from.
+  MaybeTerm comptimeShape(TypedAttr layoutParam, int64_t k) {
+    ParamFrame *scope = nullptr;
+    auto layout = dyn_cast<TypeParamAttr>(resolveParam(layoutParam, &scope));
+    auto type = layout ? dyn_cast<LIT::StructType>(layout.getTypeValue())
+                       : LIT::StructType();
+    if (!type || type.getParamValues().empty() ||
+        printed(type.getSymbol()) != "@layout::@tile_layout::@Layout")
       return std::nullopt;
-    // Up to the list's type (`> : !kgen.param_list<...>`).
-    size_t end = rest.find("> : ");
-    if (end == StringRef::npos)
+    auto shape = dyn_cast<ParamListAttr>(type.getParamValues()[0]);
+    if (!shape || k >= (int64_t)shape.getValues().size())
       return std::nullopt;
-    SmallVector<int64_t> values;
-    for (StringRef element : llvm::split(rest.take_front(end), ", ")) {
-      int64_t n;
-      if (!element.consume_front("{:scalar<index> ") ||
-          !element.consume_back("}") || element.getAsInteger(10, n))
+    auto mode = dyn_cast<TypeParamAttr>(shape.getValues()[k]);
+    auto comptimeInt = mode ? dyn_cast<LIT::StructType>(mode.getTypeValue())
+                            : LIT::StructType();
+    if (!comptimeInt || comptimeInt.getParamValues().size() != 1 ||
+        printed(comptimeInt.getSymbol()) !=
+            "@std::@utils::@coord::@ComptimeInt")
+      return std::nullopt;
+    TypedAttr value = comptimeInt.getParamValues()[0];
+    Sort sort = sortOf(value.getType());
+    if (sort.isBool || sort.width != 64)
+      return std::nullopt;
+    ParamFrame *saved = params;
+    params = scope;
+    std::string n = paramTerm(value, sort);
+    params = saved;
+    return n;
+  }
+
+  /// The integers of a parameter list (`#kgen.param_list<2, 4>`, or of
+  /// parameters `BM, BN` in a generic function), such as a `*sizes: Int`
+  /// parameter, as terms.
+  std::optional<SmallVector<std::string>> intList(TypedAttr param) {
+    // The list's elements are in the scope of the frame it came from (a
+    // caller's `BM`, passed on as `tile[BM, 16]`).
+    ParamFrame *scope = nullptr;
+    auto list = dyn_cast<ParamListAttr>(resolveParam(param, &scope));
+    if (!list)
+      return std::nullopt;
+    ParamFrame *saved = params;
+    params = scope;
+    llvm::scope_exit restore([&] { params = saved; });
+    SmallVector<std::string> values;
+    for (TypedAttr value : list.getValues()) {
+      std::string v = paramTerm(value, Sort{false, 64, true});
+      if (sortOfTerm(v).isBool || sortOfTerm(v).width != 64)
         return std::nullopt;
-      values.push_back(n);
+      values.push_back(v);
     }
     return values;
   }
@@ -3196,13 +3231,14 @@ private:
     }
     // `t._tile_in_bounds[*sizes](*coords)`, the clause of taking a tile:
     // every coordinate `c` of the pack in `[0, dim / size)` for a positive
-    // size (`sizes` is the ninth parameter, a list of integers).
+    // size (`sizes` is the ninth parameter, a list of integers or integer
+    // parameters).
     if (path.starts_with("layout::tile_tensor::TileTensor::_tile_in_bounds[") &&
         call.getNumOperands() == 2) {
       ArrayRef<TypedAttr> params = symbol.getParamValues();
       if (params.size() < 9)
         return false;
-      std::optional<SmallVector<int64_t>> sizes = intList(params[8]);
+      std::optional<SmallVector<std::string>> sizes = intList(params[8]);
       if (!sizes)
         return false;
       Value pack = call.getOperands()[1];
@@ -3215,8 +3251,6 @@ private:
         return false;
       std::string all = "true";
       for (auto [k, ref] : llvm::enumerate(refs->second)) {
-        if ((*sizes)[k] <= 0)
-          continue;
         std::optional<Loc> place = placeOf(ref);
         if (!place || !isScalar(placeType(*place)) ||
             sortOf(placeType(*place)).isBool ||
@@ -3226,9 +3260,10 @@ private:
         MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
         if (!d)
           return false;
-        all = "(and " + all + " (bvsle " + bvConst(0, 64) + " " + c +
-              ") (bvslt " + c + " (bvsdiv " + *d + " " +
-              bvConst((*sizes)[k], 64) + ")))";
+        const std::string &size = (*sizes)[k];
+        all = "(and " + all + " (ite (bvsgt " + size + " " + bvConst(0, 64) +
+              ") (and (bvsle " + bvConst(0, 64) + " " + c + ") (bvslt " + c +
+              " (bvsdiv " + *d + " " + size + "))) true))";
       }
       values[result] = define({true, 1, false}, all);
       return true;
@@ -3369,18 +3404,17 @@ private:
             "layout::tile_tensor::TileTensor::_vectorize_in_bounds[") &&
         call.getNumOperands() == 1) {
       ArrayRef<TypedAttr> params = symbol.getParamValues();
-      std::optional<SmallVector<int64_t>> sizes;
+      std::optional<SmallVector<std::string>> sizes;
       if (params.size() < 9 || !(sizes = intList(params[8])))
         return false;
       std::string all = "true";
       for (auto [k, size] : llvm::enumerate(*sizes)) {
-        if (size <= 1)
-          continue;
         MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
         if (!d)
           return false;
-        all = "(and " + all + " (= (bvsrem " + *d + " " + bvConst(size, 64) +
-              ") " + bvConst(0, 64) + "))";
+        all = "(and " + all + " (ite (bvsgt " + size + " " + bvConst(1, 64) +
+              ") (= (bvsrem " + *d + " " + size + ") " + bvConst(0, 64) +
+              ") true))";
       }
       values[result] = define({true, 1, false}, all);
       return true;
@@ -3390,15 +3424,14 @@ private:
     if (path.starts_with("layout::tile_tensor::TileTensor::vectorize[") &&
         call.getNumOperands() == 1) {
       ArrayRef<TypedAttr> params = symbol.getParamValues();
-      std::optional<SmallVector<int64_t>> sizes;
+      std::optional<SmallVector<std::string>> sizes;
       if (params.size() < 9 || !(sizes = intList(params[8])))
         return false;
       SmallVector<std::string> dims;
-      for (auto [k, size] : llvm::enumerate(*sizes)) {
+      for (auto [k, s] : llvm::enumerate(*sizes)) {
         MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
-        if (!d || size <= 0)
+        if (!d)
           return false;
-        std::string s = bvConst(size, 64);
         dims.push_back("(ite (= (bvsrem " + *d + " " + s + ") " +
                        bvConst(0, 64) + ") (bvsdiv " + *d + " " + s +
                        ") (bvadd (bvsdiv " + *d + " " + s + ") " +
@@ -3413,9 +3446,11 @@ private:
                    "(_ BitVec 64))\n";
         tensorDimDeclared = true;
       }
+      // For a positive size; a view of another has no extents to state.
       for (auto [k, d] : llvm::enumerate(dims))
-        facts.push_back("(= (tdim " + view + " " + bvConst(k, 64) + ") " + d +
-                        ")");
+        facts.push_back("(=> (bvsgt " + (*sizes)[k] + " " + bvConst(0, 64) +
+                        ") (= (tdim " + view + " " + bvConst(k, 64) + ") " + d +
+                        "))");
       return true;
     }
     return false;
@@ -3781,10 +3816,13 @@ private:
 
   /// A parameter value with the callee parameters it names replaced by the
   /// values their calls bind, as far as they are known.
-  TypedAttr resolveParam(TypedAttr attr) {
+  TypedAttr resolveParam(TypedAttr attr, ParamFrame **scope = nullptr) {
     // A type passed where a wider trait is expected: the type itself.
     while (auto upcast = dyn_cast<UpcastAttr>(attr))
       attr = upcast.getInputTypeValue();
+    // The frame the result's own parameter references belong to.
+    if (scope)
+      *scope = params;
     for (ParamFrame *frame = params; frame; frame = frame->parent) {
       while (auto upcast = dyn_cast<UpcastAttr>(attr))
         attr = upcast.getInputTypeValue();
@@ -3795,6 +3833,8 @@ private:
       if (it == frame->values.end())
         break;
       attr = it->second;
+      if (scope)
+        *scope = frame->parent;
     }
     while (auto upcast = dyn_cast<UpcastAttr>(attr))
       attr = upcast.getInputTypeValue();
