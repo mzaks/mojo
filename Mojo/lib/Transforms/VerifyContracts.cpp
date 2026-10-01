@@ -3233,6 +3233,136 @@ private:
       values[result] = define({true, 1, false}, all);
       return true;
     }
+    // `t._access_in_bounds[width](coord)`, the clause of `load` and
+    // `store`: for a flat layout without vectorization, indexed by one
+    // value per dimension, every integer coordinate in `[0, dim)`, and with
+    // a width above one the last at most `dim - width` and its stride 1.
+    // Anything else is true, as in the helper. The width is the ninth
+    // parameter, the coordinate's element types the tenth.
+    if (path.starts_with(
+            "layout::tile_tensor::TileTensor::_access_in_bounds[") &&
+        call.getNumOperands() == 2) {
+      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      if (params.size() < 10)
+        return false;
+      static llvm::Regex widthRe("_mlir_value = ([0-9]+)\\}");
+      SmallVector<StringRef> m;
+      std::string widthText = printed(resolveParam(params[8]));
+      int64_t width;
+      if (!widthRe.match(widthText, &m) || m[1].getAsInteger(10, width))
+        return false;
+      std::string typesText = printed(resolveParam(params[9]));
+      StringRef types(typesText);
+      if (!types.consume_front("#kgen.param_list<"))
+        return false;
+      SmallVector<StringRef> elementTypes = listElements(types);
+      std::string layout = printed(resolveParam(params[3]));
+      SmallVector<StringRef> shape = layoutList(layout, 0);
+      SmallVector<StringRef> strides = layoutList(layout, 1);
+      // The engine's element width (`DefaultEngine[element_width=n]`).
+      static llvm::Regex engineRe(
+          "^#kgen.type<!lit.struct<@layout::@tensor_engine::@"
+          "(DefaultEngine|DevicePointerEngine)<.*\\{:scalar<index> "
+          "([0-9]+)\\}>>> :");
+      std::string engine = printed(resolveParam(params[5]));
+      int64_t elementWidth;
+      if (shape.empty() || strides.size() != shape.size() ||
+          !engineRe.match(engine, &m) || m[2].getAsInteger(10, elementWidth))
+        return false;
+      bool nested = llvm::any_of(shape, [](StringRef mode) {
+        return mode.starts_with("@std::@utils::@coord::@Coord<");
+      });
+      if (nested || elementTypes.size() != shape.size() || elementWidth != 1) {
+        values[result] = "true";
+        return true;
+      }
+      Value coord = call.getOperands()[1];
+      std::string coordValue = isa<LIT::RefType>(coord.getType())
+                                   ? valueThrough(coord, state)
+                                   : term(coord, state);
+      std::string all = "true";
+      size_t last = shape.size() - 1;
+      for (auto [k, type] : llvm::enumerate(elementTypes)) {
+        if (type.starts_with("@std::@utils::@coord::@Coord<"))
+          continue;
+        std::string c;
+        if (std::optional<int64_t> n = comptimeIntValue(type)) {
+          c = bvConst(*n, 64);
+        } else if (!type.starts_with("@std::@simd::@SIMD<")) {
+          return false;
+        } else {
+          auto it = builtFields.find({coordValue, "/" + std::to_string(k)});
+          if (it == builtFields.end())
+            return false;
+          c = it->second;
+          Sort cs = sortOfTerm(c);
+          if (cs.isBool || cs.width > 64)
+            return false;
+          if (cs.width < 64)
+            c = "((_ " + std::string(cs.isSigned ? "sign" : "zero") +
+                "_extend " + std::to_string(64 - cs.width) + ") " + c + ")";
+        }
+        MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
+        if (!d)
+          return false;
+        std::string zero = bvConst(0, 64);
+        if (k == last && width > 1) {
+          // A runtime stride is not known to be 1.
+          std::optional<int64_t> stride = comptimeIntValue(strides[k]);
+          std::string unit = !stride        ? declare({true, 1, false})
+                             : *stride == 1 ? "true"
+                                            : "false";
+          all = "(and " + all + " " + unit + " (bvsle " + zero + " " + c +
+                ") (bvsle " + c + " (bvsub " + *d + " " + bvConst(width, 64) +
+                ")))";
+        } else {
+          all = "(and " + all + " (bvsle " + zero + " " + c + ") (bvslt " + c +
+                " " + *d + "))";
+        }
+      }
+      values[result] = define({true, 1, false}, all);
+      return true;
+    }
+    // `Coord(*values)`: field `/k` of the coordinate is the `k`th value
+    // where it is an integer (a `ComptimeInt`'s value is in its type).
+    if (path.starts_with("std::utils::coord::Coord::__init__[") &&
+        path.contains("](*$0)") && call.getNumOperands() == 1) {
+      std::optional<Loc> packPlace = placeOf(call.getOperands()[0]);
+      if (!packPlace)
+        return false;
+      auto it = packRefs.find(load(*packPlace, state, placeType(*packPlace)));
+      if (it == packRefs.end())
+        return false;
+      std::string built = declare({false, 64, false}, "g");
+      for (auto [k, ref] : llvm::enumerate(it->second)) {
+        std::optional<Loc> place = placeOf(ref);
+        if (!place || !isScalar(placeType(*place)) ||
+            sortOf(placeType(*place)).isBool)
+          continue;
+        builtFields[{built, "/" + std::to_string(k)}] =
+            load(*place, state, sortOf(placeType(*place)));
+      }
+      values[result] = built;
+      return true;
+    }
+    // `Coord(tuple)`, as a tuple literal converts (`t.load((i, j))`): the
+    // fields the tuple was built with.
+    if (path.starts_with("std::utils::coord::Coord::__init__(::Tuple[") &&
+        call.getNumOperands() == 1) {
+      Value tuple = call.getOperands()[0];
+      std::string from = isa<LIT::RefType>(tuple.getType())
+                             ? valueThrough(tuple, state)
+                             : term(tuple, state);
+      SmallVector<std::pair<std::string, std::string>> fields;
+      for (auto it = builtFields.lower_bound({from, ""});
+           it != builtFields.end() && it->first.first == from; ++it)
+        fields.push_back({it->first.second, it->second});
+      std::string built = declare({false, 64, false}, "g");
+      for (auto &[field, value] : fields)
+        builtFields[{built, field}] = value;
+      values[result] = built;
+      return true;
+    }
     // `t._vectorize_in_bounds[*sizes]()`, the clause of vectorizing: every
     // dimension a multiple of its size, where that is more than one.
     if (path.starts_with(
