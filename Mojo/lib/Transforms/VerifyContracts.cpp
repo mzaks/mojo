@@ -682,6 +682,9 @@ private:
     std::string scope;
   };
   ParamFrame *params = nullptr;
+  /// The `end` of each `comptime for` over `range(end)`, by the printed
+  /// reference to its iterator parameter.
+  std::map<std::string, std::string> comptimeRangeEnds;
   /// The references a variadic pack holds, by the pack's term.
   std::map<std::string, SmallVector<Value>> packRefs;
   /// Element references `__getitem__` returned: the list's place and the
@@ -1535,6 +1538,28 @@ private:
   /// iteration's parameter values is unknown, so what is proven holds for
   /// every one of them.
   void walkComptimeFor(Operation *loop, State &state) {
+    // Over `range(end)`: each iteration's value is in `[0, end)`.
+    Attribute decl = loop->getAttr("paramDecl");
+    Attribute initial = loop->getAttr("initial");
+    if (decl && initial) {
+      std::optional<std::string> end;
+      initial.walk([&](ParamOperatorAttr apply) {
+        ArrayRef<TypedAttr> ops = apply.getOperands();
+        if (!end && apply.getOpcode() == POC::Apply && ops.size() == 2 &&
+            StringRef(printed(ops[0]))
+                .starts_with("#kgen.symbol.constant<@std::@builtin::@range::@"
+                             "\"range[::DType](::SIMD[$0, 1])\""))
+          if (std::string e = paramTerm(ops[1], Sort{false, 64, true});
+              !sortOfTerm(e).isBool && sortOfTerm(e).width == 64)
+            end = e;
+      });
+      // Its uses name it `#kgen.param.decl.ref<"iter`30">`.
+      static llvm::Regex nameRe("param.decl \\*(\"[^\"]*\")");
+      SmallVector<StringRef> m;
+      std::string declText = printed(decl);
+      if (end && nameRe.match(declText, &m))
+        comptimeRangeEnds["#kgen.param.decl.ref<" + m[1].str() + ">"] = *end;
+    }
     if (loop->getNumResults() || loop->getNumRegions() < 1 ||
         loop->getRegion(0).empty() ||
         loop->getRegion(0).front().getNumArguments()) {
@@ -2038,6 +2063,18 @@ private:
     // A parameter expression.
     if (!values.count(result))
       values[result] = paramTerm(cst.getValue(), sort);
+    // The value of an iteration of a `comptime for` over `range(end)`.
+    if (!sort.isBool && sort.width == 64 && !comptimeRangeEnds.empty()) {
+      std::string text = printed(cst.getValue());
+      if (StringRef(text).contains("paramfor_next_value"))
+        for (auto &[name, end] : comptimeRangeEnds)
+          if (StringRef(text).contains(name)) {
+            const std::string &v = values[result];
+            facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + v +
+                            ") (bvslt " + v + " " + end + "))");
+            break;
+          }
+    }
   }
 
   /// An integer or Boolean `SIMD` operator on terms, as its SMT expression.
@@ -3843,10 +3880,23 @@ private:
 
   /// Whether a type parameter's value is `Int`.
   static bool isIntType(TypedAttr attr) {
-    if (auto sugar = dyn_cast<SugarAttr>(attr))
-      attr = sugar.getCanonical();
-    auto type = dyn_cast<TypeParamAttr>(attr);
-    return type && isInt(type.getTypeValue());
+    // Through aliases, and through a type given by a parameter expression
+    // (`comptime for k in range(n)`: `k` is the range's `Element`, `Int`).
+    for (int depth = 0; depth < 8; ++depth) {
+      if (auto sugar = dyn_cast<SugarAttr>(attr)) {
+        attr = sugar.getCanonical();
+        continue;
+      }
+      auto type = dyn_cast<TypeParamAttr>(attr);
+      if (!type)
+        return false;
+      if (auto param = dyn_cast<KGEN::ParamType>(type.getTypeValue())) {
+        attr = param.getParam();
+        continue;
+      }
+      return isInt(type.getTypeValue());
+    }
+    return false;
   }
 
   /// The value of an `IntLiteral` type parameter's literal.
