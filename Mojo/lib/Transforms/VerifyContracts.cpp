@@ -3965,6 +3965,8 @@ private:
         break;
       }
     // The dimensions: the first two `Dim`s after it, as `Dim` built them.
+    // Operands between the pack and them are host arguments
+    // (`host_arg=`), the kernel's last arguments.
     SmallVector<Value, 2> dimOperands;
     for (size_t i = next; i < call.getNumOperands() && dimOperands.size() < 2;
          ++i) {
@@ -3973,6 +3975,8 @@ private:
         type = ref.getElementType();
       if (StringRef(printed(type)).contains("@max::@gpu::@host::@dim::@Dim"))
         dimOperands.push_back(call.getOperands()[i]);
+      else if (dimOperands.empty() && known)
+        refs.push_back(call.getOperands()[i]);
     }
     if (dimOperands.size() != 2)
       known = false;
