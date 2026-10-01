@@ -3895,12 +3895,13 @@ bool isDefaultWrapper(LIT::FnOp fn) {
   return fn.getDefaultFnRefAttr() != nullptr;
 }
 
-bool inStdlib(Operation *op) {
+/// Code from an imported package (the stdlib, `layout`, ...), not from the
+/// file being checked.
+bool inLibrary(Operation *op) {
   for (Operation *parent = op->getParentOp(); parent;
        parent = parent->getParentOp())
-    if (auto pkg = dyn_cast<LIT::PackageOp>(parent))
-      if (pkg.getSymName() == "std")
-        return true;
+    if (isa<LIT::PackageOp>(parent))
+      return true;
   return false;
 }
 
@@ -3930,7 +3931,7 @@ struct VerifyContractsPass
     };
     SmallVector<Job> fns;
     getOperation().walk([&](LIT::FnOp fn) {
-      if ((includeStdlib || !inStdlib(fn)) && !isRequiredTraitMethod(fn) &&
+      if ((includeStdlib || !inLibrary(fn)) && !isRequiredTraitMethod(fn) &&
           !isDefaultWrapper(fn))
         fns.push_back({fn, {}});
     });
@@ -3939,7 +3940,7 @@ struct VerifyContractsPass
     {
       SymbolTableCollection symbols;
       getOperation().walk([&](ConformanceOp conformance) {
-        if (!includeStdlib && inStdlib(conformance))
+        if (!includeStdlib && inLibrary(conformance))
           return;
         auto trait = dyn_cast_or_null<LIT::TraitDeclOp>(symbols.lookupSymbolIn(
             module, conformance.getTraitSymbol().getSymbol()));

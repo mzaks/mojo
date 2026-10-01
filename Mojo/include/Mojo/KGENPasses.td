@@ -46,7 +46,7 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
   }];
   let options = [
     Option<"includeStdlib", "include-stdlib", "bool", /*default=*/"false",
-           "Also verify functions from the `std` package">,
+           "Also verify functions from imported packages (the stdlib, `layout`, ...)">,
     Option<"verbose", "verbose", "bool", /*default=*/"false",
            "Report proven obligations too, as remarks">,
     Option<"z3Path", "z3-path", "std::string", /*default=*/"\"\"",
