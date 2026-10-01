@@ -255,8 +255,10 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   does not prove it: the sum wraps for a large `j`; `j <= dim - 4` does).
   `Coord(i, j)`, `Coord(Idx[3], j)` and a tuple `(i, j)` are modelled
   element by element. A nested layout, a coordinate of another rank and a
-  vectorized view are not checked. `tile` with `Coord` arguments and
-  `distribute` have no contracts yet.
+  vectorized view are not checked. `tile` with `Coord` coordinates
+  (`tile[2, 4](Coord(i, j))`, `tile(coord[2, 4], Coord(i, j))`, also
+  with a runtime shape) and `tile_with_offset` have the same contract as
+  `tile[2, 4](i, j)`. `distribute` has no contract yet.
 - GPU kernels: `thread_idx`, `block_idx`, `block_dim` and `grid_dim` are
   one value per axis in a function, with the launch limits every
   supported GPU has (assumptions): `0 <= thread_idx < block_dim <= 1024`

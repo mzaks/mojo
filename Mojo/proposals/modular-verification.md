@@ -1174,11 +1174,24 @@ Tensors and GPU kernels:
   value of their parameters. kernels.mojo: 14 of 22, three of them only
   for their launched instantiations, the other 8 in `bad_*` functions,
   the same with the option.
-- Not covered yet: `tile` with `Coord` arguments, `distribute`, a
-  runtime last stride, function-level `where` constraints on parameters
-  (`where N <= 8`) as assumptions, launches through the other
-  `enqueue_function` overloads, tensors whose runtime size comes
-  from a scalar (`row_major(n)`: `dim` is not related to `n`), raw pointers, and
+- `tile` with `Coord` coordinates: `tile[*sizes](coords)` and the two
+  `tile_with_offset` overloads require `_tile_coords_in_bounds[*sizes](
+  coords)`, `tile(shape, coords)` requires `_tile_shape_in_bounds(shape,
+  coords)`, both `0 <= c < dim // size` per dimension like the `Int` form.
+  The first helper takes the sizes as integers rather than as the `Coord`
+  `coord[*sizes]`: inside the generic `tile`, that `Coord`'s element types
+  are an unevaluated `param_list.tabulate` over `tile_sizes`, which the
+  pass cannot read, while an integer list it resolves through the frames.
+  The model reads each `Coord` element as `load` and `store` do (a literal
+  `ComptimeInt`, or the integer it was built with, widened), now one
+  function, `coordElement`; a shape given at run time (`Coord(s, 8)`)
+  works the same way. The `layout`, `nn` and `linalg` kernel tests pass
+  with the clauses. tensors.mojo: 62 of 83, the other 21 in `bad_*`
+  functions.
+- Not covered yet: `distribute`, a runtime last stride, function-level `where`
+  constraints on parameters (`where N <= 8`) as assumptions, launches through
+  the other `enqueue_function` overloads, tensors whose runtime size comes from
+  a scalar (`row_major(n)`: `dim` is not related to `n`), raw pointers, and
   kernels in MAX's own packages, which are now skipped as imported code unless
   `include-stdlib=true`.
 

@@ -15,7 +15,7 @@
 
 from layout import Idx, TileTensor, row_major
 from max.gpu import block_dim, block_idx, global_idx, thread_idx
-from std.utils.coord import Coord
+from std.utils.coord import Coord, coord
 
 comptime L8 = type_of(row_major[8]())
 comptime L24 = type_of(row_major[2, 4]())
@@ -167,6 +167,27 @@ def ok_load_narrow(
     return 0
 
 
+def ok_tile_coord(t: TileTensor[DType.float32, L88, MutAnyOrigin]) -> Float32:
+    return t.tile[2, 4](Coord(3, 1))[1, 3]  # coordinates as a `Coord`
+
+
+def ok_tile_shape(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int, j: Int
+) -> Float32:
+    if 0 <= i and i < Int(t.dim[0]()) // 2:
+        if 0 <= j and j < Int(t.dim[1]()) // 4:
+            return t.tile(coord[2, 4], Coord(i, j))[1, 3]  # shape as a `Coord`
+    return 0
+
+
+def ok_tile_tuple(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin], i: Int
+) -> Float32:
+    if 0 <= i and i < 4:
+        return t.tile[2, 4]((i, 1))[1, 3]
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_static(t: TileTensor[DType.float32, L8, MutAnyOrigin]) -> Float32:
     return t[8]  # one past the end
@@ -275,4 +296,18 @@ def bad_load_narrow(
 ) -> Float32:
     if i < UInt8(9):
         return t.load[1](Coord(i, Idx[2]))
+    return 0
+
+
+def bad_tile_coords(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) -> Float32:
+    return t.tile[2, 4](Coord(4, 0))[0, 0]  # 4 tiles per column
+
+
+def bad_tile_shape(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin], s: Int
+) -> Float32:
+    if 0 < s and s <= 8:
+        return t.tile(Coord(s, 8), Coord(1, 0))[0, 0]  # `2 * s` may pass 8
     return 0
