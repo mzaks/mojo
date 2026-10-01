@@ -453,6 +453,31 @@ Parameters:
 """
 
 
+@always_inline
+def _coord_in_bounds[T: CoordLike, //](i: T, n: Int) -> Bool:
+    """Whether a scalar coordinate is in `[0, n)`, the precondition of
+    indexing a tensor dimension of extent `n`.
+
+    A tuple coordinate (a nested mode) is not checked here: this returns
+    `True` for it.
+
+    Parameters:
+        T: The coordinate type.
+
+    Args:
+        i: The coordinate.
+        n: The extent of the dimension it indexes.
+
+    Returns:
+        Whether the coordinate is in range, or `True` for a tuple.
+    """
+    comptime if T.is_tuple:
+        return True
+    else:
+        var v = Int(i.value())
+        return 0 <= v and v < n
+
+
 struct TileTensor[
     mut: Bool,
     //,
@@ -983,7 +1008,12 @@ struct TileTensor[
         ](self._unsafe_storage_cast[to_mut=True](), offset, value)
 
     @inline(.nodebug)
-    def __getitem__(self, i0: Some[CoordLike]) -> Self.ElementType:
+    def __getitem__(
+        self,
+        i0: Some[CoordLike] where Self.rank != 1 or _coord_in_bounds(
+            i0, Int(self.dim[0]())
+        ),
+    ) -> Self.ElementType:
         """Retrieve the element at the given index or coordinate.
 
         Args:
@@ -999,7 +1029,11 @@ struct TileTensor[
 
     @inline(.nodebug)
     def __getitem__(
-        self, i0: Some[CoordLike], i1: Some[CoordLike]
+        self,
+        i0: Some[CoordLike] where _coord_in_bounds(i0, Int(self.dim[0]())),
+        i1: Some[CoordLike] where Self.rank != 2 or _coord_in_bounds(
+            i1, Int(self.dim[1]())
+        ),
     ) -> Self.ElementType:
         """Retrieve the element at the given indices.
 
@@ -1308,12 +1342,43 @@ struct TileTensor[
         """
         self.store(coord, value)
 
+    @always_inline
+    def _indices_in_bounds[
+        *IndexTypes: Indexer & Copyable
+    ](self, *items: *IndexTypes) -> Bool:
+        """Whether flat indices are within the tensor's dimensions, the
+        precondition of writing an element at them.
+
+        A nested layout's flat indices address its leaf modes, which `dim`
+        does not give: this returns `True` for it.
+
+        Parameters:
+            IndexTypes: The types of the indices.
+
+        Args:
+            items: One index per dimension.
+
+        Returns:
+            Whether every index `i` is in `[0, dim[i])`, or `True` for a
+            nested layout.
+        """
+        comptime if Self.flat_rank != Self.rank:
+            return True
+        else:
+            comptime for i in range(IndexTypes.length):
+                var v = index(items[i])
+                if v < 0 or v >= Int(self.dim[i]()):
+                    return False
+            return True
+
     @inline(.nodebug)
     def __setitem__[
         *IndexTypes: Indexer & Copyable
-    ](self, *items: *IndexTypes, value: Self.ElementType) where (
-        IndexTypes.length == Self.flat_rank
-    ) & Self.mut:
+    ](
+        self,
+        *items: *IndexTypes,
+        value: Self.ElementType where self._indices_in_bounds(*items),
+    ) where (IndexTypes.length == Self.flat_rank) & Self.mut:
         """Sets a single element in the tensor at the specified indices.
 
         Uses flat indexing based on flat_rank. For non-nested layouts,
