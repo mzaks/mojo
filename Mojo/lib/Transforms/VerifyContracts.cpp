@@ -799,6 +799,7 @@ private:
   DenseMap<Value, std::pair<Loc, std::string>> elements;
   std::set<std::string> elementFunctions;
   bool tensorDimDeclared = false;
+  bool pointerExtentDeclared = false;
   /// The GPU id constants declared (see `evalGpuId`).
   std::set<std::string> gpuIds;
   /// The results of `TileTensor.dim` (see `evalTileTensor`).
@@ -2487,6 +2488,8 @@ private:
       return;
     if (name && evalCeildiv(call, *name, state))
       return;
+    if (name && evalPointer(call, *name, state))
+      return;
     if (name && evalElementWrite(call, *name, state))
       return;
     if (name && evalTupleLiteral(call, *name, state))
@@ -3801,6 +3804,63 @@ private:
     return false;
   }
 
+  /// The extent of the pointer value `p`, `Pointer._extent()`: how many
+  /// elements are valid from it, an unknown per pointer, not negative.
+  MaybeTerm pointerExtent(Value p, State &state) {
+    std::string value = isa<LIT::RefType>(p.getType()) ? valueThrough(p, state)
+                                                       : term(p, state);
+    if (sortOfTerm(value).isBool || sortOfTerm(value).width != 64)
+      return std::nullopt;
+    return define(Sort{false, 64, true}, extentOf(value));
+  }
+
+  /// `pext(value)`, not negative.
+  std::string extentOf(const std::string &value) {
+    if (!pointerExtentDeclared) {
+      prelude += "(declare-fun pext ((_ BitVec 64)) (_ BitVec 64))\n";
+      pointerExtentDeclared = true;
+    }
+    std::string e = "(pext " + value + ")";
+    facts.push_back("(bvsge " + e + " " + bvConst(0, 64) + ")");
+    return e;
+  }
+
+  /// `Pointer._extent()`, and `p._offset_in_bounds[width](offset)`, the
+  /// clause of accessing `width` elements at `offset`:
+  /// `0 <= offset <= extent - width` (the width is the last parameter).
+  bool evalPointer(LIT::CallOp call, const CalleeName &name, State &state) {
+    StringRef path = name.path;
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!symbol || call->getNumResults() != 1 ||
+        !path.starts_with("std::memory::pointer::Pointer::"))
+      return false;
+    Value result = call->getResult(0);
+    if (path.starts_with("std::memory::pointer::Pointer::_extent(") &&
+        call.getNumOperands() == 1) {
+      MaybeTerm e = pointerExtent(call.getOperands()[0], state);
+      if (!e)
+        return false;
+      values[result] = *e;
+      return true;
+    }
+    if (path.starts_with("std::memory::pointer::Pointer::_offset_in_bounds[") &&
+        call.getNumOperands() == 2 && !symbol.getParamValues().empty()) {
+      MaybeTerm e = pointerExtent(call.getOperands()[0], state);
+      std::string width =
+          paramTerm(symbol.getParamValues().back(), Sort{false, 64, true});
+      std::string offset = term(call.getOperands()[1], state);
+      if (!e || sortOfTerm(width).width != 64 || sortOfTerm(width).isBool ||
+          sortOfTerm(offset).width != 64 || sortOfTerm(offset).isBool)
+        return false;
+      values[result] =
+          define({true, 1, false}, "(and (bvsle " + bvConst(0, 64) + " " +
+                                       offset + ") (bvsle " + offset +
+                                       " (bvsub " + *e + " " + width + ")))");
+      return true;
+    }
+    return false;
+  }
+
   /// `ceildiv(a, b)` of two integers (`Int`, or a `SIMD` scalar of an
   /// integer dtype): their `__ceildiv__`, which it calls. Generic over its
   /// type, it returns through an out slot, its last operand.
@@ -3985,6 +4045,20 @@ private:
     }
     if (dimOperands.size() != 2)
       known = false;
+    // A `DeviceBuffer` passed to the kernel becomes a pointer to its
+    // elements (its `device_type`): the extent of that pointer is the
+    // buffer's length.
+    for (Value ref : refs) {
+      Type type = ref.getType();
+      if (auto r = dyn_cast<LIT::RefType>(type))
+        type = r.getElementType();
+      if (!StringRef(printed(type))
+               .contains("@max::@gpu::@host::@device_context::@DeviceBuffer<"))
+        continue;
+      std::string value = valueOf(ref);
+      if (!sortOfTerm(value).isBool && sortOfTerm(value).width == 64)
+        facts.push_back("(= " + extentOf(value) + " " + lenOf(value) + ")");
+    }
     std::map<std::string, std::string> dims;
     const char *kinds[] = {"grid_dim_", "block_dim_"};
     for (auto [k, dim] : llvm::enumerate(dimOperands)) {
