@@ -282,7 +282,11 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   are obligations, with the kernel's arguments the launch's and its
   `grid_dim` and `block_dim` the launch's `Dim`s (from `Int`s, literals
   or tuples; an omitted axis is 1). Other GPU ids in a clause are unknown
-  at the launch.
+  at the launch. A kernel compiled first and launched as
+  `ctx.enqueue_function(ctx.compile_function[kernel](), args..., ...)`
+  is checked the same way. Kernels launched as closures (no arguments, so
+  no clauses), with `host_arg`, or as precompiled external functions are
+  not checked.
 - A generic kernel that is launched (`enqueue_function[kernel[8]](...)`)
   is verified for each distinct launch, its parameters bound to the
   launch's, not for every value of them: a proof for every `BM` and `BN`

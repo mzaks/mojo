@@ -1219,11 +1219,23 @@ Tensors and GPU kernels:
   `where N <= 8`. comptime.mojo: 11 of 17, the other 6 in `bad_*`
   functions, one of them a constraint on another parameter than the one
   indexed.
-- Not covered yet: a runtime last stride, launches through
-  the other `enqueue_function` overloads, tensors whose runtime size comes from
-  a scalar (`row_major(n)`: `dim` is not related to `n`), raw pointers, and
-  kernels in MAX's own packages, which are now skipped as imported code unless
-  `include-stdlib=true`.
+- The other `enqueue_function` overloads: a kernel compiled first,
+  `ctx.enqueue_function(f, args..., grid_dim=, block_dim=)` with `f =
+  ctx.compile_function[kernel]()` (133 `enqueue_function(` calls and 119
+  `compile_function`s in the tree), is now checked like the thin one:
+  `launchedKernel` already found the kernel among the call's parameters,
+  but the pack and the dimensions were taken as operands 1 to 3, where
+  `f` comes first. They are now found by value: the pack is the first
+  operand the pass knows as one, the dimensions the first two `Dim`s
+  after it. A generic kernel compiled per size is checked per launched
+  instantiation too. A closure kernel (`enqueue_function(closure,
+  grid_dim=, block_dim=)`) has no arguments and so no clauses; the
+  overloads with `host_arg` (4 uses) and external functions are not
+  checked. kernels.mojo: 16 of 26, the other 10 in `bad_*` functions.
+- Not covered yet: a runtime last stride, launches with `host_arg`, tensors
+  whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
+  to `n`), raw pointers, and kernels in MAX's own packages, which are now
+  skipped as imported code unless `include-stdlib=true`.
 
 ## Risks and open questions
 

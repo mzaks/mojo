@@ -122,6 +122,27 @@ def ok_specialize(
     ok_launch_through[8](ctx, t)
 
 
+def ok_launch_compiled(
+    ctx: DeviceContext, c: TileTensor[DType.float32, LD, MutAnyOrigin]
+) raises:
+    # Compiled first, then launched: the same check.
+    var m = Int(c.dim[0]())
+    var n = Int(c.dim[1]())
+    var f = ctx.compile_function[ok_tiled_kernel]()
+    ctx.enqueue_function(f, c, grid_dim=(n // 16, m // 16), block_dim=256)
+
+
+def ok_compiled_kernel[N: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+    t[7, N - 1] = 0
+
+
+def ok_launch_compiled_sized(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    var f = ctx.compile_function[ok_compiled_kernel[8]]()
+    ctx.enqueue_function(f, t, grid_dim=1, block_dim=1)
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -207,3 +228,25 @@ def bad_specialize(
 ) raises:
     bad_launch_through[8](ctx, t)
     bad_launch_through[9](ctx, t)
+
+
+def bad_launch_compiled(
+    ctx: DeviceContext, c: TileTensor[DType.float32, LD, MutAnyOrigin]
+) raises:
+    var m = Int(c.dim[0]())
+    var n = Int(c.dim[1]())
+    var f = ctx.compile_function[ok_tiled_kernel]()
+    ctx.enqueue_function(f, c, grid_dim=(n // 16 + 1, m // 16), block_dim=256)
+
+
+def bad_compiled_kernel[N: Int](
+    t: TileTensor[DType.float32, L88, MutAnyOrigin]
+):
+    t[7, N - 1] = 0  # compiled with 9 below
+
+
+def bad_launch_compiled_sized(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    var f = ctx.compile_function[bad_compiled_kernel[9]]()
+    ctx.enqueue_function(f, t, grid_dim=1, block_dim=1)
