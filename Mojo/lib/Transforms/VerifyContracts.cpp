@@ -3047,6 +3047,28 @@ private:
     return define(Sort{false, 64, true}, d);
   }
 
+  /// The integers of a parameter list (`#kgen.param_list<{:scalar<index>
+  /// 2}, {:scalar<index> 4}>`), such as a `*sizes: Int` parameter.
+  std::optional<SmallVector<int64_t>> intList(TypedAttr param) {
+    std::string list = printed(resolveParam(param));
+    StringRef rest(list);
+    if (!rest.consume_front("#kgen.param_list<"))
+      return std::nullopt;
+    // Up to the list's type (`> : !kgen.param_list<...>`).
+    size_t end = rest.find("> : ");
+    if (end == StringRef::npos)
+      return std::nullopt;
+    SmallVector<int64_t> values;
+    for (StringRef element : llvm::split(rest.take_front(end), ", ")) {
+      int64_t n;
+      if (!element.consume_front("{:scalar<index> ") ||
+          !element.consume_back("}") || element.getAsInteger(10, n))
+        return std::nullopt;
+      values.push_back(n);
+    }
+    return values;
+  }
+
   /// `TileTensor` from the `layout` package: `dim[k]()`, the extent of
   /// dimension `k`, is the static size where the layout's shape says
   /// `ComptimeInt[n]`, and otherwise a function of the tensor's value (one
@@ -3146,6 +3168,45 @@ private:
           return false;
         all = "(and " + all + " (bvsle " + bvConst(0, 64) + " " + v +
               ") (bvslt " + v + " " + *d + "))";
+      }
+      values[result] = define({true, 1, false}, all);
+      return true;
+    }
+    // `t._tile_in_bounds[*sizes](*coords)`, the clause of taking a tile:
+    // every coordinate `c` of the pack in `[0, dim / size)` for a positive
+    // size (`sizes` is the ninth parameter, a list of integers).
+    if (path.starts_with("layout::tile_tensor::TileTensor::_tile_in_bounds[") &&
+        call.getNumOperands() == 2) {
+      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      if (params.size() < 9)
+        return false;
+      std::optional<SmallVector<int64_t>> sizes = intList(params[8]);
+      if (!sizes)
+        return false;
+      Value pack = call.getOperands()[1];
+      while (auto rebind = pack.getDefiningOp<RebindOp>())
+        pack = rebind->getOperand(0);
+      if (!isa<LIT::RefType>(pack.getType()))
+        return false;
+      auto refs = packRefs.find(valueThrough(pack, state));
+      if (refs == packRefs.end() || refs->second.size() != sizes->size())
+        return false;
+      std::string all = "true";
+      for (auto [k, ref] : llvm::enumerate(refs->second)) {
+        if ((*sizes)[k] <= 0)
+          continue;
+        std::optional<Loc> place = placeOf(ref);
+        if (!place || !isScalar(placeType(*place)) ||
+            sortOf(placeType(*place)).isBool ||
+            sortOf(placeType(*place)).width != 64)
+          return false;
+        std::string c = load(*place, state, sort);
+        MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
+        if (!d)
+          return false;
+        all = "(and " + all + " (bvsle " + bvConst(0, 64) + " " + c +
+              ") (bvslt " + c + " (bvsdiv " + *d + " " +
+              bvConst((*sizes)[k], 64) + ")))";
       }
       values[result] = define({true, 1, false}, all);
       return true;
