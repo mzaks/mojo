@@ -119,6 +119,68 @@ std::optional<Sort> dtypeSort(StringRef text) {
   return Sort{false, width, isSigned};
 }
 
+/// The elements of a printed list whose opening bracket was just consumed
+/// from `text` (`a, b<c, d>]`), up to its closing `]` or `>`; `text` is
+/// left after it. The arrow of a function type (`-> T`) is not a bracket.
+SmallVector<StringRef> listElements(StringRef &text) {
+  SmallVector<StringRef> elements;
+  int depth = 0;
+  size_t start = 0;
+  for (size_t c = 0; c < text.size(); ++c) {
+    char ch = text[c];
+    if (ch == '>' && c > 0 && text[c - 1] == '-')
+      continue;
+    if (ch == '<' || ch == '[' || ch == '(' || ch == '{') {
+      ++depth;
+    } else if ((ch == ']' || ch == '>') && depth == 0) {
+      if (!text.slice(start, c).trim().empty())
+        elements.push_back(text.slice(start, c).trim());
+      text = text.drop_front(c + 1);
+      return elements;
+    } else if (ch == '>' || ch == ')' || ch == '}' || ch == ']') {
+      --depth;
+    } else if (ch == ',' && depth == 0) {
+      elements.push_back(text.slice(start, c).trim());
+      start = c + 1;
+    }
+  }
+  text = StringRef();
+  return {};
+}
+
+/// List `which` (0 the shape, 1 the strides) of a printed `TileTensor`
+/// layout type, as one printed type per mode; empty if it is not one.
+SmallVector<StringRef> layoutList(StringRef layout, unsigned which) {
+  size_t at = layout.find("@layout::@tile_layout::@Layout<");
+  if (at == StringRef::npos)
+    return {};
+  StringRef rest = layout.drop_front(at);
+  SmallVector<StringRef> elements;
+  for (unsigned i = 0; i <= which; ++i) {
+    size_t open = rest.find('[');
+    if (open == StringRef::npos)
+      return {};
+    rest = rest.drop_front(open + 1);
+    elements = listElements(rest);
+  }
+  return elements;
+}
+
+/// The value of a printed `ComptimeInt` type with a literal value
+/// (`ComptimeInt<:T {:scalar<index> 8}>`). An unevaluated one
+/// (`ComptimeInt<:T apply(f, 8, 4)>`, from `vectorize`) has its operands
+/// printed, not its value, and gives none.
+std::optional<int64_t> comptimeIntValue(StringRef type) {
+  static llvm::Regex literal("\\{:scalar<index> (-?[0-9]+)\\}>$");
+  SmallVector<StringRef> m;
+  int64_t n;
+  if (!type.starts_with("@std::@utils::@coord::@ComptimeInt<") ||
+      type.contains("apply(") || !literal.match(type, &m) ||
+      m[1].getAsInteger(10, n))
+    return std::nullopt;
+  return n;
+}
+
 /// Whether printed parameter or type text names SIMD width 1.
 bool isWidthOne(StringRef text) {
   return text.contains("{1}") || text.contains("_mlir_value = 1}");
@@ -2986,52 +3048,12 @@ private:
                       State &state) {
     if (params.size() < 4 || k < 0)
       return std::nullopt;
-    static llvm::Regex intValue(
-        "(\\{:scalar<index> |scalar<index> = )(-?[0-9]+)\\}");
     // The shape is the first list of the layout type's parameters.
     std::string layout = printed(resolveParam(params[3]));
-    StringRef rest(layout);
-    size_t at = rest.find("@layout::@tile_layout::@Layout<");
-    if (at != StringRef::npos) {
-      rest = rest.drop_front(at);
-      size_t open = rest.find('[');
-      if (open != StringRef::npos) {
-        rest = rest.drop_front(open + 1);
-        // Its elements at depth 0, up to the closing bracket.
-        SmallVector<StringRef> elements;
-        int depth = 0;
-        size_t start = 0;
-        for (size_t c = 0; c < rest.size(); ++c) {
-          char ch = rest[c];
-          // The arrow of a function type (`-> T`) is not a bracket.
-          if (ch == '>' && c > 0 && rest[c - 1] == '-')
-            continue;
-          if (ch == '<' || ch == '[' || ch == '(' || ch == '{')
-            ++depth;
-          else if ((ch == '>' || ch == ')' || ch == '}') ||
-                   (ch == ']' && depth > 0))
-            --depth;
-          else if (ch == ']' && depth == 0) {
-            elements.push_back(rest.slice(start, c).trim());
-            break;
-          } else if (ch == ',' && depth == 0) {
-            elements.push_back(rest.slice(start, c).trim());
-            start = c + 1;
-          }
-        }
-        SmallVector<StringRef> m;
-        int64_t n;
-        // Only a literal value (`ComptimeInt<:T {:scalar<index> 8}>`): an
-        // unevaluated one (`ComptimeInt<:T apply(f, 8, 4)>`, from
-        // `vectorize`) has its operands printed, not its value.
-        static llvm::Regex literal("\\{:scalar<index> (-?[0-9]+)\\}>$");
-        if ((size_t)k < elements.size() &&
-            elements[k].starts_with("@std::@utils::@coord::@ComptimeInt<") &&
-            !elements[k].contains("apply(") && literal.match(elements[k], &m) &&
-            !m[1].getAsInteger(10, n))
-          return bvConst(n, 64);
-      }
-    }
+    SmallVector<StringRef> shape = layoutList(layout, 0);
+    if ((size_t)k < shape.size())
+      if (std::optional<int64_t> n = comptimeIntValue(shape[k]))
+        return bvConst(*n, 64);
     std::string value = isa<LIT::RefType>(tensor.getType())
                             ? valueThrough(tensor, state)
                             : term(tensor, state);
