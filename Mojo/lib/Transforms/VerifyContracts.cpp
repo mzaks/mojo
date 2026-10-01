@@ -3226,8 +3226,18 @@ private:
     auto shape = dyn_cast<ParamListAttr>(type.getParamValues()[0]);
     if (!shape || k >= (int64_t)shape.getValues().size())
       return std::nullopt;
-    auto mode = dyn_cast<TypeParamAttr>(shape.getValues()[k]);
-    auto comptimeInt = mode ? dyn_cast<LIT::StructType>(mode.getTypeValue())
+    ParamFrame *saved = params;
+    params = scope;
+    MaybeTerm n = comptimeIntTerm(shape.getValues()[k]);
+    params = saved;
+    return n;
+  }
+
+  /// The value of a `ComptimeInt[v]` type parameter, for a parameter
+  /// expression `v`, as a term in the current scope.
+  MaybeTerm comptimeIntTerm(TypedAttr mode) {
+    auto type = dyn_cast<TypeParamAttr>(mode);
+    auto comptimeInt = type ? dyn_cast<LIT::StructType>(type.getTypeValue())
                             : LIT::StructType();
     if (!comptimeInt || comptimeInt.getParamValues().size() != 1 ||
         printed(comptimeInt.getSymbol()) !=
@@ -3237,11 +3247,7 @@ private:
     Sort sort = sortOf(value.getType());
     if (sort.isBool || sort.width != 64)
       return std::nullopt;
-    ParamFrame *saved = params;
-    params = scope;
-    std::string n = paramTerm(value, sort);
-    params = saved;
-    return n;
+    return paramTerm(value, sort);
   }
 
   /// Element `k` of the `Coord` value `coord`, whose type is `type`, as a
@@ -3649,6 +3655,59 @@ private:
               ") true))";
       }
       values[result] = define({true, 1, false}, all);
+      return true;
+    }
+    // `t.distribute[thread_layout](tid)`: a view with `dim // threads`
+    // elements per dimension (stride `stride * threads`, starting at the
+    // thread's coordinate `(tid // s) % threads`, so within the tensor for
+    // any `tid`). Its layout type may hold them unevaluated, or computed at
+    // run time; `threads` is the thread layout's shape, the ninth parameter.
+    if (path.starts_with("layout::tile_tensor::TileTensor::distribute[") &&
+        call.getNumOperands() == 2) {
+      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      if (params.size() < 9)
+        return false;
+      ParamFrame *scope = nullptr;
+      auto threads = dyn_cast<ParamListAttr>(resolveParam(params[8], &scope));
+      SmallVector<StringRef> shape =
+          layoutList(printed(resolveParam(params[3])), 0);
+      if (!threads || shape.empty() ||
+          threads.getValues().size() != shape.size() ||
+          llvm::any_of(shape, [](StringRef mode) {
+            return mode.starts_with("@std::@utils::@coord::@Coord<");
+          }))
+        return false;
+      SmallVector<std::string> counts;
+      {
+        ParamFrame *saved = this->params;
+        this->params = scope;
+        for (TypedAttr mode : threads.getValues())
+          if (MaybeTerm n = comptimeIntTerm(mode))
+            counts.push_back(*n);
+        this->params = saved;
+      }
+      if (counts.size() != shape.size())
+        return false;
+      SmallVector<std::string> dims;
+      for (size_t k = 0; k < shape.size(); ++k) {
+        MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
+        if (!d)
+          return false;
+        dims.push_back("(bvsdiv " + *d + " " + counts[k] + ")");
+      }
+      setResultsUnknown(call);
+      std::string view = values[result];
+      if (sortOfTerm(view).width != 64 || sortOfTerm(view).isBool)
+        return false;
+      if (!tensorDimDeclared) {
+        prelude += "(declare-fun tdim ((_ BitVec 64) (_ BitVec 64)) "
+                   "(_ BitVec 64))\n";
+        tensorDimDeclared = true;
+      }
+      for (auto [k, d] : llvm::enumerate(dims))
+        facts.push_back("(=> (bvsgt " + counts[k] + " " + bvConst(0, 64) +
+                        ") (= (tdim " + view + " " + bvConst(k, 64) + ") " + d +
+                        "))");
       return true;
     }
     // `t.vectorize[*sizes]()`: a view with `ceildiv(dim, size)` vectors per
