@@ -1412,6 +1412,56 @@ struct TileTensor[
             value,
         )
 
+    @always_inline
+    def _access_in_bounds[width: SIMDLength](self, coord: Coord) -> Bool:
+        """Whether `width` elements from `coord` are within the tensor, the
+        precondition of `load[width](coord)` and `store[width](coord, v)`.
+
+        Every scalar coordinate must be in `[0, dim)`. A wider access reads
+        `width` consecutive elements of storage, which stay in the last
+        dimension's row only when its stride is 1 and its coordinate is at
+        most `dim - width`.
+
+        Only a flat layout indexed by one scalar per dimension without
+        vectorization is checked: for a nested layout, a coordinate of
+        another rank or a vectorized view (whose element indexing
+        `vectorize` and `__getitem__` state) this returns `True`, and a
+        tuple coordinate is not checked.
+
+        Parameters:
+            width: The number of elements accessed.
+
+        Args:
+            coord: The coordinate of the first element.
+
+        Returns:
+            Whether the access is within the tensor, or `True` where it is
+            not checked.
+        """
+        comptime if (
+            Self.flat_rank != Self.rank
+            or coord.rank != Self.rank
+            or Self.element_size != 1
+        ):
+            return True
+        else:
+            comptime for i in range(Self.rank):
+                comptime if not coord.element_types[i].is_tuple:
+                    var c = Int(coord[i].value())
+                    var n = Int(self.dim[i]())
+                    comptime if i == Self.rank - 1 and Int(width) > 1:
+                        comptime if Self.static_stride[i] < 0:
+                            if Int(self.layout.stride[i]().value()) != 1:
+                                return False
+                        elif Self.static_stride[i] != 1:
+                            return False
+                        if c < 0 or c > n - Int(width):
+                            return False
+                    else:
+                        if c < 0 or c >= n:
+                            return False
+            return True
+
     @inline(.nodebug)
     def load[
         width: SIMDLength = Self.element_size,
@@ -1420,7 +1470,9 @@ struct TileTensor[
         ]() if is_gpu() else align_of[Self.dtype](),
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](self, coord: Coord) -> SIMD[Self.dtype, width]:
+    ](
+        self, coord: Coord where self._access_in_bounds[width](coord)
+    ) -> SIMD[Self.dtype, width]:
         """Load elements from the tensor at the specified coordinates.
 
         Supports both hierarchical indexing (rank indices) and flat indexing
@@ -1460,7 +1512,13 @@ struct TileTensor[
             SIMD[Self.dtype, width]
         ]() if is_gpu() else align_of[Self.dtype](),
         non_temporal: Bool = False,
-    ](self, coord: Coord, value: SIMD[Self.dtype, width]) where Self.mut:
+    ](
+        self,
+        coord: Coord,
+        value: SIMD[Self.dtype, width] where self._access_in_bounds[width](
+            coord
+        ),
+    ) where Self.mut:
         """Store elements to the tensor at the specified coordinates.
 
         Supports both hierarchical indexing (rank indices) and flat indexing
