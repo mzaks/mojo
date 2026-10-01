@@ -1292,13 +1292,47 @@ Tensors and GPU kernels:
   `offset: Scalar` of any dtype) now resolve their dtypes through the
   parameter frames, and `paramTerm` reads `cast_from_builtin` (`Int(width)`
   of a `SIMDLength`).
-- Not stated yet: `List.unsafe_ptr()` (its `ref self` may be in another
-  address space, which `len(self)` in a clause cannot copy from) and
+- Not stated then (see below): `List.unsafe_ptr()` (its `ref self` may
+  be in another address space, which `len(self)` in a clause cannot copy
+  from) and
   `Span.unsafe_ptr()` (`@always_inline("builtin")`, which cannot carry
   clauses); `Pointer(to=x)`; and the accesses without an offset, `p[]`,
   `load()` and `store(v)`, which would need every such pointer's extent
   first. pointers.mojo: 6 of 11, kernels.mojo: 23 of 36, the others in
   `bad_*` functions.
+- The remaining pointer extents. `p[]`, `load[width]()` and `store(v)`
+  need an extent of at least `width` like any other access: `load()` and
+  `store(v)` through `_offset_in_bounds[width](0)` (on `self`, or on `val`
+  for the stores), `p[]` through an obligation the pass makes (`pext(p) >=
+  1`). What no clause can state the pass models: `Pointer(to=x)` gives a
+  fresh pointer with `pext >= 1` (at least: `x` may be an element of an
+  array), `List.unsafe_ptr()` and `Span.unsafe_ptr()` give a fresh pointer with `pext >= len(self)` (a
+  list's capacity and a span's memory can be longer), `Array.unsafe_ptr()`
+  `pext >=` its size parameter, and the casts that keep the element type
+  and the address (the implicit mutable-to-immutable conversion, which is
+  an ordinary call, `as_imm`, `as_unsafe_any_origin`, `unsafe_as_noalias`,
+  `unsafe_mut_cast`, `unsafe_origin_cast` and the address space casts)
+  return the same pointer value, so its extent carries over.
+  `unsafe_bitcast` changes the element size and keeps none.
+- `Pointer(to=x)` first had the clause `out self where self._extent() >=
+  1`. That compiled, but compile-time evaluation through it failed: the
+  interpreter read a null `to` in `Pointer(to=self._mlir_value)` (in
+  `Tuple.__getitem__`, reached from float formatting), so 257 Mojo tests
+  and 84 of 110 kernel tests no longer built. It did so with `out self`
+  first or last; without the clause they build. The pass models it
+  instead. The same clause on `p[]`'s `self` (the method returns a
+  reference) made code generation assert in `StackReuse` ("was supposed
+  to be elidable") in 18 Mojo tests and 93 kernel tests, so that
+  obligation is the pass's too.
+- Extents describe bounds, not lifetimes: a pointer from
+  `xs.unsafe_ptr()` keeps its extent after `xs.append(...)` reallocates,
+  and one from `alloc` after it is freed.
+- Stdlib tests: test_array 51/51 (was 38/48: the pointers from
+  `Array.unsafe_ptr()` now have extents), test_list 225/237 (was 220),
+  test_span 102/111 (was 101/110; `Pointer(to=a.unsafe_ptr()[])` adds one),
+  test_dict 24/34 (was 22/32; `Pointer(to=dict["a"])[]` adds two), the
+  others unchanged. pointers.mojo: 15 of 24, the others in `bad_*`
+  functions.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

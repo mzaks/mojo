@@ -309,16 +309,22 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   the pass reads it as an unknown, not negative, per pointer value.
   `p[unsafe_offset=i]` (and the deprecated `p[i]`) require `0 <= i <
   _extent()`; `load[width](i)`, `store[width](i, v)`, `unsafe_load` and
-  `unsafe_store` require `0 <= i <= _extent() - width`. It is stated by
+  `unsafe_store` require `0 <= i <= _extent() - width`; `p[]`,
+  `load[width]()` and `store(v)` the same at offset 0. It is stated by
   `alloc[T](n)` and `unsafe_alloc` (`n`), `stack_allocation[n, ...]()`
-  (`n`), `p.unsafe_offset(k)` and `p + k` (`k` fewer, for `k >= 0`; a
-  pointer moved backwards has no known extent), `DeviceBuffer.unsafe_ptr()`
+  (`n`), `Pointer(to=x)` (at least 1), `p.unsafe_offset(k)` and `p + k`
+  (`k` fewer, for `k >= 0`; a pointer moved backwards has no known
+  extent), `List.unsafe_ptr()`, `Span.unsafe_ptr()` and
+  `Array.unsafe_ptr()` (at least the length), `DeviceBuffer.unsafe_ptr()`
   (the buffer's length, which `enqueue_create_buffer(n)` states), and by a
-  function's own clauses (`n: Int where p._extent() >= n`). A
-  `DeviceBuffer` passed for a kernel's pointer argument has its length as
-  that pointer's extent. A pointer whose extent nothing states is
-  reported. `p[]`, `load()` and `store(v)` (element 0) are not checked,
-  and neither are `List.unsafe_ptr()` and `Span.unsafe_ptr()` stated yet.
+  function's own clauses (`n: Int where p._extent() >= n`). Casts of a
+  pointer's origin or address space (the implicit mutable-to-immutable
+  conversion, `as_imm()`, `unsafe_origin_cast`, ...) keep its extent;
+  `unsafe_bitcast` does not. A `DeviceBuffer` passed for a kernel's
+  pointer argument has its length as that pointer's extent. A pointer
+  whose extent nothing states is reported. Extents are about bounds only:
+  a pointer used after its memory is freed or reallocated (a list
+  appended to after `unsafe_ptr()`) keeps the extent it had.
 - `ceildiv(a, b)` (and `a.__ceildiv__(b)`) of integers is `-(a // -b)`
   when signed and the quotient plus one for a nonzero remainder when
   unsigned, as `SIMD` defines it; so a launch with `grid_dim=ceildiv(n,

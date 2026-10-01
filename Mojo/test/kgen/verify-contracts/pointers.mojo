@@ -10,7 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# Straight-line code for `verify-contracts`: preconditions checked at calls,
 # Raw pointers for `verify-contracts`: a pointer's extent (how many elements
 # are valid from it) is stated by `_extent()` clauses; see README.md.
 
@@ -69,6 +68,65 @@ def ok_stack(i: Int) -> Float32:
     return 0
 
 
+def ok_deref(n: Int) -> Int:
+    var p = unsafe_alloc[Int](n)
+    if n >= 1:
+        return p[]  # no offset: one element
+    return 0
+
+
+def ok_load_first(
+    p: Pointer[Float32, MutAnyOrigin],
+    n: Int where p._extent() >= n,
+) -> Float32:
+    if n >= 4:
+        p.unsafe_store(SIMD[DType.float32, 4](1))
+        return p.unsafe_load[width=4]().reduce_add()
+    return 0
+
+
+def ok_to(x: Int) -> Int:
+    var y = x
+    return Pointer(to=y)[]  # a pointer to one value
+
+
+def first(
+    p: ImmPointer[Int, _], n: Int where p._extent() >= n and n >= 1
+) -> Int:
+    return p[]
+
+
+def ok_immutable(
+    p: Pointer[Int, MutAnyOrigin],
+    n: Int where p._extent() >= n,
+) -> Int:
+    if n >= 1:
+        return first(p, n)  # converted to immutable: the same pointer
+    return 0
+
+
+def ok_list(xs: List[Int], i: Int) -> Int:
+    var p = xs.unsafe_ptr()
+    if 0 <= i and i < len(xs):
+        return p[unsafe_offset=i]  # at least `len(xs)` elements
+    return 0
+
+
+def ok_span(xs: Span[Int, _], i: Int) -> Int:
+    var p = xs.unsafe_ptr()
+    if 0 <= i and i < len(xs):
+        return p[unsafe_offset=i]
+    return 0
+
+
+def ok_array(i: Int) -> Int:
+    var a: Array[Int, 3] = [1, 2, 3]
+    var p = a.unsafe_ptr()
+    if 0 <= i and i < 3:
+        return p[unsafe_offset=i]
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_unstated(p: Pointer[Int, MutAnyOrigin], i: Int) -> Int:
     if 0 <= i and i < 4:
@@ -104,4 +162,29 @@ def bad_load(
 ) -> SIMD[DType.float32, 4]:
     if 0 <= i and i < n:
         return p.unsafe_load[width=4](i)  # the last 3 lanes may pass `n`
+    return 0
+
+
+def bad_deref(p: Pointer[Int, MutAnyOrigin]) -> Int:
+    return p[]  # may point to nothing
+
+
+def bad_load_first(
+    p: Pointer[Float32, MutAnyOrigin],
+    n: Int where p._extent() >= n,
+) -> Float32:
+    if n >= 3:
+        return p.unsafe_load[width=4]().reduce_add()  # three may be all
+    return 0
+
+
+def bad_to(x: Int) -> Int:
+    var y = x
+    return Pointer(to=y)[unsafe_offset=1]  # past the one value
+
+
+def bad_list(xs: List[Int], i: Int) -> Int:
+    var p = xs.unsafe_ptr()
+    if 0 <= i and i <= len(xs):
+        return p[unsafe_offset=i]  # `i` may be `len(xs)`
     return 0
