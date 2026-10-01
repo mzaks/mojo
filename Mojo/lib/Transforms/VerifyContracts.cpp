@@ -250,6 +250,44 @@ std::optional<CalleeName> calleeName(Attribute callee) {
   return name;
 }
 
+/// The kernel a launch (`ctx.enqueue_function[kernel](...)`, whose callee
+/// is `call`) runs, and the symbol naming it with its parameters: the
+/// function among the call's parameters, behind the `rebind` and the thunk
+/// that converts it to the declared `def` type (a function of its own,
+/// named `def[...]`, whose parameters hold the kernel). `resolve` resolves
+/// a parameter in the caller's scope.
+std::pair<LIT::FnOp, SymbolConstantAttr>
+launchedKernel(SymbolConstantAttr call, ModuleOp module,
+               SymbolTableCollection &symbols,
+               llvm::function_ref<TypedAttr(TypedAttr)> resolve) {
+  std::pair<LIT::FnOp, SymbolConstantAttr> found;
+  std::function<void(TypedAttr, int)> search = [&](TypedAttr param, int depth) {
+    if (found.first || depth > 3)
+      return;
+    param = resolve(param);
+    while (auto expr = dyn_cast<ParamOperatorAttr>(param)) {
+      if (expr.getOpcode() != POC::Rebind || expr.getOperands().size() != 1)
+        return;
+      param = resolve(expr.getOperands()[0]);
+    }
+    auto symbol = dyn_cast<SymbolConstantAttr>(param);
+    if (!symbol)
+      return;
+    auto fn = dyn_cast_or_null<LIT::FnOp>(
+        symbols.lookupSymbolIn(module, symbol.getSymbol()));
+    if (fn && !fn.getFunctionBody().empty() &&
+        !symbol.getSymbol().getRootReference().getValue().starts_with("def[")) {
+      found = {fn, symbol};
+      return;
+    }
+    for (TypedAttr inner : symbol.getParamValues())
+      search(inner, depth + 1);
+  };
+  for (TypedAttr param : call.getParamValues())
+    search(param, 0);
+  return found;
+}
+
 /// How a function is named in source: `List.__getitem__`, `ok_get`.
 std::string displayName(LIT::FnOp fn) {
   std::string name;
@@ -3618,37 +3656,9 @@ private:
         !StringRef(name.path).contains("DeviceContext::enqueue_function[") ||
         call.getNumOperands() < 4)
       return;
-    // The kernel: the function with preconditions among the call's
-    // parameters, possibly behind the thunk converting it to the declared
-    // `def` type (a function of its own, calling its `callee` parameter).
-    SymbolConstantAttr kernelSymbol;
-    LIT::FnOp kernel;
-    std::function<void(TypedAttr, int)> search = [&](TypedAttr param,
-                                                     int depth) {
-      if (kernel || depth > 3)
-        return;
-      param = resolveParam(param);
-      while (auto expr = dyn_cast<ParamOperatorAttr>(param)) {
-        if (expr.getOpcode() != POC::Rebind || expr.getOperands().size() != 1)
-          return;
-        param = resolveParam(expr.getOperands()[0]);
-      }
-      auto s = dyn_cast<SymbolConstantAttr>(param);
-      if (!s)
-        return;
-      auto f = dyn_cast_or_null<LIT::FnOp>(
-          symbols.lookupSymbolIn(module, s.getSymbol()));
-      if (f && !f.getFunctionBody().empty() &&
-          !f.getFunctionBody().front().getOps<RequiresOp>().empty()) {
-        kernel = f;
-        kernelSymbol = s;
-        return;
-      }
-      for (TypedAttr inner : s.getParamValues())
-        search(inner, depth + 1);
-    };
-    for (TypedAttr param : symbol.getParamValues())
-      search(param, 0);
+    auto [kernel, kernelSymbol] =
+        launchedKernel(symbol, module, symbols,
+                       [&](TypedAttr param) { return resolveParam(param); });
     if (!kernel || kernel.getFunctionBody().empty() ||
         kernel.getFunctionBody().front().getOps<RequiresOp>().empty())
       return;
