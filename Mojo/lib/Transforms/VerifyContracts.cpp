@@ -2217,6 +2217,10 @@ private:
       resultSort = sort;
       return floorDivision(method == "__mod__", sort, args[0], args[1]);
     }
+    if (args.size() == 2 && method == "__ceildiv__") {
+      resultSort = sort;
+      return ceilDivision(sort, args[0], args[1]);
+    }
     if (args.size() == 1 && method == "__neg__") {
       resultSort = sort;
       return "(bvneg " + args[0] + ")";
@@ -2245,6 +2249,18 @@ private:
     if (remainder)
       return "(ite " + adjust + " (bvadd " + r + " " + b.str() + ") " + r + ")";
     return "(ite " + adjust + " (bvsub " + q + " (_ bv1 " + w + ")) " + q + ")";
+  }
+
+  /// `a.__ceildiv__(b)` as `SIMD` defines it: `-(a // -b)` when signed, the
+  /// quotient plus one for a nonzero remainder when unsigned.
+  static std::string ceilDivision(Sort sort, StringRef a, StringRef b) {
+    if (sort.isSigned)
+      return "(bvneg " +
+             floorDivision(false, sort, a, ("(bvneg " + b + ")").str()) + ")";
+    std::string w = std::to_string(sort.width);
+    return "(bvadd " + floorDivision(false, sort, a, b) +
+           " (ite (= " + floorDivision(true, sort, a, b) + " (_ bv0 " + w +
+           ")) (_ bv0 " + w + ") (_ bv1 " + w + ")))";
   }
 
   /// A parameter expression's value: literals, and the integer and Boolean
@@ -2463,6 +2479,8 @@ private:
     if (name && evalDim(call, *name, state))
       return;
     if (name && evalDivmod(call, *name, state))
+      return;
+    if (name && evalCeildiv(call, *name, state))
       return;
     if (name && evalElementWrite(call, *name, state))
       return;
@@ -3778,6 +3796,42 @@ private:
     return false;
   }
 
+  /// `ceildiv(a, b)` of two integers (`Int`, or a `SIMD` scalar of an
+  /// integer dtype): their `__ceildiv__`, which it calls. Generic over its
+  /// type, it returns through an out slot, its last operand.
+  bool evalCeildiv(LIT::CallOp call, const CalleeName &name, State &state) {
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!StringRef(name.path).starts_with("std::math::math::ceildiv[") ||
+        !symbol || symbol.getParamValues().size() != 1 ||
+        call.getNumOperands() != 3)
+      return false;
+    std::optional<Loc> out = placeOf(call.getOperands()[2]);
+    if (!out)
+      return false;
+    TypedAttr type = resolveParam(symbol.getParamValues()[0]);
+    std::optional<Sort> sort;
+    if (isIntType(type))
+      sort = Sort{false, 64, true};
+    else if (auto param = dyn_cast<TypeParamAttr>(type))
+      if (std::string text = printed(param.getTypeValue());
+          StringRef(text).starts_with("!lit.struct<@std::@simd::@SIMD<") &&
+          isWidthOne(text))
+        sort = dtypeSort(text);
+    if (!sort || sort->isBool)
+      return false;
+    SmallVector<std::string, 2> args;
+    for (Value v : call.getOperands().take_front(2)) {
+      std::string a = isa<LIT::RefType>(v.getType()) ? valueThrough(v, state)
+                                                     : term(v, state);
+      if (sortOfTerm(a).isBool || sortOfTerm(a).width != sort->width)
+        return false;
+      args.push_back(a);
+    }
+    store(*out, state, define(*sort, ceilDivision(*sort, args[0], args[1])));
+    setResultsUnknown(call);
+    return true;
+  }
+
   /// `divmod(a, b)` of two `Int`s and `udivmod(a, b)` (and its unchecked
   /// form): a tuple of the quotient and the remainder (fields `/0`, `/1`),
   /// rounding toward negative infinity, or for `udivmod` of the arguments
@@ -4324,6 +4378,11 @@ private:
         (method == "__floordiv__" || method == "__mod__")) {
       values[result] = define(*sort, floorDivision(method == "__mod__", *sort,
                                                    operand(0), operand(1)));
+      return true;
+    }
+    if (call.getNumOperands() == 2 && method == "__ceildiv__") {
+      values[result] =
+          define(*sort, ceilDivision(*sort, operand(0), operand(1)));
       return true;
     }
     if (call.getNumOperands() == 1 && method == "__neg__") {
