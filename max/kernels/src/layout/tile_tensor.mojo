@@ -3086,10 +3086,40 @@ struct TileTensor[
     ]
     """Result type for SIMD-width vectorization."""
 
+    @always_inline
+    def _vectorize_in_bounds[*vector_shape: Int](self) -> Bool:
+        """Whether every dimension is a multiple of its vector size, the
+        precondition of `vectorize[*vector_shape]()`.
+
+        The vectorized view has `ceildiv(dim, size)` vectors per dimension,
+        each of `size` elements, so its last vector would extend past the
+        tensor unless `size` divides `dim`. A nested layout's modes are not
+        given by `dim`: this returns `True` for it, as does an empty vector
+        size.
+
+        Parameters:
+            vector_shape: The shape of each vector unit along each axis.
+
+        Returns:
+            Whether every vector of the view is within the tensor, or `True`
+            for a nested layout.
+        """
+        comptime if Self.flat_rank != Self.rank:
+            return True
+        else:
+            comptime for i in range(vector_shape.size):
+                comptime size = vector_shape[i]
+                comptime if size > 1:
+                    if Int(self.dim[i]()) % size != 0:
+                        return False
+            return True
+
     @inline(.nodebug)
     def vectorize[
         *vector_shape: Int
-    ](self) -> Self.VectorizedType[*vector_shape]:
+    ](
+        self where self._vectorize_in_bounds[*vector_shape](),
+    ) -> Self.VectorizedType[*vector_shape]:
         """Reshape a tensor into a vectorized form for efficient SIMD operations.
 
         This method transforms the tensor's logical layout to enable efficient
@@ -3132,7 +3162,9 @@ struct TileTensor[
         return _vectorize(self, coord[*vector_shape])
 
     @inline(.nodebug)
-    def vectorize(self) -> Self.VectorizedType[1, simd_width_of[Self.dtype]()]:
+    def vectorize(
+        self where self._vectorize_in_bounds[1, simd_width_of[Self.dtype]()](),
+    ) -> Self.VectorizedType[1, simd_width_of[Self.dtype]()]:
         """Return a SIMD-width vectorized view of this tensor.
 
         This is a convenience method that vectorizes along the last dimension
