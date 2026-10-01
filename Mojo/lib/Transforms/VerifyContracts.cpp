@@ -3244,6 +3244,36 @@ private:
     return n;
   }
 
+  /// Element `k` of the `Coord` value `coord`, whose type is `type`, as a
+  /// 64-bit term: a literal `ComptimeInt`'s value, or the integer the
+  /// coordinate was built with (`Coord(*values)`), widened by its
+  /// signedness. None for any other element, so that a struct's value is
+  /// never taken for an integer.
+  MaybeTerm coordElement(StringRef type, const std::string &coord, size_t k) {
+    if (std::optional<int64_t> n = comptimeIntValue(type))
+      return bvConst(*n, 64);
+    if (!type.starts_with("@std::@simd::@SIMD<"))
+      return std::nullopt;
+    auto it = builtFields.find({coord, "/" + std::to_string(k)});
+    if (it == builtFields.end())
+      return std::nullopt;
+    std::string c = it->second;
+    Sort sort = sortOfTerm(c);
+    if (sort.isBool || sort.width > 64)
+      return std::nullopt;
+    if (sort.width < 64)
+      c = "((_ " + std::string(sort.isSigned ? "sign" : "zero") + "_extend " +
+          std::to_string(64 - sort.width) + ") " + c + ")";
+    return c;
+  }
+
+  /// The element types of a `Coord` from its `#kgen.param_list` parameter.
+  std::optional<SmallVector<StringRef>> coordTypes(StringRef printedList) {
+    if (!printedList.consume_front("#kgen.param_list<"))
+      return std::nullopt;
+    return listElements(printedList);
+  }
+
   /// The integers of a parameter list (`#kgen.param_list<2, 4>`, or of
   /// parameters `BM, BN` in a generic function), such as a `*sizes: Int`
   /// parameter, as terms.
@@ -3409,6 +3439,80 @@ private:
       values[result] = define({true, 1, false}, all);
       return true;
     }
+    // `t._tile_coords_in_bounds[*sizes](coords)` and
+    // `t._tile_shape_in_bounds(shape, coords)`, the clauses of taking a tile
+    // with `Coord` coordinates: as `_tile_in_bounds`, with each dimension's
+    // coordinate the `Coord`'s element, and its size from the integer list
+    // `sizes` (the ninth parameter) or the shape `Coord`'s element. The
+    // `Coord`s' element types are the type lists among the parameters after
+    // the tensor's eight (and the sizes). A nested layout, another rank or a
+    // tuple element is true, as in the helpers.
+    bool fromSizes = path.starts_with(
+        "layout::tile_tensor::TileTensor::_tile_coords_in_bounds[");
+    if ((fromSizes && call.getNumOperands() == 2) ||
+        (path.starts_with(
+             "layout::tile_tensor::TileTensor::_tile_shape_in_bounds") &&
+         call.getNumOperands() == 3)) {
+      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      std::optional<SmallVector<std::string>> sizes;
+      if (fromSizes && (params.size() < 9 || !(sizes = intList(params[8]))))
+        return false;
+      SmallVector<std::string> lists;
+      for (size_t i = fromSizes ? 9 : 8;
+           i < params.size() && lists.size() < (fromSizes ? 1u : 2u); ++i) {
+        std::string text = printed(resolveParam(params[i]));
+        if (StringRef(text).starts_with("#kgen.param_list<@") ||
+            StringRef(text).starts_with("#kgen.param_list<!"))
+          lists.push_back(text);
+      }
+      if (lists.size() != (fromSizes ? 1u : 2u))
+        return false;
+      std::optional<SmallVector<StringRef>> shapeTypes;
+      if (!fromSizes && !(shapeTypes = coordTypes(lists[0])))
+        return false;
+      std::optional<SmallVector<StringRef>> elementTypes =
+          coordTypes(lists.back());
+      SmallVector<StringRef> shape =
+          layoutList(printed(resolveParam(params[3])), 0);
+      if (!elementTypes || shape.empty())
+        return false;
+      size_t rank = shape.size();
+      bool nested = llvm::any_of(shape, [](StringRef mode) {
+        return mode.starts_with("@std::@utils::@coord::@Coord<");
+      });
+      if (nested || elementTypes->size() != rank ||
+          (sizes ? sizes->size() : shapeTypes->size()) != rank) {
+        values[result] = "true";
+        return true;
+      }
+      auto valueOf = [&](Value v) {
+        return isa<LIT::RefType>(v.getType()) ? valueThrough(v, state)
+                                              : term(v, state);
+      };
+      std::string shapeValue = fromSizes ? "" : valueOf(call.getOperands()[1]);
+      std::string coordValue = valueOf(call.getOperands().back());
+      auto tuple = [](StringRef type) {
+        return type.starts_with("@std::@utils::@coord::@Coord<");
+      };
+      std::string all = "true", zero = bvConst(0, 64);
+      for (size_t k = 0; k < rank; ++k) {
+        StringRef ct = (*elementTypes)[k];
+        if (tuple(ct) || (!fromSizes && tuple((*shapeTypes)[k])))
+          continue;
+        MaybeTerm size = fromSizes
+                             ? MaybeTerm((*sizes)[k])
+                             : coordElement((*shapeTypes)[k], shapeValue, k);
+        MaybeTerm c = coordElement(ct, coordValue, k);
+        MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
+        if (!size || !c || !d)
+          return false;
+        all = "(and " + all + " (ite (bvsgt " + *size + " " + zero +
+              ") (and (bvsle " + zero + " " + *c + ") (bvslt " + *c +
+              " (bvsdiv " + *d + " " + *size + "))) true))";
+      }
+      values[result] = define({true, 1, false}, all);
+      return true;
+    }
     // `t._access_in_bounds[width](coord)`, the clause of `load` and
     // `store`: for a flat layout without vectorization, indexed by one
     // value per dimension, every integer coordinate in `[0, dim)`, and with
@@ -3461,23 +3565,10 @@ private:
       for (auto [k, type] : llvm::enumerate(elementTypes)) {
         if (type.starts_with("@std::@utils::@coord::@Coord<"))
           continue;
-        std::string c;
-        if (std::optional<int64_t> n = comptimeIntValue(type)) {
-          c = bvConst(*n, 64);
-        } else if (!type.starts_with("@std::@simd::@SIMD<")) {
+        MaybeTerm element = coordElement(type, coordValue, k);
+        if (!element)
           return false;
-        } else {
-          auto it = builtFields.find({coordValue, "/" + std::to_string(k)});
-          if (it == builtFields.end())
-            return false;
-          c = it->second;
-          Sort cs = sortOfTerm(c);
-          if (cs.isBool || cs.width > 64)
-            return false;
-          if (cs.width < 64)
-            c = "((_ " + std::string(cs.isSigned ? "sign" : "zero") +
-                "_extend " + std::to_string(64 - cs.width) + ") " + c + ")";
-        }
+        std::string c = *element;
         MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
         if (!d)
           return false;
