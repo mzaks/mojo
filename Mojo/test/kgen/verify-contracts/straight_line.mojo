@@ -13,6 +13,8 @@
 # Straight-line code for `verify-contracts`: preconditions checked at calls,
 # before elaboration; see README.md.
 
+from std.math import ceildiv
+
 
 def ok_get(xs: List[Int], i: Int where 0 <= i and i < len(xs)) -> Int:
     return xs[i]  # from the precondition
@@ -96,6 +98,13 @@ def ok_unsigned_index(xs: List[Int], n: UInt8) -> Int:
     return 0
 
 
+def ok_ceildiv(xs: List[Int], n: Int) -> Int:
+    # `ceildiv(n, 4)` blocks of 4 cover `n`: the last starts below `n`.
+    if n > 0 and len(xs) >= n:
+        return xs[(ceildiv(n, 4) - 1) * 4]
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_get(xs: List[Int], i: Int) -> Int:
     return xs[i]  # nothing is known about `i`
@@ -161,4 +170,10 @@ def bad_elif_gap(xs: List[Int], i: Int) -> Int:
 def bad_signed_index(xs: List[Int], n: Int8) -> Int:
     if Int(n) < len(xs):
         return xs[Int(n)]  # a sign-extended `Int8` may be negative
+    return 0
+
+
+def bad_ceildiv(xs: List[Int], n: Int) -> Int:
+    if n > 0 and len(xs) >= n:
+        return xs[ceildiv(n, 4) * 4 - 1]  # past `n` when 4 does not divide it
     return 0

@@ -143,6 +143,18 @@ def ok_launch_compiled_sized(
     ctx.enqueue_function(f, t, grid_dim=1, block_dim=1)
 
 
+def ok_launch_ceildiv(
+    ctx: DeviceContext, c: TileTensor[DType.float32, LD, MutAnyOrigin]
+) raises:
+    var m = Int(c.dim[0]())
+    var n = Int(c.dim[1]())
+    if m % 16 == 0 and n % 16 == 0:
+        # The grid rounded up is the exact one when 16 divides the sizes.
+        ctx.enqueue_function[ok_tiled_kernel](
+            c, grid_dim=(ceildiv(n, 16), ceildiv(m, 16)), block_dim=256
+        )
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.

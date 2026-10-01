@@ -304,6 +304,10 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   query within `generic-rlimit`, and checks only what that leaves open
   per launch. Kernels that are not launched in the module are verified
   for every value of their parameters.
+- `ceildiv(a, b)` (and `a.__ceildiv__(b)`) of integers is `-(a // -b)`
+  when signed and the quotient plus one for a nonzero remainder when
+  unsigned, as `SIMD` defines it; so a launch with `grid_dim=ceildiv(n,
+  16)` establishes `grid_dim <= n // 16` where `n % 16 == 0` is known.
 - `divmod(a, b)` of `Int`s and `udivmod(a, b)` are the quotient and
   remainder (floored, or unsigned for `udivmod`); a `comptime for k in
   range(n)` has `0 <= k < n`. In a function generic over tile sizes

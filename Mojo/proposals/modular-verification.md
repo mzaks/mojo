@@ -1232,6 +1232,17 @@ Tensors and GPU kernels:
   grid_dim=, block_dim=)`) has no arguments and so no clauses; the
   overloads with `host_arg` (4 uses) and external functions are not
   checked. kernels.mojo: 16 of 26, the other 10 in `bad_*` functions.
+- `ceildiv` (1213 calls in max/kernels/src, launch grids and loop bounds
+  among them) is modelled as `SIMD.__ceildiv__` defines it: `-(a // -b)`
+  for a signed type, the floored quotient plus one for a nonzero
+  remainder for an unsigned one, so it agrees with the stdlib for every
+  input, a zero divisor and wraparound included. The free function is
+  generic over its type and returns through an out slot, where the model
+  stores it; the method is a `SIMD` operator. A launch with
+  `grid_dim=(ceildiv(n, 16), ...)` now establishes the tiled kernel's
+  `grid_dim.x <= n // 16` under `n % 16 == 0`, and without that guard
+  still does not. straight_line.mojo: 16 of 27, kernels.mojo: 17 of 27,
+  the others in `bad_*` functions.
 - Not covered yet: a runtime last stride, launches with `host_arg`, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), raw pointers, and kernels in MAX's own packages, which are now
