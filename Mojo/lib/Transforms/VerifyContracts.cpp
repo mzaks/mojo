@@ -56,6 +56,7 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/Regex.h"
 
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -682,6 +683,9 @@ private:
     std::string scope;
   };
   ParamFrame *params = nullptr;
+  /// While a kernel's clause is instantiated at its launch: the launch's
+  /// dimensions (`grid_dim_x`, `block_dim_y`, ...) that its GPU ids read.
+  const std::map<std::string, std::string> *launchDims = nullptr;
   /// The `end` of each `comptime for` over `range(end)`, by the printed
   /// reference to its iterator parameter.
   std::map<std::string, std::string> comptimeRangeEnds;
@@ -2343,7 +2347,11 @@ private:
         obligations.push_back(ob);
       }
     }
+    if (name && !inContract)
+      checkLaunch(call, *name, state);
     if (name && evalReversedRange(call, *name, state))
+      return;
+    if (name && evalDim(call, *name, state))
       return;
     if (name && evalDivmod(call, *name, state))
       return;
@@ -2643,6 +2651,14 @@ private:
     auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
     if (!callee || !symbol)
       return frame;
+    return paramFrame(symbol, callee, call.getImplicitOrigins().size(),
+                      std::move(frame));
+  }
+
+  /// The parameters `symbol` binds of `callee`, whose last `implicit`
+  /// parameters (implicit origins) it does not.
+  ParamFrame paramFrame(SymbolConstantAttr symbol, LIT::FnOp callee,
+                        size_t implicit, ParamFrame frame) {
     frame.scope = printed(symbol.getSymbol());
     SmallVector<ParamDeclAttr> decls;
     if (auto parent = callee->getParentOfType<LIT::StructDeclOp>())
@@ -2652,7 +2668,6 @@ private:
     // The callee's implicit origin parameters come last; the call binds
     // them apart (`lit.call @f[mut *"x"]`).
     ArrayRef<ParamDeclAttr> own = callee.getParams();
-    size_t implicit = call.getImplicitOrigins().size();
     if (implicit <= own.size())
       llvm::append_range(decls, own.drop_back(implicit));
     ArrayRef<TypedAttr> values = symbol.getParamValues();
@@ -3540,6 +3555,156 @@ private:
     return true;
   }
 
+  /// `Dim(x)`, `Dim(x, y)`, `Dim(x, y, z)` and `Dim(tuple)` from MAX's GPU
+  /// host API: fields `/x`, `/y` and `/z`, an omitted axis 1. An argument is
+  /// an `Int` (its value) or an `IntLiteral` (its value, in its type); a
+  /// tuple's elements are the fields its literal was built with.
+  bool evalDim(LIT::CallOp call, const CalleeName &name, State &state) {
+    StringRef path = name.path;
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!path.starts_with("max::gpu::host::dim::Dim::__init__[") || !symbol ||
+        call->getNumResults() != 1)
+      return false;
+    ArrayRef<TypedAttr> types = symbol.getParamValues();
+    bool fromTuple = path.contains("](::Tuple[");
+    if (call.getNumOperands() != (fromTuple ? 1 : types.size()) ||
+        types.empty() || types.size() > 3)
+      return false;
+    std::string tuple;
+    if (fromTuple) {
+      Value t = call.getOperands()[0];
+      tuple = isa<LIT::RefType>(t.getType()) ? valueThrough(t, state)
+                                             : term(t, state);
+    }
+    SmallVector<std::string, 3> axes;
+    for (auto [k, param] : llvm::enumerate(types)) {
+      TypedAttr type = resolveParam(param);
+      std::string v;
+      if (std::optional<int64_t> n = intLiteralType(type)) {
+        v = bvConst(*n, 64);
+      } else if (!isIntType(type)) {
+        return false;
+      } else if (fromTuple) {
+        auto it = builtFields.find({tuple, "/" + std::to_string(k)});
+        if (it == builtFields.end())
+          return false;
+        v = it->second;
+      } else {
+        Value x = call.getOperands()[k];
+        v = isa<LIT::RefType>(x.getType()) ? valueThrough(x, state)
+                                           : term(x, state);
+      }
+      if (sortOfTerm(v).isBool || sortOfTerm(v).width != 64)
+        return false;
+      axes.push_back(v);
+    }
+    while (axes.size() < 3)
+      axes.push_back(bvConst(1, 64));
+    std::string built = declare({false, 64, false}, "g");
+    for (auto [k, axis] : llvm::enumerate(axes))
+      setBuiltField(built, std::string("/") + "xyz"[k], axis);
+    values[call->getResult(0)] = built;
+    return true;
+  }
+
+  /// A kernel launch, `ctx.enqueue_function[kernel](*args, grid_dim=g,
+  /// block_dim=b)`: the kernel's preconditions are obligations here, with
+  /// its arguments the launch's and its `grid_dim` and `block_dim` the
+  /// launch's dimensions. They are not analyzed where the arguments or
+  /// dimensions are not known.
+  void checkLaunch(LIT::CallOp call, const CalleeName &name, State &state) {
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!symbol ||
+        !StringRef(name.path).contains("DeviceContext::enqueue_function[") ||
+        call.getNumOperands() < 4)
+      return;
+    // The kernel: the function with preconditions among the call's
+    // parameters, possibly behind the thunk converting it to the declared
+    // `def` type (a function of its own, calling its `callee` parameter).
+    SymbolConstantAttr kernelSymbol;
+    LIT::FnOp kernel;
+    std::function<void(TypedAttr, int)> search = [&](TypedAttr param,
+                                                     int depth) {
+      if (kernel || depth > 3)
+        return;
+      param = resolveParam(param);
+      while (auto expr = dyn_cast<ParamOperatorAttr>(param)) {
+        if (expr.getOpcode() != POC::Rebind || expr.getOperands().size() != 1)
+          return;
+        param = resolveParam(expr.getOperands()[0]);
+      }
+      auto s = dyn_cast<SymbolConstantAttr>(param);
+      if (!s)
+        return;
+      auto f = dyn_cast_or_null<LIT::FnOp>(
+          symbols.lookupSymbolIn(module, s.getSymbol()));
+      if (f && !f.getFunctionBody().empty() &&
+          !f.getFunctionBody().front().getOps<RequiresOp>().empty()) {
+        kernel = f;
+        kernelSymbol = s;
+        return;
+      }
+      for (TypedAttr inner : s.getParamValues())
+        search(inner, depth + 1);
+    };
+    for (TypedAttr param : symbol.getParamValues())
+      search(param, 0);
+    if (!kernel || kernel.getFunctionBody().empty() ||
+        kernel.getFunctionBody().front().getOps<RequiresOp>().empty())
+      return;
+    // The arguments: the references of the pack.
+    SmallVector<Value> refs;
+    bool known = false;
+    Value pack = call.getOperands()[1];
+    std::string packValue = isa<LIT::RefType>(pack.getType())
+                                ? valueThrough(pack, state)
+                                : term(pack, state);
+    if (auto it = packRefs.find(packValue); it != packRefs.end()) {
+      refs = it->second;
+      known = true;
+    }
+    // The dimensions, as `Dim` built them.
+    std::map<std::string, std::string> dims;
+    const char *kinds[] = {"grid_dim_", "block_dim_"};
+    for (auto [k, kind] : llvm::enumerate(kinds)) {
+      Value dim = call.getOperands()[2 + k];
+      std::string value = isa<LIT::RefType>(dim.getType())
+                              ? valueThrough(dim, state)
+                              : term(dim, state);
+      for (char axis : {'x', 'y', 'z'}) {
+        auto it = builtFields.find({value, std::string("/") + axis});
+        if (it == builtFields.end())
+          known = false;
+        else
+          dims[std::string(kind) + axis] = it->second;
+      }
+    }
+    ParamFrame frame = paramFrame(kernelSymbol, kernel, 0, ParamFrame{});
+    frame.parent = params;
+    for (RequiresOp req :
+         kernel.getFunctionBody().front().getOps<RequiresOp>()) {
+      Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
+                    displayName(kernel)};
+      MaybeTerm cond;
+      if (known) {
+        ParamFrame *saved = params;
+        params = &frame;
+        launchDims = &dims;
+        cond = instantiate(req.getBody(), req.getArgs(), state,
+                           ValueRange(refs), kernel, nullptr, false);
+        launchDims = nullptr;
+        params = saved;
+      }
+      if (cond) {
+        ob.cond = *cond;
+        noteCondition(ob.cond);
+      } else {
+        ob.analyzed = false;
+      }
+      obligations.push_back(ob);
+    }
+  }
+
   /// GPU ids (`thread_idx.x`, `block_idx.y`, `block_dim.z`, `grid_dim.x`,
   /// `global_idx.x`): one value per id and axis in a function, so reads
   /// agree, with the launch limits every supported GPU has (assumptions):
@@ -3563,6 +3728,21 @@ private:
           axis = a[1];
     if (!axis || sortOf(call->getResult(0).getType()).width != 64)
       return false;
+    // In a kernel's clause at its launch: the launch's dimensions; the
+    // indices of a thread are unknowns, which only makes the clause harder
+    // to prove.
+    if (launchDims) {
+      std::string key;
+      if (kind == "_BlockDim")
+        key = "block_dim_";
+      else if (kind == "_GridDim")
+        key = "grid_dim_";
+      key += *axis;
+      auto it = launchDims->find(key);
+      values[call->getResult(0)] =
+          it != launchDims->end() ? it->second : declare(Sort{false, 64, true});
+      return true;
+    }
     auto id = [&](StringRef which) {
       std::string symbol = ("gpu_" + which + "_" + Twine(*axis)).str();
       if (gpuIds.insert(symbol).second) {
@@ -4396,7 +4576,10 @@ private:
       boundRefs.push_back(blockArg);
       return true;
     }
-    values[blockArg] = term(actual, state);
+    // A value argument given by reference (a launch's argument pack).
+    values[blockArg] = isa<LIT::RefType>(actual.getType())
+                           ? valueThrough(actual, state)
+                           : term(actual, state);
     return true;
   }
 
