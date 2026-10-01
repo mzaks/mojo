@@ -995,6 +995,34 @@ Lists as Houdini variables:
   the other files within noise. Dictionary iteration still makes
   test_dict.mojo slower than before it, by about half instead of double.
 
+Fewer Houdini candidates:
+
+- Two templates can produce the same candidate (`len(xs) >= 0` from the
+  bound against 0 and from 0 among the unchanged terms); each is now
+  asked once.
+- A list the loop changes is no longer bounded against other lists'
+  lengths (`len(keys) <= len(other)`): a list the loop appends to fails
+  those at once, and no example or stdlib test proves anything with
+  them. It keeps its bounds against its own length on entry, 0, the
+  other unchanged terms and the loop's variables.
+- Results are the same on every file. Verification time, interleaved (5 runs
+  each, medians, load 3 to 6):
+
+  | File                  | Before dict iteration | Handle cut | Deduplicated | Now    |
+  |-----------------------|-----------------------|------------|--------------|--------|
+  | test_dict.mojo        | 0.98 s (15/32)        | 1.47 s     | 1.42 s       | 1.17 s |
+  | test_list.mojo        | 0.86 s                | 0.73 s     | 0.69 s       | 0.65 s |
+  | test_deque.mojo       | 0.88 s                | 0.71 s     | 0.68 s       | 0.67 s |
+  | test_linked_list.mojo | 0.35 s                | 0.32 s     | 0.33 s       | 0.31 s |
+
+  (The first column was measured against "Now" in a separate interleaved run,
+  the other three together.) Dictionary iteration now costs test_dict.mojo about
+  a fifth for its 7 new proofs, and the other files are faster than before it,
+  as the cuts apply to every loop.
+- What is left in test_dict.mojo is mostly `test_reversed_items`: three
+  loops of about 100 candidates, four rounds each, one after the other.
+  Each query takes z3 about 0.6 ms; the time is their number.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
