@@ -2478,8 +2478,10 @@ private:
         obligations.push_back(ob);
       }
     }
-    if (name && !inContract)
+    if (name && !inContract) {
       checkLaunch(call, *name, state);
+      checkDereference(call, *name, callee, state);
+    }
     if (name && evalReversedRange(call, *name, state))
       return;
     if (name && evalDim(call, *name, state))
@@ -3823,6 +3825,29 @@ private:
     std::string e = "(pext " + value + ")";
     facts.push_back("(bvsge " + e + " " + bvConst(0, 64) + ")");
     return e;
+  }
+
+  /// `p[]`: the pointer's extent is at least 1, the precondition of
+  /// `p[unsafe_offset=0]`. Stated here, not as a clause: one on `self` of
+  /// this method (it returns a reference) makes code generation fail
+  /// (`StackReuse`: "was supposed to be elidable").
+  void checkDereference(LIT::CallOp call, const CalleeName &name,
+                        LIT::FnOp callee, State &state) {
+    if (!StringRef(name.path).starts_with(
+            "std::memory::pointer::Pointer::__getitem__(::Pointer[") ||
+        call.getNumOperands() != 1)
+      return;
+    Obligation ob{state.pc, "false", call.getLoc(),
+                  callee ? callee.getLoc() : call.getLoc(),
+                  "Pointer.__getitem__"};
+    if (MaybeTerm e = pointerExtent(call.getOperands()[0], state)) {
+      ob.cond = define({true, 1, false},
+                       "(bvsle " + bvConst(1, 64) + " " + *e + ")");
+      noteCondition(ob.cond);
+    } else {
+      ob.analyzed = false;
+    }
+    obligations.push_back(ob);
   }
 
   /// `Pointer._extent()`, and `p._offset_in_bounds[width](offset)`, the
