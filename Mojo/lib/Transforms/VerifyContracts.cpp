@@ -1600,10 +1600,16 @@ private:
           {loc, "=", std::nullopt, load(loc, before, Sort{false, 64, true})});
     for (const Loc &loc : lists) {
       bool resized = changes(loc);
+      std::string own = lenOf(load(loc, before, Sort{false, 64, false}));
       candidates.push_back({loc, "bvsge", std::nullopt, bvConst(0, 64), true});
-      for (const std::string &t : fixed)
+      for (const std::string &t : fixed) {
+        // Not against another list's length: a list the loop changes is
+        // bounded by its own length on entry and by the loop's variables.
+        if (StringRef(t).starts_with("(len ") && t != own)
+          continue;
         for (const char *op : {"bvsle", "bvsge"})
           candidates.push_back({loc, op, std::nullopt, t, true});
+      }
       for (const Loc &other : places) {
         for (const char *op : {"bvsle", "bvslt", "bvsge"})
           candidates.push_back({loc, op, other, "", true});
