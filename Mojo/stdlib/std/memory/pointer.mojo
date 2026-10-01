@@ -1423,7 +1423,9 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](self: Pointer[Scalar[dtype], ...]) -> SIMD[dtype, width]:
+    ](
+        self: Pointer[Scalar[dtype], ...] where self._offset_in_bounds[width](0)
+    ) -> SIMD[dtype, width]:
         """Loads `width` elements from the value the pointer points to.
 
         Use `alignment` to specify minimal known alignment in bytes; pass a
@@ -1537,7 +1539,9 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](self: Pointer[Scalar[dtype], ...]) -> SIMD[dtype, width]:
+    ](
+        self: Pointer[Scalar[dtype], ...] where self._offset_in_bounds[width](0)
+    ) -> SIMD[dtype, width]:
         return self.unsafe_load[
             width=width,
             alignment=alignment,
@@ -1807,7 +1811,10 @@ struct Pointer[
         alignment: Int = align_of[dtype](),
         volatile: Bool = False,
         non_temporal: Bool = False,
-    ](self: MutPointer[Scalar[dtype], ...], val: SIMD[dtype, width]):
+    ](
+        self: MutPointer[Scalar[dtype], ...],
+        val: SIMD[dtype, width] where self._offset_in_bounds[Int(width)](0),
+    ):
         """Stores a single element value `val` at element offset 0.
 
         Specify `alignment` when writing to packed/unaligned memory. Requires a
@@ -1919,7 +1926,10 @@ struct Pointer[
         alignment: Int = align_of[dtype](),
         volatile: Bool = False,
         non_temporal: Bool = False,
-    ](self: MutPointer[Scalar[dtype], ...], val: SIMD[dtype, width]):
+    ](
+        self: MutPointer[Scalar[dtype], ...],
+        val: SIMD[dtype, width] where self._offset_in_bounds[Int(width)](0),
+    ):
         self.unsafe_store[
             width,
             alignment=alignment,
