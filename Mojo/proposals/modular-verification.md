@@ -1243,7 +1243,24 @@ Tensors and GPU kernels:
   `grid_dim.x <= n // 16` under `n % 16 == 0`, and without that guard
   still does not. straight_line.mojo: 16 of 27, kernels.mojo: 17 of 27,
   the others in `bad_*` functions.
-- Not covered yet: a runtime last stride, launches with `host_arg`, tensors
+- Launches with `host_arg=` (four in max/kernels/src: a closure passed
+  by host layout as the kernel's last argument) were found, but their
+  obligations were not analyzed: the kernel's arguments were only the
+  pack's, so its last formal had no actual. The operands between the pack
+  and the first `Dim` are now appended as the kernel's last arguments
+  (none in the other overloads); a launch with a grid that fits is
+  proven and one with a block too many is not. The overload only takes a
+  kernel whose host argument is a closure, so a clause on that argument
+  is rarely one the pass could read anyway.
+- With `generic-launched=true`, the loop-invariant (Houdini) queries of a
+  launched kernel's generic proof now get a twentieth of `generic-rlimit`
+  each, like its obligations get `generic-rlimit`, instead of a twentieth
+  of `rlimit`: a candidate that runs out is dropped, which is sound. The
+  matmul launched from a generic launcher: 3.57 and 3.56 s against 3.94
+  and 4.14 s (interleaved, load about 3), keeping 4 invariants instead of
+  6 with the same results. kernels.mojo: 19 of 30, the other 11 in
+  `bad_*` functions.
+- Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), raw pointers, and kernels in MAX's own packages, which are now
   skipped as imported code unless `include-stdlib=true`.

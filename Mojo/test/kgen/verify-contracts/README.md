@@ -284,26 +284,26 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   or tuples; an omitted axis is 1). Other GPU ids in a clause are unknown
   at the launch. A kernel compiled first and launched as
   `ctx.enqueue_function(ctx.compile_function[kernel](), args..., ...)`
-  is checked the same way. Kernels launched as closures (no arguments, so
-  no clauses), with `host_arg`, or as precompiled external functions are
-  not checked.
-- A generic kernel that is launched (`enqueue_function[kernel[8]](...)`)
-  is verified for each distinct launch, its parameters bound to the
-  launch's, not for every value of them: a proof for every `BM` and `BN`
-  is nonlinear and slow (the custom-ops tiled matmul: 10 s, against 0.12 s
-  for its launched sizes). A parameter that the launch passes from its own
-  function's parameters (`kernel[dtype, N]` in a launcher generic over
-  them) is followed to the calls of that function that give it
-  (`launch[DType.float32, 8](...)`), up to three calls out; where no call
-  gives it, it stays unknown, so the check holds for every value of it.
-  An obligation proven in all of them is reported as proven for the
-  launched instantiations (and counted apart in the summary); otherwise
-  the warning has a note at each launch where it is not proven (and at
-  the call that gave the parameters). `generic-launched=true` also
-  verifies such a kernel for every value of its parameters first, each
-  query within `generic-rlimit`, and checks only what that leaves open
-  per launch. Kernels that are not launched in the module are verified
-  for every value of their parameters.
+  is checked the same way, and so is one launched with `host_arg=` (the
+  host arguments are the kernel's last arguments). Kernels launched as
+  closures (no arguments, so no clauses) or as precompiled external
+  functions are not checked.
+- A generic kernel that is launched (`enqueue_function[kernel[8]](...)`) is
+  verified for each distinct launch, its parameters bound to the launch's, not
+  for every value of them: a proof for every `BM` and `BN` is nonlinear and slow
+  (the custom-ops tiled matmul: 10 s, against 0.12 s for its launched sizes). A
+  parameter that the launch passes from its own function's parameters
+  (`kernel[dtype, N]` in a launcher generic over them) is followed to the calls
+  of that function that give it (`launch[DType.float32, 8](...)`), up to three
+  calls out; where no call gives it, it stays unknown, so the check holds for
+  every value of it. An obligation proven in all of them is reported as proven
+  for the launched instantiations (and counted apart in the summary); otherwise
+  the warning has a note at each launch where it is not proven (and at the call
+  that gave the parameters). `generic-launched=true` also verifies such a kernel
+  for every value of its parameters first, each query within `generic-rlimit`
+  (and each loop-invariant candidate within a twentieth of it), and checks only
+  what that leaves open per launch. Kernels that are not launched in the module
+  are verified for every value of their parameters.
 - `ceildiv(a, b)` (and `a.__ceildiv__(b)`) of integers is `-(a // -b)`
   when signed and the quotient plus one for a nonzero remainder when
   unsigned, as `SIMD` defines it; so a launch with `grid_dim=ceildiv(n,

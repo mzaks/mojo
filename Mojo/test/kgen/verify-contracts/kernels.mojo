@@ -155,6 +155,32 @@ def ok_launch_ceildiv(
         )
 
 
+def ok_host_kernel[
+    F: ImplicitlyCopyable & def(Int) -> Float32
+](
+    c: TileTensor[DType.float32, LD, MutAnyOrigin] where grid_dim.x <= Int(
+        c.dim[0]()
+    ) and Int(c.dim[1]()) > 0,
+    f: F,
+):
+    c[block_idx.x, 0] = f(block_idx.x)
+
+
+def ok_launch_host_arg(
+    ctx: DeviceContext, c: TileTensor[DType.float32, LD, MutAnyOrigin]
+) raises:
+    var m = Int(c.dim[0]())
+
+    def value(i: Int) {var m} -> Float32:
+        return Float32(i + m)
+
+    if Int(c.dim[1]()) > 0:
+        # A closure passed by host layout, the kernel's last argument.
+        ctx.enqueue_function[ok_host_kernel[type_of(value)]](
+            c, host_arg=value, grid_dim=m, block_dim=1
+        )
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -262,3 +288,17 @@ def bad_launch_compiled_sized(
 ) raises:
     var f = ctx.compile_function[bad_compiled_kernel[9]]()
     ctx.enqueue_function(f, t, grid_dim=1, block_dim=1)
+
+
+def bad_launch_host_arg(
+    ctx: DeviceContext, c: TileTensor[DType.float32, LD, MutAnyOrigin]
+) raises:
+    var m = Int(c.dim[0]())
+
+    def value(i: Int) {var m} -> Float32:
+        return Float32(i + m)
+
+    if Int(c.dim[1]()) > 0:
+        ctx.enqueue_function[ok_host_kernel[type_of(value)]](
+            c, host_arg=value, grid_dim=m + 1, block_dim=1  # one block too many
+        )
