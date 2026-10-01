@@ -3828,23 +3828,83 @@ private:
   /// `Pointer._extent()`, and `p._offset_in_bounds[width](offset)`, the
   /// clause of accessing `width` elements at `offset`:
   /// `0 <= offset <= extent - width` (the width is the last parameter).
+  /// Also the pointers whose extents no clause can state: `List.unsafe_ptr()`
+  /// and `Span.unsafe_ptr()` point to at least `len(self)` elements (a
+  /// list's capacity and a span's memory can be longer), `Array.unsafe_ptr()`
+  /// to at least its size; casts of the origin or the address space (the
+  /// implicit conversion of a mutable pointer to an immutable one, an
+  /// ordinary call, among them) are the same pointer.
   bool evalPointer(LIT::CallOp call, const CalleeName &name, State &state) {
     StringRef path = name.path;
     auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
-    if (!symbol || call->getNumResults() != 1 ||
-        !path.starts_with("std::memory::pointer::Pointer::"))
+    if (!symbol || call->getNumResults() != 1)
       return false;
     Value result = call->getResult(0);
-    if (path.starts_with("std::memory::pointer::Pointer::_extent(") &&
+    if ((path.starts_with("std::collections::list::List::unsafe_ptr[") ||
+         path.starts_with("std::collections::span::Span::unsafe_ptr(")) &&
         call.getNumOperands() == 1) {
+      Value self = call.getOperands()[0];
+      std::string value = isa<LIT::RefType>(self.getType())
+                              ? valueThrough(self, state)
+                              : term(self, state);
+      if (sortOfTerm(value).isBool || sortOfTerm(value).width != 64)
+        return false;
+      std::string pointer = declare({false, 64, false}, "ptr");
+      facts.push_back("(bvsge " + extentOf(pointer) + " " + lenOf(value) + ")");
+      values[result] = pointer;
+      return true;
+    }
+    if (path.starts_with("std::collections::array::Array::unsafe_ptr[") &&
+        call.getNumOperands() == 1) {
+      std::optional<Loc> loc = placeOf(call.getOperands()[0]);
+      MaybeTerm n;
+      if (loc && loc->path.empty())
+        n = arrayLength(*loc);
+      if (!n)
+        return false;
+      std::string pointer = declare({false, 64, false}, "ptr");
+      facts.push_back("(bvsge " + extentOf(pointer) + " " + *n + ")");
+      values[result] = pointer;
+      return true;
+    }
+    if (!path.consume_front("std::memory::pointer::Pointer::"))
+      return false;
+    // Casts that keep the element type and the address. (`unsafe_bitcast`
+    // changes the element type, so its extent stays unknown.)
+    bool samePointer =
+        (path.starts_with("__init__[") && path.contains("](::Pointer[")) ||
+        path.starts_with("as_imm(") ||
+        path.starts_with("as_unsafe_any_origin(") ||
+        path.starts_with("unsafe_as_noalias(") ||
+        path.starts_with("unsafe_mut_cast[") ||
+        path.starts_with("unsafe_origin_cast[") ||
+        path.starts_with("address_space_cast[") ||
+        path.starts_with("unsafe_address_space_cast[");
+    if (samePointer && call.getNumOperands() == 1 &&
+        !isa<LIT::RefType>(call.getOperands()[0].getType())) {
+      values[result] = term(call.getOperands()[0], state);
+      return true;
+    }
+    // `Pointer(to=x)` points to at least `x` (an element of an array may
+    // have more after it). Not a clause: one on this constructor makes the
+    // compile-time interpreter read a null `to` (`Pointer(to=...)` in
+    // `Tuple.__getitem__`).
+    if (path.starts_with("__init__(to:") && call.getNumOperands() == 1) {
+      std::string pointer = declare({false, 64, false}, "ptr");
+      facts.push_back("(bvsge " + extentOf(pointer) + " " + bvConst(1, 64) +
+                      ")");
+      values[result] = pointer;
+      return true;
+    }
+    if (path.starts_with("_extent(") && call.getNumOperands() == 1) {
       MaybeTerm e = pointerExtent(call.getOperands()[0], state);
       if (!e)
         return false;
       values[result] = *e;
       return true;
     }
-    if (path.starts_with("std::memory::pointer::Pointer::_offset_in_bounds[") &&
-        call.getNumOperands() == 2 && !symbol.getParamValues().empty()) {
+    if (path.starts_with("_offset_in_bounds[") && call.getNumOperands() == 2 &&
+        !symbol.getParamValues().empty()) {
       MaybeTerm e = pointerExtent(call.getOperands()[0], state);
       std::string width =
           paramTerm(symbol.getParamValues().back(), Sort{false, 64, true});
