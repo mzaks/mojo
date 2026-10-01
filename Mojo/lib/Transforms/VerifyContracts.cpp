@@ -3211,6 +3211,61 @@ private:
       values[result] = define({true, 1, false}, all);
       return true;
     }
+    // `t._vectorize_in_bounds[*sizes]()`, the clause of vectorizing: every
+    // dimension a multiple of its size, where that is more than one.
+    if (path.starts_with(
+            "layout::tile_tensor::TileTensor::_vectorize_in_bounds[") &&
+        call.getNumOperands() == 1) {
+      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      std::optional<SmallVector<int64_t>> sizes;
+      if (params.size() < 9 || !(sizes = intList(params[8])))
+        return false;
+      std::string all = "true";
+      for (auto [k, size] : llvm::enumerate(*sizes)) {
+        if (size <= 1)
+          continue;
+        MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
+        if (!d)
+          return false;
+        all = "(and " + all + " (= (bvsrem " + *d + " " + bvConst(size, 64) +
+              ") " + bvConst(0, 64) + "))";
+      }
+      values[result] = define({true, 1, false}, all);
+      return true;
+    }
+    // `t.vectorize[*sizes]()`: a view with `ceildiv(dim, size)` vectors per
+    // dimension (its layout type gives them unevaluated).
+    if (path.starts_with("layout::tile_tensor::TileTensor::vectorize[") &&
+        call.getNumOperands() == 1) {
+      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      std::optional<SmallVector<int64_t>> sizes;
+      if (params.size() < 9 || !(sizes = intList(params[8])))
+        return false;
+      SmallVector<std::string> dims;
+      for (auto [k, size] : llvm::enumerate(*sizes)) {
+        MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
+        if (!d || size <= 0)
+          return false;
+        std::string s = bvConst(size, 64);
+        dims.push_back("(ite (= (bvsrem " + *d + " " + s + ") " +
+                       bvConst(0, 64) + ") (bvsdiv " + *d + " " + s +
+                       ") (bvadd (bvsdiv " + *d + " " + s + ") " +
+                       bvConst(1, 64) + "))");
+      }
+      setResultsUnknown(call);
+      std::string view = values[result];
+      if (sortOfTerm(view).width != 64 || sortOfTerm(view).isBool)
+        return false;
+      if (!tensorDimDeclared) {
+        prelude += "(declare-fun tdim ((_ BitVec 64) (_ BitVec 64)) "
+                   "(_ BitVec 64))\n";
+        tensorDimDeclared = true;
+      }
+      for (auto [k, d] : llvm::enumerate(dims))
+        facts.push_back("(= (tdim " + view + " " + bvConst(k, 64) + ") " + d +
+                        ")");
+      return true;
+    }
     return false;
   }
 
