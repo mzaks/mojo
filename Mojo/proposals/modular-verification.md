@@ -1131,6 +1131,49 @@ Tensors and GPU kernels:
   parameters of a generic function (`tile[BM, BN]`, `row_major[BM,
   BK]()`), evaluated in the scope they come from: a caller's `BM` passed
   to `tile` was a fresh unknown in the callee's scope before.
+- Launched instantiations: of the tiled matmul's 10 s, z3 took 10.1 on
+  three obligations needing `tid udiv BN < BM` from `tid < BM * BN` for
+  every 64-bit `BM` and `BN` (2.3 to 3.8 s each, 57 to 65 million
+  resource units; with one of them fixed, 0.1 s; with both, 0.01 s;
+  bounding both to `[1, 1024]` only halved it). A generic kernel that is
+  launched was then first proven generically with
+  a smaller budget per query (`generic-rlimit`, default 10 million: its
+  other obligations needed at most about 6 million), and what that leaves
+  open is proven for each launched instantiation, the kernel encoded with
+  its parameters bound to the launch's; such an obligation is reported as
+  proven for the launched instantiations, or warned with a note at each
+  launch where it is not. The matmul with a launch: 4.8 s at a 20M
+  budget, 3.9 s at 10M, 2.9 s at 5M (load about 2); 1.2 s of it is the
+  generic Houdini search, which the budget does not limit. z3's `rlimit`
+  turned out to be per query, not cumulative over a script as the README
+  said: three queries at 20M stopped at 60M together. Finding the launches
+  first cost 1.6 s by itself while it named every call with
+  `calleeName`, which prints all of a call's parameters; it now looks at
+  the callee's symbol only (3 ms). A launch from a generic function is
+  checked too. A kernel parameter the launch passes from its launcher's
+  parameters is followed to the calls of the launcher that give it, up to
+  three calls out: an instantiation is then a chain of parameter frames
+  (the kernel's from the launch, the launcher's from its call, ...),
+  the mechanism calls already use. Where no call gives a parameter, it is
+  left unbound, an unknown in the kernel's scope (binding it to a
+  parameter of another function could let a launcher's `BM` be read as
+  the kernel's own `BM`), so the check holds for every value of it. The
+  matmul launched from a function generic over `dtype` and layouts with
+  fixed sizes (the custom-ops `execute`'s shape): 3.9 s; with `BM` and
+  `BN` its parameters too, given one call out: 4.2 s (10.9 s before the
+  chains, when the sizes stayed unknown).
+- Of those 4 s, the instantiation took 0.12 s; the rest was the generic
+  attempt (its Houdini search 1.1 s, which the budget did not limit, the
+  three exhausted budgets 1.5 s, the obligations it did prove 0.6 s) and
+  the compiler itself (about 0.45 s). So a launched generic kernel is now
+  verified only for its launched instantiations, and the generic attempt
+  first is the option `generic-launched=true`. The matmul from each of
+  the four launchers: 0.62 s (3.96 s with the option). The claim is
+  weaker, safe for the sizes launched in the module rather than for every
+  size; kernels not launched in the module are still proven for every
+  value of their parameters. kernels.mojo: 14 of 22, three of them only
+  for their launched instantiations, the other 8 in `bad_*` functions,
+  the same with the option.
 - Not covered yet: `tile` with `Coord` arguments, `distribute`, a
   runtime last stride, function-level `where` constraints on parameters
   (`where N <= 8`) as assumptions, launches through the other

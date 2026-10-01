@@ -40,8 +40,10 @@ not checked.
 
 Options: `verbose=true` reports proven obligations as remarks,
 `include-stdlib=true` also checks `std`, `rlimit=` sets the solver's
-deterministic resource limit (default 100000000; z3 counts it across a
-script, so it only stops runaway queries), `wall-seconds=` caps each z3
+deterministic resource limit of each query (default 100000000),
+`generic-launched=true` also verifies launched generic kernels for every
+value of their parameters, `generic-rlimit=` the limit of each such query
+(default 10000000; see below), `wall-seconds=` caps each z3
 process (default 60), `dump-dir=` writes the SMT-LIB scripts, and
 `cache-dir=` caches the solver's answers by a hash of each script.
 
@@ -269,6 +271,23 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `grid_dim` and `block_dim` the launch's `Dim`s (from `Int`s, literals
   or tuples; an omitted axis is 1). Other GPU ids in a clause are unknown
   at the launch.
+- A generic kernel that is launched (`enqueue_function[kernel[8]](...)`)
+  is verified for each distinct launch, its parameters bound to the
+  launch's, not for every value of them: a proof for every `BM` and `BN`
+  is nonlinear and slow (the custom-ops tiled matmul: 10 s, against 0.12 s
+  for its launched sizes). A parameter that the launch passes from its own
+  function's parameters (`kernel[dtype, N]` in a launcher generic over
+  them) is followed to the calls of that function that give it
+  (`launch[DType.float32, 8](...)`), up to three calls out; where no call
+  gives it, it stays unknown, so the check holds for every value of it.
+  An obligation proven in all of them is reported as proven for the
+  launched instantiations (and counted apart in the summary); otherwise
+  the warning has a note at each launch where it is not proven (and at
+  the call that gave the parameters). `generic-launched=true` also
+  verifies such a kernel for every value of its parameters first, each
+  query within `generic-rlimit`, and checks only what that leaves open
+  per launch. Kernels that are not launched in the module are verified
+  for every value of their parameters.
 - `divmod(a, b)` of `Int`s and `udivmod(a, b)` are the quotient and
   remainder (floored, or unsigned for `udivmod`); a `comptime for k in
   range(n)` has `0 <= k < n`. In a function generic over tile sizes

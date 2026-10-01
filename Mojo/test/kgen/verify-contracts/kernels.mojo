@@ -79,6 +79,49 @@ def ok_comptime_for(t: TileTensor[DType.float32, L88, MutAnyOrigin]) -> Float32:
     return sum
 
 
+def ok_sized_kernel[N: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+    # Not for every `N`, but for the one launched: proven for that size.
+    t[7, N - 1] = 0
+
+
+def ok_launch_sized(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    ctx.enqueue_function[ok_sized_kernel[8]](t, grid_dim=1, block_dim=1)
+
+
+def ok_partial_kernel[
+    dtype: DType, N: Int
+](t: TileTensor[dtype, L88, MutAnyOrigin]):
+    t[7, N - 1] = 0
+
+
+def ok_launch_partial[
+    dtype: DType
+](ctx: DeviceContext, t: TileTensor[dtype, L88, MutAnyOrigin]) raises:
+    # The launcher's `dtype` stays unknown; the size is fixed.
+    ctx.enqueue_function[ok_partial_kernel[dtype, 8]](
+        t, grid_dim=1, block_dim=1
+    )
+
+
+def ok_through_kernel[N: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+    t[7, N - 1] = 0
+
+
+def ok_launch_through[
+    N: Int
+](ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]) raises:
+    ctx.enqueue_function[ok_through_kernel[N]](t, grid_dim=1, block_dim=1)
+
+
+def ok_specialize(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    # `N` is fixed here, one call out from the launch.
+    ok_launch_through[8](ctx, t)
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -122,3 +165,45 @@ def bad_comptime_for(t: TileTensor[DType.float32, L88, MutAnyOrigin]) -> Float32
     comptime for k in range(9):
         sum += t[7, k]
     return sum
+
+
+def bad_sized_kernel[N: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+    t[7, N - 1] = 0  # launched with 9 below, past the row
+
+
+def bad_launch_sized(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    ctx.enqueue_function[bad_sized_kernel[8]](t, grid_dim=1, block_dim=1)
+    ctx.enqueue_function[bad_sized_kernel[9]](t, grid_dim=1, block_dim=1)
+
+
+def bad_partial_kernel[
+    dtype: DType, N: Int
+](t: TileTensor[dtype, L88, MutAnyOrigin]):
+    t[7, N - 1] = 0  # the launcher below passes any `N`
+
+
+def bad_launch_unsized[
+    N: Int
+](ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]) raises:
+    ctx.enqueue_function[bad_partial_kernel[DType.float32, N]](
+        t, grid_dim=1, block_dim=1
+    )
+
+
+def bad_through_kernel[N: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+    t[7, N - 1] = 0  # specialized with 9 two calls out
+
+
+def bad_launch_through[
+    N: Int
+](ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]) raises:
+    ctx.enqueue_function[bad_through_kernel[N]](t, grid_dim=1, block_dim=1)
+
+
+def bad_specialize(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    bad_launch_through[8](ctx, t)
+    bad_launch_through[9](ctx, t)
