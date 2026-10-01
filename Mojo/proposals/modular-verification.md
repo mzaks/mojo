@@ -1093,9 +1093,22 @@ Tensors and GPU kernels:
   among them a guard `j * 4 < dim` that does not prove `j < dim / 4`
   because the product wraps. The `layout`, `nn` and `linalg` kernel
   tests still compile and pass with both clauses.
-- Not covered yet: `tile` with `Coord` arguments, `distribute`,
-  `load[width]`/`store[width]` (a `Coord` argument, and a width that only stays
-  inside the row when the last stride is 1), tensors whose runtime size comes
+- Vectorized loads and stores: `load[width](coord)` and
+  `store[width](coord, v)` require, through `_access_in_bounds`, every
+  scalar coordinate in `[0, dim)` and, above width one, the last at most
+  `dim - width` with stride 1, since the access reads `width`
+  consecutive elements of storage. Only a flat, unvectorized layout
+  indexed by one value per dimension is checked; elsewhere (nested
+  layouts, other ranks, vectorized views, whose elements `vectorize` and
+  `__getitem__` already cover) the helper is true. The pass models
+  `Coord(*values)` and `Coord(tuple)` as fields per element, reads a
+  `ComptimeInt` element's value from its type, widens narrower integer
+  coordinates by their signedness, and treats a runtime last stride as
+  unknown. The idiomatic guard `j + width <= dim` does not prove the
+  access: the sum wraps for `j` near `Int.MAX`. `j <= dim - width` does.
+  tensors.mojo: 51 of 68, the other 17 in `bad_*` functions.
+- Not covered yet: `tile` with `Coord` arguments, `distribute`, a
+  runtime last stride, tensors whose runtime size comes
   from a scalar (`row_major(n)`: `dim` is not related to `n`), raw pointers, and
   kernels in MAX's own packages, which are now skipped as imported code unless
   `include-stdlib=true`.

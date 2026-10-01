@@ -13,7 +13,7 @@
 # `TileTensor` indexing and GPU kernels for `verify-contracts`; see README.md.
 # Needs the `max` and `layout` packages on the import path (see README.md).
 
-from layout import TileTensor, row_major
+from layout import Idx, TileTensor, row_major
 from max.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.utils.coord import Coord
 
@@ -130,6 +130,43 @@ def ok_tile_vectorize(
     return 0
 
 
+def ok_load(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) -> SIMD[DType.float32, 4]:
+    return t.load[4](Coord(7, 4))  # columns 4..7 of the last row
+
+
+def ok_load_guard(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int, j: Int
+) -> SIMD[DType.float32, 4]:
+    if 0 <= i and i < Int(t.dim[0]()):
+        if 0 <= j and j <= Int(t.dim[1]()) - 4:
+            return t.load[4](Coord(i, j))
+    return 0
+
+
+def ok_load_tuple(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin], i: Int
+) -> SIMD[DType.float32, 4]:
+    if 0 <= i and i < 8:
+        return t.load[4]((i, 4))  # a tuple converts to a `Coord`
+    return 0
+
+
+def ok_store(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin], v: SIMD[DType.float32, 8]
+):
+    t.store(Coord(Idx[3], Idx[0]), v)  # a whole row
+
+
+def ok_load_narrow(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin], i: Int32
+) -> Float32:
+    if Int32(0) <= i and i < Int32(8):
+        return t.load[1](Coord(i, Idx[2]))
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_static(t: TileTensor[DType.float32, L8, MutAnyOrigin]) -> Float32:
     return t[8]  # one past the end
@@ -202,4 +239,40 @@ def bad_vectorize_overflow(
         var v = t.vectorize[1, 4]()
         if 0 <= j and j * 4 < Int(t.dim[1]()):
             return v[0, j]  # `j * 4` wraps for a large `j`
+    return 0
+
+
+def bad_load_width(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) -> SIMD[DType.float32, 4]:
+    return t.load[4](Coord(7, 5))  # 5 + 4 > 8
+
+
+def bad_load_row(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int, j: Int
+) -> SIMD[DType.float32, 4]:
+    if 0 <= i and i < Int(t.dim[0]()) and 0 <= j and j < Int(t.dim[1]()):
+        return t.load[4](Coord(i, j))  # may run past the row
+    return 0
+
+
+def bad_load_wrap(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int, j: Int
+) -> SIMD[DType.float32, 4]:
+    if 0 <= i and i < Int(t.dim[0]()) and 0 <= j and j + 4 <= Int(t.dim[1]()):
+        return t.load[4](Coord(i, j))  # `j + 4` wraps for a large `j`
+    return 0
+
+
+def bad_store(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin], v: SIMD[DType.float32, 8]
+):
+    t.store(Coord(Idx[3], Idx[1]), v)  # one past the row
+
+
+def bad_load_narrow(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin], i: UInt8
+) -> Float32:
+    if i < UInt8(9):
+        return t.load[1](Coord(i, Idx[2]))
     return 0

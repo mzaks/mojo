@@ -247,8 +247,14 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   requires every dimension a multiple of its size (the view has
   `ceildiv(dim, size)` vectors, so the last one would reach past the
   tensor), and the view's `dim[k]()` is `ceildiv(dim[k], size)` of its
-  parent. `tile` with `Coord` arguments, `distribute` and
-  `load[width]`/`store[width]` have no contracts yet.
+  parent. `t.load[width](coord)` and `t.store[width](coord, v)` require
+  every integer coordinate in `[0, dim)` and, for a width above one, the
+  last at most `dim - width` with a static stride of 1 (`j + 4 <= dim`
+  does not prove it: the sum wraps for a large `j`; `j <= dim - 4` does).
+  `Coord(i, j)`, `Coord(Idx[3], j)` and a tuple `(i, j)` are modelled
+  element by element. A nested layout, a coordinate of another rank and a
+  vectorized view are not checked. `tile` with `Coord` arguments and
+  `distribute` have no contracts yet.
 - GPU kernels: `thread_idx`, `block_idx`, `block_dim` and `grid_dim` are
   one value per axis in a function, with the launch limits every
   supported GPU has (assumptions): `0 <= thread_idx < block_dim <= 1024`
