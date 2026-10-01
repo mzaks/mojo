@@ -53,6 +53,16 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "Path to the z3 executable (default: search PATH)">,
     Option<"rlimit", "rlimit", "unsigned", /*default=*/"100000000",
            "Deterministic solver resource limit per query">,
+    Option<"genericLaunched", "generic-launched", "bool",
+           /*default=*/"false",
+           "Also verify a generic kernel that is launched for every value "
+           "of its parameters (by default only its launched instantiations "
+           "are verified)">,
+    Option<"genericRlimit", "generic-rlimit", "unsigned",
+           /*default=*/"10000000",
+           "With generic-launched: resource limit per query of a launched "
+           "generic kernel; what it leaves open is checked for each "
+           "launched instantiation">,
     Option<"wallSeconds", "wall-seconds", "unsigned", /*default=*/"60",
            "Wall-clock cap on each z3 process, in seconds">,
     Option<"dumpDir", "dump-dir", "std::string", /*default=*/"\"\"",

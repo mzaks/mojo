@@ -484,6 +484,15 @@ struct State {
 };
 
 /// An obligation: `cond` must hold whenever `pc` does.
+/// One step of how a function is instantiated: `symbol` (a call's callee,
+/// with its parameter values) names `fn`, whose last `implicit` parameters
+/// (implicit origins) it does not bind.
+struct InstanceLink {
+  SymbolConstantAttr symbol;
+  LIT::FnOp fn;
+  size_t implicit = 0;
+};
+
 struct Obligation {
   std::string pc, cond;
   Location callLoc, clauseLoc;
@@ -656,9 +665,46 @@ public:
     std::string text = header();
     for (const Obligation &ob : obligations)
       if (ob.analyzed)
-        text += query({ob.pc}, ob.cond, solver.rlimit);
+        text +=
+            query({ob.pc}, ob.cond, queryRlimit ? queryRlimit : solver.rlimit);
     return text;
   }
+
+  /// Encodes the instantiation that `chain` names: a launched kernel with
+  /// its parameters, then the function launching it with the parameters a
+  /// call of it gives, and so on outwards. Each step's values are in the
+  /// scope of the next. A value that is a parameter the next step does not
+  /// bind (the outermost function's own) stays unbound: the parameter it
+  /// gives is then an unknown, so what is proven holds for every value of
+  /// it, and a parameter of one function cannot be read as a parameter of
+  /// the same name of another.
+  void bindInstance(ArrayRef<InstanceLink> chain) {
+    instanceFrames.clear();
+    for (const InstanceLink &link : chain)
+      instanceFrames.push_back(
+          paramFrame(link.symbol, link.fn, link.implicit, ParamFrame{}));
+    for (size_t k = 0; k + 1 < instanceFrames.size(); ++k)
+      instanceFrames[k].parent = &instanceFrames[k + 1];
+    for (size_t k = instanceFrames.size(); k-- > 0;) {
+      ParamFrame *next = instanceFrames[k].parent;
+      SmallVector<std::string> open;
+      for (auto &entry : instanceFrames[k].values) {
+        TypedAttr value = entry.second;
+        while (auto upcast = dyn_cast<UpcastAttr>(value))
+          value = upcast.getInputTypeValue();
+        if (auto ref = dyn_cast<ParamDeclRefAttr>(value);
+            ref && (!next || !next->values.count(ref.getName())))
+          open.push_back(entry.first().str());
+      }
+      for (const std::string &name : open)
+        instanceFrames[k].values.erase(name);
+    }
+    rootParams = instanceFrames.empty() ? nullptr : &instanceFrames.front();
+    params = rootParams;
+  }
+
+  /// The resource limit of each query, if not the solver's.
+  unsigned queryRlimit = 0;
 
   LIT::FnOp fn;
   SmallVector<Obligation> obligations;
@@ -721,6 +767,9 @@ private:
     std::string scope;
   };
   ParamFrame *params = nullptr;
+  /// The function's own parameters' frame: none, or an instantiation's.
+  std::vector<ParamFrame> instanceFrames;
+  ParamFrame *rootParams = nullptr;
   /// While a kernel's clause is instantiated at its launch: the launch's
   /// dimensions (`grid_dim_x`, `block_dim_y`, ...) that its GPU ids read.
   const std::map<std::string, std::string> *launchDims = nullptr;
@@ -4189,8 +4238,7 @@ private:
             : loc.root.getDefiningOp();
     if (owner && (owner == fn.getOperation() ||
                   owner->getParentOfType<LIT::FnOp>() == fn))
-      while (params)
-        params = params->parent;
+      params = rootParams;
     std::string n = paramTerm(size, sort);
     params = saved;
     return n;
@@ -4828,22 +4876,60 @@ struct VerifyContractsPass
         }
       });
     }
+    // Generic kernels as they are launched (`enqueue_function[kernel[16,
+    // 16]](...)`, possibly with parameters of the launching function), by
+    // kernel: what the generic proof leaves open is checked for each.
+    struct Instance {
+      SmallVector<InstanceLink> chain;
+      Location launch;
+    };
+    DenseMap<Operation *, SmallVector<Instance>> instances;
+    {
+      SymbolTableCollection symbols;
+      DenseSet<Operation *> verified;
+      for (Job &job : fns)
+        if (!job.refines)
+          verified.insert(job.fn);
+      // The launches, by the callee's symbol alone: printing every call's
+      // parameters (`calleeName`) costs more than the rest of this scan.
+      struct Launch {
+        InstanceLink kernel;
+        Location loc;
+      };
+      SmallVector<Launch> launches;
+      module.walk([&](LIT::CallOp call) {
+        auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+        ArrayRef<FlatSymbolRefAttr> nested =
+            symbol ? symbol.getSymbol().getNestedReferences()
+                   : ArrayRef<FlatSymbolRefAttr>();
+        if (nested.size() < 2 ||
+            !nested.back().getValue().starts_with("enqueue_function[") ||
+            !nested[nested.size() - 2].getValue().ends_with("DeviceContext"))
+          return;
+        auto [kernel, instance] = launchedKernel(
+            symbol, module, symbols, [](TypedAttr param) { return param; });
+        if (kernel && verified.count(kernel) &&
+            !instance.getParamValues().empty())
+          launches.push_back({{instance, kernel, 0}, call.getLoc()});
+      });
+      // Each distinct launch; at most 32 instantiations per kernel.
+      std::set<std::string> seen;
+      for (Launch &launch : launches) {
+        SmallVector<Instance> &list = instances[launch.kernel.fn];
+        if (list.size() < 32 && seen.insert(printed(launch.kernel.symbol)).second)
+          list.push_back({{launch.kernel}, launch.loc});
+      }
+    }
     struct Result {
       SmallVector<Obligation> obligations;
       SmallVector<Answer> answers;
       unsigned loops = 0, invariants = 0;
     };
-    std::vector<Result> results(fns.size());
-    llvm::DefaultThreadPool pool(llvm::hardware_concurrency());
-    for (size_t i = 0; i < fns.size(); ++i)
-      pool.async([&, i] {
-      SymbolTableCollection symbols;
-      std::string name = "f" + std::to_string(i);
-      FunctionEncoder enc(fns[i].fn, module, symbols, solver, name, impls,
-                          fns[i].refines);
+    // Encodes and solves one function (or instantiation) into `result`.
+    auto verify = [&](FunctionEncoder &enc, Result &result,
+                      const std::string &name) {
       if (!enc.encode())
         return;
-      Result &result = results[i];
       result.loops = enc.loopsAnalyzed;
       result.invariants = enc.invariantsFound;
       if (enc.obligations.empty())
@@ -4861,13 +4947,123 @@ struct VerifyContractsPass
         result.answers.push_back(answer);
       }
       result.obligations = std::move(enc.obligations);
+    };
+    std::vector<Result> results(fns.size());
+    // A launched generic kernel is verified only for its launched
+    // instantiations, unless `generic-launched`: a proof for every value of
+    // its parameters can be far slower (nonlinear in them) than one for the
+    // values launched.
+    auto launched = [&](size_t i) {
+      return !fns[i].refines && instances.count(fns[i].fn);
+    };
+    llvm::DefaultThreadPool pool(llvm::hardware_concurrency());
+    for (size_t i = 0; i < fns.size(); ++i) {
+      if (launched(i) && !genericLaunched)
+        continue;
+      pool.async([&, i] {
+        SymbolTableCollection symbols;
+        std::string name = "f" + std::to_string(i);
+        FunctionEncoder enc(fns[i].fn, module, symbols, solver, name, impls,
+                            fns[i].refines);
+        if (launched(i))
+          enc.queryRlimit = genericRlimit;
+        verify(enc, results[i], name);
+      });
+    }
+    pool.wait();
+    // The instantiations of the launched kernels: all of them, or with
+    // `generic-launched`, those whose generic proof left obligations open.
+    struct InstanceJob {
+      size_t job, instance;
+      Result result;
+    };
+    std::vector<InstanceJob> instanceJobs;
+    for (size_t i = 0; i < fns.size(); ++i) {
+      auto it = fns[i].refines ? instances.end() : instances.find(fns[i].fn);
+      if (it == instances.end() ||
+          (genericLaunched && llvm::all_of(results[i].answers, [](Answer a) {
+             return a == Answer::Proven;
+           })))
+        continue;
+      for (size_t j = 0; j < it->second.size(); ++j)
+        instanceJobs.push_back({i, j, {}});
+    }
+    for (size_t n = 0; n < instanceJobs.size(); ++n)
+      pool.async([&, n] {
+        InstanceJob &job = instanceJobs[n];
+        SymbolTableCollection symbols;
+        std::string name =
+            "f" + std::to_string(job.job) + ".i" + std::to_string(job.instance);
+        FunctionEncoder enc(fns[job.job].fn, module, symbols, solver, name,
+                            impls);
+        enc.bindInstance(instances.find(fns[job.job].fn.getOperation())
+                             ->second[job.instance]
+                             .chain);
+        verify(enc, job.result, name);
       });
     pool.wait();
-    unsigned total = 0, proven = 0, loops = 0, invariants = 0;
-    for (Result &result : results) {
+    // An obligation's answer in each instantiation of its function: the
+    // obligation with the same call, clause and occurrence.
+    using Key = std::tuple<const void *, const void *, unsigned>;
+    auto keys = [](const Result &result) {
+      std::map<std::pair<const void *, const void *>, unsigned> seen;
+      SmallVector<Key> out;
+      for (const Obligation &ob : result.obligations) {
+        std::pair<const void *, const void *> at{
+            ob.callLoc.getAsOpaquePointer(), ob.clauseLoc.getAsOpaquePointer()};
+        out.push_back({at.first, at.second, seen[at]++});
+      }
+      return out;
+    };
+    std::map<size_t, SmallVector<std::pair<size_t, std::map<Key, Answer>>>>
+        instanceAnswers;
+    for (InstanceJob &job : instanceJobs) {
+      std::map<Key, Answer> answers;
+      for (auto [key, answer] : llvm::zip(keys(job.result), job.result.answers))
+        answers[key] = answer;
+      instanceAnswers[job.job].push_back({job.instance, std::move(answers)});
+    }
+    // A kernel verified only for its instantiations: its obligations are
+    // those of its instantiations, in order of first appearance, each
+    // standing for its worst answer among them (the per-instantiation
+    // answers then decide what is reported).
+    if (!genericLaunched)
+      for (InstanceJob &job : instanceJobs) {
+        Result &result = results[job.job];
+        std::set<Key> have;
+        for (const Key &key : keys(result))
+          have.insert(key);
+        if (result.obligations.empty()) {
+          result.loops = job.result.loops;
+          result.invariants = job.result.invariants;
+        }
+        for (auto [key, ob, answer] : llvm::zip(
+                 keys(job.result), job.result.obligations, job.result.answers))
+          if (have.insert(key).second) {
+            result.obligations.push_back(ob);
+            result.answers.push_back(Answer::NotAnalyzed);
+          }
+      }
+    // The worst of an obligation's answers across instantiations.
+    auto rank = [](Answer a) {
+      switch (a) {
+      case Answer::Unproven:
+        return 3;
+      case Answer::Unknown:
+        return 2;
+      case Answer::NotAnalyzed:
+        return 1;
+      default:
+        return 0;
+      }
+    };
+    unsigned total = 0, proven = 0, forInstances = 0, loops = 0, invariants = 0;
+    for (auto [i, result] : llvm::enumerate(results)) {
       loops += result.loops;
       invariants += result.invariants;
-      for (auto [ob, answer] : llvm::zip(result.obligations, result.answers)) {
+      SmallVector<Key> resultKeys = keys(result);
+      for (auto [k, ob, answer] :
+           llvm::enumerate(result.obligations, result.answers)) {
         ++total;
         StringRef what = ob.postcondition ? "postcondition" : "precondition";
         // A refinement: `Box.get`'s precondition follows from
@@ -4889,6 +5085,35 @@ struct VerifyContractsPass
                 << what << " of '" << ob.callee << "' proven";
           continue;
         }
+        // Open in general: proven, or not, for each launched instantiation.
+        SmallVector<std::pair<size_t, Answer>> perInstance;
+        if (auto it = instanceAnswers.find(i); it != instanceAnswers.end())
+          for (auto &[instance, answers] : it->second) {
+            auto found = answers.find(resultKeys[k]);
+            perInstance.push_back({instance, found == answers.end()
+                                                 ? Answer::NotAnalyzed
+                                                 : found->second});
+          }
+        // Reported by the worst instantiation, if it is not checked
+        // generically.
+        if (!genericLaunched && launched(i) && !perInstance.empty()) {
+          answer = Answer::Proven;
+          for (auto &p : perInstance)
+            if (rank(p.second) > rank(answer))
+              answer = p.second;
+        }
+        if (!perInstance.empty() && llvm::all_of(perInstance, [](auto &p) {
+              return p.second == Answer::Proven;
+            })) {
+          ++proven;
+          ++forInstances;
+          if (verbose)
+            mlir::emitRemark(ob.callLoc)
+                << what << " of '" << ob.callee << "' proven for the "
+                << perInstance.size() << " launched instantiation"
+                << (perInstance.size() == 1 ? "" : "s");
+          continue;
+        }
         auto diag = mlir::emitWarning(ob.callLoc);
         switch (answer) {
         case Answer::Unproven:
@@ -4907,11 +5132,24 @@ struct VerifyContractsPass
           break;
         }
         diag.attachNote(ob.clauseLoc) << what << " declared here";
+        Operation *fn = fns[i].fn.getOperation();
+        for (auto [instance, instanceAnswer] : perInstance)
+          if (instanceAnswer != Answer::Proven) {
+            const Instance &at = instances[fn][instance];
+            diag.attachNote(at.launch)
+                << (instanceAnswer == Answer::Unknown
+                        ? "not decided within the solver limits"
+                        : "not proven")
+                << " for the instantiation launched here"
+                << (genericLaunched ? " either" : "");
+          }
       }
     }
     llvm::errs() << "verify-contracts: " << proven << "/" << total
-                 << " obligations proven (" << loops << " loops, "
-                 << invariants << " invariants)\n";
+                 << " obligations proven (";
+    if (forInstances)
+      llvm::errs() << forInstances << " only for the launched instantiations; ";
+    llvm::errs() << loops << " loops, " << invariants << " invariants)\n";
   }
 };
 
