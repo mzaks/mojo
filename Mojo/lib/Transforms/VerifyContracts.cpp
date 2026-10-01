@@ -1529,7 +1529,7 @@ private:
     // Integer places the body reads and may change, and that its conditions
     // depend on.
     llvm::StringSet<> relevant = closure(frame.conditions);
-    SmallVector<Loc> places;
+    SmallVector<Loc> places, handles;
     for (const Loc &loc : frame.loaded) {
       if (written && !written->count(loc.root))
         continue;
@@ -1537,9 +1537,17 @@ private:
       Sort sort = sortOfTerm(h);
       if (sort.isBool || sort.width != 64 || !relevant.contains(h))
         continue;
+      // A whole variable of another type (a list, whose length the
+      // conditions read) is a handle, not an integer: only whether it still
+      // holds its value on entry means something, not its bounds. (A
+      // field's type is not tracked; fields are kept.)
+      if (loc.path.empty() && !isScalar(placeType(loc))) {
+        handles.push_back(loc);
+        continue;
+      }
       places.push_back(loc);
     }
-    if (places.empty() && frame.lengths.empty())
+    if (places.empty() && handles.empty() && frame.lengths.empty())
       return;
     // Terms that do not change in the loop: values before it, and lengths
     // of lists it does not change.
@@ -1587,6 +1595,9 @@ private:
       });
     };
     SmallVector<Candidate> candidates;
+    for (const Loc &loc : handles)
+      candidates.push_back(
+          {loc, "=", std::nullopt, load(loc, before, Sort{false, 64, true})});
     for (const Loc &loc : lists) {
       bool resized = changes(loc);
       candidates.push_back({loc, "bvsge", std::nullopt, bvConst(0, 64), true});
