@@ -2220,6 +2220,8 @@ private:
       return;
     if (name && evalTupleLiteral(call, *name, state))
       return;
+    if (name && evalListFromIterator(call, *name, state))
+      return;
     if (name && callee && evalIteration(call, *name, callee, state))
       return;
     if (name && evalBuiltin(call, *name, state))
@@ -2649,7 +2651,14 @@ private:
         "std::collections::deque::Deque::__iter__[",
         // Owned iteration (`for x in xs^`, a literal).
         "std::collections::list::List::__iter__(::List[$0]$)",
-        "std::collections::array::Array::__iter__(::Array[$0, $1]$)"};
+        "std::collections::array::Array::__iter__(::Array[$0, $1]$)",
+        // A dictionary's keys, values and entries: its iterators count the
+        // entries they have seen up to its length, skipping removed ones.
+        "std::collections::dict::Dict::__iter__[",
+        "std::collections::dict::Dict::keys[",
+        "std::collections::dict::Dict::values[",
+        "std::collections::dict::Dict::items[",
+        "std::collections::dict::Dict::__reversed__["};
     static const char *collectionTypes[] = {
         "@std::@collections::@list::@List<",
         "@std::@collections::@span::@Span<",
@@ -2661,7 +2670,10 @@ private:
         "std::collections::array::_ArrayIter::",
         "std::collections::deque::_DequeIter::",
         "std::collections::list::_ListIterOwned::",
-        "std::collections::array::_ArrayIterOwned::"};
+        "std::collections::array::_ArrayIterOwned::",
+        "std::collections::dict::_DictKeyIter::",
+        "std::collections::dict::_DictValueIter::",
+        "std::collections::dict::_DictEntryIter::"};
     // The length of the collection at `v`, a reference.
     auto lengthOf = [&](Value v) -> MaybeTerm {
       std::optional<Loc> loc = placeOf(v);
@@ -2694,13 +2706,32 @@ private:
           isa<LIT::RefType>(call.getOperands()[0].getType()) &&
           (call->getNumResults() == 1 || call.getNumOperands() == 2))
         if (MaybeTerm n = lengthOf(call.getOperands()[0])) {
-          // The iterator's elements are the collection's (see `__next__`).
-          if (call.getNumOperands() == 2)
+          // The iterator's elements are the collection's (see `__next__`);
+          // a dictionary's keys and values are not indexed, so stay unknown.
+          if (call.getNumOperands() == 2 &&
+              !path.starts_with("std::collections::dict::"))
             if (std::optional<Loc> src = placeOf(call.getOperands()[0]))
               if (std::optional<Loc> out = placeOf(call.getOperands()[1]))
                 iterSources[out->root] = *src;
           return produce({{"/index", bvConst(0, 64)}, {"/length", *n}});
         }
+    // `reversed(d)`, `reversed(d.values())`, `reversed(d.items())`: a new
+    // count over the same dictionary, from no entries seen.
+    if (path.starts_with("std::builtin::reversed::reversed[") &&
+        call.getNumOperands() >= 1 &&
+        StringRef(printed(call.getOperands()[0].getType()))
+            .contains("@std::@collections::@dict::@"))
+      if (std::optional<Loc> arg = placeOf(call.getOperands()[0])) {
+        Loc length{arg->root, arg->path + "/length"};
+        MaybeTerm n = state.env.count(length)
+                          ? MaybeTerm(load(length, state, sort))
+                          : StringRef(printed(call.getOperands()[0].getType()))
+                                    .contains("@std::@collections::@dict::@Dict<")
+                                ? lengthOf(call.getOperands()[0])
+                                : std::nullopt;
+        if (n)
+          return produce({{"/index", bvConst(0, 64)}, {"/length", *n}});
+      }
     // `enumerate(xs, start=)` of such a collection.
     if (path.starts_with("std::iter::__init__::enumerate[") &&
         call.getNumOperands() >= 2 && !name.params.empty() &&
@@ -2734,9 +2765,11 @@ private:
     Loc index{self->root, self->path + inner + "/index"},
         length{self->root, self->path + inner + "/length"},
         count{self->root, self->path + "/_count"};
-    // An owned iterator (`_ListIterOwned`) only goes forward.
+    // An owned iterator (`_ListIterOwned`) only goes forward; a dictionary's
+    // counts the entries it has seen in either direction.
     bool owned = path.contains("IterOwned::");
-    if (isIterator && !owned) {
+    bool dict = path.starts_with("std::collections::dict::");
+    if (isIterator && !owned && !dict) {
       ParamFrame frame = paramFrame(call, callee);
       auto forward = frame.values.find("forward");
       if (forward == frame.values.end() ||
@@ -2800,6 +2833,36 @@ private:
     }
     havoc(*error, state, placeType(*error));
     values[call->getResult(0)] = raised;
+    return true;
+  }
+
+  /// `List(iterator)` of an iterator the pass models: as long as the
+  /// iterator has elements left (`length - index`). The elements are
+  /// unknown.
+  bool evalListFromIterator(LIT::CallOp call, const CalleeName &name,
+                            State &state) {
+    if (!StringRef(name.path).starts_with(
+            "std::collections::list::List::__init__[::Iterable & ") ||
+        call.getNumOperands() != 2)
+      return false;
+    std::optional<Loc> it = placeOf(call.getOperands()[0]);
+    std::optional<Loc> out = placeOf(call.getOperands()[1]);
+    if (!it || !out)
+      return false;
+    Loc length{it->root, it->path + "/length"}, index{it->root, it->path + "/index"};
+    if (!state.env.count(length) || !state.env.count(index))
+      return false;
+    Sort sort{false, 64, true};
+    std::string remaining = define(
+        sort, "(bvsub " + load(length, state, sort) + " " +
+                  load(index, state, sort) + ")");
+    std::string list = declare({false, 64, false}, "g");
+    store(*out, state, list);
+    state.pc = define({true, 1, false},
+                      "(and " + state.pc + " (= " + lenOf(list) + " " +
+                          remaining + "))",
+                      "r");
+    setResultsUnknown(call);
     return true;
   }
 
