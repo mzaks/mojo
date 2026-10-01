@@ -947,6 +947,32 @@ Cutting the template's cost:
   nothing on test_string_span.mojo. test_dict.mojo still pays 0.12 s for no new
   proof; which of its 94 loops that goes to is not measured.
 
+Dictionary iteration:
+
+- `for k in d`, `d.keys()`, `d.values()` and `d.items()` yield exactly
+  `len(d)` times: the dictionary's iterators count the entries they have
+  seen (`seen`), skipping removed ones, and raise when that reaches its
+  length, in either direction. `reversed` of a dictionary or of its
+  values or items starts a new count over the same dictionary. The keys
+  and values are unknown: an indexed element model would make key `i`
+  and value `i` the same unknown. Consuming a dictionary (`for k in d^`)
+  counts over its order array instead and is not modelled.
+- `List(it)` of an iterator the pass models is as long as the iterator
+  has entries left (`length - index`), so `List(d.keys())` is as long as
+  `d`.
+- test_dict.mojo: 22 of 32 calls proven (15). The other 10 index lists
+  built from dictionaries whose length the contracts only bound
+  (`d[k] = v` adds one entry or none, depending on whether `k` was
+  there).
+- Cost: test_dict.mojo's verification doubles, interleaved against the
+  previous build (1.06 s and 2.10 s, and 1.23 s and 2.46 s in another
+  run; the load rose to over 14 in both, so only the ratio holds), while
+  test_list.mojo and test_deque.mojo are unchanged. Almost all of it is
+  `test_reversed_items`, whose three `reversed(d.items())` loops each
+  append to two lists and were skipped before: each now runs a Houdini
+  search of about 388 queries in its first round and six or seven
+  rounds in all, one after the other (1.76 s of z3 time).
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through

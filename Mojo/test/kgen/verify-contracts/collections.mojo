@@ -104,6 +104,31 @@ def ok_set_add_then_pop() raises -> Int:
     return l[0]
 
 
+def ok_dict_keys_loop(d: Dict[Int, Int], i: Int) -> Int:
+    var keys = List[Int]()
+    for k in d:
+        keys.append(k)  # once per entry
+    if 0 <= i and i < len(d):
+        return keys[i]
+    return 0
+
+
+def ok_dict_values_list(d: Dict[Int, Int]) -> Int:
+    var vals = List(d.values())  # as long as `d`
+    if len(d) > 2:
+        return vals[2]
+    return 0
+
+
+def ok_dict_reversed_items(d: Dict[Int, Int]) -> Int:
+    var ks = List[Int]()
+    for e in reversed(d.items()):
+        ks.append(e.key)
+    if len(d) > 0:
+        return ks[len(d) - 1]
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_bitset(mut b: BitSet[64], i: Int):
     if 0 <= i and i <= 64:
@@ -153,3 +178,15 @@ def bad_set_after_clear() -> Int:
     s.clear()
     var l = List[Int](length=len(s), fill=0)
     return l[0]
+
+
+def bad_dict_keys_past(d: Dict[Int, Int]) -> Int:
+    var keys = List[Int]()
+    for k in d:
+        keys.append(k)
+    return keys[len(d)]  # one past the last entry
+
+
+def bad_dict_keys_unchecked(d: Dict[Int, Int]) -> Int:
+    var keys = List(d.keys())
+    return keys[0]  # `d` may be empty
