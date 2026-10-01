@@ -626,6 +626,8 @@ private:
   /// index.
   DenseMap<Value, std::pair<Loc, std::string>> elements;
   std::set<std::string> elementFunctions;
+  /// The GPU id constants declared (see `evalGpuId`).
+  std::set<std::string> gpuIds;
   /// The collection an iterator (by its place's root) iterates.
   DenseMap<Value, Loc> iterSources;
   /// The types of places named by a value of another type (an element an
@@ -2247,6 +2249,8 @@ private:
       return;
     if (name && evalListFromIterator(call, *name, state))
       return;
+    if (name && evalGpuId(call, *name))
+      return;
     if (name && callee && evalIteration(call, *name, callee, state))
       return;
     if (name && evalBuiltin(call, *name, state))
@@ -2967,6 +2971,75 @@ private:
     }
     storeFields(*out, state, fields);
     setResultsUnknown(call);
+    return true;
+  }
+
+  /// GPU ids (`thread_idx.x`, `block_idx.y`, `block_dim.z`, `grid_dim.x`,
+  /// `global_idx.x`): one value per id and axis in a function, so reads
+  /// agree, with the launch limits every supported GPU has (assumptions):
+  /// `0 <= thread_idx < block_dim <= 1024` and `0 <= block_idx < grid_dim <
+  /// 2^31`. `global_idx` is `block_idx * block_dim + thread_idx`, as the
+  /// stdlib defines it.
+  bool evalGpuId(LIT::CallOp call, const CalleeName &name) {
+    StringRef path = name.path;
+    const char *prefix = "std::_gpu::primitives::id::";
+    if (!path.starts_with(prefix) || call->getNumResults() != 1)
+      return false;
+    StringRef rest = path.drop_front(strlen(prefix));
+    StringRef kind = rest.take_until([](char c) { return c == ':'; });
+    if (!rest.drop_front(kind.size()).starts_with("::__getattr_param__["))
+      return false;
+    // The axis: the string parameter (`"x"`).
+    std::optional<char> axis;
+    for (const std::string &param : name.params)
+      for (const char *a : {"\"x\"", "\"y\"", "\"z\""})
+        if (StringRef(param).contains(a))
+          axis = a[1];
+    if (!axis || sortOf(call->getResult(0).getType()).width != 64)
+      return false;
+    auto id = [&](StringRef which) {
+      std::string symbol = ("gpu_" + which + "_" + Twine(*axis)).str();
+      if (gpuIds.insert(symbol).second) {
+        prelude += "(declare-const " + symbol + " (_ BitVec 64))\n";
+        sorts[symbol] = Sort{false, 64, true};
+        std::string dim = ("gpu_block_dim_" + Twine(*axis)).str();
+        std::string grid = ("gpu_grid_dim_" + Twine(*axis)).str();
+        if (which == "thread_idx")
+          facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + symbol +
+                          ") (bvslt " + symbol + " " + dim + "))");
+        else if (which == "block_idx")
+          facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + symbol +
+                          ") (bvslt " + symbol + " " + grid + "))");
+        else if (which == "block_dim")
+          facts.push_back("(and (bvsle " + bvConst(1, 64) + " " + symbol +
+                          ") (bvsle " + symbol + " " + bvConst(1024, 64) +
+                          "))");
+        else
+          facts.push_back("(and (bvsle " + bvConst(1, 64) + " " + symbol +
+                          ") (bvslt " + symbol + " " +
+                          bvConst(int64_t(1) << 31, 64) + "))");
+      }
+      return symbol;
+    };
+    // Declare the dimensions first: the ids' facts name them.
+    id("block_dim");
+    id("grid_dim");
+    Value result = call->getResult(0);
+    if (kind == "_ThreadIdx")
+      values[result] = id("thread_idx");
+    else if (kind == "_BlockIdx")
+      values[result] = id("block_idx");
+    else if (kind == "_BlockDim")
+      values[result] = id("block_dim");
+    else if (kind == "_GridDim")
+      values[result] = id("grid_dim");
+    else if (kind == "_GlobalIdx")
+      values[result] = define(Sort{false, 64, true},
+                              "(bvadd (bvmul " + id("block_idx") + " " +
+                                  id("block_dim") + ") " + id("thread_idx") +
+                                  ")");
+    else
+      return false;
     return true;
   }
 
