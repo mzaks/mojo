@@ -3003,6 +3003,9 @@ private:
         size_t start = 0;
         for (size_t c = 0; c < rest.size(); ++c) {
           char ch = rest[c];
+          // The arrow of a function type (`-> T`) is not a bracket.
+          if (ch == '>' && c > 0 && rest[c - 1] == '-')
+            continue;
           if (ch == '<' || ch == '[' || ch == '(' || ch == '{')
             ++depth;
           else if ((ch == '>' || ch == ')' || ch == '}') ||
@@ -3018,9 +3021,14 @@ private:
         }
         SmallVector<StringRef> m;
         int64_t n;
+        // Only a literal value (`ComptimeInt<:T {:scalar<index> 8}>`): an
+        // unevaluated one (`ComptimeInt<:T apply(f, 8, 4)>`, from
+        // `vectorize`) has its operands printed, not its value.
+        static llvm::Regex literal("\\{:scalar<index> (-?[0-9]+)\\}>$");
         if ((size_t)k < elements.size() &&
             elements[k].starts_with("@std::@utils::@coord::@ComptimeInt<") &&
-            intValue.match(elements[k], &m) && !m[2].getAsInteger(10, n))
+            !elements[k].contains("apply(") && literal.match(elements[k], &m) &&
+            !m[1].getAsInteger(10, n))
           return bvConst(n, 64);
       }
     }
