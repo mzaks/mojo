@@ -4882,6 +4882,8 @@ struct VerifyContractsPass
     struct Instance {
       SmallVector<InstanceLink> chain;
       Location launch;
+      // The outermost call that gave parameters, when not the launch.
+      std::optional<Location> via;
     };
     DenseMap<Operation *, SmallVector<Instance>> instances;
     {
@@ -4894,6 +4896,7 @@ struct VerifyContractsPass
       // parameters (`calleeName`) costs more than the rest of this scan.
       struct Launch {
         InstanceLink kernel;
+        LIT::FnOp launcher;
         Location loc;
       };
       SmallVector<Launch> launches;
@@ -4910,15 +4913,81 @@ struct VerifyContractsPass
             symbol, module, symbols, [](TypedAttr param) { return param; });
         if (kernel && verified.count(kernel) &&
             !instance.getParamValues().empty())
-          launches.push_back({{instance, kernel, 0}, call.getLoc()});
+          launches.push_back({{instance, kernel, 0},
+                              call->getParentOfType<LIT::FnOp>(),
+                              call.getLoc()});
       });
-      // Each distinct launch; at most 32 instantiations per kernel.
-      std::set<std::string> seen;
-      for (Launch &launch : launches) {
-        SmallVector<Instance> &list = instances[launch.kernel.fn];
-        if (list.size() < 32 && seen.insert(printed(launch.kernel.symbol)).second)
-          list.push_back({{launch.kernel}, launch.loc});
+      // Whether a parameter of the calling function is in it.
+      auto open = [](SymbolConstantAttr symbol) {
+        bool found = false;
+        for (TypedAttr value : symbol.getParamValues())
+          value.walk([&](ParamDeclRefAttr) { found = true; });
+        return found;
+      };
+      // The calls of the functions whose parameters a launch (or a call
+      // on the way to it) passes on, up to three levels out.
+      struct Caller {
+        InstanceLink link;
+        LIT::FnOp from;
+        Location loc;
+      };
+      DenseMap<Operation *, SmallVector<Caller>> callers;
+      DenseSet<Operation *> wanted;
+      for (Launch &launch : launches)
+        if (launch.launcher && open(launch.kernel.symbol))
+          wanted.insert(launch.launcher);
+      for (int level = 0; level < 3 && !wanted.empty(); ++level) {
+        llvm::StringSet<> names;
+        for (Operation *fn : wanted)
+          if (auto name = cast<LIT::FnOp>(fn).getSymName())
+            names.insert(*name);
+        DenseSet<Operation *> next;
+        module.walk([&](LIT::CallOp call) {
+          auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+          if (!symbol ||
+              !names.contains(symbol.getSymbol().getLeafReference().getValue()))
+            return;
+          auto fn = dyn_cast_or_null<LIT::FnOp>(
+              symbols.lookupSymbolIn(module, symbol.getSymbol()));
+          if (!fn || !wanted.count(fn))
+            return;
+          auto from = call->getParentOfType<LIT::FnOp>();
+          callers[fn].push_back({{symbol, fn, call.getImplicitOrigins().size()},
+                                 from,
+                                 call.getLoc()});
+          if (from && open(symbol) && !callers.count(from))
+            next.insert(from);
+        });
+        wanted = std::move(next);
       }
+      // Each launch, through every chain of calls that gives its open
+      // parameters; at most 32 instantiations per kernel.
+      std::set<std::string> seen;
+      std::function<void(SmallVector<InstanceLink>, LIT::FnOp, Location,
+                         std::optional<Location>, int)>
+          expand = [&](SmallVector<InstanceLink> chain, LIT::FnOp outer,
+                       Location launch, std::optional<Location> via,
+                       int depth) {
+            auto it = outer ? callers.find(outer) : callers.end();
+            if (depth < 3 && open(chain.back().symbol) && it != callers.end() &&
+                !it->second.empty()) {
+              for (const Caller &caller : it->second) {
+                SmallVector<InstanceLink> longer = chain;
+                longer.push_back(caller.link);
+                expand(std::move(longer), caller.from, launch, caller.loc,
+                       depth + 1);
+              }
+              return;
+            }
+            std::string key;
+            for (const InstanceLink &link : chain)
+              key += printed(link.symbol) + "|";
+            SmallVector<Instance> &list = instances[chain.front().fn];
+            if (list.size() < 32 && seen.insert(key).second)
+              list.push_back({std::move(chain), launch, via});
+          };
+      for (Launch &launch : launches)
+        expand({launch.kernel}, launch.launcher, launch.loc, std::nullopt, 0);
     }
     struct Result {
       SmallVector<Obligation> obligations;
@@ -5142,6 +5211,8 @@ struct VerifyContractsPass
                         : "not proven")
                 << " for the instantiation launched here"
                 << (genericLaunched ? " either" : "");
+            if (at.via)
+              diag.attachNote(*at.via) << "with the parameters given here";
           }
       }
     }
