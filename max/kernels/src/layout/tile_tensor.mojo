@@ -2423,10 +2423,48 @@ struct TileTensor[
     # type is symbolic and can't match value-level types. As a standalone
     # function, type_of(tensor).LayoutType resolves correctly.
 
+    @always_inline
+    def _tile_in_bounds[*tile_sizes: Int](self, *tile_coords: Int) -> Bool:
+        """Whether the tile at `tile_coords` lies within the tensor, the
+        precondition of `tile[*tile_sizes](*tile_coords)`.
+
+        A tile has exactly `tile_sizes` elements per dimension (it is not
+        clipped at the edge), so every one of them must be in the parent:
+        `0 <= c < dim // size` per dimension (`(c + 1) * size <= dim`
+        without its overflow). A nested layout's tile coordinates index its
+        outer modes, which `dim` does not give: this returns `True` for it,
+        as does an empty tile size.
+
+        Parameters:
+            tile_sizes: The dimensions of the tile along each axis.
+
+        Args:
+            tile_coords: The coordinates of the tile, one per dimension.
+
+        Returns:
+            Whether the whole tile is within the tensor, or `True` for a
+            nested layout.
+        """
+        comptime if Self.flat_rank != Self.rank:
+            return True
+        else:
+            comptime for i in range(tile_sizes.size):
+                comptime size = tile_sizes[i]
+                comptime if size > 0:
+                    var c = tile_coords[i]
+                    if c < 0 or c >= Int(self.dim[i]()) // size:
+                        return False
+            return True
+
     @inline(.nodebug)
     def tile[
         *tile_sizes: Int
-    ](self, *tile_coords: Int) -> Self.TileResultType[
+    ](
+        self,
+        *tile_coords: Int where self._tile_in_bounds[*tile_sizes](
+            *tile_coords
+        ),
+    ) -> Self.TileResultType[
         _IntToComptimeInt[*tile_sizes], linear_idx_type=Self.linear_idx_type
     ]:
         """Variadic-`Int`-coords form of `.tile[]`. Works on both flat
