@@ -599,7 +599,11 @@ struct Pointer[
     @inline(.nodebug)
     def __getitem__[
         I: Indexer
-    ](self, *, unsafe_offset: I) -> ref[Self.origin, Self.address_space] Self.T:
+    ](
+        self,
+        *,
+        unsafe_offset: I where self._offset_in_bounds[1](index(unsafe_offset)),
+    ) -> ref[Self.origin, Self.address_space] Self.T:
         """Return a reference to the underlying data, offset by the given index.
 
         Parameters:
@@ -629,7 +633,9 @@ struct Pointer[
     )
     def __getitem__[
         I: Indexer, //
-    ](self, offset: I) -> ref[Self.origin, Self.address_space] Self.T:
+    ](
+        self, offset: I where self._offset_in_bounds[1](index(offset))
+    ) -> ref[Self.origin, Self.address_space] Self.T:
         """Return a reference to the underlying data, offset by the given index.
 
         Parameters:
@@ -1131,6 +1137,40 @@ struct Pointer[
     # Methods
     # ===-------------------------------------------------------------------===#
 
+    @always_inline
+    def _extent(self) -> Int:
+        """The number of valid elements from this pointer onwards, for
+        contracts only.
+
+        A pointer does not know the extent of the memory it points into, so
+        this is not computed: it always returns `Int.MAX` at run time. The
+        `verify-contracts` pass reads it as an unknown, non-negative count
+        per pointer, which the postconditions of the functions that make
+        pointers (`alloc`, `List.unsafe_ptr`, `unsafe_offset`, ...) and the
+        preconditions of functions that take them state.
+
+        Returns:
+            `Int.MAX` (written as a literal: `Int.MAX` itself would make
+            this signature depend on `SIMD`'s, which depend on pointers).
+        """
+        return 9_223_372_036_854_775_807
+
+    @always_inline
+    def _offset_in_bounds[width: Int](self, offset: Int) -> Bool:
+        """Whether `width` elements from `offset` are within `_extent()`, the
+        precondition of accessing them.
+
+        Parameters:
+            width: The number of elements accessed.
+
+        Args:
+            offset: The offset of the first element.
+
+        Returns:
+            Whether `0 <= offset <= _extent() - width`.
+        """
+        return 0 <= offset and offset <= self._extent() - width
+
     @inline(.nodebug)
     def unsafe_offset[I: Indexer](self, offset: I, /) -> Self:
         """Return a pointer at an offset from the current one.
@@ -1483,7 +1523,10 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](self: Pointer[Scalar[dtype], ...], offset: Scalar) -> SIMD[dtype, width]:
+    ](
+        self: Pointer[Scalar[dtype], ...],
+        offset: Scalar where self._offset_in_bounds[width](Int(offset)),
+    ) -> SIMD[dtype, width]:
         """Loads the value the pointer points to with the given offset.
 
         Constraints:
@@ -1534,7 +1577,10 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](self: Pointer[Scalar[dtype], ...], offset: Scalar,) -> SIMD[dtype, width]:
+    ](
+        self: Pointer[Scalar[dtype], ...],
+        offset: Scalar where self._offset_in_bounds[width](Int(offset)),
+    ) -> SIMD[dtype, width]:
         return self.unsafe_load[
             width=width,
             alignment=alignment,
@@ -1555,7 +1601,10 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](self: Pointer[Scalar[dtype], ...], offset: I) -> SIMD[dtype, width]:
+    ](
+        self: Pointer[Scalar[dtype], ...],
+        offset: I where self._offset_in_bounds[width](index(offset)),
+    ) -> SIMD[dtype, width]:
         """Loads the value the pointer points to with the given offset.
 
         Constraints:
@@ -1606,7 +1655,10 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](self: Pointer[Scalar[dtype], ...], offset: I,) -> SIMD[dtype, width]:
+    ](
+        self: Pointer[Scalar[dtype], ...],
+        offset: I where self._offset_in_bounds[width](index(offset)),
+    ) -> SIMD[dtype, width]:
         return self.unsafe_load[
             width=width,
             alignment=alignment,
@@ -1629,7 +1681,9 @@ struct Pointer[
     ](
         self: MutPointer[Scalar[dtype], ...],
         offset: I,
-        val: SIMD[dtype, width],
+        val: SIMD[dtype, width] where self._offset_in_bounds[Int(width)](
+            index(offset)
+        ),
     ):
         """Stores a single element value at the given offset.
 
@@ -1675,7 +1729,9 @@ struct Pointer[
     ](
         self: MutPointer[Scalar[dtype], ...],
         offset: Scalar[offset_type],
-        val: SIMD[dtype, width],
+        val: SIMD[dtype, width] where self._offset_in_bounds[width](
+            Int(offset)
+        ),
     ):
         """Stores a single element value at the given offset.
 
@@ -1779,7 +1835,9 @@ struct Pointer[
     ](
         self: MutPointer[Scalar[dtype], ...],
         offset: I,
-        val: SIMD[dtype, width],
+        val: SIMD[dtype, width] where self._offset_in_bounds[Int(width)](
+            index(offset)
+        ),
     ):
         self.unsafe_store[
             width,
@@ -1804,7 +1862,9 @@ struct Pointer[
     ](
         self: MutPointer[Scalar[dtype], ...],
         offset: Scalar[offset_type],
-        val: SIMD[dtype, width],
+        val: SIMD[dtype, width] where self._offset_in_bounds[width](
+            Int(offset)
+        ),
     ):
         self.unsafe_store[
             width,
