@@ -1923,8 +1923,10 @@ private:
       if (candidates[i].combine.empty())
         premises = premises.take_front(plain);
       // A candidate the solver cannot decide quickly is dropped, which is
-      // sound: it is only not assumed.
-      unsigned limit = std::max(1u, solver.rlimit / 20);
+      // sound: it is only not assumed. Within the function's own budget,
+      // where it has one (a launched kernel's generic proof).
+      unsigned limit =
+          std::max(1u, (queryRlimit ? queryRlimit : solver.rlimit) / 20);
       queries += query({before.pc}, render(candidates[i], before), limit);
       for (State *end : ends) {
         SmallVector<std::string> assumptions{end->pc};
