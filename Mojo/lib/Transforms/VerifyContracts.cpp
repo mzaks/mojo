@@ -2315,6 +2315,9 @@ private:
     if (auto extract = dyn_cast<LIT::StructExtractAttr>(attr);
         extract && extract.getField().getValue() == "_mlir_value")
       return paramTerm(extract.getStructValue(), sort, depth + 1);
+    // A builtin value as a `SIMD` scalar (`Int(width)` of a `SIMDLength`).
+    if (auto cast = dyn_cast<CastFromBuiltinAttr>(attr))
+      return paramTerm(cast.getArg(), sort, depth + 1);
     // "All operands denote the same value": for integers and Booleans,
     // equality; anything else (types, structs) stays unknown.
     if (auto identical = dyn_cast<ParamIdenticalAttr>(attr);
@@ -4308,11 +4311,19 @@ private:
     }
     // An integer conversion (`Int(u8)`, `UInt8(i)`): extended by the
     // source's signedness, or truncated, as integer `cast` does.
+    // The parameters resolved: in a callee's clause they may name its own
+    // (`Int(offset)` for an `offset: Scalar` of any dtype).
+    auto resolved = [&](size_t i) {
+      auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+      return symbol && i < symbol.getParamValues().size()
+                 ? printed(resolveParam(symbol.getParamValues()[i]))
+                 : name.params[i];
+    };
     if (path.starts_with("std::simd::SIMD::__init__[::DType](::SIMD[") &&
         call.getNumOperands() == 1 && name.params.size() == 3 &&
-        isWidthOne(name.params[1]))
-      if (std::optional<Sort> to = dtypeSort(name.params[0]),
-          from = dtypeSort(name.params[2]);
+        isWidthOne(resolved(1)))
+      if (std::optional<Sort> to = dtypeSort(resolved(0)),
+          from = dtypeSort(resolved(2));
           to && from && sortOfTerm(operand(0)).width == from->width &&
           !sortOfTerm(operand(0)).isBool) {
         std::string v = operand(0);
