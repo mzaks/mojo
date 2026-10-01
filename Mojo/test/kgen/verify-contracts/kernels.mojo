@@ -15,7 +15,7 @@
 # Needs the `max` and `layout` packages on the import path (see README.md).
 
 from layout import TensorLayout, TileTensor, row_major, stack_allocation
-from max.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv
 from std.math.uutils import udivmod
@@ -181,6 +181,40 @@ def ok_launch_host_arg(
         )
 
 
+def ok_pointer_kernel(
+    dst: Pointer[Float32, MutAnyOrigin],
+    src: Pointer[Float32, MutAnyOrigin],
+    n: Int where n >= 0 and dst._extent() >= n and src._extent() >= n,
+):
+    # Raw pointers with their extent stated as a precondition.
+    var i = global_idx.x
+    if i < n:
+        dst[unsafe_offset=i] = src[unsafe_offset=i] + 1
+
+
+def ok_launch_buffers(ctx: DeviceContext, n: Int) raises:
+    var dst = ctx.enqueue_create_buffer[DType.float32](n)
+    var src = ctx.enqueue_create_buffer[DType.float32](n)
+    if n >= 0:
+        # A buffer passed for a pointer: its length is the extent.
+        ctx.enqueue_function[ok_pointer_kernel](
+            dst, src, n, grid_dim=n // 32 + 1, block_dim=32
+        )
+
+
+def ok_launch_unsafe_ptrs(ctx: DeviceContext, n: Int) raises:
+    var dst = ctx.enqueue_create_buffer[DType.float32](n)
+    var src = ctx.enqueue_create_buffer[DType.float32](n)
+    if n >= 0:
+        ctx.enqueue_function[ok_pointer_kernel](
+            dst.unsafe_ptr(),
+            src.unsafe_ptr(),
+            n,
+            grid_dim=n // 32 + 1,
+            block_dim=32,
+        )
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -301,4 +335,19 @@ def bad_launch_host_arg(
     if Int(c.dim[1]()) > 0:
         ctx.enqueue_function[ok_host_kernel[type_of(value)]](
             c, host_arg=value, grid_dim=m + 1, block_dim=1  # one block too many
+        )
+
+
+def bad_pointer_kernel(dst: Pointer[Float32, MutAnyOrigin], n: Int):
+    var i = global_idx.x
+    if i < n:
+        dst[unsafe_offset=i] = 0  # nothing states the extent of `dst`
+
+
+def bad_launch_short_buffer(ctx: DeviceContext, n: Int) raises:
+    var dst = ctx.enqueue_create_buffer[DType.float32](n)
+    var src = ctx.enqueue_create_buffer[DType.float32](n - 1)
+    if n >= 0:
+        ctx.enqueue_function[ok_pointer_kernel](
+            dst, src, n, grid_dim=n // 32 + 1, block_dim=32
         )

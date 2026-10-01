@@ -1260,9 +1260,48 @@ Tensors and GPU kernels:
   and 4.14 s (interleaved, load about 3), keeping 4 invariants instead of
   6 with the same results. kernels.mojo: 19 of 30, the other 11 in
   `bad_*` functions.
+- Raw pointers (29% of the kernel survey's indexing sites) have no size,
+  so their bounds have to be stated. `Pointer._extent()` is a
+  contract-only method (it returns `Int.MAX` at run time, and nothing
+  computes it) that the pass reads as an uninterpreted `pext(p)`, not
+  negative, of the pointer's value. Accesses at an offset require it:
+  `p[unsafe_offset=i]` and the deprecated `p[i]` (235 uses in
+  max/kernels/src) `0 <= i < _extent()`, the `load`, `store`,
+  `unsafe_load` and `unsafe_store` forms with an offset `0 <= i <=
+  _extent() - width`, through `_offset_in_bounds[width](i)`. Postconditions
+  state it where pointers are made: `alloc`/`unsafe_alloc` and the
+  `stack_allocation`s give their count, `unsafe_offset`, `+`, `-`, `+=` and
+  `-=` move it (forward only: a pointer moved backwards has no known
+  extent), `DeviceBuffer.unsafe_ptr()` gives `old(len(self))` (`old`,
+  since the call takes a mutable reference and the pass forgets what it
+  knew of the buffer across it), and `enqueue_create_buffer(n)` states the
+  buffer's length. A kernel states it for its pointer arguments
+  (`n: Int where dst._extent() >= n`); at a launch, a `DeviceBuffer` passed
+  for a pointer has its length as the extent, the pointer it becomes on
+  the device. A pointer whose extent nothing states is reported, as the
+  user chose over leaving such accesses unchecked.
+- `_extent()` returns its value as a literal rather than `Int.MAX`: with
+  `Int.MAX`, the language server's lazy parse looped (String uses
+  `unsafe_offset`, whose clause names `_extent`, whose body reached
+  `max_or_inf` and `SIMD`'s conversions back to String) and three
+  `kgen_lsp_check` tests failed. The stdlib tests that index a
+  collection's private pointer (`q._data[unsafe_offset=0]` in test_deque,
+  test_array) now report those accesses: test_deque 100/224 (was
+  100/105), test_array 38/48 (was 38/38).
+- On the way: the conversions in a callee's clause (`Int(offset)` of an
+  `offset: Scalar` of any dtype) now resolve their dtypes through the
+  parameter frames, and `paramTerm` reads `cast_from_builtin` (`Int(width)`
+  of a `SIMDLength`).
+- Not stated yet: `List.unsafe_ptr()` (its `ref self` may be in another
+  address space, which `len(self)` in a clause cannot copy from) and
+  `Span.unsafe_ptr()` (`@always_inline("builtin")`, which cannot carry
+  clauses); `Pointer(to=x)`; and the accesses without an offset, `p[]`,
+  `load()` and `store(v)`, which would need every such pointer's extent
+  first. pointers.mojo: 6 of 11, kernels.mojo: 23 of 36, the others in
+  `bad_*` functions.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
-  to `n`), raw pointers, and kernels in MAX's own packages, which are now
+  to `n`), and kernels in MAX's own packages, which are now
   skipped as imported code unless `include-stdlib=true`.
 
 ## Risks and open questions
