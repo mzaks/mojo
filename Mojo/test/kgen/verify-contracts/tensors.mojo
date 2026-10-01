@@ -188,6 +188,49 @@ def ok_tile_tuple(
     return 0
 
 
+def ok_distribute(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) -> Float32:
+    # 2 x 4 threads: each gets 4 x 2 elements, for any thread id.
+    var v = t.distribute[row_major[2, 4]()](thread_idx.x)
+    return v[3, 1]
+
+
+def ok_distribute_dynamic(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int, j: Int
+) -> Float32:
+    var v = t.distribute[row_major[2, 4]()](thread_idx.x)
+    if 0 <= i and i < Int(t.dim[0]()) // 2:
+        if 0 <= j and j < Int(t.dim[1]()) // 4:
+            return v[i, j]  # `v` has `dim // threads` elements
+    return 0
+
+
+def ok_vectorize_distribute(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int
+) -> SIMD[DType.float32, 4]:
+    if Int(t.dim[1]()) % 4 == 0 and Int(t.dim[1]()) >= 32:
+        var v = t.vectorize[1, 4]().distribute[row_major[1, 8]()](
+            thread_idx.x
+        )
+        if 0 <= i and i < Int(t.dim[0]()):
+            return v[i, 0]
+    return 0
+
+
+def ok_distribute_with_offset(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int
+) -> SIMD[DType.float32, 2]:
+    if Int(t.dim[1]()) % 2 == 0 and Int(t.dim[1]()) >= 8:
+        # As kernels write it: a vectorized view, distributed, destructured.
+        var v, coords, offset = t.vectorize[
+            1, 2
+        ]().distribute_with_offset[row_major[1, 4]()](thread_idx.x)
+        if 0 <= i and i < Int(t.dim[0]()):
+            return v[i, 0]
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_static(t: TileTensor[DType.float32, L8, MutAnyOrigin]) -> Float32:
     return t[8]  # one past the end
@@ -311,3 +354,26 @@ def bad_tile_shape(
     if 0 < s and s <= 8:
         return t.tile(Coord(s, 8), Coord(1, 0))[0, 0]  # `2 * s` may pass 8
     return 0
+
+
+def bad_distribute(
+    t: TileTensor[DType.float32, L86, MutAnyOrigin]
+) -> Float32:
+    var v = t.distribute[row_major[1, 4]()](thread_idx.x)
+    return v[7, 1]  # 6 // 4 = 1 column per thread
+
+
+def bad_distribute_dynamic(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int
+) -> Float32:
+    var v = t.distribute[row_major[2, 4]()](thread_idx.x)
+    if 0 <= i and i * 2 < Int(t.dim[0]()) and Int(t.dim[1]()) >= 4:
+        return v[i, 0]  # a row past the last full one
+    return 0
+
+
+def bad_distribute_with_offset(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) -> Float32:
+    var r = t.distribute_with_offset[row_major[2, 4]()](thread_idx.x)
+    return r[0][4, 0]  # 8 // 2 = 4 rows per thread

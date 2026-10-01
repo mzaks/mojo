@@ -1188,7 +1188,25 @@ Tensors and GPU kernels:
   works the same way. The `layout`, `nn` and `linalg` kernel tests pass
   with the clauses. tensors.mojo: 62 of 83, the other 21 in `bad_*`
   functions.
-- Not covered yet: `distribute`, a runtime last stride, function-level `where`
+- `distribute[thread_layout](tid)` has no contract: a thread's
+  coordinate is `(tid // stride) % threads`, in `[0, threads)` with
+  floored division, and its view has `dim // threads` elements (rounded
+  down) `threads` apart, the last at `threads - 1 + (dim // threads - 1)
+  - threads <= dim - 1`, so the view is within the tensor for every
+  `tid`; a dimension that `threads` does not divide leaves elements
+  uncovered, not out of range. A swizzle remaps the offset and is assumed
+  to keep it inside. What indexing the view needs is its extents: the
+  pass models the call, `tdim(view, k) = dim[k] // threads[k]` for a
+  positive count, reading the thread layout's sizes as terms (a generic
+  kernel's `row_major[TM, TN]()` included) through `comptimeIntTerm`,
+  now shared with `comptimeShape`. A static view's extents were already
+  read from its type. `distribute_with_offset` (five uses in
+  `max/kernels/src`, after `vectorize`) returns the same view as the
+  first of a tuple: the pass models it as a tuple whose field `/0` is
+  that view, so destructuring (`var v, coords, offset = ...`) and `r[0]`
+  give it; the thread's coordinates and offset stay unknown.
+  tensors.mojo: 75 of 99, the other 24 in `bad_*` functions.
+- Not covered yet: a runtime last stride, function-level `where`
   constraints on parameters (`where N <= 8`) as assumptions, launches through
   the other `enqueue_function` overloads, tensors whose runtime size comes from
   a scalar (`row_major(n)`: `dim` is not related to `n`), raw pointers, and
