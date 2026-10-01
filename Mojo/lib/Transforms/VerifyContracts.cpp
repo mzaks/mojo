@@ -615,6 +615,19 @@ public:
         values[arg] = declare(sortOf(arg.getType()), "a");
     }
     fn.walk([&](LIT::VarDeclOp decl) { roots.push_back(decl->getResult(0)); });
+    // The function's own constraints on its parameters (`where N <= 8`): the
+    // compiler rejects any instantiation that breaks them, so they hold in
+    // the body. One the parameter model cannot read is an unknown.
+    // They name the parameters by position (`#kgen.param.index.ref<0, i>`),
+    // the body by name: the position is read as the declaration.
+    if (auto pogs = fn.getFuncTypeGenerator().getParamListAttrs()) {
+      ArrayRef<ParamDeclAttr> own = fn.getParams();
+      positionalParams = &own;
+      for (ConstraintAttr constraint : pogs.getBodyConstraints())
+        facts.push_back(
+            paramTerm(constraint.getProposition(), Sort{true, 1, false}));
+      positionalParams = nullptr;
+    }
     State state;
     // A caller through the trait establishes only the trait's precondition,
     // which must imply the implementation's own.
@@ -767,6 +780,9 @@ private:
     std::string scope;
   };
   ParamFrame *params = nullptr;
+  /// While the function's own constraints are read: its parameters, which
+  /// they refer to by position.
+  ArrayRef<ParamDeclAttr> *positionalParams = nullptr;
   /// The function's own parameters' frame: none, or an instantiation's.
   std::vector<ParamFrame> instanceFrames;
   ParamFrame *rootParams = nullptr;
@@ -2241,6 +2257,12 @@ private:
       return parameterValue(printed(attr), sort);
     if (auto sugar = dyn_cast<SugarAttr>(attr))
       return paramTerm(sugar.getCanonical(), sort, depth + 1);
+    if (auto index = dyn_cast<ParamIndexRefAttr>(attr);
+        index && positionalParams && index.getDepth() == 0 &&
+        index.getIndex() < positionalParams->size())
+      return paramTerm(
+          ParamDeclRefAttr::get((*positionalParams)[index.getIndex()]), sort,
+          depth + 1);
     // A callee's parameter: the call's value for it, in the caller.
     if (auto ref = dyn_cast<ParamDeclRefAttr>(attr); ref && params)
       if (auto it = params->values.find(ref.getName());
