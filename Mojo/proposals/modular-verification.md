@@ -1107,8 +1107,34 @@ Tensors and GPU kernels:
   unknown. The idiomatic guard `j + width <= dim` does not prove the
   access: the sum wraps for `j` near `Int.MAX`. `j <= dim - width` does.
   tensors.mojo: 51 of 68, the other 17 in `bad_*` functions.
+- Launch configuration: a kernel that tiles at `block_idx` without a
+  guard relies on the grid its host chose. It now states that as `where`
+  clauses on its arguments (`grid_dim.y <= Int(c.dim[0]()) // BM`,
+  `block_dim.x == BM * BN`), assumed in its body like any precondition,
+  and each launch, `enqueue_function[kernel](args..., grid_dim=,
+  block_dim=)`, must establish them: the pass finds the kernel among the
+  launch's parameters (behind the thunk that converts it to the declared
+  `def` type), binds its arguments to the launch's, and its `grid_dim` and
+  `block_dim` to the launch's `Dim` values. `Dim` is modelled from
+  integers, literals and tuples. The custom-ops example's tiled matmul
+  kernel, copied out with such a clause added (the example's host code
+  needs the `extensibility` package, which was not built here), verifies
+  10 of 10 in about 11 s. Its host launches with `grid_dim=(ceildiv(N,
+  BN), ceildiv(M, BM))`; that pattern does not establish the clause
+  (kernels.mojo, `bad_launch_rounded_up`) unless `M` and `N` are multiples
+  of the tile, which the kernel assumes without stating it.
+- What that kernel needed besides: `udivmod` and `divmod` (with the facts
+  `q * b + r == a` and `r < b` for an unsigned nonzero divisor; without
+  them, `tid udiv BN < BM` from `tid < BM * BN` timed out), the bounds of
+  `comptime for k in range(n)`, an `Int` seen through the parameter type
+  of a `comptime for` element, and tile sizes and static extents that are
+  parameters of a generic function (`tile[BM, BN]`, `row_major[BM,
+  BK]()`), evaluated in the scope they come from: a caller's `BM` passed
+  to `tile` was a fresh unknown in the callee's scope before.
 - Not covered yet: `tile` with `Coord` arguments, `distribute`, a
-  runtime last stride, tensors whose runtime size comes
+  runtime last stride, function-level `where` constraints on parameters
+  (`where N <= 8`) as assumptions, launches through the other
+  `enqueue_function` overloads, tensors whose runtime size comes
   from a scalar (`row_major(n)`: `dim` is not related to `n`), raw pointers, and
   kernels in MAX's own packages, which are now skipped as imported code unless
   `include-stdlib=true`.

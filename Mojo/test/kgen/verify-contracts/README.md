@@ -19,8 +19,8 @@ bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
     -elaborate --verify-contracts="verbose=true"
 ```
 
-`tensors.mojo` imports the `max` and `layout` packages: build them and add
-them to the import path.
+`tensors.mojo` and `kernels.mojo` import the `max` and `layout` packages:
+build them and add them to the import path.
 
 ```bash
 ./bazelw build --config=build-mojo //max/kernels/src/layout:layout
@@ -261,6 +261,19 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   and `0 <= block_idx < grid_dim < 2^31`; `global_idx` is
   `block_idx * block_dim + thread_idx`. Kernels are verified like any
   function, on the host, before they are compiled for a GPU.
+- A kernel states the launch it relies on as `where` clauses on its
+  arguments (`grid_dim.y <= Int(c.dim[0]()) // 16`, `block_dim.x ==
+  256`), which are assumed in its body. At a launch,
+  `ctx.enqueue_function[kernel](args..., grid_dim=g, block_dim=b)`, they
+  are obligations, with the kernel's arguments the launch's and its
+  `grid_dim` and `block_dim` the launch's `Dim`s (from `Int`s, literals
+  or tuples; an omitted axis is 1). Other GPU ids in a clause are unknown
+  at the launch.
+- `divmod(a, b)` of `Int`s and `udivmod(a, b)` are the quotient and
+  remainder (floored, or unsigned for `udivmod`); a `comptime for k in
+  range(n)` has `0 <= k < n`. In a function generic over tile sizes
+  (`tile[BM, BN]`, `row_major[BM, BK]()`), the sizes are the parameters,
+  so what is proven holds for every value of them.
 - `Int.MAX`, `Int.MIN` and the bounds of the other integer dtypes
   (`max_or_inf`, `min_or_neg_inf`) are their values.
 
@@ -287,3 +300,4 @@ with).
 | `assertions.mojo`    | all `bad_*`        | all `ok_*`       |
 | `traits.mojo`        | all `bad_*`, `Bad*`| all `ok_*`       |
 | `tensors.mojo`       | all `bad_*`        | all `ok_*`       |
+| `kernels.mojo`       | all `bad_*`        | all `ok_*`       |
