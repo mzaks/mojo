@@ -2523,6 +2523,8 @@ private:
       return;
     if (name && evalDivmod(call, *name, state))
       return;
+    if (name && evalUnsignedDivision(call, *name, state))
+      return;
     if (name && evalCeildiv(call, *name, state))
       return;
     if (name && evalPointer(call, *name, state))
@@ -4062,6 +4064,35 @@ private:
     return true;
   }
 
+  /// `ufloordiv(a, b)`, `udiv_unchecked(a, b)` and `uceildiv(a, b)` of two
+  /// `Int`s: bounded, `0 <= q <= a` for `a >= 0`, which holds for any
+  /// divisor (`q` is 0 for a zero one). Not exact: an exact quotient times
+  /// an unknown made a Houdini script of a MAX kernel take 909 s instead of
+  /// 4 s (11.7 s as shift and mask by the literal 32).
+  bool evalUnsignedDivision(LIT::CallOp call, const CalleeName &name,
+                            State &state) {
+    StringRef path = name.path;
+    StringRef args2 = "(::SIMD[DType.int, 1],::SIMD[DType.int, 1])";
+    if (path != ("std::math::uutils::ufloordiv" + args2).str() &&
+        path != ("std::math::uutils::udiv_unchecked" + args2).str() &&
+        path != ("std::math::uutils::uceildiv" + args2).str())
+      return false;
+    if (call.getNumOperands() != 2 || call->getNumResults() != 1)
+      return false;
+    Value dividend = call.getOperands()[0];
+    std::string a = isa<LIT::RefType>(dividend.getType())
+                        ? valueThrough(dividend, state)
+                        : term(dividend, state);
+    if (sortOfTerm(a).isBool || sortOfTerm(a).width != 64)
+      return false;
+    std::string q = declare({false, 64, true}, "q");
+    facts.push_back("(=> (bvsle " + bvConst(0, 64) + " " + a +
+                    ") (and (bvsle " + bvConst(0, 64) + " " + q + ") (bvsle " +
+                    q + " " + a + ")))");
+    values[call->getResult(0)] = q;
+    return true;
+  }
+
   /// `Dim(x)`, `Dim(x, y)`, `Dim(x, y, z)` and `Dim(tuple)` from MAX's GPU
   /// host API: fields `/x`, `/y` and `/z`, an omitted axis 1. An argument is
   /// an `Int` (its value) or an `IntLiteral` (its value, in its type); a
@@ -4229,6 +4260,19 @@ private:
     if (!path.starts_with(prefix) || call->getNumResults() != 1)
       return false;
     StringRef rest = path.drop_front(strlen(prefix));
+    // `lane_id()`: below the warp size, 32 or 64 on supported GPUs.
+    if (rest.starts_with("lane_id(") && call.getNumOperands() == 0 &&
+        !launchDims) {
+      std::string symbol = "gpu_lane_id";
+      if (gpuIds.insert(symbol).second) {
+        prelude += "(declare-const " + symbol + " (_ BitVec 64))\n";
+        sorts[symbol] = Sort{false, 64, true};
+        facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + symbol +
+                        ") (bvslt " + symbol + " " + bvConst(64, 64) + "))");
+      }
+      values[call->getResult(0)] = symbol;
+      return true;
+    }
     StringRef kind = rest.take_until([](char c) { return c == ':'; });
     if (!rest.drop_front(kind.size()).starts_with("::__getattr_param__["))
       return false;
