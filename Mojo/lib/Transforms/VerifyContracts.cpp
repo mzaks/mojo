@@ -1223,6 +1223,8 @@ public:
   unsigned queryRlimit = 0;
   /// Whether integer divisors that may be 0 are obligations.
   bool checkDivision = false;
+  /// Whether the compilation target's unknowns are declared.
+  bool targetDeclared = false;
 
   LIT::FnOp fn;
   SmallVector<Obligation> obligations;
@@ -2810,6 +2812,88 @@ private:
            ")) (_ bv0 " + w + ") (_ bv1 " + w + ")))";
   }
 
+  /// The compilation target, as `std.sys.info` describes it: the triple is
+  /// NVIDIA's, AMD's or Apple's GPU (at most one; on the host none), RDNA
+  /// is an AMD GPU, and the build's accelerator (`--target-accelerator`,
+  /// `_accelerator_arch()`) is absent or of one vendor. `is_gpu()`,
+  /// `has_*_accelerator()`, `has_accelerator()` and `_resolve_warp_size()`
+  /// (`WARP_SIZE`) are what their bodies make of these; the warp size of an
+  /// accelerator the host only names is an unknown.
+  MaybeTerm targetPredicate(StringRef path, Sort sort) {
+    auto flag = [&](StringRef name) {
+      std::string symbol = ("target_" + name).str();
+      if (gpuIds.insert(symbol).second) {
+        prelude += "(declare-const " + symbol + " Bool)\n";
+        sorts[symbol] = Sort{true, 1, false};
+      }
+      return symbol;
+    };
+    if (!targetDeclared) {
+      targetDeclared = true;
+      std::string nv = flag("nvidia_gpu"), amd = flag("amd_gpu"),
+                  apple = flag("apple_gpu"), rdna = flag("amd_rdna");
+      std::string accNv = flag("accelerator_nvidia"),
+                  accAmd = flag("accelerator_amd"),
+                  accApple = flag("accelerator_apple"),
+                  acc = flag("accelerator");
+      facts.push_back("(and (not (and " + nv + " " + amd + ")) (not (and " +
+                      nv + " " + apple + ")) (not (and " + amd + " " + apple +
+                      ")))");
+      facts.push_back("(=> " + rdna + " " + amd + ")");
+      facts.push_back("(and (not (and " + accNv + " " + accAmd +
+                      ")) (not (and " + accNv + " " + accApple +
+                      ")) (not (and " + accAmd + " " + accApple + ")))");
+      facts.push_back("(=> (or " + accNv + " " + accAmd + " " + accApple +
+                      ") " + acc + ")");
+    }
+    std::string gpu = "(or " + flag("nvidia_gpu") + " " + flag("amd_gpu") +
+                      " " + flag("apple_gpu") + ")";
+    StringRef info = "std::sys::info::";
+    if (path.consume_front(info)) {
+      if (!sort.isBool)
+        return std::nullopt;
+      if (path == "is_nvidia_gpu()")
+        return flag("nvidia_gpu");
+      if (path == "is_amd_gpu()")
+        return flag("amd_gpu");
+      if (path == "is_apple_gpu()")
+        return flag("apple_gpu");
+      if (path == "_is_amd_rdna()")
+        return flag("amd_rdna");
+      if (path == "is_gpu()")
+        return define(sort, gpu);
+      if (path == "has_nvidia_gpu_accelerator()")
+        return define(sort, "(or " + flag("nvidia_gpu") + " " +
+                                flag("accelerator_nvidia") + ")");
+      if (path == "has_amd_gpu_accelerator()")
+        return define(sort, "(or " + flag("amd_gpu") + " " +
+                                flag("accelerator_amd") + ")");
+      if (path == "has_apple_gpu_accelerator()")
+        return define(sort, "(or " + flag("apple_gpu") + " " +
+                                flag("accelerator_apple") + ")");
+      if (path == "has_accelerator()")
+        return define(sort, "(or " + gpu + " " + flag("accelerator") + ")");
+      return std::nullopt;
+    }
+    if (path == "std::_gpu::globals::_resolve_warp_size()" && !sort.isBool &&
+        sort.width == 64) {
+      // One unknown: every `WARP_SIZE` of the function is the same.
+      std::string other = "target_accelerator_warp_size";
+      if (gpuIds.insert(other).second) {
+        prelude += "(declare-const " + other + " (_ BitVec 64))\n";
+        sorts[other] = sort;
+      }
+      auto c = [&](int64_t v) { return bvConst(v, 64); };
+      return define(sort, "(ite " + flag("nvidia_gpu") + " " + c(32) +
+                              " (ite " + flag("amd_rdna") + " " + c(32) +
+                              " (ite " + flag("amd_gpu") + " " + c(64) +
+                              " (ite " + flag("apple_gpu") + " " + c(32) +
+                              " (ite (not " + flag("accelerator") + ") " +
+                              c(0) + " " + other + ")))))");
+    }
+    return std::nullopt;
+  }
+
   /// A parameter expression's value: literals, and the integer and Boolean
   /// operators of parameter expressions (`add`, `lt`, `cond`, ...) and of
   /// `SIMD` (`apply` of `__ge__`, ...) over them. Anything else (a parameter,
@@ -2935,6 +3019,10 @@ private:
           return sub(0, sort);
         break;
       case POC::Apply:
+        if (ops.size() == 1)
+          if (std::optional<CalleeName> name = calleeName(ops[0]))
+            if (MaybeTerm t = targetPredicate(name->path, sort))
+              return *t;
         // `max_or_inf[dtype]()` and `min_or_neg_inf[dtype]()` of an integer
         // dtype (`Int.MAX`, `UInt8.MIN`): its bounds.
         if (ops.size() == 1)
