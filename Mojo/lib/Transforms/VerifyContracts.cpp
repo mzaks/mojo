@@ -5370,7 +5370,8 @@ private:
     auto operand = [&](unsigned i) {
       return term(call.getOperands()[i], state);
     };
-    if (path.starts_with("std::builtin::bool::Bool::__mlir_bool__(") &&
+    if ((path.starts_with("std::builtin::bool::Bool::__mlir_bool__(") ||
+         path.starts_with("std::builtin::bool::Bool::__bool__(")) &&
         call.getNumOperands() == 1) {
       values[result] = operand(0);
       return true;
