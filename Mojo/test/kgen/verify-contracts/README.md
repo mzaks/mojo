@@ -308,8 +308,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   (warps have 32 or 64 lanes). `ufloordiv`, `udiv_unchecked` and
   `uceildiv` are bounded unsigned divisions (`udiv_unchecked` and
   `udivmod_unchecked` require `b > 0`: by 0 they are undefined);
-  `warp.broadcast(x)` (lane 0's `x`) is
-  an unknown. The compilation target is modelled as `std.sys.info`
+  `warp.broadcast(x)` and the
+  unmasked `shuffle_idx/up/down/xor` are `x` as some thread of the same
+  block computes it: `x`'s term with thread ids, `lane_id`, arguments and
+  bounded quotients renamed to fresh copies (with their facts), so a
+  bound every thread has holds for it, but it is not this thread's `x`;
+  if `x` depends on a load or an unknown result, it is an unknown. The compilation target is modelled as `std.sys.info`
   describes it: at most one of NVIDIA's, AMD's (RDNA among them) and
   Apple's GPU triples, and the build's accelerator, if any, of one
   vendor; `is_gpu()`, `has_*_accelerator()` and `WARP_SIZE` (32 or 64 on

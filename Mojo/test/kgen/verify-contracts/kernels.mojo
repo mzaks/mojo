@@ -24,8 +24,9 @@ from max.gpu import (
     thread_idx,
 )
 from max.gpu.host import DeviceContext
+import max.gpu.primitives.warp as warp
 from std.math import ceildiv
-from std.math.uutils import udivmod
+from std.math.uutils import udivmod, ufloordiv
 from std.sys.info import (
     has_amd_gpu_accelerator,
     has_nvidia_gpu_accelerator,
@@ -254,6 +255,24 @@ def ok_launch_on_nvidia(ctx: DeviceContext) raises:
         )  # the build's accelerator is NVIDIA's
 
 
+def warp_rows(
+    out_rows: Pointer[Float32, MutAnyOrigin],
+    m: Int where out_rows._extent() >= m,
+):
+    var row = warp.broadcast(ufloordiv(global_idx.x, WARP_SIZE))
+    if row < m:
+        out_rows[unsafe_offset=row] = 0  # lane 0's row: also >= 0
+
+
+def holds(claim: Bool where claim):
+    pass
+
+
+def ok_broadcast_bounds():
+    var t = warp.shuffle_idx(thread_idx.x, 0)
+    holds(t < block_dim.x)  # every thread's is below
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -413,3 +432,16 @@ def bad_launch_anywhere(ctx: DeviceContext) raises:
     ctx.enqueue_function[nvidia_kernel](
         buf, len(buf), grid_dim=1, block_dim=64
     )  # nothing says which accelerator
+
+
+def bad_broadcast_own_value():
+    var t = warp.broadcast(thread_idx.x)
+    holds(t == thread_idx.x)  # lane 0's, not this thread's
+
+
+def bad_broadcast_load(
+    p: Pointer[Int, MutAnyOrigin], n: Int where p._extent() >= n
+):
+    if n > 0:
+        var v = warp.broadcast(p[unsafe_offset=0])
+        holds(v == p[unsafe_offset=0])  # memory is not copied

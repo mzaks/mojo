@@ -1516,6 +1516,24 @@ Tensors and GPU kernels:
   cost of pushing contracts down to kernels is this chain: every
   function between the user and the launch states what its kernel
   needs.
+- `warp.broadcast` (the user asked to address it after the gemv write-up
+  had to remove it). Lane 0 is some thread of the same block, so
+  `broadcast(x)` is `x` as some thread of the block computes it: the
+  pass copies `x`'s term, renaming what varies by thread (thread ids,
+  `lane_id`, arguments, since a device helper may be called with
+  lane-dependent ones, and bounded quotients) to fresh copies and keeping
+  what does not (parameters, block ids and dimensions, the target), and
+  copies every fact about the renamed names. Which lane is never needed,
+  so no warp-size arithmetic. The unmasked `shuffle_idx`, `shuffle_up`,
+  `shuffle_down` and `shuffle_xor` get the same model (another lane's
+  value or this lane's own); the masked forms do not (a source lane
+  outside the mask is undefined). A term that depends on anything else (a
+  load, an unknown result) leaves the value unknown, and a name that once
+  failed to copy is never shared. Checked: bounds every thread has hold
+  for a broadcast value; claims that it equals this lane's value, this
+  thread's id, a load or a helper's argument are not proven. gemv_kernel
+  as MAX has it (with `warp.broadcast`) now has all three accesses and
+  its launch proven (18.7 s).
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now
