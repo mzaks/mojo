@@ -3175,6 +3175,9 @@ private:
           if (std::optional<CalleeName> name = calleeName(ops[0]))
             if (MaybeTerm t = targetPredicate(name->path, sort))
               return *t;
+        if (ops.size() == 3 && sort.isBool)
+          if (MaybeTerm t = dtypeMembership(ops))
+            return *t;
         // `simd_width_of[dtype]()`: the target's SIMD bit width (128 on
         // every GPU target, at most 512 on CPUs, 0 for no target) divided by
         // the dtype's (8 times its size, a power of two): 0 or a power of
@@ -3270,6 +3273,60 @@ private:
     if (auto constant = dyn_cast<DTypeConstantAttr>(a))
       return constant.getDType().getValue();
     return std::nullopt;
+  }
+
+  /// `dtype in (DType.float32, DType.bfloat16, ...)` as a parameter
+  /// expression (`apply` of `Tuple.__contains__` to the tuple and the
+  /// dtype): `dtype` is one of them. Only for tuples of dtype literals; the
+  /// dtypes are compared as `DType.__eq__` does, by their `ui8` codes.
+  MaybeTerm dtypeMembership(ArrayRef<TypedAttr> ops) {
+    TypedAttr callee = ops[0];
+    while (auto expr = dyn_cast<ParamOperatorAttr>(callee))
+      if (expr.getOpcode() == POC::Rebind && expr.getOperands().size() == 1)
+        callee = expr.getOperands()[0];
+      else
+        break;
+    std::optional<CalleeName> name = calleeName(callee);
+    if (!name ||
+        !StringRef(name->path)
+             .starts_with("std::builtin::tuple::Tuple::__contains__[") ||
+        name->params.empty())
+      return std::nullopt;
+    // The tuple is built from a pack (`VariadicPack.__init__` applied to
+    // the elements): every element must be a dtype literal.
+    SmallVector<uint64_t> codes;
+    bool found = false, literal = true;
+    Attribute tuple = ops[1];
+    tuple.walk([&](ParamOperatorAttr expr) {
+      if (found || expr.getOpcode() != POC::Apply ||
+          expr.getOperands().size() != 2)
+        return;
+      std::optional<CalleeName> init = calleeName(expr.getOperands()[0]);
+      if (!init ||
+          !StringRef(init->path)
+               .starts_with("std::builtin::variadics::VariadicPack::__init__("))
+        return;
+      found = true;
+      auto pack = dyn_cast<LIT::RefPackAttr>(expr.getOperands()[1]);
+      if (!pack) {
+        literal = false;
+        return;
+      }
+      for (TypedAttr element : pack.getValues())
+        if (std::optional<uint64_t> c = dtypeLiteral(element))
+          codes.push_back(*c);
+        else
+          literal = false;
+    });
+    if (!found || !literal || codes.empty())
+      return std::nullopt;
+    std::string v = dtypeCode(ops[2]);
+    if (v.empty())
+      return std::nullopt;
+    std::string any = "(or";
+    for (uint64_t c : codes)
+      any += " (= " + v + " " + bvConst(c, 8) + ")";
+    return define({true, 1, false}, any + ")");
   }
 
   /// The `ui8` code of a `DType` value, as `DType.__eq__` compares dtypes:
