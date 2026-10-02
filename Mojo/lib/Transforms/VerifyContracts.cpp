@@ -1262,6 +1262,8 @@ public:
   bool checkDivision = false;
   /// Whether the compilation target's unknowns are declared.
   bool targetDeclared = false;
+  /// Whether target predicates are read for a kernel at its launch.
+  bool deviceView = false;
 
   LIT::FnOp fn;
   SmallVector<Obligation> obligations;
@@ -1430,6 +1432,29 @@ private:
                         [&](const SExpr &arg) { return nonlinear(arg); });
   }
   llvm::StringMap<bool> nonlinearTerms;
+
+  /// Whether `term` depends on the compilation target (`target_*`).
+  bool mentionsTarget(StringRef term) {
+    if (term.contains("target_"))
+      return true;
+    if (auto it = targetTerms.find(term); it != targetTerms.end())
+      return it->second;
+    targetTerms[term] = false;
+    bool result = false;
+    if (auto def = definitions.find(term.str()); def != definitions.end()) {
+      result = StringRef(def->second).contains("target_");
+      for (const std::string &name : namesIn(def->second))
+        if (!result && name != term)
+          result = mentionsTarget(name);
+    } else {
+      for (const std::string &name : namesIn(term))
+        if (!result && name != term)
+          result = mentionsTarget(name);
+    }
+    targetTerms[term] = result;
+    return result;
+  }
+  llvm::StringMap<bool> targetTerms;
 
   /// The names of terms (`t12`, `h3`) used in an expression.
   static SmallVector<std::string> namesIn(StringRef expr) {
@@ -2896,7 +2921,7 @@ private:
   /// (`WARP_SIZE`) are what their bodies make of these; the warp size of an
   /// accelerator the host only names is an unknown.
   MaybeTerm targetPredicate(StringRef path, Sort sort) {
-    auto flag = [&](StringRef name) {
+    auto declared = [&](StringRef name) {
       std::string symbol = ("target_" + name).str();
       if (gpuIds.insert(symbol).second) {
         prelude += "(declare-const " + symbol + " Bool)\n";
@@ -2904,14 +2929,31 @@ private:
       }
       return symbol;
     };
+    // In the device view (a kernel's assertions at its launch) the GPU
+    // triple is the build's accelerator's.
+    auto flag = [&](StringRef name) {
+      if (deviceView) {
+        if (name == "nvidia_gpu")
+          return declared("accelerator_nvidia");
+        if (name == "amd_gpu")
+          return declared("accelerator_amd");
+        if (name == "apple_gpu")
+          return declared("accelerator_apple");
+        if (name == "amd_rdna")
+          return declared("accelerator_amd_rdna");
+      }
+      return declared(name);
+    };
     if (!targetDeclared) {
       targetDeclared = true;
-      std::string nv = flag("nvidia_gpu"), amd = flag("amd_gpu"),
-                  apple = flag("apple_gpu"), rdna = flag("amd_rdna");
-      std::string accNv = flag("accelerator_nvidia"),
-                  accAmd = flag("accelerator_amd"),
-                  accApple = flag("accelerator_apple"),
-                  acc = flag("accelerator");
+      std::string nv = declared("nvidia_gpu"), amd = declared("amd_gpu"),
+                  apple = declared("apple_gpu"), rdna = declared("amd_rdna");
+      std::string accNv = declared("accelerator_nvidia"),
+                  accAmd = declared("accelerator_amd"),
+                  accApple = declared("accelerator_apple"),
+                  accRdna = declared("accelerator_amd_rdna"),
+                  acc = declared("accelerator");
+      facts.push_back("(=> " + accRdna + " " + accAmd + ")");
       facts.push_back("(and (not (and " + nv + " " + amd + ")) (not (and " +
                       nv + " " + apple + ")) (not (and " + amd + " " + apple +
                       ")))");
@@ -4847,8 +4889,7 @@ private:
     auto [kernel, kernelSymbol] =
         launchedKernel(symbol, module, symbols,
                        [&](TypedAttr param) { return resolveParam(param); });
-    if (!kernel || kernel.getFunctionBody().empty() ||
-        kernel.getFunctionBody().front().getOps<RequiresOp>().empty())
+    if (!kernel || kernel.getFunctionBody().empty())
       return;
     // The arguments: the references of the pack, the first operand that is
     // one (after `self`, and after the compiled function `f` in
@@ -4932,6 +4973,34 @@ private:
       } else {
         ob.analyzed = false;
       }
+      obligations.push_back(ob);
+    }
+    // The kernel's hardware contract, its top-level `comptime assert`s that
+    // name the target (a GPU predicate, `WARP_SIZE`), for the target it is
+    // compiled for: the build's accelerator (assumption). The launcher runs
+    // on the host (`DeviceContext` is host-only). Its other asserts are the
+    // compiler's to check where the kernel is compiled.
+    for (auto assertion :
+         kernel.getFunctionBody().front().getOps<ParamAssertOp>()) {
+      Obligation ob{state.pc, "false", call.getLoc(), assertion.getLoc(),
+                    displayName(kernel)};
+      ob.claim = "the assertion of '" + displayName(kernel) +
+                 "' for the accelerator it is launched on";
+      ParamFrame *saved = params;
+      params = &frame;
+      deviceView = true;
+      std::string cond = paramTerm(assertion.getCond(), {true, 1, false});
+      deviceView = false;
+      params = saved;
+      if (!mentionsTarget(cond))
+        continue;
+      std::string host = targetPredicate("std::sys::info::is_gpu()",
+                                         {true, 1, false})
+                             .value_or("false");
+      ob.pc = define({true, 1, false},
+                     "(and " + state.pc + " (not " + host + "))", "r");
+      ob.cond = cond;
+      noteCondition(ob.cond);
       obligations.push_back(ob);
     }
   }
@@ -6464,6 +6533,8 @@ struct VerifyContractsPass
         }
         if (ob.claim.empty())
           diag.attachNote(ob.clauseLoc) << what << " declared here";
+        else if (ob.clauseLoc != ob.callLoc)
+          diag.attachNote(ob.clauseLoc) << "stated here";
         Operation *fn = fns[i].fn.getOperation();
         for (auto [instance, instanceAnswer] : perInstance)
           if (instanceAnswer != Answer::Proven) {
