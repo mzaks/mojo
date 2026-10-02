@@ -56,8 +56,12 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/Regex.h"
 
+#include <chrono>
 #include <functional>
 #include <map>
+#include <signal.h>
+#include <sys/wait.h>
+#include <thread>
 #include <optional>
 #include <set>
 
@@ -340,6 +344,40 @@ struct SolverConfig {
   std::string cacheDir;
 };
 
+/// Runs `program` and waits at most `seconds` for it; returns its exit
+/// code, or -1 if it could not run or was killed at the cap. Not
+/// `ExecuteAndWait`'s cap: that is the process-wide `alarm()`, which the
+/// parallel solver runs overwrite (LLVM's own FIXME: "The alarm signal may
+/// be delivered to another thread"), so z3 processes ran past it for an
+/// hour and more. This polls the child instead.
+int runWithCap(StringRef program, ArrayRef<StringRef> args,
+               ArrayRef<std::optional<StringRef>> redirects, unsigned seconds) {
+  bool failed = false;
+  llvm::sys::ProcessInfo pi = llvm::sys::ExecuteNoWait(
+      program, args, std::nullopt, redirects, 0, nullptr, &failed);
+  if (failed || pi.Pid == llvm::sys::ProcessInfo::InvalidPid)
+    return -1;
+  auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+  auto pause = std::chrono::milliseconds(1);
+  int status = 0;
+  while (true) {
+    pid_t done = ::waitpid(pi.Pid, &status, WNOHANG);
+    if (done == pi.Pid)
+      return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (done == -1 && errno != EINTR)
+      return -1;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      ::kill(pi.Pid, SIGKILL);
+      while (::waitpid(pi.Pid, &status, 0) == -1 && errno == EINTR) {
+      }
+      return -1;
+    }
+    std::this_thread::sleep_for(pause);
+    pause = std::min(pause * 2, std::chrono::milliseconds(50));
+  }
+}
+
 /// Runs z3 on `script` with a wall-clock cap; returns one answer per query
 /// (queries are separated by `(echo "@@")`).
 std::optional<SmallVector<Answer>> runZ3(const SolverConfig &config,
@@ -393,9 +431,8 @@ std::optional<SmallVector<Answer>> runZ3(const SolverConfig &config,
   std::optional<StringRef> redirects[] = {StringRef(""), StringRef(outPath),
                                           StringRef("")};
   StringRef z3 = config.z3;
-  int rc = llvm::sys::ExecuteAndWait(z3, {z3, "-smt2", scriptPath},
-                                     std::nullopt, redirects,
-                                     config.wallSeconds);
+  int rc = runWithCap(z3, {z3, "-smt2", scriptPath}, redirects,
+                      config.wallSeconds);
   if (rc != 0)
     cachePath.clear(); // Stopped (e.g. at the cap): do not cache.
   auto buffer = llvm::MemoryBuffer::getFile(outPath);
