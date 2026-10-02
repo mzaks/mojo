@@ -15,10 +15,18 @@
 # Needs the `max` and `layout` packages on the import path (see README.md).
 
 from layout import TensorLayout, TileTensor, row_major, stack_allocation
-from max.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
+from max.gpu import (
+    WARP_SIZE,
+    block_dim,
+    block_idx,
+    global_idx,
+    grid_dim,
+    thread_idx,
+)
 from max.gpu.host import DeviceContext
 from std.math import ceildiv
 from std.math.uutils import udivmod
+from std.sys.info import is_gpu
 
 comptime LD = type_of(row_major(1, 1))  # dimensions known at run time
 comptime L88 = type_of(row_major[8, 8]())
@@ -215,6 +223,15 @@ def ok_launch_unsafe_ptrs(ctx: DeviceContext, n: Int) raises:
         )
 
 
+def ok_warp_size_on_gpu(
+    p: Pointer[Float32, MutAnyOrigin], n: Int where p._extent() >= n
+) -> Float32:
+    comptime assert is_gpu(), "a GPU function"
+    if n >= 64:
+        return p[unsafe_offset=WARP_SIZE - 1]  # 32 or 64 on a GPU
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -351,3 +368,11 @@ def bad_launch_short_buffer(ctx: DeviceContext, n: Int) raises:
         ctx.enqueue_function[ok_pointer_kernel](
             dst, src, n, grid_dim=n // 32 + 1, block_dim=32
         )
+
+
+def bad_warp_size_anywhere(
+    p: Pointer[Float32, MutAnyOrigin], n: Int where p._extent() >= n
+) -> Float32:
+    if n >= 64:
+        return p[unsafe_offset=WARP_SIZE - 1]  # 0 on a host: offset -1
+    return 0

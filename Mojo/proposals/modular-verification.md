@@ -1403,6 +1403,25 @@ Tensors and GPU kernels:
   of 409 files, about 96% of them divisions by runtime or parameter values
   (`num_splits`, `inner_dim`) that callers are trusted with, 82 by
   `WARP_SIZE`, which is 0 on a host without an accelerator.
+- Hardware as contracts. `WARP_SIZE` is `_resolve_warp_size()`: 32 or 64
+  on a GPU, but 0 on a host without an accelerator, so a kernel cannot
+  divide by it, or index with it, without saying where it runs. The user's
+  direction: kernels state the hardware and capabilities they are built
+  for as contracts (`where is_gpu()`, `is_nvidia_gpu()`, `WARP_SIZE ==
+  32`), checked where they are launched, rather than leaving that to the
+  launcher. Step one, in the pass: the target as `std.sys.info` describes
+  it (the triple predicates, mutually exclusive, RDNA within AMD; the
+  build's accelerator of at most one vendor; `is_gpu()`,
+  `has_*_accelerator()`, `has_accelerator()` and `_resolve_warp_size()`
+  following their bodies, the warp size of an accelerator the host only
+  names unknown), and `comptime assert c` (`kgen.param.assert`) assumed
+  from there on, which is sound because the compiler checks it wherever
+  the code is compiled. A function's `where is_gpu()` was already assumed
+  (its constraints), and the compiler enforces it at calls ("lacking
+  evidence"), accepting `comptime if is_gpu():` or the same clause on the
+  caller as evidence. `enqueue_function` does not accept such a kernel
+  yet: the clause is part of the function's type, which none of its
+  overloads take.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now
