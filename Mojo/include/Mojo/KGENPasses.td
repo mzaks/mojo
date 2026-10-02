@@ -61,6 +61,10 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "Also verify a generic kernel that is launched for every value "
            "of its parameters (by default only its launched instantiations "
            "are verified)">,
+    Option<"houdiniRlimit", "houdini-rlimit", "unsigned",
+           /*default=*/"1000000",
+           "Resource limit per loop-invariant candidate query, at most a "
+           "twentieth of the query limit (0: just that)">,
     Option<"genericRlimit", "generic-rlimit", "unsigned",
            /*default=*/"10000000",
            "With generic-launched: resource limit per query of a launched "

@@ -338,6 +338,9 @@ enum class Answer { Proven, Unproven, Unknown, NotAnalyzed };
 struct SolverConfig {
   std::string z3;
   unsigned rlimit = 100000000;
+  /// The limit of each loop-invariant candidate's query (0: a twentieth
+  /// of the function's query limit).
+  unsigned houdiniRlimit = 0;
   unsigned wallSeconds = 60;
   std::string dumpDir;
   /// Where answers are cached by a hash of the script (empty: no cache).
@@ -2544,6 +2547,8 @@ private:
       // where it has one (a launched kernel's generic proof).
       unsigned limit =
           std::max(1u, (queryRlimit ? queryRlimit : solver.rlimit) / 20);
+      if (solver.houdiniRlimit)
+        limit = std::min(limit, solver.houdiniRlimit);
       queries += query({before.pc}, render(candidates[i], before), limit);
       for (State *end : ends) {
         SmallVector<std::string> assumptions{end->pc};
@@ -6125,7 +6130,8 @@ struct VerifyContractsPass
       getOperation().emitError("verify-contracts: z3 not found");
       return signalPassFailure();
     }
-    SolverConfig solver{z3, rlimit, wallSeconds, dumpDir, cacheDir};
+    SolverConfig solver{z3, rlimit, houdiniRlimit, wallSeconds, dumpDir,
+                        cacheDir};
     if (!cacheDir.empty())
       (void)llvm::sys::fs::create_directories(cacheDir);
     // Functions are verified independently, in parallel; their results are
