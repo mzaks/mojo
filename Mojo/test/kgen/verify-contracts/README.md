@@ -53,7 +53,9 @@ of the query limit; a candidate not decided within it is dropped),
 `wall-seconds=` caps each z3
 process (default 60), `check-division=true` reports integer divisions
 by a value that may be 0, `int-retry=false` turns off the integer retry
-(below), `dump-dir=` writes the SMT-LIB scripts, and `cache-dir=` caches
+(below), `nonlinear-rlimit=` the limit a query whose goal multiplies or
+divides two unknowns is first asked with (default 10000000; then over the
+integers, then with the full limit), `dump-dir=` writes the SMT-LIB scripts, and `cache-dir=` caches
 the solver's answers by a hash of each script.
 
 Values are bit-vectors, as in the program, so wrap-around is modelled.

@@ -1588,6 +1588,33 @@ Tensors and GPU kernels:
   restored it is still reported. That assertion is new: the MiniMax test
   reads K from `a.static_shape[1]`, which is not K for a nested `a`, so
   gemv relies on flat layouts without saying so.
+- What the MiniMax models cost. Measured against the pass before them on
+  43 files (the examples, 8 stdlib tests, three gemv copies, and 18
+  linalg kernel files that use `simd_width_of`, `static_shape` or `in
+  (...)`): summed z3 work (`:rlimit-count` over the dumped scripts,
+  deterministic), and the pass's time (median of 3 interleaved runs).
+  As first committed, gemv's work tripled (755M -> 2262M) and its pass
+  went from 24 s to 40 s: with the width a power of two (`w & (w - 1) ==
+  0`), `(WARP_SIZE * w) % w == 0` in the vector kernels became provable
+  but not within the bit-vector limit, so four queries per kernel
+  instance ran to 100M and six `vectorize` preconditions were left
+  undecided. Two changes:
+  - The width as cases (`w` is 0, 1, 2, ... or 256): all eight are
+    proven, still at the limit, by the integer retry.
+  - `nonlinear-rlimit`: a goal that multiplies or divides two unknowns
+    is first asked with 10M; what that leaves open over the integers
+    with that limit and a 1 s timeout (nonlinear integer queries can run
+    for long within their limit: one of matmul_mma's ran 30 s under
+    10M); what is still open once more with the full limit, as before.
+    No proof is lost; the timeout decides only which step proves.
+  Result: work 3384M -> 2658M, proven 1410 -> 1439, every obligation
+  decided in both; summed pass time 131.8 s -> 97.4 s. gemv 23.9 ->
+  14.0 s, pointers.mojo 7.5 -> 2.0 s. Slower: amd_ping_pong_matmul 5.6
+  -> 7.7 s, matmul_mma 4.9 -> 6.3 s (integer timeouts, with less work),
+  matmul_output 0.8 -> 1.1 s.
+- gemv's clauses are in max/kernels/src/linalg/gemv.mojo (`flat_rank`
+  as a clause of `gemv_gpu`, not an assertion: clauses do not change
+  what compiles). The in-tree file reports the transposed bug.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now
