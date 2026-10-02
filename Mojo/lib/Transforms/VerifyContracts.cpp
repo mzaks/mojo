@@ -5321,6 +5321,16 @@ bool inLibrary(Operation *op) {
   return false;
 }
 
+/// The top-level package `op` is in (`nn` for `nn.softmax`), or "".
+StringRef packageOf(Operation *op) {
+  StringRef name;
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (auto package = dyn_cast<LIT::PackageOp>(parent))
+      name = package.getSymName();
+  return name;
+}
+
 struct VerifyContractsPass
     : impl::VerifyContractsBase<VerifyContractsPass> {
   using VerifyContractsBase::VerifyContractsBase;
@@ -5346,9 +5356,13 @@ struct VerifyContractsPass
       LIT::FnOp fn, refines;
     };
     SmallVector<Job> fns;
+    // Functions from the file, and from imported packages when asked.
+    auto selected = [&](Operation *op) {
+      return includeStdlib || !inLibrary(op) ||
+             llvm::is_contained(packages, packageOf(op));
+    };
     getOperation().walk([&](LIT::FnOp fn) {
-      if ((includeStdlib || !inLibrary(fn)) && !isRequiredTraitMethod(fn) &&
-          !isDefaultWrapper(fn))
+      if (selected(fn) && !isRequiredTraitMethod(fn) && !isDefaultWrapper(fn))
         fns.push_back({fn, {}});
     });
     ModuleOp module = getOperation();
@@ -5356,7 +5370,7 @@ struct VerifyContractsPass
     {
       SymbolTableCollection symbols;
       getOperation().walk([&](ConformanceOp conformance) {
-        if (!includeStdlib && inLibrary(conformance))
+        if (!selected(conformance))
           return;
         auto trait = dyn_cast_or_null<LIT::TraitDeclOp>(symbols.lookupSymbolIn(
             module, conformance.getTraitSymbol().getSymbol()));
