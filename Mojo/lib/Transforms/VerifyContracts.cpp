@@ -1396,6 +1396,41 @@ private:
     return name;
   }
 
+  /// Whether `term` multiplies, divides or takes the remainder of two
+  /// non-constant values anywhere in its definition.
+  bool nonlinear(StringRef term) {
+    if (auto it = nonlinearTerms.find(term); it != nonlinearTerms.end())
+      return it->second;
+    nonlinearTerms[term] = false; // Definitions are acyclic; guard anyway.
+    bool result = false;
+    auto def = definitions.find(term.str());
+    if (def != definitions.end())
+      if (std::optional<std::vector<SExpr>> exprs = parseSExprs(def->second))
+        for (const SExpr &e : *exprs)
+          result = result || nonlinear(e);
+    nonlinearTerms[term] = result;
+    return result;
+  }
+  bool nonlinear(const SExpr &e) {
+    if (e.list.empty())
+      return nonlinear(StringRef(e.atom));
+    static const char *ops[] = {"bvmul",  "bvudiv", "bvsdiv",
+                                "bvurem", "bvsrem", "bvsmod"};
+    if (llvm::is_contained(ops, StringRef(e.list[0].atom))) {
+      unsigned unknowns = 0;
+      for (const SExpr &arg : ArrayRef(e.list).drop_front()) {
+        bool constant = (arg.list.size() == 3 && arg.list[0].atom == "_") ||
+                        StringRef(arg.atom).starts_with("#");
+        unknowns += !constant;
+      }
+      if (unknowns >= 2)
+        return true;
+    }
+    return llvm::any_of(ArrayRef(e.list).drop_front(),
+                        [&](const SExpr &arg) { return nonlinear(arg); });
+  }
+  llvm::StringMap<bool> nonlinearTerms;
+
   /// The names of terms (`t12`, `h3`) used in an expression.
   static SmallVector<std::string> namesIn(StringRef expr) {
     SmallVector<std::string> names;
@@ -1887,10 +1922,14 @@ private:
     }
     // `comptime assert c`: the compiler checks `c` when it elaborates this
     // code (for each instantiation and target), so it holds from here on.
+    // Nonlinear ones are not assumed (sound: assuming less): products of
+    // unknown parameters in every query's path made a MAX kernel's
+    // verification take 18 s instead of 3, with the same results.
     if (auto assertion = dyn_cast<ParamAssertOp>(op)) {
       std::string cond = paramTerm(assertion.getCond(), {true, 1, false});
-      state.pc =
-          define({true, 1, false}, "(and " + state.pc + " " + cond + ")", "r");
+      if (!nonlinear(cond))
+        state.pc = define({true, 1, false},
+                          "(and " + state.pc + " " + cond + ")", "r");
       return;
     }
     if (isa<HLCF::ReturnOp>(op)) {
