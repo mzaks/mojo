@@ -3216,10 +3216,15 @@ private:
               StringRef(name->path)
                   .starts_with("std::sys::info::simd_width_of[!kgen.target,::"
                                "DType,")) {
+            // As cases, not `w & (w - 1) == 0`: each case makes the width a
+            // constant. With the bit trick six of gemv's `vectorize`
+            // preconditions ran to the solver's limit; as cases they are
+            // proven.
             std::string w = parameterValue(printed(attr), sort);
-            std::string fact = "(and (bvule " + w + " " + bvConst(256, 64) +
-                               ") (= (bvand " + w + " (bvsub " + w + " " +
-                               bvConst(1, 64) + ")) " + bvConst(0, 64) + "))";
+            std::string fact = "(or (= " + w + " " + bvConst(0, 64) + ")";
+            for (int64_t v = 1; v <= 256; v *= 2)
+              fact += " (= " + w + " " + bvConst(v, 64) + ")";
+            fact += ")";
             if (addedFacts.insert(fact).second)
               facts.push_back(fact);
             return w;
