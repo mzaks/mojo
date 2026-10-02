@@ -84,7 +84,25 @@ struct Sort {
   }
 };
 
+/// Whether the IR printer can print `entity`: it asserts on a member alias
+/// whose sugared value is not a type (seen in max/kernels/src/algorithm,
+/// where `--mlir-print-ir-after-all` asserts too).
+template <typename Entity>
+bool printable(Entity entity) {
+  bool ok = true;
+  entity.walk([&](SugarAttr sugar) {
+    if (sugar.getKind() == SugarKind::MemberAlias &&
+        !isa<TypeParamAttr>(sugar.getSugared()))
+      ok = false;
+  });
+  return ok;
+}
+
+/// The printed IR of `type`, or "<unprintable>" (which no model matches,
+/// so its values are opaque).
 std::string printed(Type type) {
+  if (!printable(type))
+    return "<unprintable>";
   std::string text;
   llvm::raw_string_ostream os(text);
   type.print(os);
@@ -92,6 +110,8 @@ std::string printed(Type type) {
 }
 
 std::string printed(Attribute attr) {
+  if (!printable(attr))
+    return "<unprintable>";
   std::string text;
   llvm::raw_string_ostream os(text);
   attr.print(os);
