@@ -1460,6 +1460,8 @@ private:
   llvm::StringMap<bool> targetTerms;
   /// The rank of each layout type parameter seen, by its printed form.
   std::map<std::string, std::string> rankTerms;
+  /// Facts that are added once however often their terms are met.
+  std::set<std::string> addedFacts;
 
   /// The names of terms (`t12`, `h3`) used in an expression.
   static SmallVector<std::string> namesIn(StringRef expr) {
@@ -3162,6 +3164,24 @@ private:
           if (std::optional<CalleeName> name = calleeName(ops[0]))
             if (MaybeTerm t = targetPredicate(name->path, sort))
               return *t;
+        // `simd_width_of[dtype]()`: the target's SIMD bit width (128 on
+        // every GPU target, at most 512 on CPUs, 0 for no target) divided by
+        // the dtype's (8 times its size, a power of two): 0 or a power of
+        // two, at most 256 (assumed).
+        if (ops.size() == 1 && !sort.isBool && sort.width == 64)
+          if (std::optional<CalleeName> name = calleeName(ops[0]);
+              name &&
+              StringRef(name->path)
+                  .starts_with("std::sys::info::simd_width_of[!kgen.target,::"
+                               "DType,")) {
+            std::string w = parameterValue(printed(attr), sort);
+            std::string fact = "(and (bvule " + w + " " + bvConst(256, 64) +
+                               ") (= (bvand " + w + " (bvsub " + w + " " +
+                               bvConst(1, 64) + ")) " + bvConst(0, 64) + "))";
+            if (addedFacts.insert(fact).second)
+              facts.push_back(fact);
+            return w;
+          }
         // `Wrapper(n)` of an integer wrapper (`GEMVAlgorithm.GEMV_KERNEL`
         // is `GEMVAlgorithm(0)`): `n`.
         if (ops.size() == 2 && !sort.isBool)
