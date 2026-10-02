@@ -1558,6 +1558,36 @@ Tensors and GPU kernels:
   pass to relate a generic tensor's `static_shape` to `dim()` and to know
   the target's SIMD width (not modelled; a false positive). Without that
   branch the call is proven.
+- The MiniMax branch, proven. Four pieces, each general:
+  - `simd_width_of[dtype]()` is 0 or a power of two, at most 256 (an
+    assumption read off the targets: `simd_bit_width` is 128 on every GPU
+    target, at most 512 on CPUs, 0 for no target; a dtype's bit width is 8
+    times its size, a power of two). `6144 % w == 0` follows.
+  - `static_shape[k]` of a generic layout and `dim[k]()` of its tensors
+    are related, but only where the layout is flat: `static_shape` counts
+    flattened leaves, `dim` outer modes, so for a nested mode 0 of shape
+    `(p, q)`, `static_shape[1]` is `q`. The fact is `flat_rank == rank and
+    static_shape[k] >= 0 => dim[k]() == static_shape[k]`, with `rank`
+    and `flat_rank` one term per layout (keyed by the frame the layout
+    resolves to, so a callee's `Self.LayoutType` is its caller's tensor's
+    and two callees' are different). `flat_rank` is known only as the
+    layout's witness (`a.LayoutType.flat_rank`): `TileTensor.flat_rank`
+    is `_Flattened[...].length`, which the frontend unrolls into a 35 KB
+    expression that no longer names it, and recognizing it by shape could
+    take something else for it.
+  - `dtype in (DType.float32, ...)` (`Tuple.__contains__` as a parameter
+    expression) is a disjunction of code comparisons, only for tuples of
+    dtype literals.
+  - A dtype's code (`#pop.dtype_to_ui8`, what `DType.__eq__` compares) is
+    one term per dtype after resolving through call frames; a callee's
+    clause (`a_type == .float32`) now speaks of its caller's `a.dtype`
+    instead of a fresh unknown per callee.
+  In the gemv copy, with `is_minimax_router_gemm` given its result as a
+  clause and `gemv_gpu` stating `comptime assert a.LayoutType.flat_rank
+  == 2`, the dispatcher's precondition is proven; with the `n == 1` bug
+  restored it is still reported. That assertion is new: the MiniMax test
+  reads K from `a.static_shape[1]`, which is not K for a nested `a`, so
+  gemv relies on flat layouts without saying so.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

@@ -13,6 +13,8 @@
 # Generic code for `verify-contracts`: each function is verified once, for
 # every value of its parameters; see README.md.
 
+from std.sys import simd_width_of
+
 
 # --- must be PROVEN ---
 def ok_param_index[n: Int](xs: List[Int]) -> Int:
@@ -87,6 +89,22 @@ def ok_where_range[n: Int](xs: List[Int]) -> Int where n <= 8:
     return sum
 
 
+def ok_simd_width[dt: DType](xs: List[Int]) -> Int:
+    comptime width = simd_width_of[dt]()  # 0 or a power of two up to 256
+    if len(xs) == 1:
+        return xs[6144 % width]
+    return 0
+
+
+def ok_dtype_in[dt: DType](xs: List[Int]) -> Int:
+    comptime if dt == DType.float32:
+        comptime if dt in (DType.float32, DType.bfloat16):
+            return 0
+        else:
+            return xs[0]  # not reached: `float32` is in the tuple
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_param_no_lower[n: Int](xs: List[Int]) -> Int:
     if n < len(xs):
@@ -131,4 +149,18 @@ def bad_where_other[
 ](xs: List[Int]) -> Int where 0 <= m and m < 8:
     if len(xs) >= 8:
         return xs[n]  # the constraint is on `m`
+    return 0
+
+
+def bad_simd_width[dt: DType](xs: List[Int]) -> Int:
+    comptime width = simd_width_of[dt]()
+    if len(xs) == 1:
+        return xs[6 % width]  # 2 for a width of 4
+    return 0
+
+
+def bad_dtype_in[dt: DType](xs: List[Int]) -> Int:
+    comptime if dt in (DType.float32, DType.bfloat16):
+        comptime if dt != DType.float32:
+            return xs[0]  # `bfloat16` gets here
     return 0

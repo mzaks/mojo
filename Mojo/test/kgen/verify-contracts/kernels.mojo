@@ -32,6 +32,7 @@ from std.sys.info import (
     has_nvidia_gpu_accelerator,
     is_gpu,
     is_nvidia_gpu,
+    simd_width_of,
 )
 
 comptime LD = type_of(row_major(1, 1))  # dimensions known at run time
@@ -273,6 +274,31 @@ def ok_broadcast_bounds():
     holds(t < block_dim.x)  # every thread's is below
 
 
+def ok_static_extent(a: TileTensor[mut=False, ...]):
+    comptime assert a.rank == 2
+    comptime assert a.LayoutType.flat_rank == 2  # no nested mode
+    comptime if a.static_shape[1] > -1:
+        holds(Int(a.dim[1]()) == a.static_shape[1])
+
+
+def is_router[
+    dtype: DType, static_K: Int
+](out result: Bool where result == (dtype == .float32 and static_K == 6144)):
+    result = dtype == .float32 and static_K == 6144
+
+
+def ok_static_router(a: TileTensor[mut=False, ...]):
+    # gemv's MiniMax branch: a K of 6144 known at compile time is a multiple
+    # of every SIMD width.
+    comptime assert a.rank == 2
+    comptime assert a.LayoutType.flat_rank == 2
+    comptime has_K = a.static_shape[1] > -1
+    comptime static_K = a.static_shape[1] if has_K else -1
+    comptime simd_width = simd_width_of[a.dtype]()
+    if has_K and is_router[a.dtype, static_K]():
+        holds(Int(a.dim[1]()) % simd_width == 0)
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -445,3 +471,16 @@ def bad_broadcast_load(
     if n > 0:
         var v = warp.broadcast(p[unsafe_offset=0])
         holds(v == p[unsafe_offset=0])  # memory is not copied
+
+
+def bad_static_extent_nested(a: TileTensor[mut=False, ...]):
+    comptime assert a.rank == 2
+    comptime if a.static_shape[1] > -1:
+        # A nested mode 0 makes `static_shape[1]` a leaf of it.
+        holds(Int(a.dim[1]()) == a.static_shape[1])
+
+
+def bad_static_extent_unknown(a: TileTensor[mut=False, ...]):
+    comptime assert a.rank == 2
+    comptime assert a.LayoutType.flat_rank == 2
+    holds(Int(a.dim[1]()) == a.static_shape[1])  # -1 when known at run time
