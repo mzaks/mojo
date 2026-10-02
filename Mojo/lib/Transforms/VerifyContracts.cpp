@@ -1458,6 +1458,8 @@ private:
     return result;
   }
   llvm::StringMap<bool> targetTerms;
+  /// The rank of each layout type parameter seen, by its printed form.
+  std::map<std::string, std::string> rankTerms;
 
   /// The names of terms (`t12`, `h3`) used in an expression.
   static SmallVector<std::string> namesIn(StringRef expr) {
@@ -3027,6 +3029,14 @@ private:
       return parameterValue(printed(attr), sort);
     if (auto sugar = dyn_cast<SugarAttr>(attr))
       return paramTerm(sugar.getCanonical(), sort, depth + 1);
+    // A layout's rank (`t.rank`, the `rank` witness of its layout type):
+    // remembered by the layout, for `num_elements()`.
+    if (auto witness = dyn_cast<GetWitnessAttr>(attr);
+        witness && witness.getWitnessName() == "rank" && !sort.isBool) {
+      std::string term = parameterValue(printed(attr), sort);
+      rankTerms[printed(witness.getTypeValue())] = term;
+      return term;
+    }
     if (auto index = dyn_cast<ParamIndexRefAttr>(attr);
         index && positionalParams && index.getDepth() == 0 &&
         index.getIndex() < positionalParams->size())
@@ -4135,6 +4145,53 @@ private:
       if (target.isBool || target.width != 64)
         return false;
       values[result] = term(call.getOperands()[0], state);
+      return true;
+    }
+    // The implicit conversion of a mutable tensor to an immutable one: the
+    // same tensor (layout and storage), so the same dimensions.
+    if (path.starts_with("layout::tile_tensor::TileTensor::__init__[") &&
+        path.contains("](::TileTensor[") && call.getNumOperands() == 1 &&
+        !isa<LIT::RefType>(call.getOperands()[0].getType())) {
+      values[result] = term(call.getOperands()[0], state);
+      return true;
+    }
+    // `t.num_elements()`: the product of its dimensions (its rank from its
+    // layout's shape).
+    if (path.starts_with("layout::tile_tensor::TileTensor::num_elements(") &&
+        call.getNumOperands() == 1) {
+      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      if (params.size() < 4)
+        return false;
+      auto product = [&](size_t rank) -> MaybeTerm {
+        std::string p;
+        for (size_t k = 0; k < rank; ++k) {
+          MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
+          if (!d)
+            return std::nullopt;
+          p = k ? "(bvmul " + p + " " + *d + ")" : *d;
+        }
+        return p;
+      };
+      std::string layout = printed(resolveParam(params[3]));
+      size_t rank = layoutList(layout, 0).size();
+      if (rank != 0) {
+        MaybeTerm p = product(rank);
+        if (!p)
+          return false;
+        values[result] = define(sort, *p);
+        return true;
+      }
+      // A generic layout: by its rank where one was seen (`comptime assert
+      // t.rank == 2`), for ranks up to 4.
+      auto it = rankTerms.find(layout);
+      if (it == rankTerms.end())
+        return false;
+      std::string n = declare(sort, "n");
+      for (size_t r = 1; r <= 4; ++r)
+        if (MaybeTerm p = product(r))
+          facts.push_back("(=> (= " + it->second + " " + bvConst(r, 64) +
+                          ") (= " + n + " " + *p + "))");
+      values[result] = n;
       return true;
     }
     if (path.starts_with("layout::tile_tensor::_coord_in_bounds[") &&
