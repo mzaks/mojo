@@ -56,6 +56,10 @@ _EXTRA_CONSTRAINTS = {
         "//conditions:default": [],
     }),
     "test_gemv_bf16.mojo": ["//:nvidia_gpu"],  # FIXME: KERN-1377
+    "test_gemv_transposed_n1.mojo": select({
+        "//:apple_gpu": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),  # Same kernel as test_gemv.mojo: MOCO-3587
     "test_gemv_multirow.mojo": ["//:nvidia_gpu"],
     "test_gemv_tma.mojo": select({
         "//:h100_gpu": ["//:h100_gpu"],
