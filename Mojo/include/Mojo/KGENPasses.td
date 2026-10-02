@@ -66,6 +66,13 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "With generic-launched: resource limit per query of a launched "
            "generic kernel; what it leaves open is checked for each "
            "launched instantiation">,
+    Option<"intRetry", "int-retry", "bool", /*default=*/"true",
+           "Ask the queries answered `unknown` again over the integers "
+           "(an exact translation; only proofs are taken)">,
+    Option<"intTranslateFile", "int-translate-file", "std::string",
+           /*default=*/"\"\"",
+           "Testing: translate this SMT-LIB file as the integer retry does, "
+           "to <file>.int.smt2, and verify nothing">,
     Option<"wallSeconds", "wall-seconds", "unsigned", /*default=*/"60",
            "Wall-clock cap on each z3 process, in seconds">,
     Option<"dumpDir", "dump-dir", "std::string", /*default=*/"\"\"",

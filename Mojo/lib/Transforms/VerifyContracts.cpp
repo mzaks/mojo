@@ -451,6 +451,483 @@ std::string query(ArrayRef<std::string> assumptions, StringRef goal,
 }
 
 //===----------------------------------------------------------------------===//
+// Integer retry
+//===----------------------------------------------------------------------===//
+//
+// A query the solver answers `unknown` over bit-vectors (typically one with
+// products of unknowns, `row * k + col < m * k`) is asked again over
+// mathematical integers, which z3's nonlinear arithmetic handles far better.
+// The translation is exact where it can be: a `w`-bit value is its signed
+// value, arithmetic wraps (`mod 2^w`), unsigned operations work on the
+// unsigned view, division keeps SMT-LIB's results for a zero divisor, and
+// shifts, masks, extracts, extensions and concatenations by constants are
+// arithmetic. Other bit operations become unknowns in range, which only
+// makes a proof harder. So an `unsat` over the integers is an `unsat` over
+// the bit-vectors; anything else stays unknown.
+
+struct SExpr {
+  std::string atom;
+  std::vector<SExpr> list;
+  bool isAtom() const { return list.empty() && !atom.empty(); }
+};
+
+/// Parses the scripts this pass writes: lists, atoms, string literals and
+/// `;` comments (dropped).
+std::optional<std::vector<SExpr>> parseSExprs(StringRef text) {
+  std::vector<std::vector<SExpr>> stack(1);
+  size_t i = 0;
+  while (i < text.size()) {
+    char c = text[i];
+    if (c == ';') {
+      while (i < text.size() && text[i] != '\n')
+        ++i;
+    } else if (isspace(static_cast<unsigned char>(c))) {
+      ++i;
+    } else if (c == '(') {
+      stack.emplace_back();
+      ++i;
+    } else if (c == ')') {
+      if (stack.size() < 2)
+        return std::nullopt;
+      SExpr e;
+      e.list = std::move(stack.back());
+      stack.pop_back();
+      if (e.list.empty())
+        e.atom = "()";
+      stack.back().push_back(std::move(e));
+      ++i;
+    } else if (c == '"') {
+      size_t j = text.find('"', i + 1);
+      if (j == StringRef::npos)
+        return std::nullopt;
+      stack.back().push_back({text.slice(i, j + 1).str(), {}});
+      i = j + 1;
+    } else {
+      size_t j = i;
+      while (j < text.size() && !isspace(static_cast<unsigned char>(text[j])) &&
+             text[j] != '(' && text[j] != ')' && text[j] != ';')
+        ++j;
+      stack.back().push_back({text.slice(i, j).str(), {}});
+      i = j;
+    }
+  }
+  if (stack.size() != 1)
+    return std::nullopt;
+  return std::move(stack.front());
+}
+
+std::string printSExpr(const SExpr &e) {
+  if (e.list.empty())
+    return e.atom;
+  std::string text = "(";
+  for (auto [k, child] : llvm::enumerate(e.list))
+    text += (k ? " " : "") + printSExpr(child);
+  return text + ")";
+}
+
+class IntTranslator {
+public:
+  /// The translated script, or nothing if it uses what is not translated.
+  std::optional<std::string> translate(StringRef script) {
+    std::optional<std::vector<SExpr>> commands = parseSExprs(script);
+    if (!commands)
+      return std::nullopt;
+    for (const SExpr &cmd : *commands)
+      if (!command(cmd))
+        return std::nullopt;
+    return out;
+  }
+
+private:
+  std::string out;
+  /// Bit width of each constant and defined term (0: not a bit-vector).
+  llvm::StringMap<unsigned> widths;
+  /// Result width of each declared function.
+  llvm::StringMap<unsigned> functionWidths;
+  /// Variables bound by enclosing quantifiers, with their widths.
+  SmallVector<std::pair<std::string, unsigned>> bound;
+  /// Unknowns standing for untranslated terms, by the term's text, with the
+  /// `push` depth they were declared at.
+  std::map<std::string, std::pair<std::string, unsigned>> abstractions;
+  std::string pending; // Their declarations, written before the command.
+  /// Applications of declared functions whose range is asserted, with the
+  /// `push` depth it was asserted at.
+  std::set<std::pair<std::string, unsigned>> ranged;
+  unsigned depth = 0, counter = 0;
+
+  static std::string pow2(unsigned k) {
+    return llvm::toString(APInt::getOneBitSet(k + 1, k), 10, false);
+  }
+  static std::string range(unsigned w, const std::string &x) {
+    return "(and (<= (- " + pow2(w - 1) + ") " + x + ") (< " + x + " " +
+           pow2(w - 1) + "))";
+  }
+  static std::string wrap(unsigned w, const std::string &x) {
+    return "(- (mod (+ " + x + " " + pow2(w - 1) + ") " + pow2(w) + ") " +
+           pow2(w - 1) + ")";
+  }
+  static std::string unsignedView(unsigned w, const std::string &x) {
+    return "(ite (< " + x + " 0) (+ " + x + " " + pow2(w) + ") " + x + ")";
+  }
+  /// The signed value of the unsigned `w`-bit value `x`.
+  static std::string signedView(unsigned w, const std::string &x) {
+    return "(ite (>= " + x + " " + pow2(w - 1) + ") (- " + x + " " + pow2(w) +
+           ") " + x + ")";
+  }
+
+  static std::optional<unsigned> bvSort(const SExpr &sort) {
+    unsigned w;
+    if (sort.list.size() == 3 && sort.list[0].atom == "_" &&
+        sort.list[1].atom == "BitVec" &&
+        !StringRef(sort.list[2].atom).getAsInteger(10, w) && w > 0)
+      return w;
+    return std::nullopt;
+  }
+  /// The sort of the translation: `Int` for a bit-vector, else as is.
+  static std::optional<std::string> sortText(const SExpr &sort,
+                                             unsigned &width) {
+    if (std::optional<unsigned> w = bvSort(sort)) {
+      width = *w;
+      return std::string("Int");
+    }
+    width = 0;
+    if (sort.atom == "Bool" || sort.atom == "Int")
+      return sort.atom;
+    return std::nullopt;
+  }
+
+  bool command(const SExpr &cmd) {
+    if (cmd.list.empty())
+      return false;
+    StringRef head = cmd.list[0].atom;
+    std::string text;
+    if (head == "declare-const" && cmd.list.size() == 3) {
+      unsigned w;
+      std::optional<std::string> sort = sortText(cmd.list[2], w);
+      if (!sort)
+        return false;
+      widths[cmd.list[1].atom] = w;
+      text = "(declare-const " + cmd.list[1].atom + " " + *sort + ")\n";
+      if (w)
+        text += "(assert " + range(w, cmd.list[1].atom) + ")\n";
+    } else if (head == "declare-fun" && cmd.list.size() == 4) {
+      std::string args;
+      for (const SExpr &arg : cmd.list[2].list) {
+        unsigned w;
+        std::optional<std::string> sort = sortText(arg, w);
+        if (!sort)
+          return false;
+        args += (args.empty() ? "" : " ") + *sort;
+      }
+      unsigned w;
+      std::optional<std::string> result = sortText(cmd.list[3], w);
+      if (!result)
+        return false;
+      functionWidths[cmd.list[1].atom] = w;
+      text = "(declare-fun " + cmd.list[1].atom + " (" + args + ") " +
+             *result + ")\n";
+    } else if (head == "define-fun" && cmd.list.size() == 5 &&
+               cmd.list[2].list.empty()) {
+      unsigned w;
+      std::optional<std::string> sort = sortText(cmd.list[3], w);
+      unsigned bodyWidth;
+      std::optional<std::string> body =
+          sort ? term(cmd.list[4], bodyWidth) : std::nullopt;
+      if (!body || bodyWidth != w)
+        return false;
+      widths[cmd.list[1].atom] = w;
+      text = "(define-fun " + cmd.list[1].atom + " () " + *sort + " " + *body +
+             ")\n";
+    } else if (head == "assert" && cmd.list.size() == 2) {
+      unsigned w;
+      std::optional<std::string> body = term(cmd.list[1], w);
+      if (!body || w)
+        return false;
+      text = "(assert " + *body + ")\n";
+    } else if (head == "push") {
+      ++depth;
+      text = printSExpr(cmd) + "\n";
+    } else if (head == "pop") {
+      if (depth)
+        --depth;
+      for (auto it = abstractions.begin(); it != abstractions.end();)
+        it = it->second.second > depth ? abstractions.erase(it) : std::next(it);
+      for (auto it = ranged.begin(); it != ranged.end();)
+        it = it->second > depth ? ranged.erase(it) : std::next(it);
+      text = printSExpr(cmd) + "\n";
+    } else if (head == "set-option" || head == "echo" ||
+               head == "check-sat") {
+      text = printSExpr(cmd) + "\n";
+    } else {
+      return false;
+    }
+    out += pending + text;
+    pending.clear();
+    return true;
+  }
+
+  std::optional<unsigned> widthOf(StringRef name) const {
+    for (auto it = bound.rbegin(); it != bound.rend(); ++it)
+      if (it->first == name)
+        return it->second;
+    auto it = widths.find(name);
+    if (it == widths.end())
+      return std::nullopt;
+    return it->second;
+  }
+
+  bool mentionsBound(const SExpr &e) const {
+    if (e.list.empty())
+      return llvm::any_of(bound, [&](auto &b) { return b.first == e.atom; });
+    return llvm::any_of(e.list, [&](const SExpr &c) { return mentionsBound(c); });
+  }
+
+  /// An unknown `w`-bit value in range for `e`, the same for the same text.
+  std::optional<std::string> abstraction(const SExpr &e, unsigned w) {
+    if (mentionsBound(e))
+      return std::nullopt;
+    std::string key = printSExpr(e);
+    auto it = abstractions.find(key);
+    if (it != abstractions.end())
+      return it->second.first;
+    std::string name = "ia" + std::to_string(counter++);
+    abstractions[key] = {name, depth};
+    pending += "(declare-const " + name + " Int)\n(assert " + range(w, name) +
+               ")\n";
+    return name;
+  }
+
+  static std::optional<APInt> literal(const SExpr &e, unsigned &w) {
+    StringRef a = e.atom;
+    if (e.list.size() == 3 && e.list[0].atom == "_" &&
+        StringRef(e.list[1].atom).starts_with("bv")) {
+      if (StringRef(e.list[2].atom).getAsInteger(10, w) || !w)
+        return std::nullopt;
+      APInt v;
+      if (StringRef(e.list[1].atom).drop_front(2).getAsInteger(10, v))
+        return std::nullopt;
+      return v.zextOrTrunc(w);
+    }
+    if (a.starts_with("#x") || a.starts_with("#b")) {
+      unsigned radix = a[1] == 'x' ? 16 : 2;
+      w = (a.size() - 2) * (radix == 16 ? 4 : 1);
+      APInt v;
+      if (!w || a.drop_front(2).getAsInteger(radix, v))
+        return std::nullopt;
+      return v.zextOrTrunc(w);
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<unsigned> smallConstant(const SExpr &e) {
+    unsigned w;
+    std::optional<APInt> v = literal(e, w);
+    if (!v || v->getActiveBits() > 16)
+      return std::nullopt;
+    return static_cast<unsigned>(v->getZExtValue());
+  }
+
+  /// The translation of `e`, and its bit width (0 for a Boolean).
+  std::optional<std::string> term(const SExpr &e, unsigned &w) {
+    if (unsigned lw; std::optional<APInt> v = literal(e, lw)) {
+      w = lw;
+      return llvm::toString(*v, 10, /*Signed=*/true);
+    }
+    if (e.list.empty()) {
+      if (e.atom == "true" || e.atom == "false") {
+        w = 0;
+        return e.atom;
+      }
+      std::optional<unsigned> width = widthOf(e.atom);
+      if (!width)
+        return std::nullopt;
+      w = *width;
+      return e.atom;
+    }
+    const SExpr &head = e.list[0];
+    ArrayRef<SExpr> args = ArrayRef(e.list).drop_front();
+    // Indexed operators: `((_ extract hi lo) x)`, `((_ zero_extend n) x)`.
+    if (!head.list.empty() && head.list.size() >= 3 &&
+        head.list[0].atom == "_" && args.size() == 1) {
+      unsigned xw;
+      std::optional<std::string> x = term(args[0], xw);
+      if (!x || !xw)
+        return std::nullopt;
+      StringRef op = head.list[1].atom;
+      unsigned a, b = 0;
+      if (StringRef(head.list[2].atom).getAsInteger(10, a) ||
+          (head.list.size() == 4 &&
+           StringRef(head.list[3].atom).getAsInteger(10, b)))
+        return std::nullopt;
+      if (op == "sign_extend") {
+        w = xw + a;
+        return x;
+      }
+      if (op == "zero_extend") {
+        w = xw + a;
+        return a ? unsignedView(xw, *x) : *x;
+      }
+      if (op == "extract" && head.list.size() == 4 && a >= b && a < xw) {
+        w = a - b + 1;
+        return signedView(w, "(mod (div " + unsignedView(xw, *x) + " " +
+                                 pow2(b) + ") " + pow2(w) + ")");
+      }
+      return std::nullopt;
+    }
+    StringRef op = head.atom;
+    if (op == "forall" || op == "exists") {
+      if (args.size() != 2)
+        return std::nullopt;
+      std::string vars, guard = "true";
+      size_t mark = bound.size();
+      for (const SExpr &v : args[0].list) {
+        if (v.list.size() != 2)
+          return std::nullopt;
+        unsigned vw;
+        std::optional<std::string> sort = sortText(v.list[1], vw);
+        if (!sort)
+          return std::nullopt;
+        vars += "(" + v.list[0].atom + " " + *sort + ")";
+        bound.push_back({v.list[0].atom, vw});
+        if (vw)
+          guard = "(and " + guard + " " + range(vw, v.list[0].atom) + ")";
+      }
+      unsigned bw;
+      std::optional<std::string> body = term(args[1], bw);
+      bound.resize(mark);
+      if (!body || bw)
+        return std::nullopt;
+      w = 0;
+      return "(" + op.str() + " (" + vars + ") (" +
+             (op == "forall" ? "=>" : "and") + " " + guard + " " + *body +
+             "))";
+    }
+    SmallVector<std::string> xs;
+    SmallVector<unsigned> ws;
+    for (const SExpr &arg : args) {
+      unsigned aw;
+      std::optional<std::string> x = term(arg, aw);
+      if (!x)
+        return std::nullopt;
+      xs.push_back(*x);
+      ws.push_back(aw);
+    }
+    auto joined = [&] {
+      std::string text;
+      for (const std::string &x : xs)
+        text += " " + x;
+      return text;
+    };
+    // Booleans and the structural operators.
+    if (op == "and" || op == "or" || op == "not" || op == "=>" ||
+        op == "xor") {
+      w = 0;
+      return "(" + op.str() + joined() + ")";
+    }
+    if (op == "=" || op == "distinct") {
+      w = 0;
+      return "(" + op.str() + joined() + ")";
+    }
+    if (op == "ite" && xs.size() == 3) {
+      w = ws[1];
+      return "(ite" + joined() + ")";
+    }
+    // A declared function: its arguments translated, its result in range
+    // (asserted once per application, or wrapped under a quantifier).
+    if (auto it = functionWidths.find(op); it != functionWidths.end()) {
+      w = it->second;
+      std::string app = "(" + op.str() + joined() + ")";
+      if (!w)
+        return app;
+      if (mentionsBound(e))
+        return wrap(w, app);
+      if (ranged.insert({app, depth}).second)
+        pending += "(assert " + range(w, app) + ")\n";
+      return app;
+    }
+    if (xs.empty() || !ws[0])
+      return std::nullopt;
+    unsigned bw = ws[0];
+    std::string a = xs[0], b = xs.size() > 1 ? xs[1] : "";
+    auto compare = [&](StringRef cmp, bool isUnsigned) {
+      w = 0;
+      if (isUnsigned)
+        return "(" + cmp.str() + " " + unsignedView(bw, a) + " " +
+               unsignedView(bw, b) + ")";
+      return "(" + cmp.str() + " " + a + " " + b + ")";
+    };
+    if (xs.size() == 2) {
+      if (op == "bvslt") return compare("<", false);
+      if (op == "bvsle") return compare("<=", false);
+      if (op == "bvsgt") return compare(">", false);
+      if (op == "bvsge") return compare(">=", false);
+      if (op == "bvult") return compare("<", true);
+      if (op == "bvule") return compare("<=", true);
+      if (op == "bvugt") return compare(">", true);
+      if (op == "bvuge") return compare(">=", true);
+    }
+    w = bw;
+    if (op == "bvadd")
+      return wrap(bw, "(+" + joined() + ")");
+    if (op == "bvmul")
+      return wrap(bw, "(*" + joined() + ")");
+    if (op == "bvsub" && xs.size() == 2)
+      return wrap(bw, "(- " + a + " " + b + ")");
+    if (op == "bvneg" && xs.size() == 1)
+      return wrap(bw, "(- " + a + ")");
+    if (xs.size() == 2 && (op == "bvudiv" || op == "bvurem")) {
+      std::string ua = unsignedView(bw, a), ub = unsignedView(bw, b);
+      std::string r = signedView(
+          bw, "(" + std::string(op == "bvudiv" ? "div" : "mod") + " " + ua +
+                  " " + ub + ")");
+      // SMT-LIB: `x udiv 0` is all ones (-1), `x urem 0` is `x`.
+      return "(ite (= " + b + " 0) " + (op == "bvudiv" ? "(- 1)" : a) + " " +
+             r + ")";
+    }
+    if (xs.size() == 2 && (op == "bvsdiv" || op == "bvsrem")) {
+      // Truncating division of the magnitudes, with the signs applied.
+      std::string q = "(div (abs " + a + ") (abs " + b + "))";
+      std::string tq = "(ite (= (< " + a + " 0) (< " + b + " 0)) " + q +
+                       " (- " + q + "))";
+      if (op == "bvsdiv")
+        return "(ite (= " + b + " 0) (ite (< " + a + " 0) 1 (- 1)) " +
+               wrap(bw, tq) + ")";
+      return "(ite (= " + b + " 0) " + a + " (- " + a + " (* " + b + " " + tq +
+             ")))";
+    }
+    if (op == "concat" && xs.size() == 2 && ws[1]) {
+      w = bw + ws[1];
+      return signedView(w, "(+ (* " + unsignedView(bw, a) + " " +
+                               pow2(ws[1]) + ") " + unsignedView(ws[1], b) +
+                               ")");
+    }
+    // Shifts and masks by constants.
+    if (xs.size() == 2)
+      if (std::optional<unsigned> k = smallConstant(args[1])) {
+        if (op == "bvshl")
+          return *k >= bw ? std::string("0")
+                          : wrap(bw, "(* " + a + " " + pow2(*k) + ")");
+        if (op == "bvlshr")
+          return *k >= bw ? std::string("0")
+                          : signedView(bw, "(div " + unsignedView(bw, a) +
+                                               " " + pow2(*k) + ")");
+        if (op == "bvashr")
+          return "(div " + a + " " + pow2(std::min(*k, bw - 1)) + ")";
+      }
+    if (op == "bvand" && xs.size() == 2) {
+      unsigned lw;
+      if (std::optional<APInt> mask = literal(args[1], lw);
+          mask && mask->isMask() && mask->countr_one() < bw)
+        return signedView(bw, "(mod " + unsignedView(bw, a) + " " +
+                                  pow2(mask->countr_one()) + ")");
+    }
+    if (StringRef(op).starts_with("bv"))
+      return abstraction(e, bw);
+    return std::nullopt;
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Encoding
 //===----------------------------------------------------------------------===//
 
@@ -693,6 +1170,9 @@ public:
       });
     return true;
   }
+
+  /// The declarations and facts the queries share.
+  std::string scriptHeader() const { return header(); }
 
   std::string script() const {
     std::string text = header();
@@ -5336,6 +5816,23 @@ struct VerifyContractsPass
   using VerifyContractsBase::VerifyContractsBase;
 
   void runOnOperation() override {
+    if (!intTranslateFile.empty()) {
+      auto buffer = llvm::MemoryBuffer::getFile(intTranslateFile);
+      std::optional<std::string> ints;
+      if (buffer)
+        ints = IntTranslator().translate((*buffer)->getBuffer());
+      if (!ints) {
+        getOperation().emitError("verify-contracts: cannot translate ")
+            << intTranslateFile;
+        return signalPassFailure();
+      }
+      std::error_code ec;
+      llvm::raw_fd_ostream os(intTranslateFile + ".int.smt2", ec);
+      if (ec)
+        return signalPassFailure();
+      os << *ints;
+      return;
+    }
     std::string z3 = z3Path;
     if (z3.empty()) {
       if (auto found = llvm::sys::findProgramByName("z3"))
@@ -5529,6 +6026,30 @@ struct VerifyContractsPass
         return;
       std::optional<SmallVector<Answer>> answers =
           runZ3(solver, enc.script(), name);
+      // Queries answered `unknown`: once more over the integers.
+      if (intRetry && answers) {
+        SmallVector<size_t> unknown;
+        std::string text = enc.scriptHeader();
+        unsigned k = 0;
+        for (const Obligation &ob : enc.obligations) {
+          if (!ob.analyzed)
+            continue;
+          if (k < answers->size() && (*answers)[k] == Answer::Unknown) {
+            unknown.push_back(k);
+            text += query({ob.pc}, ob.cond,
+                          enc.queryRlimit ? enc.queryRlimit : solver.rlimit);
+          }
+          ++k;
+        }
+        if (!unknown.empty())
+          if (std::optional<std::string> ints =
+                  IntTranslator().translate(text))
+            if (std::optional<SmallVector<Answer>> retried =
+                    runZ3(solver, *ints, name + ".int"))
+              for (auto [i, k] : llvm::enumerate(unknown))
+                if (i < retried->size() && (*retried)[i] == Answer::Proven)
+                  (*answers)[k] = Answer::Proven;
+      }
       unsigned next = 0;
       for (Obligation &ob : enc.obligations) {
         Answer answer = Answer::NotAnalyzed;
