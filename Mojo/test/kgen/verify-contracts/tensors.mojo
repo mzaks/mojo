@@ -15,6 +15,7 @@
 
 from layout import Idx, TileTensor, row_major
 from max.gpu import block_dim, block_idx, global_idx, thread_idx
+from max.gpu.host import DeviceBuffer, DeviceContext
 from std.utils.coord import Coord, coord
 
 comptime L8 = type_of(row_major[8]())
@@ -231,6 +232,29 @@ def ok_distribute_with_offset(
     return 0
 
 
+def buffer_of(
+    buf: DeviceBuffer[DType.float32], n: Int where len(buf) == n
+) -> Int:
+    return n
+
+
+def rows_of(
+    t: TileTensor[mut=False, DType.float32, ...],
+    n: Int where Int(t.dim[0]()) == n,
+) -> Int:
+    return n
+
+
+def ok_device_buffer(
+    t: TileTensor[mut=True, DType.float32, ...], ctx: DeviceContext
+) raises -> Int:
+    comptime assert t.rank == 2
+    var buf = t.to_device_buffer(ctx)  # `num_elements()` elements
+    var rows = Int(t.dim[0]())
+    _ = rows_of(t, rows)  # converted to immutable: the same tensor
+    return buffer_of(buf, rows * Int(t.dim[1]()))
+
+
 # --- must stay UNPROVEN ---
 def bad_static(t: TileTensor[DType.float32, L8, MutAnyOrigin]) -> Float32:
     return t[8]  # one past the end
@@ -377,3 +401,10 @@ def bad_distribute_with_offset(
 ) -> Float32:
     var r = t.distribute_with_offset[row_major[2, 4]()](thread_idx.x)
     return r[0][4, 0]  # 8 // 2 = 4 rows per thread
+
+
+def bad_device_buffer(
+    t: TileTensor[mut=True, DType.float32, ...], ctx: DeviceContext
+) raises -> Int:
+    var buf = t.to_device_buffer(ctx)  # the rank is not known here
+    return buffer_of(buf, Int(t.dim[0]()) * Int(t.dim[1]()))

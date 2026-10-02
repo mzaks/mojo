@@ -294,6 +294,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `dim[k] // threads[k]` of its parent, also when the thread layout's
   sizes are parameters (`row_major[TM, TN]()`), and so is that of the
   view `distribute_with_offset` returns first in its tuple.
+  `t.num_elements()` is the product of `t`'s dimensions, for a generic
+  layout by the rank a `comptime assert t.rank == r` states (r up to 4);
+  `t.to_device_buffer(ctx)` states that the buffer holds
+  `t.num_elements()` elements, and a mutable tensor converted to an
+  immutable one is the same tensor. `GemmShape.get(c, a, b)` states
+  `M`, `N` and `K` as `c`'s and `a`'s dimensions.
 - GPU kernels: `thread_idx`, `block_idx`, `block_dim` and `grid_dim` are
   one value per axis in a function, with the launch limits every
   supported GPU has (assumptions): `0 <= thread_idx < block_dim <= 1024`

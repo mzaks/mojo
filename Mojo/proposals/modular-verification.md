@@ -1496,6 +1496,26 @@ Tensors and GPU kernels:
   sample's work); at 0.5M 701/1395 and 2511M (also 3 in test_list). The
   obligation limit at 50M changed nothing (no obligation needed more).
   The user chose 1M as the default (`houdini-rlimit=`).
+- A launch of a real kernel, proven. linalg/gemv.mojo's `gemv_kernel`
+  takes raw pointers and `m`, `n`, `k`; with its extents stated
+  (`a._extent() >= m * k`, ...), its launch in `gemv_gpu_dispatch`
+  (`a.to_device_buffer(ctx)`, `Int32(m)`, ...) needs: the buffer's length
+  (`to_device_buffer` now states `len(result) == self.num_elements()`),
+  `num_elements()` as `dim[0] * dim[1]` (the pass models it; the layout
+  is generic, so by the rank `comptime assert a.rank == 2` gives), `M`,
+  `N`, `K` from `GemmShape.get` (now stated), `c` converted to immutable
+  for `GemmShape.get` being the same tensor (modelled), and what nothing
+  stated: that the shapes agree, fit in `Int32`, and that `n >= 1` (the
+  kernel writes `c[row]` for every row below `m`, which `c` with `m * n`
+  elements only has room for when `n >= 1`; `gemv_gpu` dispatches
+  `GEMV_KERNEL` only when `n == 1`, so no caller breaks it, but the
+  dispatcher does not say so). With those as preconditions of
+  `gemv_gpu_dispatch` and `gemv_gpu` (in a copy; MAX's sources are not
+  changed), the launch's two preconditions and the dispatcher's are
+  proven (the products by the integer retry); the file takes 20 s. The
+  cost of pushing contracts down to kernels is this chain: every
+  function between the user and the launch states what its kernel
+  needs.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now
