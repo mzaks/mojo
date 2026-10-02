@@ -2251,27 +2251,42 @@ private:
     return std::nullopt;
   }
 
+  /// Whether `term` is a bit-vector literal other than 0 (`(_ bv4 64)`).
+  static bool isNonzeroLiteral(StringRef term) {
+    return term.starts_with("(_ bv") && !term.starts_with("(_ bv0 ");
+  }
+
   /// `a // b` or `a % b` as Mojo defines them for integers: rounding towards
   /// negative infinity, so the remainder has the divisor's sign. SMT-LIB's
   /// signed division truncates, so a nonzero remainder of the other sign is
-  /// corrected. Division by zero is whatever SMT-LIB makes it.
+  /// corrected. Both are 0 for `b == 0`, as `SIMD` defines them (SMT-LIB's
+  /// are not: an unsigned quotient of all ones, for one).
   static std::string floorDivision(bool remainder, Sort sort, StringRef a,
                                    StringRef b) {
-    if (!sort.isSigned)
-      return ("(" + Twine(remainder ? "bvurem" : "bvudiv") + " " + a + " " + b +
-              ")")
-          .str();
     std::string w = std::to_string(sort.width);
-    std::string q = ("(bvsdiv " + a + " " + b + ")").str();
-    std::string r = ("(bvsrem " + a + " " + b + ")").str();
     std::string zero = "(_ bv0 " + w + ")";
-    std::string adjust =
-        ("(and (not (= " + r + " " + zero + ")) (not (= (bvslt " + a + " " +
-         zero + ") (bvslt " + b + " " + zero + "))))")
-            .str();
-    if (remainder)
-      return "(ite " + adjust + " (bvadd " + r + " " + b.str() + ") " + r + ")";
-    return "(ite " + adjust + " (bvsub " + q + " (_ bv1 " + w + ")) " + q + ")";
+    std::string result;
+    if (!sort.isSigned) {
+      result = ("(" + Twine(remainder ? "bvurem" : "bvudiv") + " " + a + " " +
+                b + ")")
+                   .str();
+    } else {
+      std::string q = ("(bvsdiv " + a + " " + b + ")").str();
+      std::string r = ("(bvsrem " + a + " " + b + ")").str();
+      std::string adjust =
+          ("(and (not (= " + r + " " + zero + ")) (not (= (bvslt " + a + " " +
+           zero + ") (bvslt " + b + " " + zero + "))))")
+              .str();
+      result = remainder ? "(ite " + adjust + " (bvadd " + r + " " + b.str() +
+                               ") " + r + ")"
+                         : "(ite " + adjust + " (bvsub " + q + " (_ bv1 " + w +
+                               ")) " + q + ")";
+    }
+    // The zero case only where the divisor may be 0: an `ite` on every
+    // division made a MAX kernel's verification 5x slower (145 s against 27).
+    if (isNonzeroLiteral(b))
+      return result;
+    return "(ite (= " + b.str() + " " + zero + ") " + zero + " " + result + ")";
   }
 
   /// `a.__ceildiv__(b)` as `SIMD` defines it: `-(a // -b)` when signed, the
