@@ -1333,6 +1333,61 @@ Tensors and GPU kernels:
   test_dict 24/34 (was 22/32; `Pointer(to=dict["a"])[]` adds two), the
   others unchanged. pointers.mojo: 15 of 24, the others in `bad_*`
   functions.
+- MAX's own kernels. Imported code is in the module only as far as the
+  file uses it, so `packages=nn,linalg` (verify the named top-level
+  packages' functions) only helps for what is referenced; to verify the
+  kernels themselves, each source file of max/kernels/src ran as the main
+  file (relative imports made absolute in a copy). 430 files, about 35
+  minutes on 4 workers, median 1 s a file: 5951 obligations, 580 proven;
+  145 files have none (their accesses go through `raw_load`/`raw_store`
+  and intrinsics, which have no contracts). The unproven ones are mostly
+  missing preconditions: kernels bound indices by scalar arguments (`m`,
+  `k`, `num_tokens`) that nothing relates to the extents of their
+  pointers or the dimensions of their tensors. About 20 files do not
+  parse in this setup (the `extensibility` package is not built here).
+- What the sweep found in the pass: three files crashed it in the IR
+  printer, which asserts on a member-alias sugar whose sugared value is
+  not a type (`--mlir-print-ir-after-all` asserts on them too); types and
+  attributes it cannot print are now opaque. Integer `//` and `%` by zero
+  were SMT-LIB's values (all ones for an unsigned quotient); they are 0,
+  as `SIMD` defines them, with the zero case only where the divisor is
+  not a nonzero literal. `lane_id()` is in `[0, 64)`. `ufloordiv`,
+  `udiv_unchecked` and `uceildiv` are bounded (`0 <= q <= a` for `a >=
+  0`): an exact quotient, multiplied by an unknown, made one Houdini
+  script of a MAX kernel take 909 s instead of 4 s (11.7 s as shift and
+  mask by the literal 32). `warp.broadcast(x)` stays an unknown (sound;
+  the user chose it over assuming warp-uniform values).
+- `gemv_kernel` with stated extents (`a._extent() >= m * k`, `b._extent()
+  >= k`, `c._extent() >= m`, in a scratch copy): `b.load(idx)` proven;
+  `c[global_warp_id]` and `a.load(global_warp_id * k + idx)` only without
+  its `warp.broadcast`, the latter only over the integers.
+- The integer retry. z3 does not decide `g*k + i < m*k` from `0 <= g <
+  m < 2^31`, `0 <= i < k < 2^31` over 64-bit bit-vectors (`unknown` after
+  13 s, also with the monotonicity fact given), and proves it over the
+  integers in 0.15 s (0.12 s with exact carries, 0.00 s with `mod`). So a
+  query answered `unknown` is translated and asked again: each `w`-bit
+  value is its signed value; `+`, `-`, `*` wrap by `mod 2^w`; unsigned
+  comparisons and divisions use the unsigned value; division keeps
+  SMT-LIB's results for a zero divisor; shifts, masks, extracts,
+  extensions and concatenations by constants are arithmetic; applications
+  of declared functions are kept in range; other bit operations become
+  unknowns in range (refused under a quantifier). Exact or weaker, so
+  only `unsat` is taken. A differential fuzzer (random scripts in the
+  pass's format, 8- and 64-bit, every translated operator, through
+  `int-translate-file=`) found no query `sat` over bit-vectors and `unsat`
+  over the integers in about 6,300 pairs both decided. Before results of
+  declared functions were kept in range, gemv's query was `sat` over the
+  integers (`pext` = 2^64): incomplete, not unsound. `int-retry=false`
+  turns it off. The examples and stdlib
+  tests have no query it changes; pointers.mojo's `ok_row_major` is proven
+  only with it. On the kernel sweep it changed no count: those
+  obligations fail for missing preconditions (`sat`), not `unknown`.
+- Measuring: wall-clock A/B on this machine was dominated by other load
+  (the same file 9 s and 920 s with the same binary, as queries crossed
+  the 60 s cap); the comparison that held was z3's deterministic
+  `rlimit-count` summed over the dumped scripts: old pass against this
+  one 81.7M / 50.4M, 313.9M / 201.1M and 1028.8M / 1111.3M on the three
+  files that looked slowest.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

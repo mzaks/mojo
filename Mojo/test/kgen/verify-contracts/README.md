@@ -31,7 +31,10 @@ bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
 ```
 
 Functions from imported packages (the stdlib, `layout`, ...) are not
-verified unless `include-stdlib=true`.
+verified unless `include-stdlib=true`, or `packages=nn,linalg` for the
+named top-level packages. Only what the file uses is in the module, so
+to verify a package's own kernels, run each of its source files as the
+main file (relative imports made absolute).
 
 With `-lsp=no-dump` instead of `-elaborate`, it runs on the module the
 language server checks. That parse is lazy: a stdlib function whose body
@@ -39,13 +42,28 @@ was not needed has no body there, and so no contracts, and calls to it are
 not checked.
 
 Options: `verbose=true` reports proven obligations as remarks,
-`include-stdlib=true` also checks `std`, `rlimit=` sets the solver's
+`include-stdlib=true` also checks `std`, `packages=` the named imported
+packages, `rlimit=` sets the solver's
 deterministic resource limit of each query (default 100000000),
 `generic-launched=true` also verifies launched generic kernels for every
 value of their parameters, `generic-rlimit=` the limit of each such query
 (default 10000000; see below), `wall-seconds=` caps each z3
-process (default 60), `dump-dir=` writes the SMT-LIB scripts, and
-`cache-dir=` caches the solver's answers by a hash of each script.
+process (default 60), `int-retry=false` turns off the integer retry
+(below), `dump-dir=` writes the SMT-LIB scripts, and `cache-dir=` caches
+the solver's answers by a hash of each script.
+
+Values are bit-vectors, as in the program, so wrap-around is modelled.
+z3 decides few nonlinear bit-vector facts (`row * k + col < m * k` from
+`row < m` and `col < k` is `unknown` after 13 s), so a query answered
+`unknown` is asked again over the integers: each `w`-bit value is its
+signed value, arithmetic wraps by `mod 2^w`, unsigned operations use the
+unsigned value, division keeps SMT-LIB's results for a zero divisor, and
+shifts, masks, extracts, extensions and concatenations by constants are
+arithmetic; other bit operations become unknowns in range. The
+translation is exact or weaker, so only its proofs are taken (the same
+query: `unsat` in 0.15 s). `int-translate-file=F` writes the translation
+of the SMT-LIB file `F` to `F.int.smt2` and does nothing else (for
+testing).
 
 Functions are verified in parallel, and their scripts are the same from run
 to run, so with `cache-dir=` a function whose encoding did not change costs
@@ -172,7 +190,7 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   states this through two small helpers, `_normalize_bound` and
   `_strided_count`, whose bodies the pass verifies against their
   contracts (`include-stdlib=true`). Integer `//` and `%` round towards
-  negative infinity, as Mojo defines them.
+  negative infinity, as Mojo defines them, and are 0 for a zero divisor.
 
 - `Array`: `len(a)` is the size parameter in `a`'s type (a number, or a
   parameter such as `n` in generic code), `a[i]` requires `i` in range, and
@@ -273,7 +291,10 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   one value per axis in a function, with the launch limits every
   supported GPU has (assumptions): `0 <= thread_idx < block_dim <= 1024`
   and `0 <= block_idx < grid_dim < 2^31`; `global_idx` is
-  `block_idx * block_dim + thread_idx`. Kernels are verified like any
+  `block_idx * block_dim + thread_idx`; `lane_id()` is in `[0, 64)`
+  (warps have 32 or 64 lanes). `ufloordiv`, `udiv_unchecked` and
+  `uceildiv` are unsigned divisions; `warp.broadcast(x)` (lane 0's `x`) is
+  an unknown. Kernels are verified like any
   function, on the host, before they are compiled for a GPU.
 - A kernel states the launch it relies on as `where` clauses on its
   arguments (`grid_dim.y <= Int(c.dim[0]()) // 16`, `block_dim.x ==

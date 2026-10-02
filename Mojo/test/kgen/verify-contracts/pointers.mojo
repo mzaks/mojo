@@ -127,6 +127,18 @@ def ok_array(i: Int) -> Int:
     return 0
 
 
+def ok_row_major(
+    p: Pointer[Float32, MutAnyOrigin],
+    m: Int32,
+    k: Int32 where m >= 0 and k >= 0 and p._extent() >= Int(m) * Int(k),
+    row: Int,
+    col: Int,
+) -> Float32:
+    if 0 <= row and row < Int(m) and 0 <= col and col < Int(k):
+        return p[unsafe_offset=row * Int(k) + col]  # over the integers
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_unstated(p: Pointer[Int, MutAnyOrigin], i: Int) -> Int:
     if 0 <= i and i < 4:
@@ -187,4 +199,16 @@ def bad_list(xs: List[Int], i: Int) -> Int:
     var p = xs.unsafe_ptr()
     if 0 <= i and i <= len(xs):
         return p[unsafe_offset=i]  # `i` may be `len(xs)`
+    return 0
+
+
+def bad_row_major(
+    p: Pointer[Float32, MutAnyOrigin],
+    m: Int32,
+    k: Int32 where m >= 0 and k >= 0 and p._extent() >= Int(m) * Int(k),
+    row: Int,
+    col: Int,
+) -> Float32:
+    if 0 <= row and row < Int(m) and 0 <= col and col <= Int(k):
+        return p[unsafe_offset=row * Int(k) + col]  # `col` may be `k`
     return 0
