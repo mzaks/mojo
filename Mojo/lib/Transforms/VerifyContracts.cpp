@@ -4546,7 +4546,8 @@ private:
 
   /// `ufloordiv(a, b)`, `udiv_unchecked(a, b)` and `uceildiv(a, b)` of two
   /// `Int`s: bounded, `0 <= q <= a` for `a >= 0`, which holds for any
-  /// divisor (`q` is 0 for a zero one). Not exact: an exact quotient times
+  /// divisor allowed (`q` is 0 for a zero one; `udiv_unchecked` requires
+  /// `b > 0`). Not exact: an exact quotient times
   /// an unknown made a Houdini script of a MAX kernel take 909 s instead of
   /// 4 s (11.7 s as shift and mask by the literal 32).
   bool evalUnsignedDivision(LIT::CallOp call, const CalleeName &name,
