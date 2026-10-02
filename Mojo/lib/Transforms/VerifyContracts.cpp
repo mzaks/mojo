@@ -3267,6 +3267,8 @@ private:
       return;
     if (name && evalTileTensor(call, *name, state))
       return;
+    if (name && evalWarpShuffle(call, *name, state))
+      return;
     if (name && evalGpuId(call, *name))
       return;
     if (name && callee && evalIteration(call, *name, callee, state))
@@ -5065,6 +5067,154 @@ private:
       noteCondition(ob.cond);
       obligations.push_back(ob);
     }
+  }
+
+  /// `warp.broadcast(x)` and the unmasked `shuffle_idx/up/down/xor(x, k)`:
+  /// `x` as another lane of the warp has it (or this lane's own), so as
+  /// SOME thread of the same block has it. That is `x`'s term with what
+  /// varies by thread renamed to fresh copies (`inOtherThread`); which lane
+  /// is not needed. Where `x` depends on what cannot be copied (a load, an
+  /// unknown result), the value stays unknown.
+  bool evalWarpShuffle(LIT::CallOp call, const CalleeName &name,
+                       State &state) {
+    StringRef path = name.path;
+    const char *prefix = "std::_gpu::primitives::warp::";
+    if (!path.consume_front(prefix) || call->getNumResults() != 1)
+      return false;
+    unsigned operands = path.starts_with("broadcast[") ? 1 : 2;
+    if (!(path.starts_with("broadcast[") || path.starts_with("shuffle_idx[") ||
+          path.starts_with("shuffle_up[") ||
+          path.starts_with("shuffle_down[") ||
+          path.starts_with("shuffle_xor[")) ||
+        call.getNumOperands() != operands)
+      return false;
+    Value val = call.getOperands()[0];
+    if (isa<LIT::RefType>(val.getType()))
+      return false;
+    std::string x = term(val, state);
+    Sort sort = sortOfTerm(x);
+    if (sort.isBool || sort.width != sortOf(call->getResult(0).getType()).width)
+      return false;
+    if (MaybeTerm other = inOtherThread(x))
+      values[call->getResult(0)] = *other;
+    else
+      setResultsUnknown(call);
+    return true;
+  }
+
+  /// `term` as another thread of the same block computes it: kernel
+  /// parameters, block ids and dimensions and the target are the same;
+  /// thread ids, `lane_id`, arguments (a device helper may be called with
+  /// thread-dependent ones) and bounded quotients become fresh copies, with
+  /// every fact about them copied too. Nothing if `term` depends on any
+  /// other unknown.
+  MaybeTerm inOtherThread(const std::string &term) {
+    static llvm::Regex uniform(
+        "^(p[0-9]+|gpu_(block_idx|block_dim|grid_dim)_[xyz]|target_.*)$");
+    static llvm::Regex varying("^(a[0-9]+|q[0-9]+|gpu_thread_idx_[xyz]|"
+                               "gpu_lane_id)$");
+    std::map<std::string, std::string> copied;
+    std::set<std::string> uncopyable; // Never shared: copying them fails.
+    bool failed = false;
+    std::function<std::string(StringRef)> rewrite;
+    auto copyName = [&](const std::string &name) -> std::string {
+      if (auto it = copied.find(name); it != copied.end())
+        return it->second;
+      if (uncopyable.count(name)) {
+        failed = true;
+        return name;
+      }
+      auto sort = sorts.find(name);
+      if (sort == sorts.end())
+        return name; // A function or keyword.
+      std::string result = name;
+      if (auto def = definitions.find(name); def != definitions.end()) {
+        bool before = failed;
+        failed = false;
+        std::string expr = rewrite(def->second);
+        if (failed) {
+          uncopyable.insert(name);
+          return name;
+        }
+        failed = before;
+        if (expr != def->second)
+          result = define(sort->second, expr);
+      } else if (uniform.match(name)) {
+        result = name;
+      } else if (varying.match(name)) {
+        result = declare(sort->second, "o");
+      } else {
+        uncopyable.insert(name);
+        failed = true;
+        return name;
+      }
+      copied[name] = result;
+      return result;
+    };
+    rewrite = [&](StringRef expr) -> std::string {
+      std::string out;
+      size_t i = 0;
+      while (i < expr.size() && !failed) {
+        char c = expr[i];
+        if (isalpha(static_cast<unsigned char>(c)) || c == '_') {
+          size_t j = i;
+          while (j < expr.size() &&
+                 (isalnum(static_cast<unsigned char>(expr[j])) ||
+                  expr[j] == '_'))
+            ++j;
+          out += copyName(expr.slice(i, j).str());
+          i = j;
+        } else {
+          out += c;
+          ++i;
+        }
+      }
+      return out;
+    };
+    std::string result = rewrite(term);
+    if (failed)
+      return std::nullopt;
+    // The facts about what was renamed hold for the other thread too (they
+    // are the semantics of ids and models, not this thread's path). Copying
+    // one may rename more; repeat until nothing changes.
+    std::set<size_t> done;
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (size_t k = 0; k < facts.size(); ++k) {
+        if (done.count(k))
+          continue;
+        bool mentions = false;
+        StringRef fact(facts[k]);
+        for (size_t i = 0; i < fact.size() && !mentions;) {
+          if (!isalpha(static_cast<unsigned char>(fact[i])) && fact[i] != '_') {
+            ++i;
+            continue;
+          }
+          size_t j = i;
+          while (j < fact.size() &&
+                 (isalnum(static_cast<unsigned char>(fact[j])) ||
+                  fact[j] == '_'))
+            ++j;
+          auto it = copied.find(fact.slice(i, j).str());
+          mentions = it != copied.end() && it->second != it->first;
+          i = j;
+        }
+        if (!mentions)
+          continue;
+        done.insert(k);
+        size_t before = copied.size();
+        std::string original = facts[k];
+        std::string copy = rewrite(original);
+        if (failed) {
+          failed = false; // This fact names what cannot be copied: skip it.
+          continue;
+        }
+        if (copy != original)
+          facts.push_back(copy);
+        changed = changed || copied.size() != before;
+      }
+    }
+    return result;
   }
 
   /// GPU ids (`thread_idx.x`, `block_idx.y`, `block_dim.z`, `grid_dim.x`,
