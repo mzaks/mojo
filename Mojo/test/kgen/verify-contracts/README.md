@@ -48,7 +48,8 @@ deterministic resource limit of each query (default 100000000),
 `generic-launched=true` also verifies launched generic kernels for every
 value of their parameters, `generic-rlimit=` the limit of each such query
 (default 10000000; see below), `wall-seconds=` caps each z3
-process (default 60), `int-retry=false` turns off the integer retry
+process (default 60), `check-division=true` reports integer divisions
+by a value that may be 0, `int-retry=false` turns off the integer retry
 (below), `dump-dir=` writes the SMT-LIB scripts, and `cache-dir=` caches
 the solver's answers by a hash of each script.
 
@@ -190,7 +191,10 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   states this through two small helpers, `_normalize_bound` and
   `_strided_count`, whose bodies the pass verifies against their
   contracts (`include-stdlib=true`). Integer `//` and `%` round towards
-  negative infinity, as Mojo defines them, and are 0 for a zero divisor.
+  negative infinity, as Mojo defines them, and are 0 for a zero divisor
+  (what `SIMD` computes; undocumented). With `check-division=true` each
+  `//`, `%`, `divmod`, `ceildiv` and `uutils` helper whose divisor is not
+  a nonzero literal is an obligation ("that the divisor is not 0").
 
 - `Array`: `len(a)` is the size parameter in `a`'s type (a number, or a
   parameter such as `n` in generic code), `a[i]` requires `i` in range, and
@@ -293,7 +297,9 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   and `0 <= block_idx < grid_dim < 2^31`; `global_idx` is
   `block_idx * block_dim + thread_idx`; `lane_id()` is in `[0, 64)`
   (warps have 32 or 64 lanes). `ufloordiv`, `udiv_unchecked` and
-  `uceildiv` are unsigned divisions; `warp.broadcast(x)` (lane 0's `x`) is
+  `uceildiv` are bounded unsigned divisions (`udiv_unchecked` and
+  `udivmod_unchecked` require `b > 0`: by 0 they are undefined);
+  `warp.broadcast(x)` (lane 0's `x`) is
   an unknown. Kernels are verified like any
   function, on the host, before they are compiled for a GPU.
 - A kernel states the launch it relies on as `where` clauses on its

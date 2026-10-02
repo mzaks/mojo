@@ -1388,6 +1388,21 @@ Tensors and GPU kernels:
   `rlimit-count` summed over the dumped scripts: old pass against this
   one 81.7M / 50.4M, 313.9M / 201.1M and 1028.8M / 1111.3M on the three
   files that looked slowest.
+- Division by zero. Integer `//` and `%` return 0 for a zero divisor
+  (what `SIMD` computes; its docstrings say neither that nor an error),
+  and the encoding now says so; but dividing by zero is almost always a
+  bug, so `check-division=true` makes each integer division whose
+  divisor is not a nonzero literal an obligation ("that the divisor is
+  not 0"): `//`, `%`, `__ceildiv__`, in-place `//=` and `%=` (otherwise
+  not modelled), `divmod`, `udivmod`, `ceildiv`, `ufloordiv` and
+  `uceildiv`. `udiv_unchecked` and `udivmod_unchecked` are undefined for
+  `b == 0` (their docstrings), so they state `b > 0` as a precondition,
+  checked at every call; the bounded model of `udiv_unchecked` had
+  assumed a result for 0. Off by default (the user's choice) because on
+  MAX's kernels it adds 2317 obligations, 190 proven: 2127 warnings in 237
+  of 409 files, about 96% of them divisions by runtime or parameter values
+  (`num_splits`, `inner_dim`) that callers are trusted with, 82 by
+  `WARP_SIZE`, which is 0 on a host without an accelerator.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now
