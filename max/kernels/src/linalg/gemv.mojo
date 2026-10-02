@@ -169,9 +169,11 @@ def gemv_kernel[
     c: UnsafePointer[Scalar[c_type], AnyOrigin[mut=True]],
     a: UnsafePointer[Scalar[a_type], ImmUnsafeAnyOrigin],
     b: UnsafePointer[Scalar[b_type], ImmUnsafeAnyOrigin],
-    m: Int32,
+    m: Int32 where m >= 0 and c._extent() >= Int(m),
     n: Int32,
-    k: Int32,
+    k: Int32 where (
+        k >= 0 and a._extent() >= Int(m) * Int(k) and b._extent() >= Int(k)
+    ),
 ):
     var _m = Int(m)
     var _n = Int(n)
@@ -1108,9 +1110,17 @@ def is_minimax_router_gemm[
     b_type: DType,
     static_N: Int,
     static_K: Int,
-]() -> Bool:
+](
+    out result: Bool where result == (
+        a_type == .float32
+        and b_type == .float32
+        and c_type == .float32
+        and static_N == 128
+        and static_K == 6144
+    )
+):
     """Returns whether a GEMM has the MiniMax-M3 fp32 router signature."""
-    return (
+    result = (
         a_type == .float32
         and b_type == .float32
         and c_type == .float32
@@ -1130,7 +1140,38 @@ def gemv_gpu_dispatch[
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, ...],
     b: TileTensor[mut=False, ...],
-    ctx: DeviceContext,
+    ctx: DeviceContext where (
+        Int(a.dim[0]()) == Int(c.dim[0]())
+        and Int(c.dim[0]()) < 2147483648
+        and Int(c.dim[1]()) < 2147483648
+        and Int(a.dim[1]()) < 2147483648
+        and (
+            transpose_b
+            or (
+                Int(b.dim[0]()) == Int(a.dim[1]())
+                and Int(b.dim[1]()) == Int(c.dim[1]())
+                and Int(c.dim[1]()) >= 1
+            )
+        )
+        and (
+            not transpose_b
+            or (
+                Int(b.dim[0]()) == Int(c.dim[1]())
+                and Int(b.dim[1]()) == Int(a.dim[1]())
+                and Int(c.dim[0]()) >= 1
+            )
+        )
+        and (
+            kernel_func is not GEMVAlgorithm.GEMV_KERNEL
+            or transpose_b
+            or Int(c.dim[1]()) == 1
+        )
+        and (
+            kernel_func is not GEMVAlgorithm.GEMV_KERNEL
+            or not transpose_b
+            or Int(c.dim[0]()) == 1
+        )
+    ),
 ) raises:
     """Launches the GPU GEMV kernel indicated by kernel_func with appropriate grid and block dims.
 
@@ -1552,7 +1593,31 @@ def gemv_gpu[
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, ...],
     b: TileTensor[mut=False, ...],
-    ctx: DeviceContext,
+    ctx: DeviceContext where (
+        Int(a.dim[0]()) == Int(c.dim[0]())
+        and Int(c.dim[0]()) < 2147483648
+        and Int(c.dim[1]()) < 2147483648
+        and Int(a.dim[1]()) < 2147483648
+        and (
+            transpose_b
+            or (
+                Int(b.dim[0]()) == Int(a.dim[1]())
+                and Int(b.dim[1]()) == Int(c.dim[1]())
+                and Int(c.dim[1]()) >= 1
+            )
+        )
+        and (
+            not transpose_b
+            or (
+                Int(b.dim[0]()) == Int(c.dim[1]())
+                and Int(b.dim[1]()) == Int(a.dim[1]())
+                and Int(c.dim[0]()) >= 1
+            )
+        )
+        # The MiniMax test reads K from `a.static_shape[1]`, a flattened extent:
+        # it is `a.dim[1]()` only where `a`'s layout is not nested.
+        and a.LayoutType.flat_rank == a.rank
+    ),
 ) raises:
     """Selects and dispatches the appropriate GPU GEMV kernel based on shape and hardware.
 
