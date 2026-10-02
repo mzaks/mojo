@@ -39,9 +39,11 @@
 #include "Mojo/ToolCommon/KGENPasses.h"
 
 #include "Mojo/HLCFDialect/HLCFOps.h"
+#include "Mojo/Interpreter/InterpreterAttrs.h"
 #include "Mojo/KGENDialect/KGENAttrs.h"
 #include "Mojo/KGENDialect/KGENOps.h"
 #include "Mojo/LITDialect/LITOps.h"
+#include "Mojo/POPDialect/POPAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseSet.h"
@@ -3085,6 +3087,15 @@ private:
     if (auto extract = dyn_cast<LIT::StructExtractAttr>(attr);
         extract && extract.getField().getValue() == "_mlir_value")
       return paramTerm(extract.getStructValue(), sort, depth + 1);
+    // A dtype's code (`DType.__eq__` compares these).
+    if (auto code = dyn_cast<POP::DTypeToUI8Attr>(attr);
+        code && !sort.isBool && sort.width == 8)
+      if (auto extract = dyn_cast<LIT::StructExtractAttr>(code.getValue());
+          extract && extract.getField().getValue() == "_mlir_value") {
+        std::string t = dtypeCode(extract.getStructValue());
+        if (!t.empty())
+          return t;
+      }
     // A builtin value as a `SIMD` scalar (`Int(width)` of a `SIMDLength`).
     if (auto cast = dyn_cast<CastFromBuiltinAttr>(attr))
       return paramTerm(cast.getArg(), sort, depth + 1);
@@ -3235,6 +3246,54 @@ private:
       }
     }
     return parameterValue(printed(attr), sort);
+  }
+
+  /// A parameter value without its sugar and its `store_to_mem` wrappers
+  /// (how values are passed by reference in parameter expressions).
+  static TypedAttr unwrapValue(TypedAttr a) {
+    while (true) {
+      if (auto mem = dyn_cast<StoreToMemAttr>(a))
+        a = mem.getValue();
+      else if (auto sugar = dyn_cast<SugarAttr>(a))
+        a = sugar.getCanonical();
+      else
+        return a;
+    }
+  }
+
+  /// The code of a dtype literal (`{:dtype f32}`).
+  static std::optional<uint64_t> dtypeLiteral(TypedAttr a) {
+    a = unwrapValue(a);
+    if (auto value = dyn_cast<LIT::LITStructAttr>(a);
+        value && value.getValues().size() == 1)
+      a = std::get<1>(value.getValues()[0]);
+    if (auto constant = dyn_cast<DTypeConstantAttr>(a))
+      return constant.getDType().getValue();
+    return std::nullopt;
+  }
+
+  /// The `ui8` code of a `DType` value, as `DType.__eq__` compares dtypes:
+  /// a literal's code, otherwise one unknown per dtype, the same for a
+  /// callee's dtype parameter and the caller's value for it. Empty if the
+  /// value is not a dtype.
+  std::string dtypeCode(TypedAttr value) {
+    ParamFrame *scope = nullptr;
+    value = unwrapValue(resolveParam(unwrapValue(value), &scope));
+    if (std::optional<uint64_t> c = dtypeLiteral(value))
+      return bvConst(*c, 8);
+    auto type = dyn_cast<LIT::StructType>(value.getType());
+    if (!type || printed(type.getSymbol()) != "@std::@builtin::@dtype::@DType")
+      return "";
+    MLIRContext *ctx = value.getContext();
+    TypedAttr code = POP::DTypeToUI8Attr::get(
+        ctx,
+        LIT::StructExtractAttr::get(value, StringAttr::get(ctx, "_mlir_value"),
+                                    DTypeType::get(ctx)));
+    ParamFrame *saved = params;
+    params = scope;
+    std::string term = parameterValue(printed(code), Sort{false, 8, false});
+    params = saved;
+    return term;
   }
 
   void evalCall(LIT::CallOp call, State &state) {
