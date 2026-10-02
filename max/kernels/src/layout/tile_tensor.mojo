@@ -3764,7 +3764,12 @@ struct TileTensor[
         }
 
     @inline(.always)
-    def to_device_buffer(self, ctx: DeviceContext) -> DeviceBuffer[Self.dtype]:
+    def to_device_buffer(
+        self,
+        ctx: DeviceContext,
+        out result: DeviceBuffer[Self.dtype] where len(result)
+        == self.num_elements(),
+    ):
         """Convert the tensor to a `DeviceBuffer`.
 
         Works for tensors backed by either `DefaultEngine` or

@@ -412,7 +412,10 @@ struct GemmShape(TrivialRegisterPassable):
         c: TileTensor[mut=False, ...],
         a: TileTensor[mut=False, ...],
         b: TileTensor[mut=False, ...],
-    ) -> GemmShape:
+        out result: GemmShape where result.M == Int(c.dim[0]())
+        and result.N == Int(c.dim[1]())
+        and result.K == Int(a.dim[1]()),
+    ):
         """Constructor of a gemm shape record from TileTensor inputs.
 
         M, N, and K are intentionally calculated using `a` and `c` ONLY. This
