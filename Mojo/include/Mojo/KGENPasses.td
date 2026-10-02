@@ -66,6 +66,9 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "With generic-launched: resource limit per query of a launched "
            "generic kernel; what it leaves open is checked for each "
            "launched instantiation">,
+    Option<"checkDivision", "check-division", "bool", /*default=*/"false",
+           "Report integer divisions by a value that may be 0 (`//`, `%`, "
+           "`divmod`, `ceildiv` and the `uutils` helpers)">,
     Option<"intRetry", "int-retry", "bool", /*default=*/"true",
            "Ask the queries answered `unknown` again over the integers "
            "(an exact translation; only proofs are taken)">,

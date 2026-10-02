@@ -1000,6 +1000,9 @@ struct Obligation {
   /// For a refinement check, the implementation of the trait method
   /// `callee` that is held to its clauses.
   std::string implementation;
+  /// What the obligation says, when it is not a callee's clause ("that the
+  /// divisor is not 0").
+  std::string claim;
 };
 
 /// A loop being walked: where its iterations continue and exit, and what
@@ -1218,6 +1221,8 @@ public:
 
   /// The resource limit of each query, if not the solver's.
   unsigned queryRlimit = 0;
+  /// Whether integer divisors that may be 0 are obligations.
+  bool checkDivision = false;
 
   LIT::FnOp fn;
   SmallVector<Obligation> obligations;
@@ -2729,6 +2734,22 @@ private:
       return "(bvneg " + args[0] + ")";
     }
     return std::nullopt;
+  }
+
+  /// With `check-division`, a division at `call` by `divisor` must not
+  /// divide by 0. Mojo's integer `//` and `%` return 0 then (undocumented;
+  /// `SIMD` masks the result), which is almost always a bug.
+  void checkDivisor(LIT::CallOp call, StringRef divisor, State &state) {
+    if (!checkDivision || inContract || isNonzeroLiteral(divisor) ||
+        sortOfTerm(divisor).isBool)
+      return;
+    Obligation ob{state.pc, "false", call.getLoc(), call.getLoc(), "division"};
+    ob.claim = "that the divisor is not 0";
+    ob.cond = define({true, 1, false}, "(not (= " + divisor.str() + " " +
+                                           bvConst(0, sortOfTerm(divisor).width) +
+                                           "))");
+    noteCondition(ob.cond);
+    obligations.push_back(ob);
   }
 
   /// Whether `term` is a bit-vector literal other than 0 (`(_ bv4 64)`).
@@ -4494,6 +4515,7 @@ private:
         return false;
       args.push_back(a);
     }
+    checkDivisor(call, args[1], state);
     store(*out, state, define(*sort, ceilDivision(*sort, args[0], args[1])));
     setResultsUnknown(call);
     return true;
@@ -4528,6 +4550,9 @@ private:
       if (sortOfTerm(a).isBool || sortOfTerm(a).width != 64)
         return false;
     Sort as{false, 64, !isUnsigned};
+    // `udivmod_unchecked` states `b > 0` as a precondition.
+    if (!path.contains("_unchecked("))
+      checkDivisor(call, args[1], state);
     std::string built = declare({false, 64, false}, "g");
     std::string q = define(sort, floorDivision(false, as, args[0], args[1]));
     std::string r = define(sort, floorDivision(true, as, args[0], args[1]));
@@ -4566,6 +4591,16 @@ private:
                         : term(dividend, state);
     if (sortOfTerm(a).isBool || sortOfTerm(a).width != 64)
       return false;
+    // `udiv_unchecked` states `b > 0` as a precondition (by 0 it is
+    // undefined); the others return 0 for it.
+    if (!path.starts_with("std::math::uutils::udiv_unchecked")) {
+      Value divisor = call.getOperands()[1];
+      checkDivisor(call,
+                   isa<LIT::RefType>(divisor.getType())
+                       ? valueThrough(divisor, state)
+                       : term(divisor, state),
+                   state);
+    }
     std::string q = declare({false, 64, true}, "q");
     facts.push_back("(=> (bvsle " + bvConst(0, 64) + " " + a +
                     ") (and (bvsle " + bvConst(0, 64) + " " + q + ") (bvsle " +
@@ -5112,15 +5147,21 @@ private:
     }
     if (call.getNumOperands() == 2 &&
         (method == "__floordiv__" || method == "__mod__")) {
+      checkDivisor(call, operand(1), state);
       values[result] = define(*sort, floorDivision(method == "__mod__", *sort,
                                                    operand(0), operand(1)));
       return true;
     }
     if (call.getNumOperands() == 2 && method == "__ceildiv__") {
+      checkDivisor(call, operand(1), state);
       values[result] =
           define(*sort, ceilDivision(*sort, operand(0), operand(1)));
       return true;
     }
+    // In place (`x //= y`): not modelled, but its divisor is checked.
+    if (call.getNumOperands() == 2 &&
+        (method == "__ifloordiv__" || method == "__imod__"))
+      checkDivisor(call, operand(1), state);
     if (call.getNumOperands() == 1 && method == "__neg__") {
       values[result] = define(*sort, "(bvneg " + operand(0) + ")");
       return true;
@@ -6080,6 +6121,7 @@ struct VerifyContractsPass
         std::string name = "f" + std::to_string(i);
         FunctionEncoder enc(fns[i].fn, module, symbols, solver, name, impls,
                             fns[i].refines);
+        enc.checkDivision = checkDivision;
         if (launched(i))
           enc.queryRlimit = genericRlimit;
         verify(enc, results[i], name);
@@ -6111,6 +6153,7 @@ struct VerifyContractsPass
             "f" + std::to_string(job.job) + ".i" + std::to_string(job.instance);
         FunctionEncoder enc(fns[job.job].fn, module, symbols, solver, name,
                             impls);
+        enc.checkDivision = checkDivision;
         enc.bindInstance(instances.find(fns[job.job].fn.getOperation())
                              ->second[job.instance]
                              .chain);
@@ -6185,7 +6228,8 @@ struct VerifyContractsPass
         // `Counter.get`'s; `Box.bump` establishes `Counter.bump`'s
         // postcondition.
         std::string claim =
-            ob.implementation.empty() ? ""
+            !ob.claim.empty()             ? ob.claim
+            : ob.implementation.empty() ? ""
             : ob.postcondition
                 ? "that '" + ob.implementation + "' establishes the " +
                       what.str() + " of '" + ob.callee + "'"
@@ -6246,7 +6290,8 @@ struct VerifyContractsPass
                << "' is not analyzed yet (this control flow is not supported)";
           break;
         }
-        diag.attachNote(ob.clauseLoc) << what << " declared here";
+        if (ob.claim.empty())
+          diag.attachNote(ob.clauseLoc) << what << " declared here";
         Operation *fn = fns[i].fn.getOperation();
         for (auto [instance, instanceAnswer] : perInstance)
           if (instanceAnswer != Answer::Proven) {
