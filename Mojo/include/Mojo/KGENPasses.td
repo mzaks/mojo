@@ -65,6 +65,11 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            /*default=*/"1000000",
            "Resource limit per loop-invariant candidate query, at most a "
            "twentieth of the query limit (0: just that)">,
+    Option<"nonlinearRlimit", "nonlinear-rlimit", "unsigned",
+           /*default=*/"10000000",
+           "With int-retry: resource limit per query whose goal multiplies "
+           "or divides two unknowns, at most the query limit (0: just "
+           "that); what it leaves open is asked again over the integers">,
     Option<"genericRlimit", "generic-rlimit", "unsigned",
            /*default=*/"10000000",
            "With generic-launched: resource limit per query of a launched "

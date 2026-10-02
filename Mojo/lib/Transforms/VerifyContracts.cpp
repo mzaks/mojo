@@ -347,6 +347,10 @@ struct SolverConfig {
   std::string dumpDir;
   /// Where answers are cached by a hash of the script (empty: no cache).
   std::string cacheDir;
+  /// The limit of each query whose goal is nonlinear (0: the query
+  /// limit). Bit-vector products and quotients of unknowns can use up any
+  /// limit where the integer retry decides them at once.
+  unsigned nonlinearRlimit = 0;
 };
 
 /// Runs `program` and waits at most `seconds` for it; returns its exit
@@ -1219,13 +1223,28 @@ public:
   /// The declarations and facts the queries share.
   std::string scriptHeader() const { return header(); }
 
-  std::string script() const {
+  std::string script() {
     std::string text = header();
     for (const Obligation &ob : obligations)
       if (ob.analyzed)
-        text +=
-            query({ob.pc}, ob.cond, queryRlimit ? queryRlimit : solver.rlimit);
+        text += query({ob.pc}, ob.cond, limitOf(ob));
     return text;
+  }
+
+  /// The query limit of every obligation.
+  unsigned fullLimit() const {
+    return queryRlimit ? queryRlimit : solver.rlimit;
+  }
+
+  /// The limit `ob` is first asked with: lower for a nonlinear goal
+  /// (`nonlinear-rlimit`), which is then asked over the integers and only
+  /// if that does not decide it, again with the full limit.
+  unsigned limitOf(const Obligation &ob) {
+    unsigned limit = fullLimit();
+    if (solver.nonlinearRlimit && solver.nonlinearRlimit < limit &&
+        nonlinear(ob.cond))
+      limit = solver.nonlinearRlimit;
+    return limit;
   }
 
   /// Encodes the instantiation that `chain` names: a launched kernel with
@@ -6689,6 +6708,8 @@ struct VerifyContractsPass
     }
     SolverConfig solver{z3, rlimit, houdiniRlimit, wallSeconds, dumpDir,
                         cacheDir};
+    if (intRetry)
+      solver.nonlinearRlimit = nonlinearRlimit;
     if (!cacheDir.empty())
       (void)llvm::sys::fs::create_directories(cacheDir);
     // Functions are verified independently, in parallel; their results are
@@ -6872,29 +6893,50 @@ struct VerifyContractsPass
         return;
       std::optional<SmallVector<Answer>> answers =
           runZ3(solver, enc.script(), name);
-      // Queries answered `unknown`: once more over the integers.
+      // Queries answered `unknown`: once more over the integers (with the
+      // limit they were asked with), and those asked with a lower limit and
+      // still open, again with the full one.
       if (intRetry && answers) {
-        SmallVector<size_t> unknown;
-        std::string text = enc.scriptHeader();
-        unsigned k = 0;
-        for (const Obligation &ob : enc.obligations) {
-          if (!ob.analyzed)
-            continue;
-          if (k < answers->size() && (*answers)[k] == Answer::Unknown) {
-            unknown.push_back(k);
-            text += query({ob.pc}, ob.cond,
-                          enc.queryRlimit ? enc.queryRlimit : solver.rlimit);
+        SmallVector<const Obligation *> analyzed;
+        for (const Obligation &ob : enc.obligations)
+          if (ob.analyzed)
+            analyzed.push_back(&ob);
+        auto retry = [&](bool lowered, StringRef suffix) {
+          SmallVector<size_t> open;
+          std::string text = enc.scriptHeader();
+          for (auto [k, ob] : llvm::enumerate(analyzed)) {
+            unsigned limit = enc.limitOf(*ob);
+            if (k >= answers->size() || (*answers)[k] != Answer::Unknown ||
+                (lowered && limit == enc.fullLimit()))
+              continue;
+            open.push_back(k);
+            // Over the integers, nonlinear queries can run for long without
+            // using up their limit; one asked with a lower limit gets 1 s
+            // there, as what stays open is asked again with the full limit.
+            bool capped = !lowered && limit < enc.fullLimit();
+            if (capped)
+              text += "(set-option :timeout 1000)\n";
+            text +=
+                query({ob->pc}, ob->cond, lowered ? enc.fullLimit() : limit);
+            if (capped)
+              text += "(set-option :timeout 0)\n";
           }
-          ++k;
-        }
-        if (!unknown.empty())
-          if (std::optional<std::string> ints =
-                  IntTranslator().translate(text))
-            if (std::optional<SmallVector<Answer>> retried =
-                    runZ3(solver, *ints, name + ".int"))
-              for (auto [i, k] : llvm::enumerate(unknown))
-                if (i < retried->size() && (*retried)[i] == Answer::Proven)
-                  (*answers)[k] = Answer::Proven;
+          if (open.empty())
+            return;
+          std::optional<std::string> ints;
+          if (!lowered)
+            ints = IntTranslator().translate(text);
+          if (!lowered && !ints)
+            return;
+          if (std::optional<SmallVector<Answer>> retried =
+                  runZ3(solver, lowered ? text : *ints, name + suffix.str()))
+            for (auto [i, k] : llvm::enumerate(open))
+              if (i < retried->size() &&
+                  (lowered || (*retried)[i] == Answer::Proven))
+                (*answers)[k] = (*retried)[i];
+        };
+        retry(/*lowered=*/false, ".int");
+        retry(/*lowered=*/true, ".full");
       }
       unsigned next = 0;
       for (Obligation &ob : enc.obligations) {
