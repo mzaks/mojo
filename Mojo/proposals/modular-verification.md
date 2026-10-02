@@ -1481,6 +1481,21 @@ Tensors and GPU kernels:
   s, 3.6 s, 10.2 s (gemv), 14.3 s, 18.7 s, 20.5 s and 24.4 s. A sweep
   that runs several `kgen`s at once oversubscribes the machine: each
   already runs its solvers on every core.
+- Where solver time goes. Per query, with z3's cumulative `rlimit`
+  after each check, over 30 random kernel files and 6 stdlib tests: in
+  the kernels, 8% of the work proves obligations, 37% fails to (31% `sat`,
+  6% at the limit), and 56% is loop-invariant candidates (16% that hold,
+  30% that fail, 10% undecided at their limit); the stdlib tests need
+  5% of the kernels' work and no proof there costs more than 2M. A lower
+  first limit with a retry of what it leaves open saves nothing: nothing
+  predicts which queries will be proofs. Measured on the same files
+  (proofs, summed `rlimit-count`): the loop-invariant limit at 5M (a
+  twentieth of 100M, the old default) 720/1395 and 3783M; at 1M 711/1395
+  and 2784M (-26%; all 9 lost proofs in pipeline/schedulers.mojo,
+  compile-time code whose 550 invariant candidates are 45% of the
+  sample's work); at 0.5M 701/1395 and 2511M (also 3 in test_list). The
+  obligation limit at 50M changed nothing (no obligation needed more).
+  The user chose 1M as the default (`houdini-rlimit=`).
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

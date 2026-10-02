@@ -47,7 +47,10 @@ packages, `rlimit=` sets the solver's
 deterministic resource limit of each query (default 100000000),
 `generic-launched=true` also verifies launched generic kernels for every
 value of their parameters, `generic-rlimit=` the limit of each such query
-(default 10000000; see below), `wall-seconds=` caps each z3
+(default 10000000; see below), `houdini-rlimit=` the limit of each
+loop-invariant candidate's query (default 1000000, at most a twentieth
+of the query limit; a candidate not decided within it is dropped),
+`wall-seconds=` caps each z3
 process (default 60), `check-division=true` reports integer divisions
 by a value that may be 0, `int-retry=false` turns off the integer retry
 (below), `dump-dir=` writes the SMT-LIB scripts, and `cache-dir=` caches
