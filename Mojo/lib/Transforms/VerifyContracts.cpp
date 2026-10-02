@@ -2719,6 +2719,12 @@ private:
         havocAll(state);
       return;
     }
+    // The field of an integer wrapper value is the value itself.
+    if (auto extract = dyn_cast<LIT::StructExtractOp>(op);
+        extract && intWrapper(extract.getContainer().getType())) {
+      values[extract.getResult()] = term(extract.getContainer(), state);
+      return;
+    }
     if (isa<LIT::RefLoadOp>(op) ||
         op->getName().getStringRef() == "lit.load.consume") {
       Operation *loadOp = op;
@@ -3156,6 +3162,14 @@ private:
           if (std::optional<CalleeName> name = calleeName(ops[0]))
             if (MaybeTerm t = targetPredicate(name->path, sort))
               return *t;
+        // `Wrapper(n)` of an integer wrapper (`GEMVAlgorithm.GEMV_KERNEL`
+        // is `GEMVAlgorithm(0)`): `n`.
+        if (ops.size() == 2 && !sort.isBool)
+          if (auto symbol = dyn_cast<SymbolConstantAttr>(ops[0]))
+            if (auto init = dyn_cast_or_null<LIT::FnOp>(
+                    symbols.lookupSymbolIn(module, symbol.getSymbol()));
+                init && isFieldInit(init))
+              return paramTerm(ops[1], sort, depth + 1);
         // `max_or_inf[dtype]()` and `min_or_neg_inf[dtype]()` of an integer
         // dtype (`Int.MAX`, `UInt8.MIN`): its bounds.
         if (ops.size() == 1)
@@ -3256,6 +3270,8 @@ private:
     if (name && evalUnsignedDivision(call, *name, state))
       return;
     if (name && evalCeildiv(call, *name, state))
+      return;
+    if (callee && evalIntWrapperCall(call, callee, state))
       return;
     if (name && evalPointer(call, *name, state))
       return;
@@ -4641,6 +4657,123 @@ private:
     std::string e = "(pext " + value + ")";
     facts.push_back("(bvsge " + e + " " + bvConst(0, 64) + ")");
     return e;
+  }
+
+  /// A struct with a single integer field and no parameters (an enum-like
+  /// wrapper such as `GEMVAlgorithm`, a file descriptor): its values are
+  /// represented by that integer. Null if `type` is not one.
+  LIT::StructDeclOp intWrapper(Type type) {
+    auto st = dyn_cast<LIT::StructType>(type);
+    if (!st || !st.getParamValues().empty())
+      return {};
+    auto decl = dyn_cast_or_null<LIT::StructDeclOp>(
+        symbols.lookupSymbolIn(module, st.getSymbol()));
+    if (!decl)
+      return {};
+    SmallVector<LIT::StructFieldOp> fields;
+    for (Region &region : decl->getRegions())
+      for (Block &block : region)
+        for (auto field : block.getOps<LIT::StructFieldOp>())
+          fields.push_back(field);
+    if (fields.size() != 1)
+      return {};
+    Type fieldType = fields.front().getType();
+    Sort sort = sortOf(fieldType);
+    if (!isScalar(fieldType) || sort.isBool || sort.width != 64)
+      return {};
+    return decl;
+  }
+
+  /// Whether `init` is the constructor of an integer wrapper from its one
+  /// integer argument: it stores that argument into the field and returns
+  /// the value, and does nothing else.
+  bool isFieldInit(LIT::FnOp init) {
+    if (init.getFunctionBody().empty() ||
+        !init->getParentOfType<LIT::StructDeclOp>())
+      return false;
+    Block &body = init.getFunctionBody().front();
+    if (body.getNumArguments() != 1 || init->getNumResults() > 1)
+      return false;
+    Value arg = body.getArgument(0);
+    unsigned stores = 0;
+    for (Operation &op : body) {
+      StringRef opName = op.getName().getStringRef();
+      if (opName == "lit.ref.store") {
+        Value stored = op.getOperand(0);
+        for (Operation *def = stored.getDefiningOp();
+             def && def->getName().getStringRef() == "kgen.rebind";
+             def = stored.getDefiningOp())
+          stored = def->getOperand(0);
+        if (stored != arg)
+          return false;
+        ++stores;
+        continue;
+      }
+      if (!llvm::is_contained(
+              {StringRef("lit.var.decl"), StringRef("lit.ref.struct.ger"),
+               StringRef("kgen.rebind"), StringRef("lit.load.consume"),
+               StringRef("lit.var.lifetime.start"),
+               StringRef("lit.var.lifetime.end"), StringRef("hlcf.return"),
+               StringRef("debuginfo.value"), StringRef("debuginfo.kill")},
+              opName))
+        return false;
+    }
+    if (stores != 1)
+      return false;
+    // The value returned is of an integer wrapper type.
+    for (Operation &op : body)
+      if (isa<HLCF::ReturnOp>(op))
+        return op.getNumOperands() == 1 &&
+               intWrapper(op.getOperand(0).getType());
+    return false;
+  }
+
+  /// A call of an integer wrapper's own function: its constructor from the
+  /// integer is that integer; a method whose body only reads fields,
+  /// rebinds, calls and returns (`__eq__`, `__is__`, `__ne__`) is
+  /// evaluated in place, with its arguments' values (so `k is
+  /// GEMVAlgorithm.GEMV_KERNEL` is `k == 0`).
+  bool evalIntWrapperCall(LIT::CallOp call, LIT::FnOp callee, State &state) {
+    auto decl = callee->getParentOfType<LIT::StructDeclOp>();
+    if (!decl || callee.getFunctionBody().empty() ||
+        call->getNumResults() != 1)
+      return false;
+    // Only functions of integer wrappers.
+    bool ofWrapper = false;
+    for (Type t : callee.getFunctionBody().front().getArgumentTypes())
+      ofWrapper = ofWrapper || intWrapper(t);
+    if (!ofWrapper && !intWrapper(call->getResult(0).getType()))
+      return false;
+    if (isFieldInit(callee) && call.getNumOperands() == 1) {
+      values[call->getResult(0)] = term(call.getOperands()[0], state);
+      return true;
+    }
+    Block &body = callee.getFunctionBody().front();
+    if (!llvm::hasSingleElement(callee.getFunctionBody()) ||
+        body.getNumArguments() != call.getNumOperands() ||
+        !body.getOps<RequiresOp>().empty())
+      return false;
+    for (Value operand : call.getOperands())
+      if (isa<LIT::RefType>(operand.getType()))
+        return false;
+    for (Operation &op : body)
+      if (!isa<LIT::StructExtractOp, LIT::CallOp, HLCF::ReturnOp>(op) &&
+          !llvm::is_contained({StringRef("kgen.rebind"),
+                               StringRef("kgen.param.constant")},
+                              op.getName().getStringRef()))
+        return false;
+    for (auto [arg, operand] : llvm::zip(body.getArguments(), call.getOperands()))
+      values[arg] = term(operand, state);
+    for (Operation &op : body) {
+      if (auto ret = dyn_cast<HLCF::ReturnOp>(op)) {
+        if (ret.getNumOperands() != 1)
+          return false;
+        values[call->getResult(0)] = term(ret.getOperand(0), state);
+        return true;
+      }
+      walkOp(&op, state);
+    }
+    return false;
   }
 
   /// `p[]`: the pointer's extent is at least 1, the precondition of
