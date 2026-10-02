@@ -26,7 +26,12 @@ from max.gpu import (
 from max.gpu.host import DeviceContext
 from std.math import ceildiv
 from std.math.uutils import udivmod
-from std.sys.info import is_gpu
+from std.sys.info import (
+    has_amd_gpu_accelerator,
+    has_nvidia_gpu_accelerator,
+    is_gpu,
+    is_nvidia_gpu,
+)
 
 comptime LD = type_of(row_major(1, 1))  # dimensions known at run time
 comptime L88 = type_of(row_major[8, 8]())
@@ -232,6 +237,23 @@ def ok_warp_size_on_gpu(
     return 0
 
 
+def nvidia_kernel(
+    dst: Pointer[Int, MutAnyOrigin], n: Int where dst._extent() >= n
+):
+    comptime assert is_nvidia_gpu(), "uses NVIDIA's warp of 32"
+    comptime assert WARP_SIZE == 32
+    if thread_idx.x < n:
+        dst[unsafe_offset=thread_idx.x] = WARP_SIZE
+
+
+def ok_launch_on_nvidia(ctx: DeviceContext) raises:
+    var buf = ctx.enqueue_create_buffer[DType.int](64)
+    comptime if has_nvidia_gpu_accelerator():
+        ctx.enqueue_function[nvidia_kernel](
+            buf, len(buf), grid_dim=1, block_dim=64
+        )  # the build's accelerator is NVIDIA's
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -376,3 +398,18 @@ def bad_warp_size_anywhere(
     if n >= 64:
         return p[unsafe_offset=WARP_SIZE - 1]  # 0 on a host: offset -1
     return 0
+
+
+def bad_launch_on_amd(ctx: DeviceContext) raises:
+    var buf = ctx.enqueue_create_buffer[DType.int](64)
+    comptime if has_amd_gpu_accelerator():
+        ctx.enqueue_function[nvidia_kernel](
+            buf, len(buf), grid_dim=1, block_dim=64
+        )  # an AMD GPU: neither assertion holds
+
+
+def bad_launch_anywhere(ctx: DeviceContext) raises:
+    var buf = ctx.enqueue_create_buffer[DType.int](64)
+    ctx.enqueue_function[nvidia_kernel](
+        buf, len(buf), grid_dim=1, block_dim=64
+    )  # nothing says which accelerator

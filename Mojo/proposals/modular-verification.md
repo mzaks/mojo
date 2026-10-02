@@ -1422,6 +1422,65 @@ Tensors and GPU kernels:
   caller as evidence. `enqueue_function` does not accept such a kernel
   yet: the clause is part of the function's type, which none of its
   overloads take.
+- Hardware contracts at launches. The user chose to change MAX's
+  launch API so kernels can say `where is_gpu()` in their signature. The
+  thin `enqueue_function`, `compile_function` and `DeviceGraph`'s
+  `add_function` were given `func: def(*args: *declared_arg_types) thin
+  -> None where is_gpu()`; unconstrained kernels still converted, but a
+  kernel with the very clause did not. The compiler does not convert a
+  function with a `where` clause to a variadic function type, even one
+  with the same clause:
+
+  ```mojo
+  def run[
+      declared: TypeList[Trait=AnyType, ...], //,
+      f: def(* args: * declared) thin -> None where is_gpu(),
+  ](): pass
+
+  def k_gpu(x: Int) where is_gpu(): pass
+  def k_plain(x: Int): pass
+
+  run[k_plain]()  # accepted
+  run[k_gpu]()    # error: 'run' parameter 'f' has 'def(*args:
+                  # *TypeList[Int]()) thin -> None where is_gpu()' type,
+                  # but value has type 'def k_gpu(x: Int) thin -> None
+                  # where is_gpu()'
+  ```
+
+  (A non-variadic `def() thin -> None where is_gpu()` parameter accepts
+  both; a generic clause `c: Bool, f: def() ... where c` accepts any
+  clause but `c` is not inferred.) The change was reverted; the compiler
+  would have to convert constrained functions to variadic types, and to
+  let a launch discharge any clause against the device target (infer the
+  clause, or have offload compilation check it), for signature clauses
+  to work. Meanwhile a kernel's top-level `comptime assert`s that name
+  the target are its hardware contract: the compiler checks them where
+  the kernel is
+  compiled, the pass assumes them in its body, and at each launch they
+  are obligations for the build's accelerator (target predicates read as
+  the accelerator's vendor, `WARP_SIZE` as its warp size; assumptions: a
+  kernel is compiled for that accelerator, and the launcher runs on the
+  host). A mismatch is reported at the launch ("cannot prove the
+  assertion of 'k' for the accelerator it is launched on", with a note at
+  the assert) instead of when the kernel is compiled for a GPU.
+  `comptime if has_nvidia_gpu_accelerator():` establishes
+  `is_nvidia_gpu()` and `WARP_SIZE == 32`; `has_accelerator()` does not
+  establish `is_gpu()`, because an accelerator name the stdlib does not
+  recognize has no known triple.
+- Two regressions found by sweeping MAX's kernels with the launch checks.
+  (1) The solver's wall-clock cap was not enforced: `ExecuteAndWait`'s
+  timeout is the process-wide `alarm()`, which parallel calls overwrite,
+  so z3 processes ran for 15 minutes to over an hour past a 60 s cap;
+  z3 now runs under `waitpid` polling and is killed at the cap. (2)
+  Assuming every `comptime assert` put products of kernel parameters
+  into every query's path condition: block_scaled_matmul_small_bn.mojo
+  took 18 s instead of 3.1 s; nonlinear asserts are no longer assumed,
+  and only asserts that name the target are checked at launches. With
+  both fixed, the files that had looked slowest take, one at a time at
+  load 3-4: 3.4 s (block_scaled_matmul, 672 s in the broken sweep), 4.1
+  s, 3.6 s, 10.2 s (gemv), 14.3 s, 18.7 s, 20.5 s and 24.4 s. A sweep
+  that runs several `kgen`s at once oversubscribes the machine: each
+  already runs its solvers on every core.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

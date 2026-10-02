@@ -306,9 +306,17 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   vendor; `is_gpu()`, `has_*_accelerator()` and `WARP_SIZE` (32 or 64 on
   a GPU, 0 on a host without an accelerator, the accelerator's otherwise)
   follow. `comptime assert c` is assumed from there on (the compiler
-  checks it wherever the code is compiled), as are a function's
-  `where` constraints, so a function that states `is_gpu()` knows
-  `WARP_SIZE`. Kernels are verified like any
+  checks it wherever the code is compiled), unless `c` is nonlinear
+  (products of parameters; assuming those made every query slow), as
+  are a function's `where` constraints, so a function that states
+  `is_gpu()` knows `WARP_SIZE`. A kernel's top-level `comptime assert`s
+  that name the target are its hardware contract: at each launch they
+  must hold for the build's accelerator
+  (assumptions: a kernel is compiled for the accelerator the build names,
+  `--target-accelerator`, and the launcher runs on the host), which the
+  launcher states with `comptime if has_nvidia_gpu_accelerator():` and the
+  like; `has_accelerator()` is not enough (an accelerator name the stdlib
+  does not recognize has no known GPU triple). Kernels are verified like any
   function, on the host, before they are compiled for a GPU.
 - A kernel states the launch it relies on as `where` clauses on its
   arguments (`grid_dim.y <= Int(c.dim[0]()) // 16`, `block_dim.x ==
