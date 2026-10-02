@@ -1460,8 +1460,13 @@ private:
     return result;
   }
   llvm::StringMap<bool> targetTerms;
-  /// The rank of each layout type parameter seen, by its printed form.
-  std::map<std::string, std::string> rankTerms;
+  /// The `rank` and `flat_rank` of each layout type parameter seen, by name
+  /// and `layoutKey`.
+  std::map<std::pair<std::string, std::string>, std::string> layoutWitnesses;
+  /// The terms of each generic layout's `static_shape[k]` and of its
+  /// tensors' `dim[k]()`, by `layoutKey` and `k`.
+  std::map<std::pair<std::string, int64_t>, SmallVector<std::string>>
+      staticShapeTerms, dimTerms;
   /// Facts that are added once however often their terms are met.
   std::set<std::string> addedFacts;
 
@@ -3039,14 +3044,37 @@ private:
       return parameterValue(printed(attr), sort);
     if (auto sugar = dyn_cast<SugarAttr>(attr))
       return paramTerm(sugar.getCanonical(), sort, depth + 1);
-    // A layout's rank (`t.rank`, the `rank` witness of its layout type):
-    // remembered by the layout, for `num_elements()`.
+    // A layout's rank and flat rank (`t.rank`, the `rank` witness of its
+    // layout type): one term per layout, for `num_elements()` and
+    // `static_shape`.
     if (auto witness = dyn_cast<GetWitnessAttr>(attr);
-        witness && witness.getWitnessName() == "rank" && !sort.isBool) {
-      std::string term = parameterValue(printed(attr), sort);
-      rankTerms[printed(witness.getTypeValue())] = term;
-      return term;
-    }
+        witness && !sort.isBool && sort.width == 64 &&
+        (witness.getWitnessName() == "rank" ||
+         witness.getWitnessName() == "flat_rank"))
+      return layoutWitness(witness.getWitnessName(),
+                           layoutKey(witness.getTypeValue()));
+    // `static_shape[k]` of a layout type: its `k`th flat extent, or -1 where
+    // that is known only at run time.
+    if (auto bind = dyn_cast<BindParamsAttr>(attr);
+        bind && !sort.isBool && sort.width == 64 &&
+        bind.getParamValues().size() == 1)
+      if (auto witness = dyn_cast<GetWitnessAttr>(bind.getGenerator());
+          witness && witness.getWitnessName() == "static_shape") {
+        std::string k = paramTerm(bind.getParamValues()[0], sort, depth + 1);
+        static llvm::Regex constRe("^\\(_ bv([0-9]+) 64\\)$");
+        SmallVector<StringRef> m;
+        int64_t index;
+        if (constRe.match(k, &m) && !m[1].getAsInteger(10, index)) {
+          std::string term = parameterValue(printed(attr), sort);
+          std::pair<std::string, int64_t> at{layoutKey(witness.getTypeValue()),
+                                             index};
+          auto &terms = staticShapeTerms[at];
+          if (!llvm::is_contained(terms, term))
+            terms.push_back(term);
+          relateStaticShape(at);
+          return term;
+        }
+      }
     if (auto index = dyn_cast<ParamIndexRefAttr>(attr);
         index && positionalParams && index.getDepth() == 0 &&
         index.getIndex() < positionalParams->size())
@@ -4180,7 +4208,54 @@ private:
     }
     std::string d = "(tdim " + value + " " + bvConst(k, 64) + ")";
     facts.push_back("(bvsge " + d + " " + bvConst(0, 64) + ")");
-    return define(Sort{false, 64, true}, d);
+    std::string dim = define(Sort{false, 64, true}, d);
+    std::pair<std::string, int64_t> at{layoutKey(params[3]), k};
+    auto &terms = dimTerms[at];
+    if (!llvm::is_contained(terms, dim))
+      terms.push_back(dim);
+    relateStaticShape(at);
+    return dim;
+  }
+
+  /// A layout type parameter, as the frame it belongs to and its printed
+  /// value there: the same layout reached through a callee's parameters has
+  /// the same key, and two callees' `Self.LayoutType` different ones.
+  std::string layoutKey(TypedAttr layout) {
+    ParamFrame *scope = nullptr;
+    TypedAttr resolved = resolveParam(layout, &scope);
+    return (scope ? scope->scope : std::string()) + "|" + printed(resolved);
+  }
+
+  /// The `rank` or `flat_rank` witness of a layout (by `layoutKey`): one
+  /// unknown per layout.
+  std::string layoutWitness(StringRef name, const std::string &layout) {
+    auto [it, inserted] = layoutWitnesses.try_emplace({name.str(), layout});
+    if (inserted) {
+      it->second = declare(Sort{false, 64, true}, "p");
+      prelude += "; " + it->second + ": " + name.str() + " of " +
+                 StringRef(layout).take_front(300).str() + "\n";
+    }
+    return it->second;
+  }
+
+  /// `static_shape[k]` is the `k`th extent of the flattened shape, -1 where
+  /// it is known only at run time; `dim[k]()` is the `k`th outer mode's
+  /// extent. They are the same extent where no mode is nested (`flat_rank
+  /// == rank`), and then a known `static_shape[k]` is `dim[k]()`.
+  void relateStaticShape(const std::pair<std::string, int64_t> &at) {
+    auto shapes = staticShapeTerms.find(at);
+    auto dims = dimTerms.find(at);
+    if (shapes == staticShapeTerms.end() || dims == dimTerms.end())
+      return;
+    std::string flat = "(= " + layoutWitness("flat_rank", at.first) + " " +
+                       layoutWitness("rank", at.first) + ")";
+    for (const std::string &shape : shapes->second)
+      for (const std::string &dim : dims->second) {
+        std::string fact = "(=> (and " + flat + " (bvsge " + shape + " " +
+                           bvConst(0, 64) + ")) (= " + dim + " " + shape + "))";
+        if (addedFacts.insert(fact).second)
+          facts.push_back(fact);
+      }
   }
 
   /// Extent `k` of a `TileTensor` layout type parameter whose shape says
@@ -4337,8 +4412,8 @@ private:
       }
       // A generic layout: by its rank where one was seen (`comptime assert
       // t.rank == 2`), for ranks up to 4.
-      auto it = rankTerms.find(layout);
-      if (it == rankTerms.end())
+      auto it = layoutWitnesses.find({"rank", layoutKey(params[3])});
+      if (it == layoutWitnesses.end())
         return false;
       std::string n = declare(sort, "n");
       for (size_t r = 1; r <= 4; ++r)
