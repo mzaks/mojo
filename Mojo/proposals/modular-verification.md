@@ -1534,6 +1534,30 @@ Tensors and GPU kernels:
   thread's id, a load or a helper's argument are not proven. gemv_kernel
   as MAX has it (with `warp.broadcast`) now has all three accesses and
   its launch proven (18.7 s).
+- Enum-like wrappers, so a contract can name the algorithm it is about.
+  The gemv contracts stated the vector side of C as `>= 1` (memory
+  safety); a correct result needs `== 1`, but only for `GEMV_KERNEL`,
+  since the dispatcher also runs `GEMV_SPLIT_K` with `M` up to 16. Saying
+  `kernel_func is not GEMVAlgorithm.GEMV_KERNEL or ...` needs the
+  comparison: a struct with one integer field and no parameters is now
+  represented by that integer (field extraction is the identity, a
+  constructor that only stores its argument gives it, also in a
+  `comptime` constant's `apply`), and its own methods whose bodies only
+  extract, rebind, call and return are evaluated in place (`__is__` calls
+  `__eq__`, which compares fields). A method from a trait default (taking
+  references, like `Equatable.__ne__`) is not evaluated. `Bool.__bool__`
+  (inserted for `not (...)`) was an unknown; it is the identity.
+- With the per-kernel clause (non-transposed `GEMV_KERNEL` needs `N ==
+  1`, transposed `M == 1`) on the dispatcher, in a copy of gemv.mojo,
+  `gemv_gpu`'s call to it is reported: its `n == 1` branch picks
+  `GEMV_KERNEL` without checking `transpose_b`, the transposed bug the
+  GPU test confirmed. With that branch fixed (`n == 1 and not
+  transpose_b`), the call is still reported, for the MiniMax branch
+  (`M <= 16`, f32, static `K = 6144`), which takes `GEMV_KERNEL` only if
+  `k % simd_width != 0`: that never happens, but proving it needs the
+  pass to relate a generic tensor's `static_shape` to `dim()` and to know
+  the target's SIMD width (not modelled; a false positive). Without that
+  branch the call is proven.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

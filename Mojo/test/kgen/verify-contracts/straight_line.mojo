@@ -41,6 +41,43 @@ def bump(mut n: Int):
     n += 5
 
 
+struct Mode(Equatable, TrivialRegisterPassable):
+    """An enum-like wrapper of one integer, compared by value."""
+
+    var _value: Int
+
+    comptime FAST = Self(0)
+    comptime SAFE = Self(1)
+
+    @always_inline
+    def __init__(out self, value: Int):
+        self._value = value
+
+    @always_inline
+    def __eq__(self, other: Self) -> Bool:
+        return self._value == other._value
+
+    @always_inline
+    def __ne__(self, other: Self) -> Bool:
+        return self._value != other._value
+
+    @always_inline
+    def __is__(self, other: Self) -> Bool:
+        return self == other
+
+    @always_inline
+    def __isnot__(self, other: Self) -> Bool:
+        return self != other
+
+
+def run(
+    mode: Mode, xs: List[Int] where mode is not Mode.FAST or len(xs) > 0
+) -> Int:
+    if mode is Mode.FAST:
+        return xs[0]  # FAST needs a non-empty list
+    return 0
+
+
 # --- must be PROVEN ---
 def ok_get_checked(xs: List[Int], i: Int) -> Int:
     if 0 <= i and i < len(xs):
@@ -110,6 +147,13 @@ def ok_udiv_unchecked(a: Int, b: Int) -> Int:
     if b > 0:
         return udiv_unchecked(a, b)  # by 0 it is undefined
     return 0
+
+
+def ok_mode_chosen(xs: List[Int]) -> Int:
+    var mode = Mode.SAFE
+    if len(xs) > 0:
+        mode = Mode.FAST
+    return run(mode, xs)  # FAST only when the list is not empty
 
 
 # --- must stay UNPROVEN ---
@@ -190,3 +234,10 @@ def bad_udiv_unchecked(a: Int, b: Int) -> Int:
     if b >= 0:
         return udiv_unchecked(a, b)  # `b` may be 0
     return 0
+
+
+def bad_mode_chosen(xs: List[Int], fast: Bool) -> Int:
+    var mode = Mode.SAFE
+    if fast:
+        mode = Mode.FAST
+    return run(mode, xs)  # FAST may come with an empty list

@@ -381,6 +381,14 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   whose extent nothing states is reported. Extents are about bounds only:
   a pointer used after its memory is freed or reallocated (a list
   appended to after `unsafe_ptr()`) keeps the extent it had.
+- A struct with a single integer field and no parameters (an enum-like
+  wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
+  field is the value, `Wrapper(n)` (a constructor that only stores its
+  argument, also as a `comptime` constant) is `n`, and its own methods
+  whose bodies only read fields, call and return (`__eq__`, `__ne__`,
+  `__is__`, `__isnot__`) are evaluated in place. So a clause can say
+  `mode is not Mode.FAST or len(xs) > 0`, and a caller that picks the
+  mode on a branch establishes it. `Bool.__bool__` is the identity.
 - `ceildiv(a, b)` (and `a.__ceildiv__(b)`) of integers is `-(a // -b)`
   when signed and the quotient plus one for a nonzero remainder when
   unsigned, as `SIMD` defines it; so a launch with `grid_dim=ceildiv(n,
