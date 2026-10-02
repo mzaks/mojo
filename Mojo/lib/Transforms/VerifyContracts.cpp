@@ -1846,6 +1846,14 @@ private:
       state.alive = false; // Raises out of the function.
       return;
     }
+    // `comptime assert c`: the compiler checks `c` when it elaborates this
+    // code (for each instantiation and target), so it holds from here on.
+    if (auto assertion = dyn_cast<ParamAssertOp>(op)) {
+      std::string cond = paramTerm(assertion.getCond(), {true, 1, false});
+      state.pc =
+          define({true, 1, false}, "(and " + state.pc + " " + cond + ")", "r");
+      return;
+    }
     if (isa<HLCF::ReturnOp>(op)) {
       if (refines && !inContract)
         proveTraitEnsures(op, state);
