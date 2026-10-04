@@ -1381,6 +1381,8 @@ private:
   /// The valid extents (`_valid_dim`) of the partial tiles and views of
   /// them, by the tensor's term; any other tensor's are its `dim`s.
   std::map<std::string, SmallVector<std::string>> partialValid;
+  /// The shapes of layout values `row_major(Coord(...))` built, by term.
+  std::map<std::string, SmallVector<std::string>> layoutShapes;
   /// The collection an iterator (by its place's root) iterates.
   DenseMap<Value, Loc> iterSources;
   /// The types of places named by a value of another type (an element an
@@ -3588,8 +3590,13 @@ private:
       params = frame.parent;
     }
     assumeAssertion(call, name, state);
-    if (name)
-      recordTile(call, *name, state);
+    // Their operands as they were before the call (a reference argument it
+    // may write is unknown after it).
+    if (name) {
+      recordTile(call, *name, before);
+      recordRowMajor(call, *name, before);
+      checkReshape(call, *name, before);
+    }
     assumeListLiteral(call, name, before, state);
     if (callee)
       assumeCopy(call, callee, before, state);
@@ -5033,6 +5040,102 @@ private:
                     size + "))) " + size + " " + clamped + ")"));
     }
     partialValid[tile] = std::move(valid);
+  }
+
+  /// After `row_major(coord)`: the layout's shape is the coordinate's
+  /// elements (`Coord(n, k)` built with integers).
+  void recordRowMajor(LIT::CallOp call, const CalleeName &name,
+                      State &state) {
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!symbol || call->getNumResults() != 1 || call.getNumOperands() != 1 ||
+        !StringRef(name.path).starts_with("layout::tile_layout::row_major[") ||
+        symbol.getParamValues().empty())
+      return;
+    // Kept alive while its elements are used.
+    std::string typeList = printed(resolveParam(symbol.getParamValues()[0]));
+    std::optional<SmallVector<StringRef>> types = coordTypes(typeList);
+    if (!types)
+      return;
+    std::string coord = tensorTerm(call.getOperands()[0], state);
+    SmallVector<std::string> shape;
+    for (auto [k, type] : llvm::enumerate(*types)) {
+      MaybeTerm e = coordElement(type, coord, k);
+      if (!e)
+        return;
+      shape.push_back(*e);
+    }
+    layoutShapes[term(call->getResult(0), state)] = std::move(shape);
+  }
+
+  /// The number of elements of a tensor's valid extents: their product, for
+  /// a rank its layout gives or a `rank` seen (up to 4).
+  MaybeTerm validCount(ArrayRef<TypedAttr> params, Value tensor,
+                       State &state) {
+    if (params.size() < 4)
+      return std::nullopt;
+    auto product = [&](size_t rank) -> MaybeTerm {
+      std::string p;
+      for (size_t k = 0; k < rank; ++k) {
+        MaybeTerm d = validExtent(params, tensor, k, state);
+        if (!d)
+          return std::nullopt;
+        p = k ? "(bvmul " + p + " " + *d + ")" : *d;
+      }
+      return p;
+    };
+    size_t rank = layoutList(printed(resolveParam(params[3])), 0).size();
+    if (rank)
+      return product(rank);
+    auto it = layoutWitnesses.find({"rank", layoutKey(params[3])});
+    if (it == layoutWitnesses.end())
+      return std::nullopt;
+    std::string n = declare(Sort{false, 64, true}, "n");
+    for (size_t r = 1; r <= 4; ++r)
+      if (MaybeTerm p = product(r))
+        facts.push_back("(=> (= " + it->second + " " + bvConst(r, 64) +
+                        ") (= " + n + " " + *p + "))");
+    return n;
+  }
+
+  /// `t.reshape(layout)` for a layout `row_major(Coord(...))` built: the
+  /// view's dimensions are the layout's shape, and an obligation that it
+  /// covers no more elements than `t` validly holds (the view reads from
+  /// `t`'s first element on; assumed: `t` has no zero stride). Any other
+  /// layout leaves the view's dimensions unknown, as before.
+  void checkReshape(LIT::CallOp call, const CalleeName &name, State &state) {
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!symbol || call->getNumResults() != 1 || call.getNumOperands() != 2 ||
+        !StringRef(name.path).starts_with(
+            "layout::tile_tensor::TileTensor::reshape["))
+      return;
+    auto it = layoutShapes.find(tensorTerm(call.getOperands()[1], state));
+    std::string view = term(call->getResult(0), state);
+    if (it == layoutShapes.end() || sortOfTerm(view).isBool ||
+        sortOfTerm(view).width != 64)
+      return;
+    if (!tensorDimDeclared) {
+      prelude += "(declare-fun tdim ((_ BitVec 64) (_ BitVec 64)) "
+                 "(_ BitVec 64))\n";
+      tensorDimDeclared = true;
+    }
+    std::string size;
+    for (auto [k, d] : llvm::enumerate(it->second)) {
+      facts.push_back("(= (tdim " + view + " " + bvConst(k, 64) + ") " + d +
+                      ")");
+      size = k ? "(bvmul " + size + " " + d + ")" : d;
+    }
+    if (inContract || size.empty())
+      return;
+    Obligation ob{state.pc, "false", call.getLoc(), call.getLoc(),
+                  "TileTensor.reshape"};
+    ob.claim = "that the new layout covers no more elements than the tensor";
+    if (MaybeTerm count =
+            validCount(symbol.getParamValues(), call.getOperands()[0], state))
+      ob.cond = define({true, 1, false}, "(bvsle " + size + " " + *count + ")");
+    else
+      ob.analyzed = false;
+    noteCondition(ob.cond);
+    obligations.push_back(ob);
   }
 
   /// The extent of the pointer value `p`, `Pointer._extent()`: how many
