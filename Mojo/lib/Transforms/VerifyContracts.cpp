@@ -351,6 +351,8 @@ struct SolverConfig {
   /// limit). Bit-vector products and quotients of unknowns can use up any
   /// limit where the integer retry decides them at once.
   unsigned nonlinearRlimit = 0;
+  /// Whether `runCases` splits open queries over finite-domain unknowns.
+  bool caseSplit = true;
 };
 
 /// Runs `program` and waits at most `seconds` for it; returns its exit
@@ -1222,6 +1224,13 @@ public:
 
   /// The declarations and facts the queries share.
   std::string scriptHeader() const { return header(); }
+  void solveCases(const std::string &text, SmallVectorImpl<Answer> &answers,
+                  StringRef name, ArrayRef<bool> reask) {
+    runCases(text, answers, name, reask);
+  }
+  bool obligationDependsOnCases(const Obligation &ob) {
+    return dependsOnCases(ob.cond) || dependsOnCases(ob.pc);
+  }
 
   std::string script() {
     std::string text = header();
@@ -1398,6 +1407,153 @@ private:
   SmallVector<LoopFrame *> loops;
   SmallVector<TryFrame *> tries;
 
+  /// Case splitting: `answers` of the queries of `text`, upgraded to
+  /// proven where every case proves them. A case is a combination of
+  /// values of the finite-domain unknowns `text` declares, defined as those
+  /// constants, so products and quotients by them fold (a bit-vector
+  /// product of two unknowns is what z3 cannot decide within its limits).
+  /// Only where an answer is unknown, and for at most 64 cases.
+  void runCases(const std::string &text, SmallVectorImpl<Answer> &answers,
+                StringRef name, ArrayRef<bool> reask = {}) {
+    // A refuted query may hold with the case facts (an exact quotient where
+    // the script only bounds it): asked again where `reask` says it depends
+    // on what the cases change.
+    if (!solver.caseSplit)
+      return;
+    auto open = [&](size_t i) {
+      return answers[i] == Answer::Unknown ||
+             (answers[i] == Answer::Unproven && !caseFacts.empty() &&
+              i < reask.size() && reask[i]);
+    };
+    bool any = false;
+    for (size_t i = 0; i < answers.size(); ++i)
+      any = any || open(i);
+    if (!any)
+      return;
+    // The finite-domain unknowns the open queries depend on (through
+    // definitions); others stay unknowns, which is sound.
+    std::set<std::string> used;
+    {
+      size_t at = text.find("(echo \"@@\")");
+      SmallVector<std::string> work;
+      if (at != std::string::npos)
+        for (const std::string &n : namesIn(StringRef(text).drop_front(at)))
+          work.push_back(n);
+      while (!work.empty()) {
+        std::string n = work.pop_back_val();
+        if (!used.insert(n).second)
+          continue;
+        if (auto def = definitions.find(n); def != definitions.end())
+          for (const std::string &m : namesIn(def->second))
+            work.push_back(m);
+      }
+    }
+    // Every one the script declares (facts, such as loop invariants, may
+    // relate them to the queries); only those the queries depend on if
+    // that is more than 64 cases.
+    SmallVector<std::pair<std::string, ArrayRef<int64_t>>> domains;
+    size_t cases = 1;
+    for (bool onlyUsed : {false, true}) {
+      domains.clear();
+      cases = 1;
+      for (auto &[unknown, values] : finiteDomains) {
+        std::string decl = "(declare-const " + unknown + " (_ BitVec 64))\n";
+        if ((onlyUsed && !used.count(unknown)) ||
+            text.find(decl) == std::string::npos)
+          continue;
+        domains.push_back({unknown, values});
+        cases *= values.size();
+      }
+      if (cases <= 64)
+        break;
+    }
+    if (domains.empty() || cases > 64)
+      return;
+    std::string extra;
+    for (const std::string &fact : caseFacts)
+      extra += "(assert " + fact + ")\n";
+    // The header, and each query (from its `(echo "@@")`).
+    StringRef marker = "(echo \"@@\")";
+    size_t firstQuery = text.find(marker.str());
+    if (firstQuery == std::string::npos)
+      return;
+    std::string head = text.substr(0, firstQuery) + extra;
+    SmallVector<StringRef> queries;
+    for (StringRef rest = StringRef(text).drop_front(firstQuery);
+         !rest.empty();) {
+      size_t next = rest.find(marker, marker.size());
+      queries.push_back(rest.take_front(next));
+      rest = rest.drop_front(std::min(next, rest.size()));
+    }
+    if (queries.size() != answers.size())
+      return;
+    // In a case the finite-domain unknowns are constants, so what holds is
+    // quick to prove: each query gets at most 5M (a refuted query re-asked
+    // for the case facts would otherwise cost its full limit in every case).
+    static llvm::Regex limitRe("\\(set-option :rlimit ([0-9]+)\\)");
+    SmallVector<std::string> capped;
+    for (StringRef q : queries) {
+      std::string text = q.str();
+      SmallVector<StringRef> m;
+      uint64_t limit;
+      if (limitRe.match(text, &m) && !m[1].getAsInteger(10, limit) &&
+          limit > 5000000) {
+        size_t at = text.find(m[0].str());
+        text.replace(at, m[0].size(), "(set-option :rlimit 5000000)");
+      }
+      capped.push_back(std::move(text));
+    }
+    // Still to decide: open and not refuted by a case so far (a query a case
+    // refutes is not asked again, so a real failure costs one or two cases).
+    SmallVector<bool> pending;
+    for (size_t i = 0; i < answers.size(); ++i)
+      pending.push_back(open(i));
+    // The script of case `c` for the queries `asked`.
+    auto caseScript = [&](size_t c, ArrayRef<size_t> asked) {
+      std::string t = head;
+      for (size_t i : asked)
+        t += capped[i];
+      size_t rest = c;
+      for (auto &[unknown, values] : domains) {
+        int64_t v = values[rest % values.size()];
+        rest /= values.size();
+        std::string decl = "(declare-const " + unknown + " (_ BitVec 64))\n";
+        t.replace(t.find(decl), decl.size(),
+                  "(define-fun " + unknown + " () (_ BitVec 64) " +
+                      bvConst(v, 64) + ")\n");
+      }
+      return t;
+    };
+    // The first case alone (a refuted query is dropped from the rest), then
+    // the others in groups of 8 per solver process, separated by `(reset)`:
+    // starting a process per case cost more than the cases' own work.
+    for (size_t first = 0; first < cases;) {
+      size_t last = first == 0 ? 1 : std::min(cases, first + 8);
+      SmallVector<size_t> asked;
+      for (size_t i = 0; i < pending.size(); ++i)
+        if (pending[i])
+          asked.push_back(i);
+      if (asked.empty())
+        break;
+      std::string t;
+      for (size_t c = first; c < last; ++c)
+        t += (c == first ? "" : "(reset)\n") + caseScript(c, asked);
+      std::optional<SmallVector<Answer>> r =
+          runZ3(solver, t, (name + ".case" + Twine(first)).str());
+      if (!r || r->size() != asked.size() * (last - first))
+        return;
+      // A query undecided in a case is not proven either.
+      for (size_t c = 0; c < last - first; ++c)
+        for (auto [j, i] : llvm::enumerate(asked))
+          if ((*r)[c * asked.size() + j] != Answer::Proven)
+            pending[i] = false;
+      first = last;
+    }
+    for (auto [i, a] : llvm::enumerate(answers))
+      if (pending[i])
+        a = Answer::Proven;
+  }
+
   std::string header() const {
     std::string text = "; " + displayName(fn) + "\n" +
                        "(set-option :print-success false)\n" + prelude;
@@ -1497,6 +1653,36 @@ private:
       staticShapeTerms, dimTerms;
   /// Facts that are added once however often their terms are met.
   std::set<std::string> addedFacts;
+  /// Unknowns that range over a few values (a SIMD width, the warp size),
+  /// by name: what `runCases` substitutes.
+  std::map<std::string, SmallVector<int64_t>> finiteDomains;
+  /// The `simd_width_of` widths, by dtype and target (`simdWidth`).
+  std::map<std::string, std::string> simdWidths;
+  /// Facts asserted only in the cases of `runCases`, where they are cheap:
+  /// exact unsigned quotients, whose divisor a case makes a constant.
+  SmallVector<std::string> caseFacts;
+  /// The quotients `caseFacts` make exact.
+  std::set<std::string> caseQuotients;
+  llvm::StringMap<bool> caseTerms;
+
+  /// Whether a term depends (through definitions) on a finite-domain
+  /// unknown or a quotient made exact in the cases: whether case splitting
+  /// can change its answer.
+  bool dependsOnCases(StringRef term) {
+    if (finiteDomains.count(term.str()) || caseQuotients.count(term.str()))
+      return true;
+    if (auto it = caseTerms.find(term); it != caseTerms.end())
+      return it->second;
+    caseTerms[term] = false;
+    bool result = false;
+    auto def = definitions.find(term.str());
+    for (const std::string &name :
+         namesIn(def != definitions.end() ? StringRef(def->second) : term))
+      if (!result && name != term)
+        result = dependsOnCases(name);
+    caseTerms[term] = result;
+    return result;
+  }
 
   /// The names of terms (`t12`, `h3`) used in an expression.
   static SmallVector<std::string> namesIn(StringRef expr) {
@@ -2533,8 +2719,10 @@ private:
           if (kept[i])
             asked.append(1 + ends.size(), i);
         std::string text = rebuild(set, kept, before, head, ends, render);
-        std::optional<SmallVector<Answer>> answers = runZ3(
-            solver, text, dumpPrefix + ".houdini" + std::to_string(houdiniRuns++));
+        std::string run = dumpPrefix + ".houdini" + std::to_string(houdiniRuns++);
+        std::optional<SmallVector<Answer>> answers = runZ3(solver, text, run);
+        if (answers)
+          runCases(text, *answers, run);
         bool changed = false;
         for (auto [k, i] : llvm::enumerate(asked)) {
           bool proven = answers && k < answers->size() &&
@@ -3110,13 +3298,22 @@ private:
         facts.push_back("(or (= " + other + " " + bvConst(32, 64) + ") (= " +
                         other + " " + bvConst(64, 64) + "))");
       }
-      auto c = [&](int64_t v) { return bvConst(v, 64); };
-      return define(sort, "(ite " + flag("nvidia_gpu") + " " + c(32) +
-                              " (ite " + flag("amd_rdna") + " " + c(32) +
-                              " (ite " + flag("amd_gpu") + " " + c(64) +
-                              " (ite " + flag("apple_gpu") + " " + c(32) +
-                              " (ite (not " + flag("accelerator") + ") " +
-                              c(0) + " " + other + ")))))");
+      // One constant per view, so case splitting (`runCases`) can give it
+      // each of its values.
+      std::string w = deviceView ? "target_device_warp_size" : "target_warp_size";
+      if (gpuIds.insert(w).second) {
+        prelude += "(declare-const " + w + " (_ BitVec 64))\n";
+        sorts[w] = sort;
+        auto c = [&](int64_t v) { return bvConst(v, 64); };
+        facts.push_back("(= " + w + " (ite " + flag("nvidia_gpu") + " " +
+                        c(32) + " (ite " + flag("amd_rdna") + " " + c(32) +
+                        " (ite " + flag("amd_gpu") + " " + c(64) + " (ite " +
+                        flag("apple_gpu") + " " + c(32) + " (ite (not " +
+                        flag("accelerator") + ") " + c(0) + " " + other +
+                        "))))))");
+        finiteDomains[w] = {0, 32, 64};
+      }
+      return w;
     }
     return std::nullopt;
   }
@@ -3293,29 +3490,10 @@ private:
         if (ops.size() == 3 && sort.isBool)
           if (MaybeTerm t = dtypeMembership(ops))
             return *t;
-        // `simd_width_of[dtype]()`: the target's SIMD bit width (128 on
-        // every GPU target, at most 512 on CPUs, 0 for no target) divided by
-        // the dtype's (8 times its size, a power of two): 0 or a power of
-        // two, at most 256 (assumed).
         if (ops.size() == 1 && !sort.isBool && sort.width == 64)
-          if (std::optional<CalleeName> name = calleeName(ops[0]);
-              name &&
-              StringRef(name->path)
-                  .starts_with("std::sys::info::simd_width_of[!kgen.target,::"
-                               "DType,")) {
-            // As cases, not `w & (w - 1) == 0`: each case makes the width a
-            // constant. With the bit trick six of gemv's `vectorize`
-            // preconditions ran to the solver's limit; as cases they are
-            // proven.
-            std::string w = parameterValue(printed(attr), sort);
-            std::string fact = "(or (= " + w + " " + bvConst(0, 64) + ")";
-            for (int64_t v = 1; v <= 256; v *= 2)
-              fact += " (= " + w + " " + bvConst(v, 64) + ")";
-            fact += ")";
-            if (addedFacts.insert(fact).second)
-              facts.push_back(fact);
-            return w;
-          }
+          if (auto symbol = dyn_cast<SymbolConstantAttr>(ops[0]))
+            if (MaybeTerm w = simdWidth(symbol))
+              return *w;
         // `Wrapper(n)` of an integer wrapper (`GEMVAlgorithm.GEMV_KERNEL`
         // is `GEMVAlgorithm(0)`): `n`.
         if (ops.size() == 2 && !sort.isBool)
@@ -3393,6 +3571,38 @@ private:
     if (auto constant = dyn_cast<DTypeConstantAttr>(a))
       return constant.getDType().getValue();
     return std::nullopt;
+  }
+
+  /// `simd_width_of[dtype, target]()` (the `DType` overload), as a
+  /// parameter expression or a call (a clause calls it): the target's SIMD
+  /// bit width (128 on every GPU target, at most 512 on CPUs, 0 for no
+  /// target) divided by the dtype's (8 times its size, a power of two): 0 or
+  /// a power of two, at most 256 (assumed). One term per dtype and target
+  /// (resolved through call frames), so a clause's call and a body's
+  /// `comptime` are the same width. As cases, not `w & (w - 1) == 0`: each
+  /// case makes the width a constant; with the bit trick six of gemv's
+  /// `vectorize` preconditions ran to the solver's limit.
+  MaybeTerm simdWidth(SymbolConstantAttr symbol) {
+    std::optional<CalleeName> name = calleeName(symbol);
+    ArrayRef<TypedAttr> ps = symbol.getParamValues();
+    if (!name || ps.size() < 2 ||
+        !StringRef(name->path)
+             .starts_with("std::sys::info::simd_width_of[!kgen.target,::DType,"))
+      return std::nullopt;
+    std::string key = "simd_width_of|" + layoutKey(unwrapValue(ps[1])) + "|" +
+                      layoutKey(unwrapValue(ps[0]));
+    auto [it, inserted] = simdWidths.try_emplace(key, "");
+    if (!inserted)
+      return it->second;
+    std::string w = declare(Sort{false, 64, true}, "p");
+    prelude += "; " + w + ": " + StringRef(key).take_front(300).str() + "\n";
+    std::string fact = "(or (= " + w + " " + bvConst(0, 64) + ")";
+    for (int64_t v = 1; v <= 256; v *= 2)
+      fact += " (= " + w + " " + bvConst(v, 64) + ")";
+    facts.push_back(fact + ")");
+    finiteDomains[w] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 256};
+    it->second = w;
+    return w;
   }
 
   /// `dtype in (DType.float32, DType.bfloat16, ...)` as a parameter
@@ -3544,6 +3754,13 @@ private:
       return;
     if (name && evalGpuId(call, *name))
       return;
+    if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+        symbol && call.getNumOperands() == 0 && call->getNumResults() == 1)
+      if (MaybeTerm w = simdWidth(symbol);
+          w && sortOf(call->getResult(0).getType()).width == 64) {
+        values[call->getResult(0)] = *w;
+        return;
+      }
     if (name && callee && evalIteration(call, *name, callee, state))
       return;
     if (name && evalBuiltin(call, *name, state))
@@ -4323,7 +4540,12 @@ private:
   std::string layoutKey(TypedAttr layout) {
     ParamFrame *scope = nullptr;
     TypedAttr resolved = resolveParam(layout, &scope);
-    return (scope ? scope->scope : std::string()) + "|" + printed(resolved);
+    std::string text = printed(resolved);
+    // A closed expression (no parameter in it: a concrete layout, the
+    // accelerator's target) is the same in every frame.
+    bool closed = !StringRef(text).contains("param.decl.ref") &&
+                  !StringRef(text).contains("param.index.ref");
+    return (scope && !closed ? scope->scope : std::string()) + "|" + text;
   }
 
   /// The `rank` or `flat_rank` witness of a layout (by `layoutKey`): one
@@ -5521,9 +5743,17 @@ private:
     std::string b = isa<LIT::RefType>(divisorValue.getType())
                         ? valueThrough(divisorValue, state)
                         : term(divisorValue, state);
-    if (!sortOfTerm(b).isBool && sortOfTerm(b).width == 64)
+    if (!sortOfTerm(b).isBool && sortOfTerm(b).width == 64) {
       facts.push_back("(=> (= " + b + " " + bvConst(0, 64) + ") (= " + q +
                       " " + bvConst(0, 64) + "))");
+      std::string exact = path.starts_with("std::math::uutils::uceildiv")
+                              ? ceilDivision(Sort{false, 64, false}, a, b)
+                              : "(bvudiv " + a + " " + b + ")";
+      caseQuotients.insert(q);
+      caseFacts.push_back("(=> (and (bvsle " + bvConst(0, 64) + " " + a +
+                          ") (bvsgt " + b + " " + bvConst(0, 64) + ")) (= " +
+                          q + " " + exact + "))");
+    }
     values[call->getResult(0)] = q;
     return true;
   }
@@ -6989,6 +7219,7 @@ struct VerifyContractsPass
                         cacheDir};
     if (intRetry)
       solver.nonlinearRlimit = nonlinearRlimit;
+    solver.caseSplit = caseSplit;
     if (!cacheDir.empty())
       (void)llvm::sys::fs::create_directories(cacheDir);
     // Functions are verified independently, in parallel; their results are
@@ -7172,6 +7403,36 @@ struct VerifyContractsPass
         return;
       std::optional<SmallVector<Answer>> answers =
           runZ3(solver, enc.script(), name);
+      // Still open: case splitting over the finite-domain unknowns, before
+      // the full limit (a case makes them constants, so it is quick where
+      // the full limit runs to its end).
+      auto cases = [&] {
+        SmallVector<size_t> open;
+        SmallVector<bool> reask;
+        std::string text = enc.scriptHeader();
+        size_t k = 0;
+        for (const Obligation &ob : enc.obligations) {
+          if (!ob.analyzed)
+            continue;
+          if (k < answers->size() && ((*answers)[k] == Answer::Unknown ||
+                                      (*answers)[k] == Answer::Unproven)) {
+            open.push_back(k);
+            reask.push_back(enc.obligationDependsOnCases(ob));
+            text += query({ob.pc}, ob.cond, enc.limitOf(ob));
+          }
+          ++k;
+        }
+        if (!open.empty()) {
+          SmallVector<Answer> sub;
+          for (size_t k : open)
+            sub.push_back((*answers)[k]);
+          enc.solveCases(text, sub, name + ".cases", reask);
+          for (auto [i, k] : llvm::enumerate(open))
+            if (sub[i] == Answer::Proven)
+              (*answers)[k] = Answer::Proven;
+        }
+      };
+
       // Queries answered `unknown`: once more over the integers (with the
       // limit they were asked with), and those asked with a lower limit and
       // still open, again with the full one.
@@ -7214,8 +7475,11 @@ struct VerifyContractsPass
                   (lowered || (*retried)[i] == Answer::Proven))
                 (*answers)[k] = (*retried)[i];
         };
+        cases();
         retry(/*lowered=*/false, ".int");
         retry(/*lowered=*/true, ".full");
+      } else if (answers) {
+        cases();
       }
       unsigned next = 0;
       for (Obligation &ob : enc.obligations) {

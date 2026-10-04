@@ -70,6 +70,10 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "With int-retry: resource limit per query whose goal multiplies "
            "or divides two unknowns, at most the query limit (0: just "
            "that); what it leaves open is asked again over the integers">,
+    Option<"caseSplit", "case-split", "bool", /*default=*/"true",
+           "Ask queries the solver leaves open once per value of the "
+           "unknowns with few values (the warp size, a SIMD width), as "
+           "constants (at most 64 combinations)">,
     Option<"genericRlimit", "generic-rlimit", "unsigned",
            /*default=*/"10000000",
            "With generic-launched: resource limit per query of a launched "
