@@ -2026,6 +2026,8 @@ private:
     }
     if (opName == "hlcf.comptime.yield") {
       state.yields.clear();
+      for (Value operand : op->getOperands())
+        state.yields.push_back(term(operand, state));
       return;
     }
     if (opName == "hlcf.comptime.if") {
@@ -2161,11 +2163,12 @@ private:
   /// parameter expression in `conds`) is true, or the else arm (the last
   /// region). Conditions are evaluated with `paramTerm`, so a literal or an
   /// expression over the function's parameters decides or constrains the
-  /// arm; the same expression in two places is the same choice.
+  /// arm; the same expression in two places is the same choice. As an
+  /// expression (`x if comptime (c) else y`) its results are what the taken
+  /// arm yields.
   void walkComptimeIf(Operation *op, State &state) {
     auto ifOp = dyn_cast<HLCF::ComptimeIfOp>(op);
-    if (!ifOp || op->getNumResults() ||
-        op->getNumRegions() != ifOp.getConds().size() + 1) {
+    if (!ifOp || op->getNumRegions() != ifOp.getConds().size() + 1) {
       notAnalyzed(op, state);
       return;
     }
@@ -2190,7 +2193,14 @@ private:
     if (!elseRegion.empty())
       walkBlock(elseRegion.front(), elseArm);
     arms.push_back(std::move(elseArm));
-    State joined = merge(arms);
+    SmallVector<std::string> results;
+    State joined = merge(arms, &results);
+    if (op->getNumResults()) {
+      // An arm that yields fewer values than the results gives unknowns.
+      if (results.size() != op->getNumResults())
+        results.clear();
+      bindResults(op, results);
+    }
     joined.yields = state.yields;
     state = std::move(joined);
   }
