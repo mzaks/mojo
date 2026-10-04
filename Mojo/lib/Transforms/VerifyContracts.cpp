@@ -1378,6 +1378,9 @@ private:
   std::set<std::string> gpuIds;
   /// The results of `TileTensor.dim` (see `evalTileTensor`).
   llvm::DenseSet<Value> tensorDims;
+  /// The valid extents (`_valid_dim`) of the partial tiles and views of
+  /// them, by the tensor's term; any other tensor's are its `dim`s.
+  std::map<std::string, SmallVector<std::string>> partialValid;
   /// The collection an iterator (by its place's root) iterates.
   DenseMap<Value, Loc> iterSources;
   /// The types of places named by a value of another type (an element an
@@ -2922,6 +2925,48 @@ private:
     obligations.push_back(ob);
   }
 
+  /// A partial tile (or a view of one) passed to a function other than the
+  /// `TileTensor` methods whose clauses check `_valid_dim`: that function
+  /// was verified for a tensor every element of which is backed, so the
+  /// tile must not be partial here (its valid extents its `dim`s).
+  void checkPartialTiles(LIT::CallOp call, const CalleeName &name,
+                         State &state) {
+    StringRef path = name.path;
+    if (path.consume_front("layout::tile_tensor::TileTensor::"))
+      for (const char *method :
+           {"tile[", "vectorize[", "dim[", "_valid_dim[", "__getitem__",
+            "__setitem__", "load[", "store[", "_indices_in_bounds",
+            "_access_in_bounds", "_vectorize_in_bounds", "_tile_in_bounds",
+            "_tile_coords_in_bounds", "_tile_shape_in_bounds"})
+        if (path.starts_with(method))
+          return;
+    for (Value operand : call.getOperands()) {
+      Type type = operand.getType();
+      if (auto ref = dyn_cast<LIT::RefType>(type))
+        type = ref.getElementType();
+      auto st = dyn_cast<LIT::StructType>(type);
+      if (!st || printed(st.getSymbol()) != "@layout::@tile_tensor::@TileTensor")
+        continue;
+      auto it = partialValid.find(tensorTerm(operand, state));
+      if (it == partialValid.end())
+        continue;
+      std::string all = "true";
+      for (auto [k, valid] : llvm::enumerate(it->second)) {
+        MaybeTerm d = tensorDim(st.getParamValues(), operand, k, state);
+        if (!d)
+          return;
+        all = "(and " + all + " (= " + valid + " " + *d + "))";
+      }
+      LIT::FnOp callee = lookup(call);
+      Obligation ob{state.pc, "false", call.getLoc(), call.getLoc(),
+                    callee ? displayName(callee) : name.path};
+      ob.claim = "that the tile passed is not partial (every element backed)";
+      ob.cond = define({true, 1, false}, all);
+      noteCondition(ob.cond);
+      obligations.push_back(ob);
+    }
+  }
+
   /// Whether `term` is a bit-vector literal other than 0 (`(_ bv4 64)`).
   static bool isNonzeroLiteral(StringRef term) {
     return term.starts_with("(_ bv") && !term.starts_with("(_ bv0 ");
@@ -3469,6 +3514,7 @@ private:
     if (name && !inContract) {
       checkLaunch(call, *name, state);
       checkDereference(call, *name, callee, state);
+      checkPartialTiles(call, *name, state);
     }
     if (name && evalReversedRange(call, *name, state))
       return;
@@ -3542,6 +3588,8 @@ private:
       params = frame.parent;
     }
     assumeAssertion(call, name, state);
+    if (name)
+      recordTile(call, *name, state);
     assumeListLiteral(call, name, before, state);
     if (callee)
       assumeCopy(call, callee, before, state);
@@ -4512,6 +4560,22 @@ private:
       values[result] = *d;
       return true;
     }
+    // `t._valid_dim[k]()`: the valid extent (`validExtent`).
+    if (path.starts_with("layout::tile_tensor::TileTensor::_valid_dim[") &&
+        call.getNumOperands() == 1) {
+      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      SmallVector<StringRef> m;
+      int64_t k;
+      std::string last =
+          params.empty() ? "" : printed(resolveParam(params.back()));
+      if (!intValue.match(last, &m) || m[2].getAsInteger(10, k))
+        return false;
+      MaybeTerm d = validExtent(params, call.getOperands()[0], k, state);
+      if (!d)
+        return false;
+      values[result] = *d;
+      return true;
+    }
     // `t._indices_in_bounds(*items)`, the clause of writing an element:
     // every index `i` of the pack in `[0, dim[i])`.
     if (path.starts_with(
@@ -4534,8 +4598,8 @@ private:
             sortOf(placeType(*place)).width != 64)
           return false;
         std::string v = load(*place, state, sort);
-        MaybeTerm d =
-            tensorDim(symbol.getParamValues(), call.getOperands()[0], k, state);
+        MaybeTerm d = validExtent(symbol.getParamValues(), call.getOperands()[0],
+                                  k, state);
         if (!d)
           return false;
         all = "(and " + all + " (bvsle " + bvConst(0, 64) + " " + v +
@@ -4545,41 +4609,23 @@ private:
       return true;
     }
     // `t._tile_in_bounds[*sizes](*coords)`, the clause of taking a tile:
-    // every coordinate `c` of the pack in `[0, dim / size)` for a positive
-    // size (`sizes` is the ninth parameter, a list of integers or integer
-    // parameters).
+    // every coordinate `c` of the pack not negative for a positive size
+    // (`sizes` is the ninth parameter). The tile may extend past the edge:
+    // its valid extents say how much of it is backed (`recordTile`).
     if (path.starts_with("layout::tile_tensor::TileTensor::_tile_in_bounds[") &&
         call.getNumOperands() == 2) {
       ArrayRef<TypedAttr> params = symbol.getParamValues();
       if (params.size() < 9)
         return false;
       std::optional<SmallVector<std::string>> sizes = intList(params[8]);
-      if (!sizes)
-        return false;
-      Value pack = call.getOperands()[1];
-      while (auto rebind = pack.getDefiningOp<RebindOp>())
-        pack = rebind->getOperand(0);
-      if (!isa<LIT::RefType>(pack.getType()))
-        return false;
-      auto refs = packRefs.find(valueThrough(pack, state));
-      if (refs == packRefs.end() || refs->second.size() != sizes->size())
+      std::optional<SmallVector<std::string>> coords =
+          intPack(call.getOperands()[1], state);
+      if (!sizes || !coords || coords->size() != sizes->size())
         return false;
       std::string all = "true";
-      for (auto [k, ref] : llvm::enumerate(refs->second)) {
-        std::optional<Loc> place = placeOf(ref);
-        if (!place || !isScalar(placeType(*place)) ||
-            sortOf(placeType(*place)).isBool ||
-            sortOf(placeType(*place)).width != 64)
-          return false;
-        std::string c = load(*place, state, sort);
-        MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
-        if (!d)
-          return false;
-        const std::string &size = (*sizes)[k];
+      for (auto [c, size] : llvm::zip(*coords, *sizes))
         all = "(and " + all + " (ite (bvsgt " + size + " " + bvConst(0, 64) +
-              ") (and (bvsle " + bvConst(0, 64) + " " + c + ") (bvslt " + c +
-              " (bvsdiv " + *d + " " + size + "))) true))";
-      }
+              ") (bvsle " + bvConst(0, 64) + " " + c + ") true))";
       values[result] = define({true, 1, false}, all);
       return true;
     }
@@ -4647,7 +4693,7 @@ private:
                              ? MaybeTerm((*sizes)[k])
                              : coordElement((*shapeTypes)[k], shapeValue, k);
         MaybeTerm c = coordElement(ct, coordValue, k);
-        MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
+        MaybeTerm d = validExtent(params, call.getOperands()[0], k, state);
         if (!size || !c || !d)
           return false;
         all = "(and " + all + " (ite (bvsgt " + *size + " " + zero +
@@ -4713,7 +4759,7 @@ private:
         if (!element)
           return false;
         std::string c = *element;
-        MaybeTerm d = tensorDim(params, call.getOperands()[0], k, state);
+        MaybeTerm d = validExtent(params, call.getOperands()[0], k, state);
         if (!d)
           return false;
         std::string zero = bvConst(0, 64);
@@ -4889,9 +4935,104 @@ private:
         facts.push_back("(=> (bvsgt " + (*sizes)[k] + " " + bvConst(0, 64) +
                         ") (= (tdim " + view + " " + bvConst(k, 64) + ") " + d +
                         "))");
+      // A view of a partial tile: a vector is valid where all its elements
+      // are, so `valid // size` of them.
+      std::string parent = tensorTerm(call.getOperands()[0], state);
+      if (auto it = partialValid.find(parent);
+          it != partialValid.end() && it->second.size() == sizes->size()) {
+        SmallVector<std::string> valid;
+        for (auto [v, size] : llvm::zip(it->second, *sizes))
+          valid.push_back(define(sort, "(ite (bvsgt " + size + " " +
+                                           bvConst(0, 64) + ") (bvsdiv " + v +
+                                           " " + size + ") " + v + ")"));
+        partialValid[view] = std::move(valid);
+      }
       return true;
     }
     return false;
+  }
+
+  /// A tensor argument's value, through a reference.
+  std::string tensorTerm(Value tensor, State &state) {
+    return isa<LIT::RefType>(tensor.getType()) ? valueThrough(tensor, state)
+                                               : term(tensor, state);
+  }
+
+  /// `_valid_dim[k]()` of a tensor whose type parameters are `params`: the
+  /// recorded extent of a partial tile (or a view of one), else `dim[k]()`.
+  MaybeTerm validExtent(ArrayRef<TypedAttr> params, Value tensor, int64_t k,
+                        State &state) {
+    if (auto it = partialValid.find(tensorTerm(tensor, state));
+        it != partialValid.end() && k >= 0 && (size_t)k < it->second.size())
+      return it->second[k];
+    return tensorDim(params, tensor, k, state);
+  }
+
+  /// The integers a variadic `*args: Int` pack holds (its references'
+  /// values), in order.
+  std::optional<SmallVector<std::string>> intPack(Value pack, State &state) {
+    while (auto rebind = pack.getDefiningOp<RebindOp>())
+      pack = rebind->getOperand(0);
+    if (!isa<LIT::RefType>(pack.getType()))
+      return std::nullopt;
+    auto refs = packRefs.find(valueThrough(pack, state));
+    if (refs == packRefs.end())
+      return std::nullopt;
+    SmallVector<std::string> ints;
+    for (Value ref : refs->second) {
+      std::optional<Loc> place = placeOf(ref);
+      if (!place || !isScalar(placeType(*place)) ||
+          sortOf(placeType(*place)).isBool ||
+          sortOf(placeType(*place)).width != 64)
+        return std::nullopt;
+      ints.push_back(load(*place, state, Sort{false, 64, true}));
+    }
+    return ints;
+  }
+
+  /// After `t.tile[*sizes](*coords)` (the `Int` coordinates form): the
+  /// tile's valid extents, `clamp(valid(t) - c * size, 0, size)` per
+  /// dimension, so a tile past the edge (partial) is indexed only where it
+  /// is backed.
+  void recordTile(LIT::CallOp call, const CalleeName &name, State &state) {
+    StringRef path = name.path;
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!symbol || call->getNumResults() != 1 || call.getNumOperands() != 2 ||
+        !path.starts_with("layout::tile_tensor::TileTensor::tile[") ||
+        !path.contains("*::SIMD[DType.int, 1]"))
+      return;
+    ArrayRef<TypedAttr> params = symbol.getParamValues();
+    if (params.size() < 9)
+      return;
+    std::optional<SmallVector<std::string>> sizes = intList(params[8]);
+    std::optional<SmallVector<std::string>> coords =
+        intPack(call.getOperands()[1], state);
+    std::string tile = term(call->getResult(0), state);
+    if (!sizes || !coords || coords->size() != sizes->size() ||
+        sortOfTerm(tile).isBool || sortOfTerm(tile).width != 64)
+      return;
+    Sort sort{false, 64, true};
+    std::string zero = bvConst(0, 64);
+    SmallVector<std::string> valid;
+    for (auto [k, size] : llvm::enumerate(*sizes)) {
+      MaybeTerm parent = validExtent(params, call.getOperands()[0], k, state);
+      if (!parent)
+        return;
+      const std::string &c = (*coords)[k];
+      std::string rest = define(sort, "(bvsub " + *parent + " (bvmul " + c +
+                                          " " + size + "))");
+      std::string clamped = define(
+          sort, "(ite (bvslt " + rest + " " + zero + ") " + zero +
+                    " (ite (bvslt " + size + " " + rest + ") " + size + " " +
+                    rest + "))");
+      // A whole tile (`0 <= c < valid // size`, the old clause) is valid
+      // throughout: stated so, the solver need not multiply `c * size`.
+      valid.push_back(define(
+          sort, "(ite (and (bvsgt " + size + " " + zero + ") (bvsle " + zero +
+                    " " + c + ") (bvslt " + c + " (bvsdiv " + *parent + " " +
+                    size + "))) " + size + " " + clamped + ")"));
+    }
+    partialValid[tile] = std::move(valid);
   }
 
   /// The extent of the pointer value `p`, `Pointer._extent()`: how many

@@ -1011,7 +1011,7 @@ struct TileTensor[
     def __getitem__(
         self,
         i0: Some[CoordLike] where Self.rank != 1 or _coord_in_bounds(
-            i0, Int(self.dim[0]())
+            i0, self._valid_dim[0]()
         ),
     ) -> Self.ElementType:
         """Retrieve the element at the given index or coordinate.
@@ -1030,9 +1030,9 @@ struct TileTensor[
     @inline(.nodebug)
     def __getitem__(
         self,
-        i0: Some[CoordLike] where _coord_in_bounds(i0, Int(self.dim[0]())),
+        i0: Some[CoordLike] where _coord_in_bounds(i0, self._valid_dim[0]()),
         i1: Some[CoordLike] where Self.rank != 2 or _coord_in_bounds(
-            i1, Int(self.dim[1]())
+            i1, self._valid_dim[1]()
         ),
     ) -> Self.ElementType:
         """Retrieve the element at the given indices.
@@ -2585,13 +2585,14 @@ struct TileTensor[
 
     @always_inline
     def _tile_in_bounds[*tile_sizes: Int](self, *tile_coords: Int) -> Bool:
-        """Whether the tile at `tile_coords` lies within the tensor, the
-        precondition of `tile[*tile_sizes](*tile_coords)`.
+        """Whether `tile_coords` are valid tile coordinates, the precondition
+        of `tile[*tile_sizes](*tile_coords)`: not negative.
 
-        A tile has exactly `tile_sizes` elements per dimension (it is not
-        clipped at the edge), so every one of them must be in the parent:
-        `0 <= c < dim // size` per dimension (`(c + 1) * size <= dim`
-        without its overflow). A nested layout's tile coordinates index its
+        The tile may extend past the tensor's edge (a partial tile, as a
+        kernel takes for the last block of a row and then guards each
+        access). Its elements past the edge are not valid: its
+        `_valid_dim` counts only those within the tensor, and indexing it is
+        checked against that. A nested layout's tile coordinates index its
         outer modes, which `dim` does not give: this returns `True` for it,
         as does an empty tile size.
 
@@ -2602,8 +2603,8 @@ struct TileTensor[
             tile_coords: The coordinates of the tile, one per dimension.
 
         Returns:
-            Whether the whole tile is within the tensor, or `True` for a
-            nested layout.
+            Whether every coordinate is not negative, or `True` for a nested
+            layout.
         """
         comptime if Self.flat_rank != Self.rank:
             return True
@@ -2611,8 +2612,7 @@ struct TileTensor[
             comptime for i in range(tile_sizes.size):
                 comptime size = tile_sizes[i]
                 comptime if size > 0:
-                    var c = tile_coords[i]
-                    if c < 0 or c >= Int(self.dim[i]()) // size:
+                    if tile_coords[i] < 0:
                         return False
             return True
 
@@ -2852,6 +2852,23 @@ struct TileTensor[
             )
         else:
             return Scalar[Self.linear_idx_type](self.layout.shape[i]().value())
+
+    @always_inline
+    def _valid_dim[i: Int](self) -> Int:
+        """The number of elements along dimension `i` that the tensor's
+        memory backs: `dim[i]()`, except for a partial tile (one taken past
+        its parent's edge), whose elements past the edge are not valid.
+
+        Contract-only: the verifier tracks it; at run time this returns
+        `dim[i]()`.
+
+        Parameters:
+            i: The dimension index.
+
+        Returns:
+            How many elements along dimension `i` may be accessed.
+        """
+        return Int(self.dim[i]())
 
     @inline(.nodebug)
     def dim[
