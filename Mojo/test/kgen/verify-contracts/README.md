@@ -55,7 +55,8 @@ process (default 60), `check-division=true` reports integer divisions
 by a value that may be 0, `int-retry=false` turns off the integer retry
 (below), `nonlinear-rlimit=` the limit a query whose goal multiplies or
 divides two unknowns is first asked with (default 10000000; then over the
-integers, then with the full limit), `dump-dir=` writes the SMT-LIB scripts, and `cache-dir=` caches
+integers, then with the full limit), `case-split=false` turns off case
+splitting (below), `dump-dir=` writes the SMT-LIB scripts, and `cache-dir=` caches
 the solver's answers by a hash of each script.
 
 Values are bit-vectors, as in the program, so wrap-around is modelled.
@@ -398,6 +399,28 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   tensors only if the layout is flat: say `comptime assert
   t.LayoutType.flat_rank == t.rank` (the layout's own `flat_rank`;
   `t.flat_rank` is expanded beyond recognition).
+- A tile may extend past its tensor's edge (a partial tile, as a kernel
+  takes for the last block of a row): `tile[...](*coords)` requires only
+  coordinates not negative, and the tile's `_valid_dim[k]()` (contract-only)
+  counts the elements memory backs, `clamp(valid - c * size, 0, size)`;
+  indexing, `load`, `store` and nested tiles are checked against it, and a
+  vectorized view of it holds `valid // size` vectors. A partial tile passed
+  to any other function is an obligation that it is whole: that function
+  was verified for a tensor every element of which is backed.
+- `t.reshape(row_major(Coord(...)))`: the view's dimensions are the
+  layout's shape, and it must cover no more elements than `t` validly holds
+  (assumed: `t` has no zero stride). Other layouts leave them unknown.
+- `x if comptime (c) else y` is the value of the taken arm.
+- A local closure (`@__parameter def` in a function) that is only ever
+  called is verified where it is called, with its caller's state; one
+  passed on (`vectorize[f]`, a launch, an epilogue parameter) on its own.
+- `lane_id()` is below `WARP_SIZE`; the warp size of an accelerator the
+  stdlib does not hard-code is 32 or 64 (every `GPUInfo` says so); a
+  launched kernel's own target is a GPU; `ufloordiv(a, 0)` is 0.
+- Queries left open over the warp size and SIMD widths (unknowns with few
+  values) are asked once per combination of their values, as constants
+  (at most 64 combinations; `case-split=false` turns this off), with
+  unsigned quotients exact in those cases.
 - `ceildiv(a, b)` (and `a.__ceildiv__(b)`) of integers is `-(a // -b)`
   when signed and the quotient plus one for a nonzero remainder when
   unsigned, as `SIMD` defines it; so a launch with `grid_dim=ceildiv(n,

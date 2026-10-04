@@ -105,6 +105,15 @@ def ok_dtype_in[dt: DType](xs: List[Int]) -> Int:
     return 0
 
 
+def ok_comptime_expression[
+    flag: Bool
+](xs: List[Int], n: Int where n >= 0 and n < 1000) -> Int:
+    var k = (n + 1) if comptime (flag) else (n + 2)
+    if len(xs) > n + 2:
+        return xs[k]  # either arm's value is below n + 3
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_param_no_lower[n: Int](xs: List[Int]) -> Int:
     if n < len(xs):
@@ -163,4 +172,13 @@ def bad_dtype_in[dt: DType](xs: List[Int]) -> Int:
     comptime if dt in (DType.float32, DType.bfloat16):
         comptime if dt != DType.float32:
             return xs[0]  # `bfloat16` gets here
+    return 0
+
+
+def bad_comptime_expression[
+    flag: Bool
+](xs: List[Int], n: Int where n >= 0 and n < 1000) -> Int:
+    var k = n if comptime (flag) else (n + 3)
+    if len(xs) > n + 2:
+        return xs[k]  # n + 3 when `flag` is False
     return 0

@@ -1615,6 +1615,57 @@ Tensors and GPU kernels:
 - gemv's clauses are in max/kernels/src/linalg/gemv.mojo (`flat_rank`
   as a clause of `gemv_gpu`, not an assertion: clauses do not change
   what compiles). The in-tree file reports the transposed bug.
+- gemv_kernel_vector, proven in all three launched instantiations, with
+  its clauses (`m`, `k` within the tensors, `k % simd_width == 0`, which
+  its last iteration needs: it checks where a vector starts, not where it
+  ends) and the dispatcher's for `GEMV_KERNEL_VECTOR` (`k % simd_width ==
+  0`; `N == 1`, or transposed with `M == 1`: its `m == 1` launch reads B
+  as N x K). What it took, each general:
+  - `x if comptime (c) else y` (`num_iters`): an unsupported region that
+    forgot everything known; now the taken arm's value.
+  - An empty origin union (`#lit<origin.union >`) wrote everything at a
+    loop head; it names no memory (`MutAnyOrigin` is another attribute).
+  - `lane_id() < WARP_SIZE` (was `< 64`); an unnamed accelerator's warp
+    size 32 or 64; a launched kernel runs on a GPU; `ufloordiv(a, 0) == 0`.
+  - Partial tiles: the kernel's last iteration takes a tile past the row's
+    end and guards each lane. `_valid_dim` (contract-only, in
+    tile_tensor.mojo) is what `__getitem__` and the other access clauses
+    check; `tile` requires only coordinates not negative; the pass tracks
+    `clamp(valid - c * size, 0, size)` through `tile` and `valid // size`
+    through `vectorize`, with a whole tile stated as `size` (else a tile of
+    parametric size became undecided). A partial tile passed elsewhere is
+    an obligation that it is whole. In a kernel without clauses the
+    failure moves from taking the tile to reading it (the in-tree gemv: 33
+    -> 30 proven before the other changes, the same check).
+  - `reshape(row_major(Coord(n, k)))`: the view's dimensions, and an
+    obligation that it fits (the `n == 1` launch reshapes B).
+  - Case splitting: `(lane + last * WARP_SIZE) * simd_width` and
+    `k // (WARP_SIZE * simd_width)` are products and quotients of two
+    unknowns, which bit-blasting does not decide. Both have few values (32
+    or 64; 0 or a power of two up to 256), so a query left open is asked
+    per combination with them defined as constants (at most 64 cases; the
+    first case alone, then batches of 8), with unsigned quotients exact
+    only there (exact everywhere cost 8x). A refuted query is asked again
+    only if it depends on what the cases change. A `simd_width_of` call
+    in a clause and the same `comptime` in a body are one term. Measured
+    with `case-split=false`: the cases cost nothing overall (125.0 s
+    against 124.4 s on the 43 files) and prove 4 more.
+  - Local closures called directly (`_one_row_per_warp`) are walked at
+    their calls with the caller's state; before, the closure's definition
+    forgot everything and its launch was checked without context. One
+    passed on (an epilogue, `vectorize[f]`) is still verified alone; the
+    first version also skipped those (lora's epilogue went unchecked), a
+    callee's parameter list now counts as passing it on.
+  A third latent issue: gemv's MiniMax branch can pick
+  `GEMV_KERNEL_VECTOR` for `1 < M <= 16` (when `ceildiv(N, 2)` exceeds
+  the device's `MAX_GRID_DIM_Y`), and the dispatcher's vector branch then
+  launches nothing. Unreachable today (MiniMax's static N is 128), but the
+  code states neither that the runtime N is the static one nor the grid
+  limit; the in-tree file reports the call for it and for the transposed
+  bug. Cost on the 43 files against the committed pass: proven 1439 ->
+  1500, obligations analyzed 2034 -> 2154 (closures, comptime-if arms),
+  solver work 2658M -> 3801M, summed pass time 97.5 -> 156.5 s (load
+  3.5-4); gemv 14 -> 27.5 s with 18 more proven.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

@@ -14,13 +14,14 @@
 # the launches that must establish it, for `verify-contracts`; see README.md.
 # Needs the `max` and `layout` packages on the import path (see README.md).
 
-from layout import TensorLayout, TileTensor, row_major, stack_allocation
+from layout import Coord, TensorLayout, TileTensor, row_major, stack_allocation
 from max.gpu import (
     WARP_SIZE,
     block_dim,
     block_idx,
     global_idx,
     grid_dim,
+    lane_id,
     thread_idx,
 )
 from max.gpu.host import DeviceContext
@@ -299,6 +300,47 @@ def ok_static_router(a: TileTensor[mut=False, ...]):
         holds(Int(a.dim[1]()) % simd_width == 0)
 
 
+def ok_lane_in_warp():
+    comptime assert is_gpu(), "a GPU function"
+    holds(lane_id() < WARP_SIZE)  # below the warp size, not only below 64
+
+
+def ok_warp_simd_product[dt: DType]():
+    # A product of two unknowns with few values: decided per case.
+    comptime width = simd_width_of[dt]()
+    holds((WARP_SIZE * width) % width == 0)
+
+
+def ok_partial_tile(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], j: Int
+) -> Float32:
+    # The last tile of a row may extend past it: its accesses are checked
+    # against what memory backs.
+    if Int(t.dim[0]()) > 0 and 0 <= j and j < 1000:
+        var tile = t.tile[1, 32](0, j)
+        if j * 32 + 5 < Int(t.dim[1]()):
+            return tile[0, 5]
+    return 0
+
+
+def ok_reshape(t: TileTensor[DType.float32, LD, MutAnyOrigin], n: Int):
+    if n > 0 and Int(t.dim[0]()) == 1 and Int(t.dim[1]()) == n:
+        var flat = t.reshape(row_major(Coord(n, 1)))
+        flat[n - 1, 0] = 0  # the view is n x 1
+
+
+def ok_local_closure(t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int):
+    @__parameter
+    def write() raises:
+        t[0, i] = 0  # checked at the call, where `i` is in bounds
+
+    if Int(t.dim[0]()) > 0 and 0 <= i and i < Int(t.dim[1]()):
+        try:
+            write()
+        except:
+            pass
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -484,3 +526,29 @@ def bad_static_extent_unknown(a: TileTensor[mut=False, ...]):
     comptime assert a.rank == 2
     comptime assert a.LayoutType.flat_rank == 2
     holds(Int(a.dim[1]()) == a.static_shape[1])  # -1 when known at run time
+
+
+def bad_partial_tile(
+    t: TileTensor[DType.float32, LD, MutAnyOrigin], j: Int
+) -> Float32:
+    if Int(t.dim[0]()) > 0 and j >= 0:
+        var tile = t.tile[1, 32](0, j)
+        return tile[0, 5]  # past the edge for the last tile
+    return 0
+
+
+def bad_reshape_larger(t: TileTensor[DType.float32, LD, MutAnyOrigin], n: Int):
+    if n > 0 and Int(t.dim[0]()) == 1 and Int(t.dim[1]()) == n:
+        var big = t.reshape(row_major(Coord(n + 1, 1)))  # one too many
+        big[0, 0] = 0
+
+
+def bad_local_closure(t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int):
+    @__parameter
+    def write() raises:
+        t[0, i] = 0
+
+    try:
+        write()  # nothing bounds `i` here
+    except:
+        pass
