@@ -1756,6 +1756,10 @@ private:
   /// of the function's roots, so it may reach any of them.
   std::optional<SmallVector<Value>> rootsNamedBy(StringRef origin) {
     SmallVector<Value> named;
+    // The empty union (`#lit<origin.union >`, no origin at all) reaches no
+    // root; `MutAnyOrigin` is `#lit.any.origin`, which this does not match.
+    if (origin.starts_with("#lit<origin.union >"))
+      return named;
     for (Value root : roots) {
       std::string name = quotedOriginName(root);
       if (!name.empty() && origin.contains(name))
