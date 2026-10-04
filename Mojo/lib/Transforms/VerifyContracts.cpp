@@ -1153,6 +1153,11 @@ public:
     });
     valueOrder = &order;
     llvm::scope_exit reset([] { valueOrder = nullptr; });
+    fn.walk([&](LIT::FnOp nested) {
+      if (nested != fn)
+        if (auto decl = nested.getParamDeclAttr())
+          closures[ParamDeclRefAttr::get(decl)] = nested;
+    });
     Block &entry = body.front();
     // Arguments: integers and Booleans are unknowns of their sort; references
     // are places, whose values at entry are unknowns.
@@ -1392,6 +1397,12 @@ private:
   std::map<std::string, SmallVector<std::string>> partialValid;
   /// The shapes of layout values `row_major(Coord(...))` built, by term.
   std::map<std::string, SmallVector<std::string>> layoutShapes;
+  /// Local closures (`@parameter def` in the function), by the reference a
+  /// call names them with: walked inline at their calls.
+  DenseMap<Attribute, LIT::FnOp> closures;
+  /// While a closure's body is walked at a call: where its returns and
+  /// raises leave it.
+  SmallVector<SmallVector<State> *> closureExits;
   /// The collection an iterator (by its place's root) iterates.
   DenseMap<Value, Loc> iterSources;
   /// The types of places named by a value of another type (an element an
@@ -2173,7 +2184,11 @@ private:
       evalForall(forall, state);
       return;
     }
+    if (isa<LIT::FnOp>(op))
+      return; // A local closure's definition: walked where it is called.
     if (op->getName().getStringRef() == "lit.error_return") {
+      if (!closureExits.empty())
+        closureExits.back()->push_back(state); // Raises out of the closure.
       state.alive = false; // Raises out of the function.
       return;
     }
@@ -2190,6 +2205,11 @@ private:
       return;
     }
     if (isa<HLCF::ReturnOp>(op)) {
+      if (!closureExits.empty()) {
+        closureExits.back()->push_back(state); // Returns from the closure.
+        state.alive = false;
+        return;
+      }
       if (refines && !inContract)
         proveTraitEnsures(op, state);
       state.alive = false;
@@ -3683,7 +3703,43 @@ private:
     return term;
   }
 
+  /// A call of a local closure: its body, walked here with the caller's
+  /// state (it reads and writes the caller's variables it captures, by
+  /// reference), its arguments the call's operands. What its returns and
+  /// raises leave is merged; its results are unknown.
+  bool inlineClosure(LIT::CallOp call, State &state) {
+    auto it = closures.find(call.getCallee());
+    if (it == closures.end() || closureExits.size() >= 4)
+      return false;
+    Block &entry = it->second.getFunctionBody().front();
+    if (entry.getNumArguments() != call.getNumOperands())
+      return false;
+    for (auto [arg, operand] : llvm::zip(entry.getArguments(), call.getOperands())) {
+      if (isa<LIT::RefType>(arg.getType())) {
+        if (std::optional<Loc> loc = placeOf(operand))
+          refArgs[arg] = *loc;
+      } else {
+        values[arg] = term(operand, state);
+      }
+    }
+    SmallVector<State> exits;
+    closureExits.push_back(&exits);
+    State body = state;
+    body.yields.clear();
+    walkBlock(entry, body);
+    closureExits.pop_back();
+    if (body.alive)
+      exits.push_back(std::move(body));
+    State joined = merge(exits);
+    joined.yields = state.yields;
+    state = std::move(joined);
+    setResultsUnknown(call);
+    return true;
+  }
+
   void evalCall(LIT::CallOp call, State &state) {
+    if (inlineClosure(call, state))
+      return;
     std::optional<CalleeName> name = calleeName(call.getCallee());
     LIT::FnOp callee = lookup(call);
     ParamFrame frame = paramFrame(call, callee);
@@ -7235,8 +7291,38 @@ struct VerifyContractsPass
       return includeStdlib || !inLibrary(op) ||
              llvm::is_contained(packages, packageOf(op));
     };
+    // A local closure only ever called directly is verified where it is
+    // called, with its caller's state (`inlineClosure`); one that escapes
+    // (a parameter of another call: `vectorize[f]`, a launch) on its own.
+    auto calledOnly = [](LIT::FnOp fn) {
+      LIT::FnOp outer = fn->getParentOfType<LIT::FnOp>();
+      auto decl = fn.getParamDeclAttr();
+      if (!outer || !decl)
+        return false;
+      Attribute ref = ParamDeclRefAttr::get(decl);
+      bool escapes = false;
+      outer->walk([&](Operation *op) {
+        if (escapes || op == fn.getOperation())
+          return;
+        // A direct call names the closure as its callee; any other
+        // mention (a callee's parameter, `f[elementwise_lambda_fn=g]`) passes
+        // it on.
+        auto call = dyn_cast<LIT::CallOp>(op);
+        for (NamedAttribute attr : op->getAttrs()) {
+          if (call && attr.getValue() == call.getCalleeAttr() &&
+              call.getCalleeAttr() == ref)
+            continue;
+          attr.getValue().walk([&](Attribute a) {
+            if (a == ref)
+              escapes = true;
+          });
+        }
+      });
+      return !escapes;
+    };
     getOperation().walk([&](LIT::FnOp fn) {
-      if (selected(fn) && !isRequiredTraitMethod(fn) && !isDefaultWrapper(fn))
+      if (selected(fn) && !isRequiredTraitMethod(fn) && !isDefaultWrapper(fn) &&
+          !calledOnly(fn))
         fns.push_back({fn, {}});
     });
     ModuleOp module = getOperation();
