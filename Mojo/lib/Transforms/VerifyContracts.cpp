@@ -1256,6 +1256,10 @@ public:
   /// it, and a parameter of one function cannot be read as a parameter of
   /// the same name of another.
   void bindInstance(ArrayRef<InstanceLink> chain) {
+    // A launched kernel runs on the GPU: its own target is one.
+    if (MaybeTerm gpu = targetPredicate("std::sys::info::is_gpu()",
+                                        Sort{true, 1, false}))
+      facts.push_back(*gpu);
     instanceFrames.clear();
     for (const InstanceLink &link : chain)
       instanceFrames.push_back(
@@ -3055,6 +3059,9 @@ private:
       if (gpuIds.insert(other).second) {
         prelude += "(declare-const " + other + " (_ BitVec 64))\n";
         sorts[other] = sort;
+        // Every `GPUInfo` the stdlib names says 32 or 64 (assumed).
+        facts.push_back("(or (= " + other + " " + bvConst(32, 64) + ") (= " +
+                        other + " " + bvConst(64, 64) + "))");
       }
       auto c = [&](int64_t v) { return bvConst(v, 64); };
       return define(sort, "(ite " + flag("nvidia_gpu") + " " + c(32) +
@@ -5265,6 +5272,14 @@ private:
     facts.push_back("(=> (bvsle " + bvConst(0, 64) + " " + a +
                     ") (and (bvsle " + bvConst(0, 64) + " " + q + ") (bvsle " +
                     q + " " + a + ")))");
+    // By 0 the quotient is 0 (`udiv_unchecked` requires `b > 0` instead).
+    Value divisorValue = call.getOperands()[1];
+    std::string b = isa<LIT::RefType>(divisorValue.getType())
+                        ? valueThrough(divisorValue, state)
+                        : term(divisorValue, state);
+    if (!sortOfTerm(b).isBool && sortOfTerm(b).width == 64)
+      facts.push_back("(=> (= " + b + " " + bvConst(0, 64) + ") (= " + q +
+                      " " + bvConst(0, 64) + "))");
     values[call->getResult(0)] = q;
     return true;
   }
@@ -5611,7 +5626,8 @@ private:
     if (!path.starts_with(prefix) || call->getNumResults() != 1)
       return false;
     StringRef rest = path.drop_front(strlen(prefix));
-    // `lane_id()`: below the warp size, 32 or 64 on supported GPUs.
+    // `lane_id()`: below the warp size (`WARP_SIZE`), 32 or 64 on
+    // supported GPUs.
     if (rest.starts_with("lane_id(") && call.getNumOperands() == 0 &&
         !launchDims) {
       std::string symbol = "gpu_lane_id";
@@ -5620,6 +5636,11 @@ private:
         sorts[symbol] = Sort{false, 64, true};
         facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + symbol +
                         ") (bvslt " + symbol + " " + bvConst(64, 64) + "))");
+        if (MaybeTerm warp = targetPredicate(
+                "std::_gpu::globals::_resolve_warp_size()",
+                Sort{false, 64, true}))
+          facts.push_back("(=> (bvsgt " + *warp + " " + bvConst(0, 64) +
+                          ") (bvslt " + symbol + " " + *warp + "))");
       }
       values[call->getResult(0)] = symbol;
       return true;
