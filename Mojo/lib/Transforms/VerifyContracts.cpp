@@ -1149,6 +1149,9 @@ struct Candidate {
   /// `rhsLoc` keeps its value on entry (`len(xs) + i` when each iteration
   /// pops once and increments `i`).
   std::string combine = "";
+  /// The candidate is instead that `lhs`, a strided range's cursor, is a
+  /// whole number of steps (`rhsLoc`, as on entry) from where it started.
+  bool stride = false;
 };
 
 /// A function's postcondition: its `kgen.ensures` clauses, which are
@@ -2688,6 +2691,56 @@ private:
     walkLoopBody(loop, loop->getRegion(0).front(), /*comptime=*/true, state);
   }
 
+  /// Whether all that `loop` (and the local closures it calls) does to the
+  /// variable `root`, a range's iterator, is to call `__next__` on it: no
+  /// store to it, and no other call that may write it.
+  bool onlyAdvanced(Operation *loop, Value root) {
+    bool only = true;
+    SmallVector<Operation *> work{loop};
+    llvm::SmallPtrSet<Operation *, 4> seen{loop};
+    auto names = [&](Value ref) {
+      std::optional<Loc> loc = placeOf(ref);
+      return !loc || loc->root == root;
+    };
+    while (only && !work.empty())
+      work.pop_back_val()->walk([&](Operation *op) {
+        if (!only)
+          return;
+        if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
+          only = !names(store->getOperand(1));
+        } else if (auto call = dyn_cast<LIT::CallOp>(op)) {
+          ArrayRef<TypedAttr> bound;
+          if (auto closure =
+                  closures.find(closureCallee(call.getCallee(), bound));
+              closure != closures.end() &&
+              seen.insert(closure->second.getOperation()).second)
+            work.push_back(closure->second.getOperation());
+          bool takes = false;
+          for (Value operand : call.getOperands())
+            if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
+                ref && !ref.isMutableKnown(false) && names(operand))
+              takes = true;
+          // The error and result slots of `__next__` are other variables;
+          // a reference that names no known place may be this one.
+          if (takes) {
+            std::optional<CalleeName> name = calleeName(call.getCallee());
+            std::optional<Loc> self = call.getNumOperands()
+                                          ? placeOf(call.getOperands()[0])
+                                          : std::nullopt;
+            only = name && self && self->root == root &&
+                   StringRef(name->path).starts_with("std::builtin::range::") &&
+                   StringRef(name->path).contains("::__next__") &&
+                   llvm::all_of(call.getOperands().drop_front(),
+                                [&](Value operand) {
+                                  std::optional<Loc> loc = placeOf(operand);
+                                  return loc && loc->root != root;
+                                });
+          }
+        }
+      });
+    return only;
+  }
+
   void walkLoopBody(Operation *loop, Block &bodyBlock, bool comptime,
                     State &state) {
     // The loop head: what the loop may write holds an unknown there, bound
@@ -2712,6 +2765,13 @@ private:
                    ? head.env.erase(it)
                    : std::next(it);
         head.refs.erase(loc);
+        // A range the loop only advances keeps its end and its step: they
+        // are not candidates for the invariant search, which the two more
+        // unknowns per strided loop made several times larger.
+        for (const char *field : {"/end", "/step"})
+          if (auto it = before.env.find(Loc{root, field});
+              it != before.env.end() && onlyAdvanced(loop, root))
+            head.env[Loc{root, field}] = it->second;
       }
     } else {
       havocAll(head);
@@ -2741,12 +2801,22 @@ private:
     // depend on.
     llvm::StringSet<> relevant = closure(frame.conditions);
     SmallVector<Loc> places, handles;
+    SmallVector<std::string> keptTerms;
     for (const Loc &loc : frame.loaded) {
       if (written && !written->count(loc.root))
         continue;
       std::string h = load(loc, head, Sort{false, 64, false});
       Sort sort = sortOfTerm(h);
-      if (sort.isBool || sort.width != 64 || !relevant.contains(h))
+      if (sort.isBool || sort.width != 64)
+        continue;
+      // What the loop head kept from before the loop (a range's end) needs
+      // no invariant.
+      if (auto kept = before.env.find(loc);
+          kept != before.env.end() && kept->second == h) {
+        keptTerms.push_back(h); // Still a bound to compare the others with.
+        continue;
+      }
+      if (!relevant.contains(h))
         continue;
       // A whole variable of another type (a list, whose length the
       // conditions read) is a handle, not an integer: only whether it still
@@ -2765,7 +2835,7 @@ private:
     std::set<std::string> headNames;
     for (const Loc &loc : places)
       headNames.insert(load(loc, head, Sort{false, 64, true}));
-    SmallVector<std::string> fixed;
+    SmallVector<std::string> fixed(keptTerms.begin(), keptTerms.end());
     for (const Loc &loc : places)
       fixed.push_back(load(loc, before, Sort{false, 64, true}));
     for (const std::string &length : frame.lengths)
@@ -2833,6 +2903,14 @@ private:
       }
     }
     for (const Loc &loc : places) {
+      // The cursor of a strided range (`evalStridedRange`), by its step.
+      if (StringRef(loc.path).ends_with("/start")) {
+        Loc step{loc.root,
+                 StringRef(loc.path).drop_back(strlen("/start")).str() +
+                     "/step"};
+        if (before.env.count(step))
+          candidates.push_back({loc, "=", step, "", false, "", true});
+      }
       candidates.push_back({loc, "bvsge", std::nullopt, bvConst(0, 64)});
       for (const std::string &t : fixed)
         for (const char *op : {"bvsle", "bvslt", "bvsge"})
@@ -2843,6 +2921,12 @@ private:
             candidates.push_back({loc, op, other, ""});
     }
     auto render = [&](const Candidate &c, State &at) {
+      if (c.stride) {
+        std::string start0 = load(c.lhs, before, Sort{false, 64, true});
+        std::string step0 = load(*c.rhsLoc, before, Sort{false, 64, true});
+        return "(= (bvsrem (bvsub " + load(c.lhs, at, Sort{false, 64, true}) +
+               " " + start0 + ") " + step0 + ") " + bvConst(0, 64) + ")";
+      }
       if (!c.combine.empty()) {
         auto value = [&](State &in) {
           std::string lhs = load(c.lhs, in, Sort{false, 64, true});
@@ -5969,7 +6053,9 @@ private:
 
   /// `min(a, b)` and `max(a, b)` of two integers (`Int`, or a `SIMD` scalar
   /// of an integer dtype): the smaller and the larger, as their dtype
-  /// compares.
+  /// compares. `align_down(a, b)` and `align_up(a, b)` of two such: `a // b`
+  /// and `ceildiv(a, b)` times `b`, as the stdlib computes them (by zero as
+  /// `//` is here).
   bool evalMinMax(LIT::CallOp call, const CalleeName &name, State &state) {
     StringRef path = name.path;
     bool isMin = path ==
@@ -5978,7 +6064,13 @@ private:
     bool isMax = path ==
                  "std::math::math::max[::DType,::SIMDLength](::SIMD[$0, "
                  "$1],::SIMD[$0, $1])";
-    if ((!isMin && !isMax) || call.getNumOperands() != 2 ||
+    bool isDown = path.starts_with(
+        "std::math::math::align_down[::DType,::SIMDLength](::SIMD[$0, $1],"
+        "::SIMD[$0, $1])");
+    bool isUp = path.starts_with(
+        "std::math::math::align_up[::DType,::SIMDLength](::SIMD[$0, $1],"
+        "::SIMD[$0, $1])");
+    if ((!isMin && !isMax && !isDown && !isUp) || call.getNumOperands() != 2 ||
         call->getNumResults() != 1)
       return false;
     std::string type = printed(call->getResult(0).getType());
@@ -5995,6 +6087,14 @@ private:
       if (sortOfTerm(a).isBool || sortOfTerm(a).width != sort->width)
         return false;
       args.push_back(a);
+    }
+    if (isDown || isUp) {
+      std::string quotient =
+          isDown ? floorDivision(/*remainder=*/false, *sort, args[0], args[1])
+                 : ceilDivision(*sort, args[0], args[1]);
+      values[call->getResult(0)] =
+          define(*sort, "(bvmul " + quotient + " " + args[1] + ")");
+      return true;
     }
     std::string less =
         std::string(sort->isSigned ? "(bvslt " : "(bvult ") +
@@ -7150,6 +7250,22 @@ private:
         std::string start = term(call.getOperands()[0], state);
         fields["/curr"] = start;
         fields["/end"] = max(*sort, start, term(call.getOperands()[1], state));
+      } else if (call.getNumOperands() == 3 && sort->width == 64 &&
+                 sort->isSigned) {
+        // `range(start, end, step)`, a forward `_StridedRange`: a zero step
+        // makes it the empty range from 0 with step 1.
+        std::string step = term(call.getOperands()[2], state);
+        std::string zero = bvConst(0, 64);
+        std::string degenerate =
+            define({true, 1, false}, "(= " + step + " " + zero + ")");
+        auto unless = [&](const std::string &v, const std::string &other) {
+          return define(*sort,
+                        "(ite " + degenerate + " " + other + " " + v + ")");
+        };
+        fields["/start"] = unless(term(call.getOperands()[0], state), zero);
+        fields["/end"] = unless(term(call.getOperands()[1], state), zero);
+        fields["/step"] = unless(step, bvConst(1, 64));
+        fields["/idx"] = zero;
       } else {
         return false;
       }
@@ -7203,6 +7319,77 @@ private:
     return false;
   }
 
+  /// The forward `_StridedRange` over `Int` (`range(start, end, step)`), its
+  /// `__iter__` and `__next__` as the stdlib defines them: `__next__` raises
+  /// once a step has wrapped (`/idx`) or the cursor (`/start`) has reached
+  /// the end in the step's direction, and otherwise returns the cursor and
+  /// advances it by the step.
+  bool evalStridedRange(LIT::CallOp call, const CalleeName &name,
+                        State &state) {
+    StringRef path = name.path;
+    const char *strided = "std::builtin::range::_StridedRange::";
+    std::optional<Sort> dtype = dtypeSort(name.params[0]);
+    if (!dtype || dtype->isBool || dtype->width != 64 || !dtype->isSigned ||
+        !StringRef(name.params[1]).contains("= true") ||
+        call.getNumOperands() < 1)
+      return false;
+    Sort sort = *dtype;
+    StringRef method = path.drop_front(strlen(strided));
+    std::optional<Loc> self = placeOf(call.getOperands()[0]);
+    if (!self)
+      return false;
+    Loc start{self->root, self->path + "/start"},
+        end{self->root, self->path + "/end"},
+        step{self->root, self->path + "/step"},
+        idx{self->root, self->path + "/idx"};
+    if (method.starts_with("__iter__") && call.getNumOperands() == 1 &&
+        call->getNumResults() == 1) {
+      Value result = call->getResult(0);
+      values[result] = declare({false, 64, false}, "g");
+      records[result] = {{"/start", load(start, state, sort)},
+                         {"/end", load(end, state, sort)},
+                         {"/step", load(step, state, sort)},
+                         {"/idx", load(idx, state, sort)}};
+      return true;
+    }
+    if (method.starts_with("__next__") && call.getNumOperands() == 3 &&
+        call->getNumResults() == 1) {
+      std::optional<Loc> error = placeOf(call.getOperands()[1]);
+      std::optional<Loc> out = placeOf(call.getOperands()[2]);
+      if (!error || !out)
+        return false;
+      std::string s = load(start, state, sort), e = load(end, state, sort),
+                  st = load(step, state, sort), i = load(idx, state, sort);
+      std::string zero = bvConst(0, 64);
+      std::string raised =
+          define({true, 1, false}, "(or (not (= " + i + " " + zero +
+                                       ")) (ite (bvsgt " + st + " " + zero +
+                                       ") (bvsge " + s + " " + e + ") (bvsge " +
+                                       e + " " + s + ")))");
+      noteCondition(raised);
+      std::string next = "(bvadd " + s + " " + st + ")";
+      std::string wrapped = "(xor (bvslt " + next + " " + s + ") (bvslt " + st +
+                            " " + zero + "))";
+      std::string newStart =
+          define(sort, "(ite " + raised + " " + s + " " + next + ")");
+      std::string newIdx =
+          define(sort, "(ite " + raised + " " + i + " (ite " + wrapped + " " +
+                           bvConst(1, 64) + " " + zero + "))");
+      store(start, state, newStart);
+      store(idx, state, newIdx);
+      // `store` makes the range itself unknown, not its other fields.
+      state.env[start] = newStart;
+      state.env[idx] = newIdx;
+      state.env[end] = e;
+      state.env[step] = st;
+      store(*out, state, s);
+      havoc(*error, state, placeType(*error));
+      values[call->getResult(0)] = raised;
+      return true;
+    }
+    return false;
+  }
+
   /// `reversed(range(...))` over `Int`, and the reversed iterator's
   /// `__iter__` and `__next__`. The stdlib walks from `end - 1` down to the
   /// range's start, inclusive, flagging exhaustion; this models the same
@@ -7237,6 +7424,8 @@ private:
     const char *strided = "std::builtin::range::_StridedRange::";
     if (!path.starts_with(strided) || name.params.size() < 2)
       return false;
+    if (evalStridedRange(call, name, state))
+      return true;
     std::optional<Sort> dtype = dtypeSort(name.params[0]);
     if (!dtype || dtype->isBool || dtype->width != 64 || !dtype->isSigned ||
         !StringRef(name.params[1]).contains("= false") ||
