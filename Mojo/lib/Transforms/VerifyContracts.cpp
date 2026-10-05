@@ -7268,7 +7268,7 @@ struct VerifyContractsPass
         z3 = *found;
     }
     if (z3.empty()) {
-      getOperation().emitError("verify-contracts: z3 not found");
+      emitError(getOperation().getLoc(), "verify-contracts: z3 not found");
       return signalPassFailure();
     }
     SolverConfig solver{z3, rlimit, houdiniRlimit, wallSeconds, dumpDir,
@@ -7278,6 +7278,16 @@ struct VerifyContractsPass
     solver.caseSplit = caseSplit;
     if (!cacheDir.empty())
       (void)llvm::sys::fs::create_directories(cacheDir);
+    // The scripts are run from `dump-dir`: one that cannot be written to
+    // would leave every query unanswered.
+    if (!dumpDir.empty())
+      if (std::error_code ec = llvm::sys::fs::create_directories(dumpDir)) {
+        // By location: an error on the module prints all of it.
+        emitError(getOperation().getLoc(),
+                  "verify-contracts: cannot create dump-dir '" + dumpDir +
+                      "': " + ec.message());
+        return signalPassFailure();
+      }
     // Functions are verified independently, in parallel; their results are
     // reported afterwards, in order.
     // Each function, and each implementation of a trait method with
