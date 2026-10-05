@@ -1045,11 +1045,21 @@ struct State {
 /// An obligation: `cond` must hold whenever `pc` does.
 /// One step of how a function is instantiated: `symbol` (a call's callee,
 /// with its parameter values) names `fn`, whose last `implicit` parameters
-/// (implicit origins) it does not bind.
+/// (implicit origins) it does not bind. For a local closure, `closure` is
+/// its call's callee (`f[4]`) instead, binding its own parameters; the other
+/// names in its body are the enclosing function's.
 struct InstanceLink {
   SymbolConstantAttr symbol;
   LIT::FnOp fn;
   size_t implicit = 0;
+  BindParamsAttr closure = {};
+
+  ArrayRef<TypedAttr> values() const {
+    return closure ? closure.getParamValues() : symbol.getParamValues();
+  }
+  Attribute callee() const {
+    return closure ? Attribute(closure) : Attribute(symbol);
+  }
 };
 
 struct Obligation {
@@ -1289,11 +1299,34 @@ public:
                                         Sort{true, 1, false}))
       facts.push_back(*gpu);
     instanceFrames.clear();
-    for (const InstanceLink &link : chain)
-      instanceFrames.push_back(
-          paramFrame(link.symbol, link.fn, link.implicit, ParamFrame{}));
+    for (const InstanceLink &link : chain) {
+      if (!link.closure) {
+        instanceFrames.push_back(
+            paramFrame(link.symbol, link.fn, link.implicit, ParamFrame{}));
+        continue;
+      }
+      ParamFrame frame;
+      frame.transparent = true;
+      frame.scope = printed(link.closure);
+      LIT::FnOp closure = link.fn;
+      ArrayRef<ParamDeclAttr> decls = closure.getParams();
+      decls = decls.drop_back(std::min(decls.size(), link.implicit));
+      ArrayRef<TypedAttr> bound = link.closure.getParamValues();
+      if (decls.size() == bound.size())
+        for (auto [decl, value] : llvm::zip(decls, bound))
+          frame.values[decl.getName()] = value;
+      instanceFrames.push_back(std::move(frame));
+    }
     for (size_t k = 0; k + 1 < instanceFrames.size(); ++k)
       instanceFrames[k].parent = &instanceFrames[k + 1];
+    // Whether the frames from `frame` on give `name` a value: a closure's
+    // frame passes the names it does not bind on to its caller's.
+    auto bound = [](ParamFrame *frame, StringRef name) {
+      for (; frame; frame = frame->transparent ? frame->parent : nullptr)
+        if (frame->values.count(name))
+          return true;
+      return false;
+    };
     for (size_t k = instanceFrames.size(); k-- > 0;) {
       ParamFrame *next = instanceFrames[k].parent;
       SmallVector<std::string> open;
@@ -1302,7 +1335,7 @@ public:
         while (auto upcast = dyn_cast<UpcastAttr>(value))
           value = upcast.getInputTypeValue();
         if (auto ref = dyn_cast<ParamDeclRefAttr>(value);
-            ref && (!next || !next->values.count(ref.getName())))
+            ref && !bound(next, ref.getName()))
           open.push_back(entry.first().str());
       }
       for (const std::string &name : open)
@@ -7528,11 +7561,25 @@ struct VerifyContractsPass
                               call.getLoc()});
       });
       // Whether a parameter of the calling function is in it.
-      auto open = [](SymbolConstantAttr symbol) {
+      auto openValues = [](ArrayRef<TypedAttr> values) {
         bool found = false;
-        for (TypedAttr value : symbol.getParamValues())
+        for (TypedAttr value : values)
           value.walk([&](ParamDeclRefAttr) { found = true; });
         return found;
+      };
+      auto open = [&](SymbolConstantAttr symbol) {
+        return openValues(symbol.getParamValues());
+      };
+      // The same of a chain's last step; through a closure's call, which
+      // gives only the closure's own parameters, of the step before it too.
+      auto openChain = [&](ArrayRef<InstanceLink> chain) {
+        for (const InstanceLink &link : llvm::reverse(chain)) {
+          if (openValues(link.values()))
+            return true;
+          if (!link.closure)
+            break;
+        }
+        return false;
       };
       // The calls of the functions whose parameters a launch (or a call
       // on the way to it) passes on, up to three levels out.
@@ -7546,6 +7593,30 @@ struct VerifyContractsPass
       for (Launch &launch : launches)
         if (launch.launcher && open(launch.kernel.symbol))
           wanted.insert(launch.launcher);
+      // A launch in a local closure with parameters of its own
+      // (`_rows_per_warp[rows]`): the closure's calls give them, the
+      // function they are in the rest.
+      for (Operation *op :
+           SmallVector<Operation *>(wanted.begin(), wanted.end())) {
+        auto closure = cast<LIT::FnOp>(op);
+        auto decl = closure.getParamDeclAttr();
+        auto outer = closure->getParentOfType<LIT::FnOp>();
+        if (!decl || !outer || !calledOnly(closure))
+          continue;
+        Attribute ref = ParamDeclRefAttr::get(decl);
+        outer->walk([&](LIT::CallOp call) {
+          ArrayRef<TypedAttr> bound;
+          auto bind = dyn_cast<BindParamsAttr>(call.getCallee());
+          if (!bind || closureCallee(bind, bound) != ref)
+            return;
+          auto from = call->getParentOfType<LIT::FnOp>();
+          InstanceLink link{
+              {}, closure, call.getImplicitOrigins().size(), bind};
+          callers[closure].push_back({link, from, call.getLoc()});
+          if (from)
+            wanted.insert(from);
+        });
+      }
       for (int level = 0; level < 3 && !wanted.empty(); ++level) {
         llvm::StringSet<> names;
         for (Operation *fn : wanted)
@@ -7579,7 +7650,7 @@ struct VerifyContractsPass
                        Location launch, std::optional<Location> via,
                        int depth) {
             auto it = outer ? callers.find(outer) : callers.end();
-            if (depth < 3 && open(chain.back().symbol) && it != callers.end() &&
+            if (depth < 3 && openChain(chain) && it != callers.end() &&
                 !it->second.empty()) {
               for (const Caller &caller : it->second) {
                 SmallVector<InstanceLink> longer = chain;
@@ -7591,7 +7662,7 @@ struct VerifyContractsPass
             }
             std::string key;
             for (const InstanceLink &link : chain)
-              key += printed(link.symbol) + "|";
+              key += printed(link.callee()) + "|";
             SmallVector<Instance> &list = instances[chain.front().fn];
             if (list.size() < 32 && seen.insert(key).second)
               list.push_back({std::move(chain), launch, via});
