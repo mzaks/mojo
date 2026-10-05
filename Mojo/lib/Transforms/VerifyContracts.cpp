@@ -3658,6 +3658,10 @@ private:
           if (auto symbol = dyn_cast<SymbolConstantAttr>(ops[0]))
             if (MaybeTerm w = simdWidth(symbol))
               return *w;
+        if (ops.size() == 1 && !sort.isBool && sort.width == 64)
+          if (auto symbol = dyn_cast<SymbolConstantAttr>(ops[0]))
+            if (MaybeTerm bytes = dtypeSize(symbol))
+              return *bytes;
         // `Wrapper(n)` of an integer wrapper (`GEMVAlgorithm.GEMV_KERNEL`
         // is `GEMVAlgorithm(0)`): `n`.
         if (ops.size() == 2 && !sort.isBool)
@@ -3766,7 +3770,69 @@ private:
     facts.push_back(fact + ")");
     finiteDomains[w] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 256};
     it->second = w;
+    // On the accelerator's target (`get_gpu_target()`): every GPU target
+    // the stdlib lists has 128-bit vectors, so the width is 16 over the
+    // dtype's size in bytes, and 0 only for a 256-bit dtype.
+    if (std::string target = printed(ps[0]);
+        StringRef(target).contains("accelerator_arch"))
+      if (MaybeTerm bytes = dtypeBytes(ps[1])) {
+        std::string cases = "(or";
+        for (int64_t b = 1; b <= 32; b *= 2)
+          cases += " (and (= " + *bytes + " " + bvConst(b, 64) + ") (= " + w +
+                   " " + bvConst(16 / b, 64) + "))";
+        facts.push_back(cases + ")");
+        finiteDomains[w] = {0, 1, 2, 4, 8, 16};
+      }
     return w;
+  }
+
+  /// `size_of[dtype]()` (the `DType` overload) as a parameter expression:
+  /// the dtype's size in bytes, on every target. A literal's is in its
+  /// name (`f32`, `bf16`, `si8`; `bool` is one byte, `index` eight); any
+  /// other dtype's is a power of two up to 32 (`uint256` is the widest),
+  /// one term per dtype expression.
+  MaybeTerm dtypeSize(SymbolConstantAttr symbol) {
+    std::optional<CalleeName> name = calleeName(symbol);
+    ArrayRef<TypedAttr> ps = symbol.getParamValues();
+    if (!name || ps.size() < 2 ||
+        !StringRef(name->path)
+             .starts_with("std::sys::info::size_of[!kgen.target,::DType,"))
+      return std::nullopt;
+    return dtypeBytes(ps[1]);
+  }
+
+  /// The size in bytes of the dtype a parameter value names (see
+  /// `dtypeSize`).
+  MaybeTerm dtypeBytes(TypedAttr param) {
+    TypedAttr dtype = unwrapValue(resolveParam(unwrapValue(param)));
+    std::string text = printed(dtype);
+    // `{:dtype f32}` or `{_mlir_value: dtype = f32}`.
+    static llvm::Regex literalRe("dtype (= )?([a-z]+)([0-9]*)[a-z0-9]*\\}");
+    SmallVector<StringRef> m;
+    if (literalRe.match(text, &m)) {
+      unsigned bits;
+      if (m[2] == "bool")
+        return bvConst(1, 64);
+      if (m[2] == "index" || m[2] == "uindex")
+        return bvConst(8, 64);
+      if (!m[3].getAsInteger(10, bits) && bits >= 8 && bits <= 256 &&
+          llvm::isPowerOf2_32(bits))
+        return bvConst(bits / 8, 64);
+      return std::nullopt;
+    }
+    std::string key = "size_of|" + layoutKey(unwrapValue(param));
+    auto [it, inserted] = simdWidths.try_emplace(key, "");
+    if (!inserted)
+      return it->second;
+    std::string bytes = declare(Sort{false, 64, true}, "p");
+    prelude +=
+        "; " + bytes + ": " + StringRef(key).take_front(300).str() + "\n";
+    std::string fact = "(or";
+    for (int64_t v = 1; v <= 32; v *= 2)
+      fact += " (= " + bytes + " " + bvConst(v, 64) + ")";
+    facts.push_back(fact + ")");
+    it->second = bytes;
+    return bytes;
   }
 
   /// `dtype in (DType.float32, DType.bfloat16, ...)` as a parameter
@@ -6372,6 +6438,32 @@ private:
     return result;
   }
 
+  /// The unknown of a GPU id on an axis (`thread_idx`, `block_idx`,
+  /// `block_dim`, `grid_dim`), declared with its limits at its first use.
+  std::string gpuIdSymbol(StringRef which, char axis) {
+    std::string symbol = ("gpu_" + which + "_" + Twine(axis)).str();
+    if (gpuIds.insert(symbol).second) {
+      prelude += "(declare-const " + symbol + " (_ BitVec 64))\n";
+      sorts[symbol] = Sort{false, 64, true};
+      std::string dim = ("gpu_block_dim_" + Twine(axis)).str();
+      std::string grid = ("gpu_grid_dim_" + Twine(axis)).str();
+      if (which == "thread_idx")
+        facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + symbol +
+                        ") (bvslt " + symbol + " " + dim + "))");
+      else if (which == "block_idx")
+        facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + symbol +
+                        ") (bvslt " + symbol + " " + grid + "))");
+      else if (which == "block_dim")
+        facts.push_back("(and (bvsle " + bvConst(1, 64) + " " + symbol +
+                        ") (bvsle " + symbol + " " + bvConst(1024, 64) + "))");
+      else
+        facts.push_back("(and (bvsle " + bvConst(1, 64) + " " + symbol +
+                        ") (bvslt " + symbol + " " +
+                        bvConst(int64_t(1) << 31, 64) + "))");
+    }
+    return symbol;
+  }
+
   /// GPU ids (`thread_idx.x`, `block_idx.y`, `block_dim.z`, `grid_dim.x`,
   /// `global_idx.x`): one value per id and axis in a function, so reads
   /// agree, with the launch limits every supported GPU has (assumptions):
@@ -6403,6 +6495,32 @@ private:
       values[call->getResult(0)] = symbol;
       return true;
     }
+    // `warp_id()`: `thread_idx.x` divided by the warp size, unsigned, for
+    // a warp size of 32 or 64. Broadcast within the warp, it is the same
+    // value.
+    if ((rest.starts_with("warp_id[") || rest.starts_with("_warp_id[")) &&
+        call.getNumOperands() == 0 && !launchDims &&
+        sortOf(call->getResult(0).getType()).width == 64) {
+      MaybeTerm warp = targetPredicate(
+          "std::_gpu::globals::_resolve_warp_size()", Sort{false, 64, true});
+      if (!warp)
+        return false;
+      gpuIdSymbol("block_dim", 'x');
+      gpuIdSymbol("grid_dim", 'x');
+      std::string thread = gpuIdSymbol("thread_idx", 'x');
+      // By shifts for the warp sizes GPUs have, and unknown for any other:
+      // a quotient of two unknowns made every query that reads it a
+      // nonlinear one, asked three times (blockwise_fp8: 150M more work to
+      // leave the same obligations open).
+      std::string other = declare(Sort{false, 64, true}, "u");
+      values[call->getResult(0)] =
+          define(Sort{false, 64, true},
+                 "(ite (= " + *warp + " " + bvConst(32, 64) + ") (bvlshr " +
+                     thread + " " + bvConst(5, 64) + ") (ite (= " + *warp +
+                     " " + bvConst(64, 64) + ") (bvlshr " + thread + " " +
+                     bvConst(6, 64) + ") " + other + "))");
+      return true;
+    }
     StringRef kind = rest.take_until([](char c) { return c == ':'; });
     if (!rest.drop_front(kind.size()).starts_with("::__getattr_param__["))
       return false;
@@ -6429,30 +6547,7 @@ private:
           it != launchDims->end() ? it->second : declare(Sort{false, 64, true});
       return true;
     }
-    auto id = [&](StringRef which) {
-      std::string symbol = ("gpu_" + which + "_" + Twine(*axis)).str();
-      if (gpuIds.insert(symbol).second) {
-        prelude += "(declare-const " + symbol + " (_ BitVec 64))\n";
-        sorts[symbol] = Sort{false, 64, true};
-        std::string dim = ("gpu_block_dim_" + Twine(*axis)).str();
-        std::string grid = ("gpu_grid_dim_" + Twine(*axis)).str();
-        if (which == "thread_idx")
-          facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + symbol +
-                          ") (bvslt " + symbol + " " + dim + "))");
-        else if (which == "block_idx")
-          facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + symbol +
-                          ") (bvslt " + symbol + " " + grid + "))");
-        else if (which == "block_dim")
-          facts.push_back("(and (bvsle " + bvConst(1, 64) + " " + symbol +
-                          ") (bvsle " + symbol + " " + bvConst(1024, 64) +
-                          "))");
-        else
-          facts.push_back("(and (bvsle " + bvConst(1, 64) + " " + symbol +
-                          ") (bvslt " + symbol + " " +
-                          bvConst(int64_t(1) << 31, 64) + "))");
-      }
-      return symbol;
-    };
+    auto id = [&](StringRef which) { return gpuIdSymbol(which, *axis); };
     // Declare the dimensions first: the ids' facts name them.
     id("block_dim");
     id("grid_dim");
