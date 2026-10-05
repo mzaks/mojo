@@ -2585,27 +2585,38 @@ private:
       else
         all = true;
     };
-    root->walk([&](Operation *op) {
-      if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
-        addRef(store->getOperand(1));
-      } else if (auto call = dyn_cast<LIT::CallOp>(op)) {
-        for (Value operand : call.getOperands())
-          if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
-              ref && !ref.isMutableKnown(false))
-            addRef(operand);
-        // Keep the printed list alive while its elements are used.
-        std::string origins = printed(call.getImplicitOriginsAttr());
-        for (StringRef origin : topLevelElements(origins))
-          if (!origin.ends_with(": !lit.origin<false>"))
-            addOrigin(origin);
-      } else if (op->getNumRegions() &&
-                 !isa<HLCF::IfOp, HLCF::LoopOp, LIT::TryOp, RequiresOp,
-                      EnsuresOp, OldOp, ForallOp>(op) &&
-                 op->getName().getStringRef() != "hlcf.comptime.if" &&
-                 op->getName().getStringRef() != "hlcf.comptime.for") {
-        all = true;
-      }
-    });
+    // The code, and the bodies of the local closures it calls: they are
+    // walked at their calls and write the variables they capture.
+    SmallVector<Operation *> work{root};
+    llvm::SmallPtrSet<Operation *, 4> seen{root};
+    while (!work.empty())
+      work.pop_back_val()->walk([&](Operation *op) {
+        if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
+          addRef(store->getOperand(1));
+        } else if (auto call = dyn_cast<LIT::CallOp>(op)) {
+          ArrayRef<TypedAttr> bound;
+          if (auto closure =
+                  closures.find(closureCallee(call.getCallee(), bound));
+              closure != closures.end() &&
+              seen.insert(closure->second.getOperation()).second)
+            work.push_back(closure->second.getOperation());
+          for (Value operand : call.getOperands())
+            if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
+                ref && !ref.isMutableKnown(false))
+              addRef(operand);
+          // Keep the printed list alive while its elements are used.
+          std::string origins = printed(call.getImplicitOriginsAttr());
+          for (StringRef origin : topLevelElements(origins))
+            if (!origin.ends_with(": !lit.origin<false>"))
+              addOrigin(origin);
+        } else if (op->getNumRegions() && !seen.count(op) &&
+                   !isa<HLCF::IfOp, HLCF::LoopOp, LIT::TryOp, RequiresOp,
+                        EnsuresOp, OldOp, ForallOp>(op) &&
+                   op->getName().getStringRef() != "hlcf.comptime.if" &&
+                   op->getName().getStringRef() != "hlcf.comptime.for") {
+          all = true;
+        }
+      });
     // Locals declared in the code are written before they are read.
     root->walk([&](LIT::VarDeclOp decl) { written.insert(decl->getResult(0)); });
     if (all)
