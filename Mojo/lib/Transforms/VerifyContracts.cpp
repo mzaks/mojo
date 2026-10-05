@@ -1472,6 +1472,11 @@ private:
   /// The `end` of each `comptime for` over `range(end)`, by the printed
   /// reference to its iterator parameter.
   std::map<std::string, std::string> comptimeRangeEnds;
+  /// While a `comptime for` is walked unrolled: the current iteration's
+  /// value, by the loop's iterator (`"iter`30"`).
+  std::map<std::string, std::string> comptimeIterations;
+  /// How many times the innermost unrolled body is walked.
+  uint64_t unrolledBodies = 1;
   /// The references a variadic pack holds, by the pack's term.
   std::map<std::string, SmallVector<Value>> packRefs;
   /// Element references `__getitem__` returned: the list's place and the
@@ -1688,6 +1693,101 @@ private:
     deps[name] = namesIn(expr);
     definitions[name] = expr.str();
     return name;
+  }
+
+  /// The elements of the application `(head a b ...)`, head first; empty
+  /// for anything else.
+  static SmallVector<StringRef> application(StringRef term) {
+    SmallVector<StringRef> parts;
+    term = term.trim();
+    if (!term.consume_front("(") || !term.consume_back(")"))
+      return parts;
+    size_t start = 0;
+    int depth = 0;
+    for (size_t i = 0; i <= term.size(); ++i) {
+      char c = i < term.size() ? term[i] : ' ';
+      if (c == '(')
+        ++depth;
+      else if (c == ')')
+        --depth;
+      else if (c == ' ' && depth == 0) {
+        if (i > start)
+          parts.push_back(term.slice(start, i));
+        start = i + 1;
+      }
+    }
+    return parts;
+  }
+
+  /// The value of a 64-bit term that is a constant by its definition.
+  std::optional<int64_t> constantInt(StringRef term, unsigned depth = 0) {
+    term = term.trim();
+    static llvm::Regex constRe("^\\(_ bv([0-9]+) 64\\)$");
+    SmallVector<StringRef> m;
+    uint64_t v;
+    if (constRe.match(term, &m) && !m[1].getAsInteger(10, v))
+      return (int64_t)v;
+    if (auto it = definitions.find(term.str());
+        it != definitions.end() && depth < 32)
+      return constantInt(it->second, depth + 1);
+    return std::nullopt;
+  }
+
+  /// Whether a Boolean term is decided by its definition alone: constants
+  /// compared with constants, under `and`, `or`, `not` and `xor`. A
+  /// launched instantiation's `comptime if` over its parameters is.
+  std::optional<bool> decided(StringRef term, unsigned depth = 0) {
+    term = term.trim();
+    if (term == "true")
+      return true;
+    if (term == "false")
+      return false;
+    if (depth > 32)
+      return std::nullopt;
+    if (auto it = definitions.find(term.str()); it != definitions.end())
+      return decided(it->second, depth + 1);
+    SmallVector<StringRef> parts = application(term);
+    if (parts.empty())
+      return std::nullopt;
+    StringRef head = parts[0];
+    ArrayRef<StringRef> args = ArrayRef(parts).drop_front();
+    if (head == "and" || head == "or") {
+      bool all = true;
+      for (StringRef arg : args) {
+        std::optional<bool> v = decided(arg, depth + 1);
+        if (v && *v == (head == "or"))
+          return head == "or";
+        all = all && v.has_value();
+      }
+      if (all)
+        return head == "and";
+      return std::nullopt;
+    }
+    if (head == "not" && args.size() == 1) {
+      if (std::optional<bool> v = decided(args[0], depth + 1))
+        return !*v;
+      return std::nullopt;
+    }
+    if (head == "xor" && args.size() == 2) {
+      std::optional<bool> a = decided(args[0], depth + 1),
+                          b = decided(args[1], depth + 1);
+      if (a && b)
+        return *a != *b;
+      return std::nullopt;
+    }
+    if (args.size() == 2 &&
+        (head == "=" || head == "bvslt" || head == "bvsle" || head == "bvsgt" ||
+         head == "bvsge")) {
+      std::optional<int64_t> a = constantInt(args[0]), b = constantInt(args[1]);
+      if (!a || !b)
+        return std::nullopt;
+      return head == "="       ? *a == *b
+             : head == "bvslt" ? *a < *b
+             : head == "bvsle" ? *a <= *b
+             : head == "bvsgt" ? *a > *b
+                               : *a >= *b;
+    }
+    return std::nullopt;
   }
 
   /// Whether `term` multiplies, divides or takes the remainder of two
@@ -2481,6 +2581,7 @@ private:
     }
     SmallVector<State> arms;
     std::string none = "true"; // No earlier condition held.
+    bool taken = false;        // An earlier condition is true by constants.
     for (auto [i, condAttr] : llvm::enumerate(ifOp.getConds())) {
       auto typed = dyn_cast<TypedAttr>(condAttr);
       std::string cond = typed ? paramTerm(typed, {true, 1, false})
@@ -2488,15 +2589,27 @@ private:
       State arm = state;
       arm.yields.clear();
       arm.pc = "(and " + state.pc + " " + none + " " + cond + ")";
+      // An arm whose condition is false by constants alone (a launched
+      // instantiation's `comptime if unroll_factor == 1`) is not compiled.
+      // It is still walked, so that its obligations have an answer in
+      // every instantiation, but as unreachable: no invariants are
+      // searched for its loops (`findInvariants`).
+      std::optional<bool> known =
+          taken ? std::optional<bool>(false) : decided(cond);
+      if (known && !*known)
+        arm.pc = "false";
       if (!op->getRegion(i).empty())
         walkBlock(op->getRegion(i).front(), arm);
       arms.push_back(std::move(arm));
+      taken = taken || (known && *known);
       none = "(and " + none + " (not " + cond + "))";
     }
     State elseArm = state;
     elseArm.yields.clear();
     elseArm.pc = "(and " + state.pc + " " + none + ")";
     Region &elseRegion = op->getRegion(op->getNumRegions() - 1);
+    if (taken)
+      elseArm.pc = "false";
     if (!elseRegion.empty())
       walkBlock(elseRegion.front(), elseArm);
     arms.push_back(std::move(elseArm));
@@ -2539,8 +2652,26 @@ private:
                               "paramfor_next_value.*"
                               "#kgen\\.param\\.decl\\.ref<(\"iter[^\"]*\")>");
     SmallVector<StringRef> m;
-    if (iterRe.match(expr, &m))
+    if (iterRe.match(expr, &m)) {
+      // Unrolled: this iteration's value.
+      if (auto it = comptimeIterations.find(m[1].str());
+          it != comptimeIterations.end() && !sort.isBool && sort.width == 64)
+        return it->second;
       key = "paramfor_next_value|" + m[1].str();
+    } else if (!comptimeIterations.empty()) {
+      // An unrolled iteration has a next value; any other expression of
+      // its iterator is that iteration's alone.
+      static llvm::Regex hasNextRe(
+          "^#kgen\\.param\\.expr<apply, .*paramfor_has_next.*"
+          "#kgen\\.param\\.decl\\.ref<(\"iter[^\"]*\")>");
+      SmallVector<StringRef> h;
+      if (sort.isBool && hasNextRe.match(expr, &h) &&
+          comptimeIterations.count(h[1].str()))
+        return "true";
+      for (auto &[iter, value] : comptimeIterations)
+        if (StringRef(expr).contains(iter))
+          key += "|" + iter + "=" + value;
+    }
     auto [it, inserted] =
         parameterValues.try_emplace(scope + key + "|" + sort.str(), "");
     if (inserted) {
@@ -2663,6 +2794,7 @@ private:
     // Over `range(end)`: each iteration's value is in `[0, end)`.
     Attribute decl = loop->getAttr("paramDecl");
     Attribute initial = loop->getAttr("initial");
+    std::string iterator, count;
     if (decl && initial) {
       std::optional<std::string> end;
       initial.walk([&](ParamOperatorAttr apply) {
@@ -2679,8 +2811,11 @@ private:
       static llvm::Regex nameRe("param.decl \\*(\"[^\"]*\")");
       SmallVector<StringRef> m;
       std::string declText = printed(decl);
-      if (end && nameRe.match(declText, &m))
+      if (end && nameRe.match(declText, &m)) {
         comptimeRangeEnds["#kgen.param.decl.ref<" + m[1].str() + ">"] = *end;
+        iterator = m[1].str();
+        count = *end;
+      }
     }
     if (loop->getNumResults() || loop->getNumRegions() < 1 ||
         loop->getRegion(0).empty() ||
@@ -2688,7 +2823,69 @@ private:
       notAnalyzed(loop, state);
       return;
     }
+    if (unrollComptimeFor(loop, iterator, count, state))
+      return;
     walkLoopBody(loop, loop->getRegion(0).front(), /*comptime=*/true, state);
+  }
+
+  /// A `comptime for` over `range(count)` with a small constant count: its
+  /// body, walked once per iteration with the iteration's value, as
+  /// elaboration unrolls it. What the iterations do adds up exactly (a
+  /// counter the body increments), where the loop abstraction keeps only
+  /// what holds for an arbitrary iteration. Only a loop that changes an
+  /// integer variable from outside it (directly or in a closure it calls):
+  /// for any other the abstraction loses nothing, and unrolling every short
+  /// loop more than doubled the solver's work on the kernels. At most 8
+  /// iterations, and 16 bodies through nested loops.
+  bool unrollComptimeFor(Operation *loop, const std::string &iterator,
+                         const std::string &count, State &state) {
+    static llvm::Regex constRe("^\\(_ bv([0-9]+) 64\\)$");
+    SmallVector<StringRef> m;
+    uint64_t n;
+    if (iterator.empty() || !constRe.match(count, &m) ||
+        m[1].getAsInteger(10, n) || n > 8 ||
+        unrolledBodies * std::max<uint64_t>(n, 1) > 16 ||
+        comptimeIterations.count(iterator))
+      return false;
+    std::optional<llvm::DenseSet<Value>> written = writtenRoots(loop);
+    if (!written || llvm::none_of(*written, [&](Value root) {
+          Operation *def = root.getDefiningOp();
+          if (def && (loop->isAncestor(def) ||
+                      def->getParentOfType<LIT::FnOp>() != fn))
+            return false; // The loop's own local, or a closure's.
+          return isIntPlace(placeType(Loc{root, ""}));
+        }))
+      return false;
+    uint64_t outer = unrolledBodies;
+    unrolledBodies *= std::max<uint64_t>(n, 1);
+    Block &body = loop->getRegion(0).front();
+    SmallVector<State> exits;
+    State current = state;
+    current.yields.clear();
+    for (uint64_t k = 0; k < n && current.alive; ++k) {
+      comptimeIterations[iterator] = bvConst(k, 64);
+      // The body's parameter constants are this iteration's.
+      loop->walk([&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
+      LoopFrame frame{labelOf(loop), true, {}, {}, {}, {}, {}};
+      loops.push_back(&frame);
+      State iteration = current;
+      walkBlock(body, iteration);
+      loops.pop_back();
+      // Falling off the body, or `continue`, starts the next iteration.
+      if (iteration.alive)
+        frame.continues.push_back(iteration);
+      llvm::append_range(exits, frame.breaks);
+      current = merge(frame.continues);
+    }
+    comptimeIterations.erase(iterator);
+    loop->walk([&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
+    unrolledBodies = outer;
+    if (current.alive)
+      exits.push_back(current);
+    State exit = merge(exits);
+    exit.yields = state.yields;
+    state = std::move(exit);
+    return true;
   }
 
   /// Whether all that `loop` (and the local closures it calls) does to the
@@ -2797,6 +2994,11 @@ private:
   void findInvariants(const LoopFrame &frame, State &before, State &head,
                       StringRef headReach,
                       const std::optional<llvm::DenseSet<Value>> &written) {
+    // An unreachable loop (in a `comptime if` arm that is not compiled)
+    // needs none.
+    if (std::optional<bool> reachable = decided(before.pc);
+        reachable && !*reachable)
+      return;
     // Integer places the body reads and may change, and that its conditions
     // depend on.
     llvm::StringSet<> relevant = closure(frame.conditions);
