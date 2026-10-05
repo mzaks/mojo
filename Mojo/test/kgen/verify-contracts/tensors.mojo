@@ -13,7 +13,7 @@
 # `TileTensor` indexing and GPU kernels for `verify-contracts`; see README.md.
 # Needs the `max` and `layout` packages on the import path (see README.md).
 
-from layout import Idx, TileTensor, row_major
+from layout import Idx, TileTensor, row_major, stack_allocation
 from max.gpu import block_dim, block_idx, global_idx, thread_idx
 from max.gpu.host import DeviceBuffer, DeviceContext
 from std.utils.coord import Coord, coord
@@ -255,6 +255,33 @@ def ok_device_buffer(
     return buffer_of(buf, rows * Int(t.dim[1]()))
 
 
+def ok_comptime_for_write[N: Int]() -> Float32:
+    var t = stack_allocation[dtype=DType.float32](row_major[4, N]())
+    comptime for j in range(N):
+        t[1, j] = 1  # the index of a `comptime for` in a written element
+    return t[0, 0]
+
+
+def ok_store_width[
+    N: Int, W: Int
+](v: SIMD[DType.float32, W]) -> Float32:
+    comptime assert W > 0
+    var t = stack_allocation[dtype=DType.float32](row_major[N, W]())
+    comptime for i in range(N):
+        t.store(Coord(i, Idx[0]), v)  # a row of `W`, whatever `W` is
+    return 0
+
+
+def ok_comptime_for_guard[
+    N: Int
+](t: TileTensor[DType.float32, LD, MutAnyOrigin]):
+    comptime for i in range(N):
+        if i >= Int(t.dim[0]()):
+            continue
+        if Int(t.dim[1]()) > 0:
+            t[i, 0] = 0  # the same `i` as in the guard
+
+
 # --- must stay UNPROVEN ---
 def bad_static(t: TileTensor[DType.float32, L8, MutAnyOrigin]) -> Float32:
     return t[8]  # one past the end
@@ -408,3 +435,30 @@ def bad_device_buffer(
 ) raises -> Int:
     var buf = t.to_device_buffer(ctx)  # the rank is not known here
     return buffer_of(buf, Int(t.dim[0]()) * Int(t.dim[1]()))
+
+
+def bad_comptime_for_write[N: Int]() -> Float32:
+    var t = stack_allocation[dtype=DType.float32](row_major[4, N]())
+    comptime for j in range(N):
+        t[1, j + 1] = 1  # column N
+    return t[0, 0]
+
+
+def bad_store_width[
+    N: Int, W: Int
+](v: SIMD[DType.float32, W]) -> Float32:
+    comptime assert W > 0
+    var t = stack_allocation[dtype=DType.float32](row_major[N, W]())
+    comptime for i in range(N):
+        t.store(Coord(i, Idx[1]), v)  # one past the row for any width
+    return 0
+
+
+def bad_comptime_for_guard[
+    N: Int
+](t: TileTensor[DType.float32, LD, MutAnyOrigin]):
+    comptime for i in range(N):
+        if i > Int(t.dim[0]()):
+            continue
+        if Int(t.dim[1]()) > 0:
+            t[i, 0] = 0  # row `dim[0]` gets through

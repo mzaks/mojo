@@ -14,6 +14,8 @@
 # README.md.
 
 
+from std.math import align_down
+
 def change(mut xs: List[Int]):
     xs.clear()
 
@@ -152,6 +154,63 @@ def ok_list_elements() -> Int:
     return t
 
 
+def ok_strided(xs: List[Int], n: Int) -> Int:
+    var sum = 0
+    if n <= len(xs) and n < 1000:
+        for i in range(0, n, 4):
+            sum += xs[i]  # `i` is below `n`
+    return sum
+
+
+def ok_strided_from(xs: List[Int], t: Int) -> Int:
+    var sum = 0
+    if 0 <= t and t < 8 and len(xs) == 100:
+        for i in range(t, 100, 8):
+            sum += xs[i]
+    return sum
+
+
+def ok_strided_down(xs: List[Int]) -> Int:
+    var sum = 0
+    if len(xs) == 100:
+        for i in range(99, 0, -3):
+            sum += xs[i]
+    return sum
+
+
+def ok_comptime_count(xs: List[Int]) -> Int:
+    var sum = 0
+    var at = 0
+    if len(xs) == 3:
+        comptime for _u in range(3):
+            sum += xs[at]  # 0, 1, 2: a short `comptime for` is unrolled
+            at += 1
+    return sum
+
+
+def ok_unrolled(xs: List[Int]) -> Int:
+    var sum = 0
+    var at = 0
+
+    @__parameter
+    def step():
+        sum += xs[at]
+        at += 1
+
+    var n = len(xs)
+    if n > 1000000:
+        return 0
+    # Two steps per iteration over the even part, then the rest: `at` is
+    # the strided loop's cursor, and ends where the second loop starts.
+    var paired = align_down(n, 2)
+    for _outer in range(0, paired, 2):
+        comptime for _u in range(2):
+            step()
+    for _rest in range(paired, n):
+        step()
+    return sum
+
+
 # --- must stay UNPROVEN ---
 def bad_one_past(xs: List[Int]) -> Int:
     var s = 0
@@ -242,3 +301,63 @@ def bad_unknown_elements(xs: List[Int]) -> Int:
     for x in xs:
         t += small(x)  # nothing is known about the elements
     return t
+
+
+def bad_strided_past(xs: List[Int], n: Int) -> Int:
+    var sum = 0
+    if n <= len(xs) and n < 1000:
+        for i in range(0, n, 4):
+            sum += xs[i + 1]  # `i + 1` may be `n`
+    return sum
+
+
+def bad_strided_down(xs: List[Int]) -> Int:
+    var sum = 0
+    if len(xs) == 100:
+        for i in range(100, 0, -3):
+            sum += xs[i]  # starts at 100
+    return sum
+
+
+def bad_comptime_count(xs: List[Int]) -> Int:
+    var sum = 0
+    var at = 0
+    if len(xs) == 3:
+        comptime for _u in range(4):
+            sum += xs[at]  # the fourth is past the end
+            at += 1
+    return sum
+
+
+def bad_unrolled(xs: List[Int]) -> Int:
+    var sum = 0
+    var at = 0
+
+    @__parameter
+    def step():
+        sum += xs[at]
+        at += 1
+
+    var n = len(xs)
+    if n > 1000000:
+        return 0
+    var paired = align_down(n, 2)
+    for _outer in range(0, paired, 2):
+        comptime for _u in range(3):  # one more than the stride
+            step()
+    return sum
+
+
+def bad_closure_counter(xs: List[Int]) -> Int:
+    var sum = 0
+    var at = 0
+
+    @__parameter
+    def step():
+        sum += xs[at]
+        at += 1  # written in the closure: the loop below changes it
+
+    if len(xs) >= 1:
+        for _ in range(5):
+            step()
+    return sum

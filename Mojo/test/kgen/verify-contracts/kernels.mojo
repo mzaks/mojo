@@ -23,8 +23,9 @@ from max.gpu import (
     grid_dim,
     lane_id,
     thread_idx,
+    warp_id,
 )
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, get_gpu_target
 import max.gpu.primitives.warp as warp
 from std.math import ceildiv
 from std.math.uutils import udivmod, ufloordiv
@@ -356,6 +357,39 @@ def ok_launch_in_closure(
     launch[4]()
 
 
+def ok_per_warp_kernel[
+    threads: Int
+](c: TileTensor[DType.float32, LD, MutAnyOrigin] where block_dim.x == threads):
+    # One slot per warp of the block: `warp_id()` is `thread_idx.x` over the
+    # warp size (of the GPU it is launched on).
+    var s = stack_allocation[dtype=DType.float32](
+        row_major[1, threads // WARP_SIZE]()
+    )
+    s[0, warp_id()] = 0
+
+
+def ok_launch_per_warp(
+    ctx: DeviceContext, c: TileTensor[DType.float32, LD, MutAnyOrigin]
+) raises:
+    ctx.enqueue_function[ok_per_warp_kernel[128]](
+        c, grid_dim=1, block_dim=128
+    )
+
+
+def ok_gpu_simd_width(xs: List[Int]) -> Int:
+    comptime w = simd_width_of[DType.float32, target=get_gpu_target()]()
+    if len(xs) == 5:
+        return xs[w]  # 4: every GPU target has 128-bit vectors
+    return 0
+
+
+def ok_gpu_simd_width_any[dt: DType](xs: List[Int]) -> Int:
+    comptime w = simd_width_of[dt, target=get_gpu_target()]()
+    if len(xs) == 17:
+        return xs[w]  # at most 16, for a one-byte dtype
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -582,3 +616,27 @@ def bad_launch_in_closure(
 
     launch[4]()
     launch[5]()  # row 9 of 8
+
+
+def bad_per_warp_kernel[
+    threads: Int
+](c: TileTensor[DType.float32, LD, MutAnyOrigin] where block_dim.x == threads):
+    var s = stack_allocation[dtype=DType.float32](
+        row_major[1, threads // WARP_SIZE - 1]()
+    )
+    s[0, warp_id()] = 0  # one slot short
+
+
+def launch_short_per_warp(
+    ctx: DeviceContext, c: TileTensor[DType.float32, LD, MutAnyOrigin]
+) raises:
+    ctx.enqueue_function[bad_per_warp_kernel[128]](
+        c, grid_dim=1, block_dim=128
+    )
+
+
+def bad_gpu_simd_width_any[dt: DType](xs: List[Int]) -> Int:
+    comptime w = simd_width_of[dt, target=get_gpu_target()]()
+    if len(xs) == 17:
+        return xs[w - 1]  # the width is 0 for a 256-bit dtype
+    return 0

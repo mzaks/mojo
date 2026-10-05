@@ -1705,6 +1705,45 @@ Tensors and GPU kernels:
 - `dump-dir=` naming a directory that does not exist left every script
   unwritten and every obligation "not decided within the solver limits";
   the directory is now created, and it is an error if it cannot be.
+- `gemv_split_k`, first step (its clauses are not in the tree yet). The
+  kernel accumulates over K in a closure, `_k_iter_body`, that counts its
+  calls in a captured `iteration`; the launcher's loops call it
+  `unroll_factor` times per step (`comptime for`), then once per
+  remaining iteration. What it needed:
+  - A fix: a loop did not count what a closure it calls writes among the
+    variables it changes, so `iteration` stayed 0 at every loop head, and
+    six tile preconditions were proven for iteration 0 only. With a
+    counter incremented in a closure called five times, `xs[counter]` was
+    proven for a list of length 1 (`bad_closure_counter`).
+  - `comptime for` indices in written elements and `Coord`s, one unknown
+    per iteration, `load`/`store` with a parameter width,
+    `size_of[dtype]`, `warp_id()`, strided ranges with the whole-steps
+    invariant, `align_down`.
+  - Unrolling `comptime for _u in range(unroll_factor): _k_iter_body()`,
+    so that `iteration` is the strided loop's cursor exactly.
+  - `simd_width_of[dtype, target=get_gpu_target()]` is 16 over the
+    dtype's size in bytes: 0 only for `int256`/`uint256`, which nothing
+    rules out for the dispatcher's dtypes.
+  With clauses on `m`, `n` and `k` (extents, `k % simd_width == 0`,
+  `block_dim.x == num_threads`, and the grid covering whole tiles where
+  the bounds guards are off), the two router-gate instantiations prove
+  everything but the AMD `weight_tile.load[simd_width]` (the `load`
+  clause's model needs a literal layout). The remainder loop needs
+  `invariant-retry=true`: that the counter ends where the unrolled loop's
+  cursor did takes 1.2M units on entry against the candidates' 1M. Open:
+  the dispatcher's instantiations (one with an unknown config tuple),
+  both launches, the AMD load.
+  Cost, 41 inputs on a quiet machine, against the committed pass: proven
+  1549 -> 1573, solver work 4.30B -> 4.66B (+8%), summed time 220 ->
+  310 s. The first version cost +60%: the invariant search rediscovered
+  each strided range's end and step every round (gemv: 195M -> 1356M
+  units), `warp_id()` was a quotient of two unknowns, and asking
+  undecided candidates again, then by default, made kernels without
+  clauses fail slowly. What is left: gemv's longest chain of solver runs
+  (functions are verified in parallel) is now a `gemv_split_k`
+  instantiation whose config is unknown (29 s against 16 s), and three
+  obligations of blockwise_fp8 that could not be evaluated before are
+  now nonlinear queries that stay open (332M -> 632M).
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

@@ -13,7 +13,7 @@
 # Generic code for `verify-contracts`: each function is verified once, for
 # every value of its parameters; see README.md.
 
-from std.sys import simd_width_of
+from std.sys import simd_width_of, size_of
 
 
 # --- must be PROVEN ---
@@ -144,6 +144,20 @@ def ok_closure_passes_parameter[limit: Int](x: Int) -> Int:
     return total
 
 
+def ok_dtype_size(xs: List[Int]) -> Int:
+    comptime width = 16 // size_of[DType.float32]()
+    if len(xs) == 5:
+        return xs[width]  # 4: a `float32` is 4 bytes
+    return 0
+
+
+def ok_dtype_size_any[dt: DType](xs: List[Int]) -> Int:
+    comptime bytes = size_of[dt]()
+    if len(xs) == 33:
+        return xs[bytes]  # at most 32, a `uint256`
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_param_no_lower[n: Int](xs: List[Int]) -> Int:
     if n < len(xs):
@@ -225,3 +239,10 @@ def bad_closure_parameter(xs: List[Int]) -> Int:
         add[0]()
         add[4]()  # this call's `k` is past the end
     return total
+
+
+def bad_dtype_size[dt: DType](xs: List[Int]) -> Int:
+    comptime width = 16 // size_of[dt]()
+    if len(xs) == 16:
+        return xs[width]  # 16 for a one-byte dtype
+    return 0

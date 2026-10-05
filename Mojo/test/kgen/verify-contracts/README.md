@@ -56,7 +56,11 @@ by a value that may be 0, `int-retry=false` turns off the integer retry
 (below), `nonlinear-rlimit=` the limit a query whose goal multiplies or
 divides two unknowns is first asked with (default 10000000; then over the
 integers, then with the full limit), `case-split=false` turns off case
-splitting (below), `dump-dir=` writes the SMT-LIB scripts (the directory
+splitting (below), `invariant-retry=true` asks a loop-invariant candidate
+left undecided on loop entry once more with twice its limit (a loop after
+a large body can need it; off by default, since on kernels without
+clauses it costs about half again as much), `dump-dir=` writes the
+SMT-LIB scripts (the directory
 is created; a script the same as one already run is neither run nor
 written again), and `cache-dir=` caches
 the solver's answers by a hash of each script.
@@ -420,7 +424,25 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   call's values; a kernel it launches is verified for them (`launch[4]()`
   launching `kernel[rows]` gives the instantiation `kernel[4]`).
 - `min(a, b)` and `max(a, b)` of two integers are the smaller and the
-  larger as their dtype compares (signed or unsigned).
+  larger as their dtype compares (signed or unsigned); `align_down(a, b)`
+  and `align_up(a, b)` are `a // b` and `ceildiv(a, b)` times `b`.
+- A loop that calls a local closure changes what the closure writes.
+- The index of a `comptime for` is one unknown per loop, in `[0, end)`
+  over `range(end)`, also in a written element (`t[1, j] = v`) and in a
+  `Coord`. A loop over a constant range of at most 8 iterations that
+  changes an integer variable from outside it (a counter, also in a
+  closure it calls) is walked once per iteration instead, so that what
+  the iterations do adds up. A `comptime if` arm that is false by
+  constants alone is unreachable.
+- `range(start, end, step)`: the loop variable is the cursor, a whole
+  number of steps from `start`. A loop that only advances its range
+  keeps the range's end and step.
+- `load[width]` and `store[width]` with a parameter width;
+  `size_of[dtype]()` is the dtype's size in bytes (a power of two up to
+  32 where the dtype is not a literal);
+  `simd_width_of[dtype, target=get_gpu_target()]()` is 16 over that size
+  (every GPU target has 128-bit vectors: 0 only for a 256-bit dtype);
+  `warp_id()` is `thread_idx.x` over a warp size of 32 or 64.
 - `lane_id()` is below `WARP_SIZE`; the warp size of an accelerator the
   stdlib does not hard-code is 32 or 64 (every `GPUInfo` says so); a
   launched kernel's own target is a GPU; `ufloordiv(a, 0)` is 0.
