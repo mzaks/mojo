@@ -361,9 +361,25 @@ def gemv_kernel_vector_multirow[
     c: TileTensor[c_type, c_layout, MutAnyOrigin, Engine=c_engine],  # m
     a: TileTensor[a_type, a_layout, ImmutAnyOrigin, Engine=a_engine],  # m * k
     b: TileTensor[b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],  # 1 * k
-    m: Int32,
+    m: Int32 where (
+        m >= 0
+        and Int(a.dim[0]()) >= Int(m)
+        and (
+            transpose_b or (Int(c.dim[0]()) >= Int(m) and Int(c.dim[1]()) >= 1)
+        )
+        and (
+            not transpose_b
+            or (Int(c.dim[0]()) >= 1 and Int(c.dim[1]()) >= Int(m))
+        )
+    ),
     n: Int32,
-    k: Int32,
+    k: Int32 where (
+        k >= 0
+        and Int(k) % simd_width == 0
+        and Int(a.dim[1]()) >= Int(k)
+        and Int(b.dim[0]()) >= 1
+        and Int(b.dim[1]()) >= Int(k)
+    ),
 ):
     var _m = Int(m)
     var _k = Int(k)
