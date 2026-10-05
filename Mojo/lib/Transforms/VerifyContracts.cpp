@@ -369,6 +369,9 @@ struct SolverConfig {
   unsigned nonlinearRlimit = 0;
   /// Whether `runCases` splits open queries over finite-domain unknowns.
   bool caseSplit = true;
+  /// Whether an invariant candidate undecided on loop entry is asked again
+  /// with twice its limit.
+  bool invariantRetry = false;
   /// The scripts already run, or running, in this run of the pass.
   std::shared_ptr<struct ScriptMemo> memo = {};
 };
@@ -3162,6 +3165,48 @@ private:
         std::optional<SmallVector<Answer>> answers = runZ3(solver, text, run);
         if (answers)
           runCases(text, *answers, run);
+        // With `invariant-retry`: a candidate left undecided on loop entry,
+        // and not refuted, is asked once more alone with twice the limit.
+        // After a large body (a kernel's unrolled iterations) the
+        // invariants that relate a counter to the next loop's cursor need
+        // slightly more than the limit on entry (1.2M against 1M). Off by
+        // default: the invariants it keeps turn obligations a kernel
+        // without clauses fails quickly into ones asked up to the full
+        // limit (gemv: 1380M of work without it, 2020M with it).
+        std::vector<bool> open(set.size(), false), refuted(set.size(), false);
+        if (answers)
+          for (auto [k, i] : llvm::enumerate(asked))
+            if (k < answers->size()) {
+              bool entry = k % (1 + ends.size()) == 0;
+              if ((*answers)[k] == Answer::Unknown && entry)
+                open[i] = true;
+              else if ((*answers)[k] != Answer::Proven)
+                refuted[i] = true;
+            }
+        bool any = false;
+        for (size_t i = 0; i < set.size(); ++i) {
+          open[i] = open[i] && !refuted[i];
+          any = any || open[i];
+        }
+        if (any && solver.invariantRetry) {
+          SmallVector<size_t> again;
+          for (size_t i = 0; i < set.size(); ++i)
+            if (kept[i] && open[i])
+              again.append(1 + ends.size(), i);
+          std::string retry =
+              rebuild(set, kept, before, head, ends, render, &open, 2);
+          std::string name =
+              dumpPrefix + ".houdini" + std::to_string(houdiniRuns++);
+          std::optional<SmallVector<Answer>> more = runZ3(solver, retry, name);
+          std::vector<bool> failed(set.size(), false);
+          for (auto [k, i] : llvm::enumerate(again))
+            if (!more || k >= more->size() || (*more)[k] != Answer::Proven)
+              failed[i] = true;
+          for (auto [k, i] : llvm::enumerate(asked))
+            if (open[i] && !failed[i] && k < answers->size() &&
+                (*answers)[k] == Answer::Unknown)
+              (*answers)[k] = Answer::Proven;
+        }
         bool changed = false;
         for (auto [k, i] : llvm::enumerate(asked)) {
           bool proven = answers && k < answers->size() &&
@@ -3198,11 +3243,14 @@ private:
   }
 
   /// The Houdini script for the kept candidates: rendering first (which may
-  /// add definitions to the prelude), then the header, then the queries.
+  /// add definitions to the prelude), then the header, then the queries; of
+  /// the candidates in `only` alone (all kept ones are assumed), with
+  /// `scale` times the limit, when asking again what was left undecided.
   template <typename Render>
-  std::string rebuild(ArrayRef<Candidate> candidates,
-                      const std::vector<bool> &kept, State &before,
-                      State &head, ArrayRef<State *> ends, Render &render) {
+  std::string
+  rebuild(ArrayRef<Candidate> candidates, const std::vector<bool> &kept,
+          State &before, State &head, ArrayRef<State *> ends, Render &render,
+          const std::vector<bool> *only = nullptr, unsigned scale = 1) {
     // The templates relating a length to a loop variable (`combine`, last)
     // are assumed only in their own queries: assumed in every query, they
     // made z3 much slower on the whole script, although each query alone
@@ -3217,7 +3265,7 @@ private:
       }
     std::string queries;
     for (size_t i = 0; i < candidates.size(); ++i) {
-      if (!kept[i])
+      if (!kept[i] || (only && !(*only)[i]))
         continue;
       ArrayRef<std::string> premises(assumed);
       if (candidates[i].combine.empty())
@@ -3229,6 +3277,9 @@ private:
           std::max(1u, (queryRlimit ? queryRlimit : solver.rlimit) / 20);
       if (solver.houdiniRlimit)
         limit = std::min(limit, solver.houdiniRlimit);
+      if (scale > 1)
+        limit = std::min<uint64_t>(uint64_t(limit) * scale,
+                                   queryRlimit ? queryRlimit : solver.rlimit);
       queries += query({before.pc}, render(candidates[i], before), limit);
       for (State *end : ends) {
         SmallVector<std::string> assumptions{end->pc};
@@ -7996,6 +8047,7 @@ struct VerifyContractsPass
     if (intRetry)
       solver.nonlinearRlimit = nonlinearRlimit;
     solver.caseSplit = caseSplit;
+    solver.invariantRetry = invariantRetry;
     solver.memo = std::make_shared<ScriptMemo>();
     if (!cacheDir.empty())
       (void)llvm::sys::fs::create_directories(cacheDir);

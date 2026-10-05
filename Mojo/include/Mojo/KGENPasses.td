@@ -74,6 +74,10 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "Ask queries the solver leaves open once per value of the "
            "unknowns with few values (the warp size, a SIMD width), as "
            "constants (at most 64 combinations)">,
+    Option<"invariantRetry", "invariant-retry", "bool", /*default=*/"false",
+           "Ask a loop-invariant candidate left undecided on loop entry once "
+           "more, alone, with twice its limit (a loop after a large body "
+           "needs it; it costs about half again as much on such kernels)">,
     Option<"genericRlimit", "generic-rlimit", "unsigned",
            /*default=*/"10000000",
            "With generic-launched: resource limit per query of a launched "
