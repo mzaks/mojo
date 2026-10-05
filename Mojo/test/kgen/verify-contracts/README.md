@@ -56,7 +56,9 @@ by a value that may be 0, `int-retry=false` turns off the integer retry
 (below), `nonlinear-rlimit=` the limit a query whose goal multiplies or
 divides two unknowns is first asked with (default 10000000; then over the
 integers, then with the full limit), `case-split=false` turns off case
-splitting (below), `dump-dir=` writes the SMT-LIB scripts, and `cache-dir=` caches
+splitting (below), `dump-dir=` writes the SMT-LIB scripts (the directory
+is created; a script the same as one already run is neither run nor
+written again), and `cache-dir=` caches
 the solver's answers by a hash of each script.
 
 Values are bit-vectors, as in the program, so wrap-around is modelled.
@@ -414,6 +416,11 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
 - A local closure (`@__parameter def` in a function) that is only ever
   called is verified where it is called, with its caller's state; one
   passed on (`vectorize[f]`, a launch, an epilogue parameter) on its own.
+  A closure with parameters of its own (`f[4]()`) is walked with that
+  call's values; a kernel it launches is verified for them (`launch[4]()`
+  launching `kernel[rows]` gives the instantiation `kernel[4]`).
+- `min(a, b)` and `max(a, b)` of two integers are the smaller and the
+  larger as their dtype compares (signed or unsigned).
 - `lane_id()` is below `WARP_SIZE`; the warp size of an accelerator the
   stdlib does not hard-code is 32 or 64 (every `GPUInfo` says so); a
   launched kernel's own target is a GPU; `ufloordiv(a, 0)` is 0.

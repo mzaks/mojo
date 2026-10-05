@@ -13,7 +13,7 @@
 # Straight-line code for `verify-contracts`: preconditions checked at calls,
 # before elaboration; see README.md.
 
-from std.math import ceildiv
+from std.math import ceildiv, max, min
 from std.math.uutils import udiv_unchecked
 
 
@@ -156,6 +156,20 @@ def ok_mode_chosen(xs: List[Int]) -> Int:
     return run(mode, xs)  # FAST only when the list is not empty
 
 
+def ok_clamped(xs: List[Int], i: Int) -> Int:
+    # Clamping the index keeps a read past the end on the last element.
+    if len(xs) > 0:
+        return xs[max(min(i, len(xs) - 1), 0)]
+    return 0
+
+
+def ok_max_unsigned(xs: List[Int], n: UInt8) -> Int:
+    # 250 is the larger as bytes compare, though negative as a signed one.
+    if len(xs) == 6:
+        return xs[Int(max(n, UInt8(250))) - 250]
+    return 0
+
+
 # --- must stay UNPROVEN ---
 def bad_get(xs: List[Int], i: Int) -> Int:
     return xs[i]  # nothing is known about `i`
@@ -241,3 +255,15 @@ def bad_mode_chosen(xs: List[Int], fast: Bool) -> Int:
     if fast:
         mode = Mode.FAST
     return run(mode, xs)  # FAST may come with an empty list
+
+
+def bad_clamped(xs: List[Int], i: Int) -> Int:
+    if len(xs) > 0:
+        return xs[max(min(i, len(xs)), 0)]  # `len(xs)` is one too far
+    return 0
+
+
+def bad_min_unsigned(xs: List[Int], n: UInt8) -> Int:
+    if len(xs) == 251:
+        return xs[Int(min(n, UInt8(251)))]  # 251 when `n` is larger
+    return 0

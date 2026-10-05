@@ -1666,6 +1666,45 @@ Tensors and GPU kernels:
   1500, obligations analyzed 2034 -> 2154 (closures, comptime-if arms),
   solver work 2658M -> 3801M, summed pass time 97.5 -> 156.5 s (load
   3.5-4); gemv 14 -> 27.5 s with 18 more proven.
+- `gemv_kernel_vector_multirow` (the vector kernel with `rows_per_warp`
+  rows per warp), with the vector kernel's clauses: proven for its launched
+  instantiation (`rows_per_warp = 4`; not for every value, where
+  `global_warp_id * rows_per_warp` may wrap), and both of its launches.
+  What it needed:
+  - Closures with parameters of their own. The kernel is launched from
+    `_rows_per_warp[rows]`, called as `_rows_per_warp[4]()`: the callee is
+    `bind_params(closure, 4)`, which counted as passing the closure on, so
+    it was verified alone. Such a call is now walked like a plain
+    closure's, with a frame that binds only the closure's parameters and
+    passes every other name on to the caller's (a caller's `transpose_b`
+    read inside the closure, or given to a callee there, is the caller's
+    term). Parameter constants in the body are evaluated again at each
+    call: the first version kept the first call's values, and `f[4]()`
+    followed by `f[8]()` proved `rows == 4` twice
+    (`bad_closure_parameter`).
+  - Launches in such closures: the kernel's instantiation takes the
+    closure's values from its calls (`kernel[rows]` is `kernel[4]`), and
+    the enclosing function's callers give the rest as before. This also
+    gives `gemv_split_k`, launched from
+    `_gemv_split_k_dispatch[num_threads, tile_n, ...]`, five
+    instantiations instead of two.
+  - `min` and `max` of integers (`min(row_base + r, last_row)` clamps the
+    row): the smaller and larger as the dtype compares.
+  - The same script is run once per run of the pass. Instantiations that
+    differ in a parameter the proof does not read have identical scripts
+    (the ping-pong matmul's three `KernelConfig`s: 421M of work without
+    this, 140M with it).
+  Removing the clamp or the `row < _m` guard of the stores in a copy is
+  reported. Cost on 44 inputs against the committed pass: proven 1660 ->
+  1685, obligations 2453 -> 2459, solver work 6063M -> 6920M (+14%): the
+  gemv copies 920M -> 1065M each (the three more `gemv_split_k`
+  instantiations), the ping-pong matmul 118M -> 140M with nothing more
+  proven (the closures in its kernel are now walked at each call: its
+  script grew from 1285 to 1729 lines) and blockwise fp8 307M -> 332M,
+  not looked into. Times were not comparable (load 7-60).
+- `dump-dir=` naming a directory that does not exist left every script
+  unwritten and every obligation "not decided within the solver limits";
+  the directory is now created, and it is an error if it cannot be.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

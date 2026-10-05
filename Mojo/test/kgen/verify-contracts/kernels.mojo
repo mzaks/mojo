@@ -341,6 +341,21 @@ def ok_local_closure(t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int):
             pass
 
 
+def ok_rows_kernel[rows: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+    # For the `rows` the closure's call gives its launch.
+    t[2 * rows - 1, 0] = 0
+
+
+def ok_launch_in_closure(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    @__parameter
+    def launch[rows: Int]() raises:
+        ctx.enqueue_function[ok_rows_kernel[rows]](t, grid_dim=1, block_dim=1)
+
+    launch[4]()
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -552,3 +567,18 @@ def bad_local_closure(t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int):
         write()  # nothing bounds `i` here
     except:
         pass
+
+
+def bad_rows_kernel[rows: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+    t[2 * rows - 1, 0] = 0
+
+
+def bad_launch_in_closure(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    @__parameter
+    def launch[rows: Int]() raises:
+        ctx.enqueue_function[bad_rows_kernel[rows]](t, grid_dim=1, block_dim=1)
+
+    launch[4]()
+    launch[5]()  # row 9 of 8

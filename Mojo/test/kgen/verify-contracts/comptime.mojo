@@ -114,6 +114,36 @@ def ok_comptime_expression[
     return 0
 
 
+def ok_closure_parameter(xs: List[Int]) -> Int:
+    var total = 0
+
+    @__parameter
+    def add[k: Int]():
+        total += xs[k]  # checked at each call, for that call's `k`
+
+    if len(xs) >= 4:
+        add[0]()
+        add[3]()
+    return total
+
+
+def at_most[limit: Int](x: Int where x <= limit) -> Int:
+    return x
+
+
+def ok_closure_passes_parameter[limit: Int](x: Int) -> Int:
+    var total = 0
+
+    @__parameter
+    def add[k: Int]():
+        # `limit` is the enclosing function's, in the callee's clause too.
+        total += at_most[limit](x - k)
+
+    if 0 <= x and x <= limit:
+        add[1]()
+    return total
+
+
 # --- must stay UNPROVEN ---
 def bad_param_no_lower[n: Int](xs: List[Int]) -> Int:
     if n < len(xs):
@@ -182,3 +212,16 @@ def bad_comptime_expression[
     if len(xs) > n + 2:
         return xs[k]  # n + 3 when `flag` is False
     return 0
+
+
+def bad_closure_parameter(xs: List[Int]) -> Int:
+    var total = 0
+
+    @__parameter
+    def add[k: Int]():
+        total += xs[k]
+
+    if len(xs) >= 4:
+        add[0]()
+        add[4]()  # this call's `k` is past the end
+    return total
