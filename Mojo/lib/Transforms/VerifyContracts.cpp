@@ -60,12 +60,14 @@
 
 #include <chrono>
 #include <functional>
+#include <future>
 #include <map>
+#include <mutex>
+#include <optional>
+#include <set>
 #include <signal.h>
 #include <sys/wait.h>
 #include <thread>
-#include <optional>
-#include <set>
 
 using namespace M;
 using namespace KGEN;
@@ -367,6 +369,8 @@ struct SolverConfig {
   unsigned nonlinearRlimit = 0;
   /// Whether `runCases` splits open queries over finite-domain unknowns.
   bool caseSplit = true;
+  /// The scripts already run, or running, in this run of the pass.
+  std::shared_ptr<struct ScriptMemo> memo = {};
 };
 
 /// Runs `program` and waits at most `seconds` for it; returns its exit
@@ -403,10 +407,45 @@ int runWithCap(StringRef program, ArrayRef<StringRef> args,
   }
 }
 
+/// The answers to the scripts of one run of the pass, by script: the same
+/// script is run once (the instantiations of a kernel that differ in a
+/// parameter its proof does not read have the same scripts), and whoever
+/// asks while it runs waits for it.
+struct ScriptMemo {
+  using Answers = std::optional<SmallVector<Answer>>;
+  std::mutex mutex;
+  std::map<std::string, std::shared_future<Answers>> answers;
+};
+
+std::optional<SmallVector<Answer>>
+runScript(const SolverConfig &config, StringRef script, StringRef dumpName);
+
 /// Runs z3 on `script` with a wall-clock cap; returns one answer per query
-/// (queries are separated by `(echo "@@")`).
+/// (queries are separated by `(echo "@@")`). A script already run is not
+/// run, or dumped, again.
 std::optional<SmallVector<Answer>> runZ3(const SolverConfig &config,
                                          StringRef script, StringRef dumpName) {
+  if (!config.memo)
+    return runScript(config, script, dumpName);
+  std::promise<ScriptMemo::Answers> promise;
+  std::shared_future<ScriptMemo::Answers> running;
+  {
+    std::lock_guard<std::mutex> lock(config.memo->mutex);
+    auto [it, inserted] = config.memo->answers.try_emplace(script.str());
+    if (inserted)
+      it->second = promise.get_future().share();
+    else
+      running = it->second;
+  }
+  if (running.valid())
+    return running.get();
+  ScriptMemo::Answers answers = runScript(config, script, dumpName);
+  promise.set_value(answers);
+  return answers;
+}
+
+std::optional<SmallVector<Answer>>
+runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
   // The answers to a script are a function of the script and the solver:
   // the limits are deterministic, and runs stopped at the wall-clock cap are
   // not cached.
@@ -7412,6 +7451,7 @@ struct VerifyContractsPass
     if (intRetry)
       solver.nonlinearRlimit = nonlinearRlimit;
     solver.caseSplit = caseSplit;
+    solver.memo = std::make_shared<ScriptMemo>();
     if (!cacheDir.empty())
       (void)llvm::sys::fs::create_directories(cacheDir);
     // The scripts are run from `dump-dir`: one that cannot be written to
