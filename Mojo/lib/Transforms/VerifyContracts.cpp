@@ -2528,13 +2528,31 @@ private:
   /// expression in the function.
   std::string parameterValue(const std::string &expr, Sort sort) {
     std::string scope = scopeKey(params, expr);
+    // The value of a `comptime for`'s iteration is one unknown per loop:
+    // its uses print the same iterator with its element type as `Int` or
+    // as the range's `Element` alias.
+    std::string key = expr;
+    static llvm::Regex iterRe("^#kgen\\.param\\.expr<apply_result_slot, .*"
+                              "paramfor_next_value.*"
+                              "#kgen\\.param\\.decl\\.ref<(\"iter[^\"]*\")>");
+    SmallVector<StringRef> m;
+    if (iterRe.match(expr, &m))
+      key = "paramfor_next_value|" + m[1].str();
     auto [it, inserted] =
-        parameterValues.try_emplace(scope + expr + "|" + sort.str(), "");
+        parameterValues.try_emplace(scope + key + "|" + sort.str(), "");
     if (inserted) {
       it->second = declare(sort, "p");
       // Name it in the script, for `dump-dir` debugging.
       prelude += "; " + it->second + ": " +
                  StringRef(expr).take_front(300).str() + "\n";
+      // An iteration over `range(end)` is in `[0, end)`, also where it is
+      // read inside a larger parameter expression (`jj * tile_n`).
+      if (m.size() > 1 && !sort.isBool && sort.width == 64)
+        if (auto end = comptimeRangeEnds.find("#kgen.param.decl.ref<" +
+                                              m[1].str() + ">");
+            end != comptimeRangeEnds.end())
+          facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + it->second +
+                          ") (bvslt " + it->second + " " + end->second + "))");
     }
     return it->second;
   }
@@ -3548,6 +3566,15 @@ private:
     // A builtin value as a `SIMD` scalar (`Int(width)` of a `SIMDLength`).
     if (auto cast = dyn_cast<CastFromBuiltinAttr>(attr))
       return paramTerm(cast.getArg(), sort, depth + 1);
+    // And back: the builtin value of an `Int` (`SIMDLength(W)` holds
+    // `W._mlir_value`) is the `Int`.
+    if (auto cast = dyn_cast<CastToBuiltinAttr>(attr); cast && depth < 16)
+      if (auto extract = dyn_cast<LIT::StructExtractAttr>(cast.getArg());
+          extract && extract.getField().getValue() == "_mlir_value" &&
+          !sort.isBool && sort.width == 64 &&
+          isScalar(extract.getStructValue().getType()) &&
+          sortOf(extract.getStructValue().getType()).width == 64)
+        return paramTerm(extract.getStructValue(), sort, depth + 1);
     // "All operands denote the same value": for integers and Booleans,
     // equality; anything else (types, structs) stays unknown.
     if (auto identical = dyn_cast<ParamIdenticalAttr>(attr);
@@ -4825,7 +4852,9 @@ private:
   MaybeTerm coordElement(StringRef type, const std::string &coord, size_t k) {
     if (std::optional<int64_t> n = comptimeIntValue(type))
       return bvConst(*n, 64);
-    if (!type.starts_with("@std::@simd::@SIMD<"))
+    // An integer, or the index of a `comptime for` (the range's `Element`).
+    if (!type.starts_with("@std::@simd::@SIMD<") &&
+        !type.contains("\"Element\", @std::@simd::@SIMD<"))
       return std::nullopt;
     auto it = builtFields.find({coord, "/" + std::to_string(k)});
     if (it == builtFields.end())
@@ -5021,9 +5050,7 @@ private:
       for (auto [k, ref] : llvm::enumerate(refs->second)) {
         std::optional<Loc> place = placeOf(ref);
         // An `Int` (possibly behind an alias), as `index` takes it.
-        if (!place || !isScalar(placeType(*place)) ||
-            sortOf(placeType(*place)).isBool ||
-            sortOf(placeType(*place)).width != 64)
+        if (!place || !isIntPlace(placeType(*place)))
           return false;
         std::string v = load(*place, state, sort);
         MaybeTerm d = validExtent(symbol.getParamValues(), call.getOperands()[0],
@@ -5143,12 +5170,16 @@ private:
       ArrayRef<TypedAttr> params = symbol.getParamValues();
       if (params.size() < 10)
         return false;
+      // The width: a literal, or a parameter's value (`load[simd_width]`).
       static llvm::Regex widthRe("_mlir_value = ([0-9]+)\\}");
       SmallVector<StringRef> m;
       std::string widthText = printed(resolveParam(params[8]));
-      int64_t width;
-      if (!widthRe.match(widthText, &m) || m[1].getAsInteger(10, width))
-        return false;
+      int64_t literalWidth;
+      std::string width;
+      if (widthRe.match(widthText, &m) && !m[1].getAsInteger(10, literalWidth))
+        width = bvConst(literalWidth, 64);
+      else
+        width = paramTerm(params[8], Sort{false, 64, true});
       std::string typesText = printed(resolveParam(params[9]));
       StringRef types(typesText);
       if (!types.consume_front("#kgen.param_list<"))
@@ -5191,18 +5222,21 @@ private:
         if (!d)
           return false;
         std::string zero = bvConst(0, 64);
-        if (k == last && width > 1) {
+        std::string scalar =
+            "(and (bvsle " + zero + " " + c + ") (bvslt " + c + " " + *d + "))";
+        if (k == last) {
           // A runtime stride is not known to be 1.
           std::optional<int64_t> stride = comptimeIntValue(strides[k]);
           std::string unit = !stride        ? declare({true, 1, false})
                              : *stride == 1 ? "true"
                                             : "false";
-          all = "(and " + all + " " + unit + " (bvsle " + zero + " " + c +
-                ") (bvsle " + c + " (bvsub " + *d + " " + bvConst(width, 64) +
-                ")))";
+          std::string wide = "(and " + unit + " (bvsle " + zero + " " + c +
+                             ") (bvsle " + c + " (bvsub " + *d + " " + width +
+                             ")))";
+          all = "(and " + all + " (ite (bvsgt " + width + " " + bvConst(1, 64) +
+                ") " + wide + " " + scalar + "))";
         } else {
-          all = "(and " + all + " (bvsle " + zero + " " + c + ") (bvslt " + c +
-                " " + *d + "))";
+          all = "(and " + all + " " + scalar + ")";
         }
       }
       values[result] = define({true, 1, false}, all);
@@ -5221,6 +5255,13 @@ private:
       std::string built = declare({false, 64, false}, "g");
       for (auto [k, ref] : llvm::enumerate(it->second)) {
         std::optional<Loc> place = placeOf(ref);
+        if (place && isa<KGEN::ParamType>(placeType(*place)) &&
+            isIntPlace(placeType(*place))) {
+          // The index of a `comptime for`.
+          setBuiltField(built, "/" + std::to_string(k),
+                        load(*place, state, Sort{false, 64, true}));
+          continue;
+        }
         if (!place || !isScalar(placeType(*place)) ||
             sortOf(placeType(*place)).isBool)
           continue;
@@ -5396,6 +5437,15 @@ private:
     return tensorDim(params, tensor, k, state);
   }
 
+  /// Whether a place holds a 64-bit integer: an `Int`, or a type that is
+  /// one by a parameter expression (the index of a `comptime for` over a
+  /// range has the range's `Element` type).
+  bool isIntPlace(Type type) {
+    if (auto param = dyn_cast<KGEN::ParamType>(type))
+      return isIntType(param.getParam());
+    return isScalar(type) && !sortOf(type).isBool && sortOf(type).width == 64;
+  }
+
   /// The integers a variadic `*args: Int` pack holds (its references'
   /// values), in order.
   std::optional<SmallVector<std::string>> intPack(Value pack, State &state) {
@@ -5409,9 +5459,7 @@ private:
     SmallVector<std::string> ints;
     for (Value ref : refs->second) {
       std::optional<Loc> place = placeOf(ref);
-      if (!place || !isScalar(placeType(*place)) ||
-          sortOf(placeType(*place)).isBool ||
-          sortOf(placeType(*place)).width != 64)
+      if (!place || !isIntPlace(placeType(*place)))
         return std::nullopt;
       ints.push_back(load(*place, state, Sort{false, 64, true}));
     }
