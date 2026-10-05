@@ -256,6 +256,20 @@ std::string bvConst(int64_t value, unsigned width) {
          std::to_string(width) + ")";
 }
 
+/// The local closure a call's callee names: the reference itself (`f()`),
+/// or the one all of whose parameters the callee binds (`f[4]()`, to
+/// `bound`). Null for any other callee.
+Attribute closureCallee(Attribute callee, ArrayRef<TypedAttr> &bound) {
+  if (auto bind = dyn_cast<BindParamsAttr>(callee)) {
+    for (TypedAttr value : bind.getParamValues())
+      if (isa<UnboundAttr>(value))
+        return {};
+    bound = bind.getParamValues();
+    callee = bind.getGenerator();
+  }
+  return isa<ParamDeclRefAttr>(callee) ? callee : Attribute();
+}
+
 /// `callee`'s symbol as `a::b::c`, and its parameter values as text.
 struct CalleeName {
   std::string path;
@@ -1362,10 +1376,13 @@ private:
   /// parameters (its struct's, then its own), which are expressions in the
   /// caller's parameters (`parent`). `scope` keeps the callee's unknown
   /// parameter expressions apart from the caller's of the same name.
+  /// A local closure's frame (`transparent`) holds its own parameters only:
+  /// every other name in its body is its caller's, looked up in `parent`.
   struct ParamFrame {
     llvm::StringMap<TypedAttr> values;
     ParamFrame *parent = nullptr;
     std::string scope;
+    bool transparent = false;
   };
   ParamFrame *params = nullptr;
   /// While the function's own constraints are read: its parameters, which
@@ -2420,10 +2437,25 @@ private:
     state = std::move(joined);
   }
 
+  /// The scope of the printed parameter expression `expr` read in `frame`:
+  /// the frame's, or inside local closures their caller's, since a closure's
+  /// body names its caller's parameters. An expression that names a
+  /// closure's own parameter (a body refers to parameters by name, printed
+  /// quoted) is that call's alone.
+  static std::string scopeKey(ParamFrame *frame, StringRef expr) {
+    std::string own;
+    for (; frame && frame->transparent; frame = frame->parent)
+      if (llvm::any_of(frame->values, [&](const auto &entry) {
+            return expr.contains(("\"" + entry.first() + "\"").str());
+          }))
+        own += frame->scope + "|";
+    return (frame ? frame->scope + "|" : std::string()) + own;
+  }
+
   /// The value of a parameter expression (printed): one unknown per
   /// expression in the function.
   std::string parameterValue(const std::string &expr, Sort sort) {
-    std::string scope = params ? params->scope + "|" : "";
+    std::string scope = scopeKey(params, expr);
     auto [it, inserted] =
         parameterValues.try_emplace(scope + expr + "|" + sort.str(), "");
     if (inserted) {
@@ -3386,15 +3418,17 @@ private:
           ParamDeclRefAttr::get((*positionalParams)[index.getIndex()]), sort,
           depth + 1);
     // A callee's parameter: the call's value for it, in the caller.
-    if (auto ref = dyn_cast<ParamDeclRefAttr>(attr); ref && params)
-      if (auto it = params->values.find(ref.getName());
-          it != params->values.end()) {
-        ParamFrame *callee = params;
-        params = callee->parent;
-        std::string t = paramTerm(it->second, sort, depth + 1);
-        params = callee;
-        return t;
-      }
+    if (auto ref = dyn_cast<ParamDeclRefAttr>(attr))
+      for (ParamFrame *frame = params; frame;
+           frame = frame->transparent ? frame->parent : nullptr)
+        if (auto it = frame->values.find(ref.getName());
+            it != frame->values.end()) {
+          ParamFrame *callee = params;
+          params = frame->parent;
+          std::string t = paramTerm(it->second, sort, depth + 1);
+          params = callee;
+          return t;
+        }
     if (auto simd = dyn_cast<SIMDAttr>(attr)) {
       ArrayRef<DTypeValue> vals = simd.getValues();
       if (vals.size() == 1) {
@@ -3705,14 +3739,22 @@ private:
 
   /// A call of a local closure: its body, walked here with the caller's
   /// state (it reads and writes the caller's variables it captures, by
-  /// reference), its arguments the call's operands. What its returns and
-  /// raises leave is merged; its results are unknown.
+  /// reference), its arguments the call's operands, its own parameters
+  /// (`f[4]()`) the call's values. What its returns and raises leave is
+  /// merged; its results are unknown.
   bool inlineClosure(LIT::CallOp call, State &state) {
-    auto it = closures.find(call.getCallee());
+    ArrayRef<TypedAttr> bound;
+    Attribute ref = closureCallee(call.getCallee(), bound);
+    auto it = closures.find(ref);
     if (it == closures.end() || closureExits.size() >= 4)
       return false;
+    // Its implicit origin parameters come last; the call binds them apart.
+    ArrayRef<ParamDeclAttr> decls = it->second.getParams();
+    decls = decls.drop_back(
+        std::min(decls.size(), call.getImplicitOrigins().size()));
     Block &entry = it->second.getFunctionBody().front();
-    if (entry.getNumArguments() != call.getNumOperands())
+    if (entry.getNumArguments() != call.getNumOperands() ||
+        (!bound.empty() && bound.size() != decls.size()))
       return false;
     for (auto [arg, operand] : llvm::zip(entry.getArguments(), call.getOperands())) {
       if (isa<LIT::RefType>(arg.getType())) {
@@ -3722,12 +3764,27 @@ private:
         values[arg] = term(operand, state);
       }
     }
+    ParamFrame frame;
+    frame.parent = params;
+    frame.transparent = true;
+    frame.scope = printed(call.getCallee());
+    for (auto [decl, value] : llvm::zip(decls, bound))
+      frame.values[decl.getName()] = value;
+    ParamFrame *saved = params;
+    if (!bound.empty()) {
+      params = &frame;
+      // Its parameter expressions are this call's: not what an earlier call
+      // of it left.
+      it->second->walk(
+          [&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
+    }
     SmallVector<State> exits;
     closureExits.push_back(&exits);
     State body = state;
     body.yields.clear();
     walkBlock(entry, body);
     closureExits.pop_back();
+    params = saved;
     if (body.alive)
       exits.push_back(std::move(body));
     State joined = merge(exits);
@@ -4603,7 +4660,8 @@ private:
     // accelerator's target) is the same in every frame.
     bool closed = !StringRef(text).contains("param.decl.ref") &&
                   !StringRef(text).contains("param.index.ref");
-    return (scope && !closed ? scope->scope : std::string()) + "|" + text;
+    std::string key = closed ? std::string() : scopeKey(scope, text);
+    return (key.empty() ? "|" : key) + text;
   }
 
   /// The `rank` or `flat_rank` witness of a layout (by `layoutKey`): one
@@ -6611,8 +6669,14 @@ private:
       if (!ref)
         break;
       auto it = frame->values.find(ref.getName());
-      if (it == frame->values.end())
-        break;
+      if (it == frame->values.end()) {
+        if (!frame->transparent)
+          break;
+        // Not a closure's own parameter: its caller's.
+        if (scope)
+          *scope = frame->parent;
+        continue;
+      }
       attr = it->second;
       if (scope)
         *scope = frame->parent;
@@ -7358,9 +7422,22 @@ struct VerifyContractsPass
         // it on.
         auto call = dyn_cast<LIT::CallOp>(op);
         for (NamedAttribute attr : op->getAttrs()) {
-          if (call && attr.getValue() == call.getCalleeAttr() &&
-              call.getCalleeAttr() == ref)
-            continue;
+          if (call && attr.getValue() == call.getCalleeAttr()) {
+            // `f()`, or `f[4]()` with all of its parameters, none of which
+            // mentions it.
+            ArrayRef<TypedAttr> bound;
+            size_t own = fn.getParams().size();
+            own -= std::min(own, call.getImplicitOrigins().size());
+            if (closureCallee(call.getCallee(), bound) == ref &&
+                (bound.empty() || bound.size() == own)) {
+              for (TypedAttr value : bound)
+                value.walk([&](Attribute a) {
+                  if (a == ref)
+                    escapes = true;
+                });
+              continue;
+            }
+          }
           attr.getValue().walk([&](Attribute a) {
             if (a == ref)
               escapes = true;
