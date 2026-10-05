@@ -3792,6 +3792,8 @@ private:
       return;
     if (name && evalUnsignedDivision(call, *name, state))
       return;
+    if (name && evalMinMax(call, *name, state))
+      return;
     if (name && evalCeildiv(call, *name, state))
       return;
     if (callee && evalIntWrapperCall(call, callee, state))
@@ -5707,6 +5709,43 @@ private:
     checkDivisor(call, args[1], state);
     store(*out, state, define(*sort, ceilDivision(*sort, args[0], args[1])));
     setResultsUnknown(call);
+    return true;
+  }
+
+  /// `min(a, b)` and `max(a, b)` of two integers (`Int`, or a `SIMD` scalar
+  /// of an integer dtype): the smaller and the larger, as their dtype
+  /// compares.
+  bool evalMinMax(LIT::CallOp call, const CalleeName &name, State &state) {
+    StringRef path = name.path;
+    bool isMin = path ==
+                 "std::math::math::min[::DType,::SIMDLength](::SIMD[$0, "
+                 "$1],::SIMD[$0, $1])";
+    bool isMax = path ==
+                 "std::math::math::max[::DType,::SIMDLength](::SIMD[$0, "
+                 "$1],::SIMD[$0, $1])";
+    if ((!isMin && !isMax) || call.getNumOperands() != 2 ||
+        call->getNumResults() != 1)
+      return false;
+    std::string type = printed(call->getResult(0).getType());
+    if (!StringRef(type).starts_with("!lit.struct<@std::@simd::@SIMD<") ||
+        !isWidthOne(type))
+      return false;
+    std::optional<Sort> sort = dtypeSort(type);
+    if (!sort || sort->isBool)
+      return false;
+    SmallVector<std::string, 2> args;
+    for (Value v : call.getOperands()) {
+      std::string a = isa<LIT::RefType>(v.getType()) ? valueThrough(v, state)
+                                                     : term(v, state);
+      if (sortOfTerm(a).isBool || sortOfTerm(a).width != sort->width)
+        return false;
+      args.push_back(a);
+    }
+    std::string less =
+        std::string(sort->isSigned ? "(bvslt " : "(bvult ") +
+        (isMin ? args[0] + " " + args[1] : args[1] + " " + args[0]) + ")";
+    values[call->getResult(0)] =
+        define(*sort, "(ite " + less + " " + args[0] + " " + args[1] + ")");
     return true;
   }
 
