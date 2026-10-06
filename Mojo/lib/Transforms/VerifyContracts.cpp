@@ -1466,7 +1466,29 @@ public:
       else
         values[arg] = declare(sortOf(arg.getType()), "a");
     }
-    fn.walk([&](LIT::VarDeclOp decl) { roots.push_back(decl->getResult(0)); });
+    fn.walk([&](LIT::VarDeclOp decl) {
+      Value root = decl->getResult(0);
+      roots.push_back(root);
+      // Only ever loaded from, stored to and borrowed immutably (and its
+      // lifetime marked), or passed to a range's own methods, which keep no
+      // reference: nothing else writes it. That an immutable borrow is not
+      // turned into a pointer that is written through is assumed.
+      if (llvm::all_of(root.getUses(), [&](OpOperand &use) {
+            Operation *user = use.getOwner();
+            StringRef op = user->getName().getStringRef();
+            if (auto call = dyn_cast<LIT::CallOp>(user)) {
+              std::optional<CalleeName> name = calleeName(call.getCallee());
+              return name && StringRef(name->path).starts_with(
+                                 "std::builtin::range::");
+            }
+            return isa<LIT::RefLoadOp>(user) || op == "lit.load.consume" ||
+                   op == "lit.ref.immut" ||
+                   op.starts_with("lit.var.lifetime.") ||
+                   op.starts_with("lit.ownership.") ||
+                   (isa<LIT::RefStoreOp>(user) && use.getOperandNumber() == 1);
+          }))
+        unborrowed.insert(root);
+    });
     // The function's own constraints on its parameters (`where N <= 8`): the
     // compiler rejects any instantiation that breaks them, so they hold in
     // the body. One the parameter model cannot read is an unknown.
@@ -1701,6 +1723,11 @@ private:
   DenseMap<Value, Loc> refArgs; // Contract block arguments bound to places.
   /// The function's reference arguments and local variables.
   SmallVector<Value> roots;
+  /// The local variables that are never borrowed (see `encode`).
+  DenseSet<Value> unborrowed;
+  /// What the last `writtenRoots` found written by name, also where the
+  /// code may write anything a reference leads to.
+  llvm::DenseSet<Value> storedRoots;
   std::string prelude;
   SmallVector<std::string> facts;
   std::map<std::string, Sort> sorts;
@@ -2497,7 +2524,20 @@ private:
       }
       return;
     }
+    // An origin that names no root (`MutAnyOrigin`, a tensor's) may reach
+    // any memory a reference or pointer leads to: not the local variables
+    // that are never borrowed, which keep what they hold.
+    std::map<Loc, std::string> kept;
+    for (auto &[loc, value] : state.env)
+      if (unborrowed.count(loc.root))
+        kept.insert({loc, value});
+    std::map<Loc, Loc> keptRefs;
+    for (auto &[loc, target] : state.refs)
+      if (unborrowed.count(loc.root))
+        keptRefs.insert({loc, target});
     havocAll(state);
+    state.env = std::move(kept);
+    state.refs = std::move(keptRefs);
   }
 
   void havocAll(State &state) {
@@ -3076,6 +3116,7 @@ private:
       });
     // Locals declared in the code are written before they are read.
     root->walk([&](LIT::VarDeclOp decl) { written.insert(decl->getResult(0)); });
+    storedRoots = written;
     if (all)
       return std::nullopt;
     return written;
@@ -3276,7 +3317,26 @@ private:
             head.env[Loc{root, field}] = it->second;
       }
     } else {
+      // Anything a reference leads to: not a variable that is never
+      // borrowed and that the loop does not write, nor the end and step of
+      // such a range that it only advances.
+      std::map<Loc, std::string> kept;
+      for (auto &[loc, value] : head.env) {
+        if (!unborrowed.count(loc.root))
+          continue;
+        if (!storedRoots.count(loc.root) ||
+            ((loc.path == "/end" || loc.path == "/step") &&
+             onlyAdvanced(loop, loc.root)))
+          kept.insert({loc, value});
+      }
+      // What such a `ref` local refers to does not change either.
+      std::map<Loc, Loc> keptRefs;
+      for (auto &[loc, target] : head.refs)
+        if (unborrowed.count(loc.root) && !storedRoots.count(loc.root))
+          keptRefs.insert({loc, target});
       havocAll(head);
+      head.env = std::move(kept);
+      head.refs = std::move(keptRefs);
     }
     State headAtEntry = head;
     LoopFrame frame{labelOf(loop), comptime, {}, {}, {}, {}, {}};
