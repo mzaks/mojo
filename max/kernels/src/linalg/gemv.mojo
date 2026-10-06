@@ -954,8 +954,19 @@ def gevm_kernel[
     a: UnsafePointer[Scalar[a_type], ImmUnsafeAnyOrigin],
     b: UnsafePointer[Scalar[b_type], ImmUnsafeAnyOrigin],
     m: Int32,
-    n: Int32,
-    k: Int32,
+    n: Int32 where (
+        n >= 0
+        and c._extent() >= Int(n)
+        and grid_dim.x * WARP_SIZE <= Int(n)
+    ),
+    k: Int32 where (
+        k >= 0
+        and Int(k) % (tile_size // WARP_SIZE) == 0
+        and a._extent() >= Int(k)
+        and b._extent() >= Int(k) * Int(n)
+        and block_dim.x == tile_size
+        and tile_size % WARP_SIZE == 0
+    ),
 ):
     var _k = Int(k)
     var _n = Int(n)
@@ -1258,6 +1269,15 @@ def gemv_gpu_dispatch[
             kernel_func is not GEMVAlgorithm.GEMV_KERNEL_VECTOR
             or Int(c.dim[1]()) == 1
             or (transpose_b and Int(c.dim[0]()) == 1)
+        )
+        and (
+            kernel_func is not GEMVAlgorithm.GEVM_KERNEL
+            or (
+                not transpose_b
+                and Int(c.dim[0]()) == 1
+                and Int(c.dim[1]()) % WARP_SIZE == 0
+                and Int(a.dim[1]()) % WARP_SIZE == 0
+            )
         )
         and (
             kernel_func is not GEMVAlgorithm.GEMV_SPLIT_K
@@ -1904,7 +1924,13 @@ def gemv[
 def naive_gemv(
     c_buf: TileTensor[mut=True, ...],
     a_buf: TileTensor[mut=False, ...],
-    b_buf: TileTensor[mut=False, ...],
+    b_buf: TileTensor[mut=False, ...] where (
+        Int(a_buf.dim[0]()) < 2147483648
+        and Int(a_buf.dim[1]()) < 2147483648
+        and c_buf.ptr._extent() >= Int(a_buf.dim[0]())
+        and a_buf.ptr._extent() >= Int(a_buf.dim[0]()) * Int(a_buf.dim[1]())
+        and b_buf.ptr._extent() >= Int(a_buf.dim[1]())
+    ),
 ):
     """Computes a reference matrix-vector product C = A * b using a scalar nested loop.
 
