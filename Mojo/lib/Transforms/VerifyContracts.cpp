@@ -1632,7 +1632,12 @@ public:
   /// at the cost of the longest solver runs. It is what the launch compiles
   /// to only once the launcher's own parameters are given.
   std::optional<std::string> opaqueParameter() {
-    for (ParamDeclAttr decl : fn.getParams()) {
+    return opaqueParameterOf(fn);
+  }
+  /// The same of `kernel`, with its parameters as `params` binds them (at
+  /// its launch).
+  std::optional<std::string> opaqueParameterOf(LIT::FnOp kernel) {
+    for (ParamDeclAttr decl : kernel.getParams()) {
       auto ref = ParamDeclRefAttr::get(decl);
       std::string type = printed(ref.getType());
       if (!StringRef(type).contains("@std::@simd::@SIMD<") ||
@@ -6973,6 +6978,17 @@ private:
     }
     ParamFrame frame = paramFrame(kernelSymbol, kernel, 0, ParamFrame{});
     frame.parent = params;
+    // A launch whose instantiation is not verified (`opaqueParameter`,
+    // reported where the instantiations are): its clauses, over the same
+    // unknown values, are not asked either.
+    {
+      ParamFrame *saved = params;
+      params = &frame;
+      bool opaque = opaqueParameterOf(kernel).has_value();
+      params = saved;
+      if (opaque)
+        return;
+    }
     for (RequiresOp req :
          kernel.getFunctionBody().front().getOps<RequiresOp>()) {
       Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
