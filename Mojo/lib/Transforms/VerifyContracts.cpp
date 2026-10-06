@@ -4123,11 +4123,11 @@ private:
     return w;
   }
 
-  /// `size_of[dtype]()` (the `DType` overload) as a parameter expression:
-  /// the dtype's size in bytes, on every target. A literal's is in its
-  /// name (`f32`, `bf16`, `si8`; `bool` is one byte, `index` eight); any
-  /// other dtype's is a power of two up to 32 (`uint256` is the widest),
-  /// one term per dtype expression.
+  /// `size_of[dtype]()` (the `DType` overload) as a parameter expression or
+  /// a call (a clause calls it): the dtype's size in bytes, on every target.
+  /// A literal's is in its name (`f32`, `bf16`, `si8`; `bool` is one byte,
+  /// `index` eight); any other dtype's is a power of two up to 32 (`uint256`
+  /// is the widest), one term per dtype expression.
   MaybeTerm dtypeSize(SymbolConstantAttr symbol) {
     std::optional<CalleeName> name = calleeName(symbol);
     ArrayRef<TypedAttr> ps = symbol.getParamValues();
@@ -4384,10 +4384,14 @@ private:
       return;
     if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
         symbol && call.getNumOperands() == 0 && call->getNumResults() == 1)
-      if (MaybeTerm w = simdWidth(symbol);
-          w && sortOf(call->getResult(0).getType()).width == 64) {
-        values[call->getResult(0)] = *w;
-        return;
+      if (sortOf(call->getResult(0).getType()).width == 64) {
+        MaybeTerm w = simdWidth(symbol);
+        if (!w)
+          w = dtypeSize(symbol);
+        if (w) {
+          values[call->getResult(0)] = *w;
+          return;
+        }
       }
     if (name && callee && evalIteration(call, *name, callee, state))
       return;
