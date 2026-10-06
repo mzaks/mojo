@@ -1394,6 +1394,38 @@ public:
     params = rootParams;
   }
 
+  /// After `bindInstance`: the name of an integer parameter of the kernel
+  /// whose value in this instantiation is computed by a function outside
+  /// the standard library that elaboration evaluates and the verifier does
+  /// not (`config[1]` of `comptime config = _gemv_config[...]()`), if any.
+  /// Such an instantiation is not verified: loops are unrolled and tiles
+  /// sized by these values, so with them unknown next to nothing is proven,
+  /// at the cost of the longest solver runs. It is what the launch compiles
+  /// to only once the launcher's own parameters are given.
+  std::optional<std::string> opaqueParameter() {
+    for (ParamDeclAttr decl : fn.getParams()) {
+      auto ref = ParamDeclRefAttr::get(decl);
+      std::string type = printed(ref.getType());
+      if (!StringRef(type).contains("@std::@simd::@SIMD<") ||
+          !StringRef(type).contains("{:dtype index}"))
+        continue;
+      TypedAttr value = resolveParam(ref);
+      while (auto sugar = dyn_cast<SugarAttr>(value))
+        value = sugar.getCanonical();
+      bool opaque = false;
+      value.walk([&](SymbolConstantAttr symbol) {
+        if (opaque ||
+            StringRef(printed(symbol.getSymbol())).starts_with("@std::"))
+          return;
+        opaque = isa_and_nonnull<LIT::FnOp>(
+            symbols.lookupSymbolIn(module, symbol.getSymbol()));
+      });
+      if (opaque)
+        return decl.getName().str();
+    }
+    return std::nullopt;
+  }
+
   /// The resource limit of each query, if not the solver's.
   unsigned queryRlimit = 0;
   /// Whether integer divisors that may be 0 are obligations.
@@ -8537,6 +8569,8 @@ struct VerifyContractsPass
     struct InstanceJob {
       size_t job, instance;
       Result result;
+      /// The parameter that makes it opaque (`opaqueParameter`): skipped.
+      std::optional<std::string> opaque = std::nullopt;
     };
     std::vector<InstanceJob> instanceJobs;
     for (size_t i = 0; i < fns.size(); ++i) {
@@ -8561,9 +8595,24 @@ struct VerifyContractsPass
         enc.bindInstance(instances.find(fns[job.job].fn.getOperation())
                              ->second[job.instance]
                              .chain);
+        if ((job.opaque = enc.opaqueParameter()))
+          return;
         verify(enc, job.result, name);
       });
     pool.wait();
+    for (InstanceJob &job : instanceJobs)
+      if (job.opaque) {
+        LIT::FnOp kernel = fns[job.job].fn;
+        const Instance &at = instances[kernel.getOperation()][job.instance];
+        auto diag = mlir::emitWarning(at.launch);
+        diag << "'" << displayName(kernel)
+             << "' is not verified for the instantiation launched here: its "
+                "parameter '"
+             << *job.opaque
+             << "' is computed by a function the verifier does not evaluate";
+        if (at.via)
+          diag.attachNote(*at.via) << "with the parameters given here";
+      }
     // An obligation's answer in each instantiation of its function: the
     // obligation with the same call, clause and occurrence.
     using Key = std::tuple<const void *, const void *, unsigned>;
@@ -8580,6 +8629,8 @@ struct VerifyContractsPass
     std::map<size_t, SmallVector<std::pair<size_t, std::map<Key, Answer>>>>
         instanceAnswers;
     for (InstanceJob &job : instanceJobs) {
+      if (job.opaque)
+        continue;
       std::map<Key, Answer> answers;
       for (auto [key, answer] : llvm::zip(keys(job.result), job.result.answers))
         answers[key] = answer;
@@ -8591,6 +8642,8 @@ struct VerifyContractsPass
     // answers then decide what is reported).
     if (!genericLaunched)
       for (InstanceJob &job : instanceJobs) {
+        if (job.opaque)
+          continue;
         Result &result = results[job.job];
         std::set<Key> have;
         for (const Key &key : keys(result))
