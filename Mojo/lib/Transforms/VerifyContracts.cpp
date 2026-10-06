@@ -3180,11 +3180,12 @@ private:
         std::optional<SmallVector<Answer>> answers = runZ3(solver, text, run);
         if (answers)
           runCases(text, *answers, run);
-        // With `invariant-retry`: a candidate left undecided on loop entry,
-        // and not refuted, is asked once more alone with twice the limit.
+        // With `invariant-retry`: a candidate left undecided, and not
+        // refuted, is asked once more alone with four times the limit.
         // After a large body (a kernel's unrolled iterations) the
         // invariants that relate a counter to the next loop's cursor need
-        // slightly more than the limit on entry (1.2M against 1M). Off by
+        // slightly more than the limit (1.2M to 2M against 1M), on entry
+        // or to be kept, and which ones changes with the script. Off by
         // default: the invariants it keeps turn obligations a kernel
         // without clauses fails quickly into ones asked up to the full
         // limit (gemv: 1380M of work without it, 2020M with it).
@@ -3192,8 +3193,7 @@ private:
         if (answers)
           for (auto [k, i] : llvm::enumerate(asked))
             if (k < answers->size()) {
-              bool entry = k % (1 + ends.size()) == 0;
-              if ((*answers)[k] == Answer::Unknown && entry)
+              if ((*answers)[k] == Answer::Unknown)
                 open[i] = true;
               else if ((*answers)[k] != Answer::Proven)
                 refuted[i] = true;
@@ -3209,7 +3209,7 @@ private:
             if (kept[i] && open[i])
               again.append(1 + ends.size(), i);
           std::string retry =
-              rebuild(set, kept, before, head, ends, render, &open, 2);
+              rebuild(set, kept, before, head, ends, render, &open, 4);
           std::string name =
               dumpPrefix + ".houdini" + std::to_string(houdiniRuns++);
           std::optional<SmallVector<Answer>> more = runZ3(solver, retry, name);
