@@ -35,6 +35,8 @@ from layout.swizzle import Swizzle, make_swizzle
 import max.gpu.primitives.warp as warp
 from max.algorithm.reduction import _reduce_generator
 from max.gpu import (
+    block_dim,
+    grid_dim,
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
@@ -555,9 +557,25 @@ def gemv_split_k[
     output: TileTensor[c_type, c_layout, MutAnyOrigin, Engine=c_engine],
     act: TileTensor[a_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
     weight: TileTensor[b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],
-    m: Int32,
-    n: Int32,
-    k: Int32,
+    m: Int32 where (
+        m >= 0
+        and Int(act.dim[0]()) >= Int(m)
+        and Int(output.dim[0]()) >= Int(m)
+        and (check_bounds_m or grid_dim.x * tile_m <= Int(m))
+    ),
+    n: Int32 where (
+        n >= 0
+        and Int(weight.dim[0]()) >= Int(n)
+        and Int(output.dim[1]()) >= Int(n)
+        and (check_bounds_n or grid_dim.y * tile_n <= Int(n))
+    ),
+    k: Int32 where (
+        k >= 0
+        and Int(k) % simd_width == 0
+        and Int(act.dim[1]()) >= Int(k)
+        and Int(weight.dim[1]()) >= Int(k)
+        and block_dim.x == num_threads
+    ),
 ):
     """GEMV with tiling in K dimension.
     Assuming the B (weight) matrix is transposed i.e. row major N x K, this kernel
@@ -617,6 +635,18 @@ def gemv_split_k[
     comptime assert output.flat_rank == 2, "output must be of rank 2"
     comptime assert act.flat_rank == 2, "act must be of rank 2"
     comptime assert weight.flat_rank == 2, "weight must be of rank 2"
+    # Each thread loads `simd_width` consecutive elements of a row of
+    # `act` and of `weight`: their rows must be contiguous.
+    comptime assert (
+        a_layout.rank == 2
+        and a_layout.flat_rank == 2
+        and a_layout.static_stride[1] == 1
+    ), "act must be a flat rank 2 layout with unit row stride"
+    comptime assert (
+        b_layout.rank == 2
+        and b_layout.flat_rank == 2
+        and b_layout.static_stride[1] == 1
+    ), "weight must be a flat rank 2 layout with unit row stride"
 
     # tile_m represents how many rows each thread will process of the output activation matrix
     # tile_n represents how many rows each thread will process of the weight matrix.
@@ -801,7 +831,22 @@ def router_gate_mixed_gemv[
     m: Int,
     n: Int,
     k: Int,
-    ctx: DeviceContext,
+    ctx: DeviceContext where (
+        m >= 0
+        and m < 2147483648
+        and k >= 0
+        and k < 2147483648
+        and n >= 0
+        and n < 2147483648
+        and n == static_N
+        and Int(a.dim[0]()) >= m
+        and Int(c.dim[0]()) >= m
+        and Int(b.dim[0]()) >= n
+        and Int(c.dim[1]()) >= n
+        and Int(a.dim[1]()) >= k
+        and Int(b.dim[1]()) >= k
+        and k % (16 // size_of[DType.float32]()) == 0
+    ),
 ) raises:
     """Launches the mixed bf16-activation × fp32-weight router-gate GEMV.
 
@@ -1214,6 +1259,15 @@ def gemv_gpu_dispatch[
             or Int(c.dim[1]()) == 1
             or (transpose_b and Int(c.dim[0]()) == 1)
         )
+        and (
+            kernel_func is not GEMVAlgorithm.GEMV_SPLIT_K
+            or (
+                transpose_b
+                and Int(a.dim[1]())
+                % simd_width_of[a.dtype, target=get_gpu_target()]()
+                == 0
+            )
+        )
     ),
 ) raises:
     """Launches the GPU GEMV kernel indicated by kernel_func with appropriate grid and block dims.
@@ -1237,6 +1291,19 @@ def gemv_gpu_dispatch[
     comptime assert c.rank == 2, "c must be of rank 2"
     comptime assert a.rank == 2, "a must be of rank 2"
     comptime assert b.rank == 2, "b must be of rank 2"
+    # `gemv_split_k` is instantiated for every dispatch and needs flat
+    # layouts: its bounds guards are chosen from `static_shape`, which is
+    # `dim` only when no mode is nested.
+    comptime assert (
+        type_of(c).LayoutType.flat_rank == 2
+    ), "c must be of flat rank 2"
+    comptime assert (
+        type_of(a).LayoutType.flat_rank == 2
+    ), "a must be of flat rank 2"
+    comptime assert (
+        type_of(b).LayoutType.flat_rank == 2
+    ), "b must be of flat rank 2"
+    comptime assert tile_m >= 1, "tile_m must be positive"
 
     var shape = GemmShape.get[transpose_b=False](c, a, b)
     var m = shape.M
