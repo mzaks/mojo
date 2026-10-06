@@ -20,7 +20,10 @@ bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
 ```
 
 `tensors.mojo` and `kernels.mojo` import the `max` and `layout` packages:
-build them and add them to the import path.
+build them and add them to the import path. `gemv_split_k.mojo` launches a
+kernel of `linalg`: it needs every kernel package on the import path and
+`packages=linalg`, and is compiled too (`-elaborate` without
+`--verify-contracts`), which checks its `comptime assert`s.
 
 ```bash
 ./bazelw build --config=build-mojo //max/kernels/src/layout:layout
@@ -57,7 +60,7 @@ by a value that may be 0, `int-retry=false` turns off the integer retry
 divides two unknowns is first asked with (default 10000000; then over the
 integers, then with the full limit), `case-split=false` turns off case
 splitting (below), `invariant-retry=true` asks a loop-invariant candidate
-left undecided on loop entry once more with twice its limit (a loop after
+left undecided once more with four times its limit (a loop after
 a large body can need it; off by default, since on kernels without
 clauses it costs about half again as much), `dump-dir=` writes the
 SMT-LIB scripts (the directory
@@ -364,7 +367,14 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   every value of it. An obligation proven in all of them is reported as proven
   for the launched instantiations (and counted apart in the summary); otherwise
   the warning has a note at each launch where it is not proven (and at the call
-  that gave the parameters). `generic-launched=true` also verifies such a kernel
+  that gave the parameters). An instantiation that unrolls a loop fewer times
+  than another has nothing to prove for the iterations it lacks. An
+  instantiation with an integer parameter computed by a function outside the
+  standard library (`config[1]` of `comptime config = _gemv_config[...]()`) is
+  not verified, with a warning at its launch: the verifier does not evaluate
+  the function, and with loop counts and tile sizes unknown next to nothing is
+  proven. Launch the kernel with the values written out to verify it for them
+  (`gemv_split_k.mojo`). `generic-launched=true` also verifies such a kernel
   for every value of its parameters first, each query within `generic-rlimit`
   (and each loop-invariant candidate within a twentieth of it), and checks only
   what that leaves open per launch. Kernels that are not launched in the module
@@ -436,10 +446,14 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   constants alone is unreachable.
 - `range(start, end, step)`: the loop variable is the cursor, a whole
   number of steps from `start`. A loop that only advances its range
-  keeps the range's end and step.
-- `load[width]` and `store[width]` with a parameter width;
-  `size_of[dtype]()` is the dtype's size in bytes (a power of two up to
-  32 where the dtype is not a literal);
+  keeps the range's end and step. A counter the body changes beside the
+  range is as many steps from its value on entry as the cursor is from
+  `start` (a candidate invariant).
+- `load[width]` and `store[width]` with a parameter width; of a tile of a
+  generic layout they need the parent's rows contiguous: say `comptime
+  assert L.rank == 2 and L.flat_rank == 2 and L.static_stride[1] == 1`;
+  `size_of[dtype]()` (also called in a clause) is the dtype's size in
+  bytes (a power of two up to 32 where the dtype is not a literal);
   `simd_width_of[dtype, target=get_gpu_target()]()` is 16 over that size
   (every GPU target has 128-bit vectors: 0 only for a 256-bit dtype);
   `warp_id()` is `thread_idx.x` over a warp size of 32 or 64.
@@ -487,3 +501,4 @@ with).
 | `tensors.mojo`       | all `bad_*`        | all `ok_*`       |
 | `kernels.mojo`       | all `bad_*`        | all `ok_*`       |
 | `pointers.mojo`      | all `bad_*`        | all `ok_*`       |
+| `gemv_split_k.mojo`  | (none)             | all `ok_*`       |

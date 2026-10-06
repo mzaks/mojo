@@ -178,6 +178,17 @@ def ok_strided_down(xs: List[Int]) -> Int:
     return sum
 
 
+def ok_strided_counter(xs: List[Int], n: Int) -> Int:
+    var sum = 0
+    var block = 0
+    if 0 <= n and n <= len(xs) and n < 1000:
+        # The loop's variable is unused: `block` counts its steps of 4.
+        for _ in range(0, n, 4):
+            sum += xs[block * 4]
+            block += 1
+    return sum
+
+
 def ok_comptime_count(xs: List[Int]) -> Int:
     var sum = 0
     var at = 0
@@ -308,6 +319,16 @@ def bad_strided_past(xs: List[Int], n: Int) -> Int:
     if n <= len(xs) and n < 1000:
         for i in range(0, n, 4):
             sum += xs[i + 1]  # `i + 1` may be `n`
+    return sum
+
+
+def bad_strided_counter(xs: List[Int], n: Int) -> Int:
+    var sum = 0
+    var block = 0
+    if 0 <= n and n <= len(xs) and n < 1000:
+        for _ in range(0, n, 4):
+            sum += xs[block * 4]
+            block += 2  # two blocks per step of 4
     return sum
 
 

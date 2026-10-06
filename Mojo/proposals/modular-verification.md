@@ -1705,7 +1705,8 @@ Tensors and GPU kernels:
 - `dump-dir=` naming a directory that does not exist left every script
   unwritten and every obligation "not decided within the solver limits";
   the directory is now created, and it is an error if it cannot be.
-- `gemv_split_k`, first step (its clauses are not in the tree yet). The
+- `gemv_split_k`, first step (its clauses came with the second step,
+  below). The
   kernel accumulates over K in a closure, `_k_iter_body`, that counts its
   calls in a captured `iteration`; the launcher's loops call it
   `unroll_factor` times per step (`comptime for`), then once per
@@ -1744,6 +1745,43 @@ Tensors and GPU kernels:
   instantiation whose config is unknown (29 s against 16 s), and three
   obligations of blockwise_fp8 that could not be evaluated before are
   now nonlinear queries that stay open (332M -> 632M).
+- `gemv_split_k`, second step: its clauses are in the tree, with the
+  launchers' (`router_gate_mixed_gemv`, and `gemv_gpu_dispatch` for
+  `GEMV_SPLIT_K`). What it needed:
+  - `size_of` called in a clause; a tile of a generic layout in `load`'s
+    clause, with a compile-time requirement on the kernel that `act` and
+    `weight` are flat with a last stride of 1 (stated only by the AMD
+    `load`, relied on by `vectorize` too).
+  - The K loop with `unroll_factor == 1`, whose variable is unused beside
+    the counter: a candidate that the counter is as many steps from its
+    value on entry as the cursor is from its start.
+  - `static_N` is `dim[1]` only for a flat layout: the dispatcher asserts
+    `type_of(c).LayoutType.flat_rank == 2`.
+  - A report fix: an instantiation that unrolls a loop fewer times was
+    reported as not analyzing the iterations it lacks (22 warnings).
+  - `invariant-retry` for any undecided candidate, at four times the
+    limit: this kernel's invariants are valid and at the limit (0.7M to
+    2.0M units against 1M), and which instantiation lost them changed
+    with any change to the script.
+  A dead end: the dispatcher takes `(num_threads, tile_n,
+  unroll_factor)` from a function the verifier does not evaluate.
+  Stating the values it can return as facts changed nothing, since
+  unrolling is decided from constants while the body is walked. Such an
+  instantiation is now skipped with a warning (it proved nothing and
+  cost the most), and `gemv_split_k.mojo` launches the kernel with eight
+  configurations written out, which a compile of the file checks
+  against the NVIDIA function (the AMD one depends on the accelerator
+  it is built for and is not covered; the dispatcher's own launch with
+  these values is not either).
+  Result with `invariant-retry=true`: both router-gate launches and
+  their instantiations proven; the dispatcher's MiniMax launch proven
+  and its instantiation except two queries undecided at 5.1M to 6.8M
+  units against 5M (the dtype is unknown there); the harness 139/139
+  in 18 s. On the gemv file that is 153 of 179 obligations; without the
+  option 150, one router-gate instantiation losing its loop invariants.
+  Cost, 43 inputs, against the pass before this step: proven 1694 ->
+  1845, solver work 6.54B -> 5.42B, summed time 443 -> 291 s; only the
+  gemv copies and the examples changed.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

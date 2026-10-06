@@ -35,6 +35,7 @@ from std.sys.info import (
     is_gpu,
     is_nvidia_gpu,
     simd_width_of,
+    size_of,
 )
 
 comptime LD = type_of(row_major(1, 1))  # dimensions known at run time
@@ -376,6 +377,46 @@ def ok_launch_per_warp(
     )
 
 
+def ok_unrolled_kernel[n: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+    # Unrolled `n` times, as elaboration does: the launch with fewer
+    # iterations has nothing to prove for the later ones.
+    var row = 0
+    comptime for _ in range(n):
+        t[row, 0] = 0
+        row += 2
+
+
+def ok_launch_unrolled(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    ctx.enqueue_function[ok_unrolled_kernel[2]](t, grid_dim=1, block_dim=1)
+    ctx.enqueue_function[ok_unrolled_kernel[4]](t, grid_dim=1, block_dim=1)
+
+
+def ok_size_of_call(
+    xs: List[Int], k: Int where 0 <= k < 16 // size_of[DType.float32]()
+) -> Int:
+    # A clause calls `size_of`; the body's `comptime` is the same 4 bytes.
+    comptime w = 16 // size_of[DType.float32]()
+    if len(xs) == w:
+        return xs[k]
+    return 0
+
+
+def ok_tile_load[
+    L: TensorLayout
+](t: TileTensor[DType.float32, L, MutAnyOrigin], i: Int) -> Float32:
+    # A tile keeps its parent's strides: of a flat parent whose rows are
+    # contiguous, four consecutive elements of a row may be loaded.
+    comptime assert (
+        L.rank == 2 and L.flat_rank == 2 and L.static_stride[1] == 1
+    ), "rows must be contiguous"
+    if 0 <= i and i < Int(t.dim[0]()) // 2 and Int(t.dim[1]()) >= 8:
+        var tile = t.tile[2, 8](i, 0)
+        return tile.load[4](Coord(1, 4))[0]
+    return 0
+
+
 def ok_gpu_simd_width(xs: List[Int]) -> Int:
     comptime w = simd_width_of[DType.float32, target=get_gpu_target()]()
     if len(xs) == 5:
@@ -633,6 +674,72 @@ def launch_short_per_warp(
     ctx.enqueue_function[bad_per_warp_kernel[128]](
         c, grid_dim=1, block_dim=128
     )
+
+
+def bad_unrolled_kernel[n: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+    var row = 0
+    comptime for _ in range(n):
+        t[row, 0] = 0  # the fifth iteration writes row 8 of 8
+        row += 2
+
+
+def launch_unrolled_past(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    ctx.enqueue_function[bad_unrolled_kernel[2]](t, grid_dim=1, block_dim=1)
+    ctx.enqueue_function[bad_unrolled_kernel[5]](t, grid_dim=1, block_dim=1)
+
+
+def bad_size_of_call(
+    xs: List[Int], k: Int where 0 <= k <= 16 // size_of[DType.float32]()
+) -> Int:
+    comptime w = 16 // size_of[DType.float32]()
+    if len(xs) == w:
+        return xs[k]  # k may be 4
+    return 0
+
+
+def _pick_rows() -> Int:
+    return 4
+
+
+def opaque_rows_kernel[
+    rows: Int
+](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+    t[2 * rows - 1, 0] = 0
+
+
+def bad_launch_opaque(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    # `rows` is computed by a function the verifier does not evaluate: the
+    # kernel is not verified for this launch, which is reported here.
+    comptime rows = _pick_rows()
+    ctx.enqueue_function[opaque_rows_kernel[rows]](
+        t, grid_dim=1, block_dim=1
+    )
+
+
+def bad_tile_load[
+    L: TensorLayout
+](t: TileTensor[DType.float32, L, MutAnyOrigin], i: Int) -> Float32:
+    comptime assert L.rank == 2 and L.flat_rank == 2, "flat"
+    if 0 <= i and i < Int(t.dim[0]()) // 2 and Int(t.dim[1]()) >= 8:
+        var tile = t.tile[2, 8](i, 0)
+        return tile.load[4](Coord(1, 4))[0]  # the row stride may not be 1
+    return 0
+
+
+def bad_tile_load_past[
+    L: TensorLayout
+](t: TileTensor[DType.float32, L, MutAnyOrigin], i: Int) -> Float32:
+    comptime assert (
+        L.rank == 2 and L.flat_rank == 2 and L.static_stride[1] == 1
+    ), "rows must be contiguous"
+    if 0 <= i and i < Int(t.dim[0]()) // 2 and Int(t.dim[1]()) >= 8:
+        var tile = t.tile[2, 8](i, 0)
+        return tile.load[4](Coord(1, 5))[0]  # 5 + 4 > 8
+    return 0
 
 
 def bad_gpu_simd_width_any[dt: DType](xs: List[Int]) -> Int:
