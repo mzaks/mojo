@@ -2153,6 +2153,9 @@ private:
   /// tensors' `dim[k]()`, by `layoutKey` and `k`.
   std::map<std::pair<std::string, int64_t>, SmallVector<std::string>>
       staticShapeTerms, dimTerms;
+  /// The value of each field read of a tensor (`t.ptr`), by the tensor's
+  /// term and the getter.
+  std::map<std::pair<std::string, std::string>, std::string> tensorFields;
   /// The term of each generic layout's `static_stride[k]`, by `layoutKey`
   /// and `k`.
   std::map<std::pair<std::string, int64_t>, std::string> staticStrideTerms;
@@ -5661,6 +5664,23 @@ private:
       if (target.isBool || target.width != 64)
         return false;
       values[result] = term(call.getOperands()[0], state);
+      return true;
+    }
+    // `t.ptr` (and any other field read through `__getattr_param__`): a
+    // function of the tensor's value and the field, so a clause's
+    // `t.ptr._extent()` is about the pointer the body reads.
+    if (path.starts_with(
+            "layout::tile_tensor::TileTensor::__getattr_param__[") &&
+        call.getNumOperands() == 1) {
+      std::string tensor = tensorTerm(call.getOperands()[0], state);
+      Sort field = sortOf(result.getType());
+      if (sortOfTerm(tensor).isBool || sortOfTerm(tensor).width != 64)
+        return false;
+      auto [it, inserted] = tensorFields.try_emplace(
+          {tensor, printed(call.getCallee())}, "");
+      if (inserted)
+        it->second = declare(field);
+      values[result] = it->second;
       return true;
     }
     // The implicit conversion of a mutable tensor to an immutable one: the
