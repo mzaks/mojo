@@ -1861,6 +1861,9 @@ private:
   /// tensors' `dim[k]()`, by `layoutKey` and `k`.
   std::map<std::pair<std::string, int64_t>, SmallVector<std::string>>
       staticShapeTerms, dimTerms;
+  /// The term of each generic layout's `static_stride[k]`, by `layoutKey`
+  /// and `k`.
+  std::map<std::pair<std::string, int64_t>, std::string> staticStrideTerms;
   /// Facts that are added once however often their terms are met.
   std::set<std::string> addedFacts;
   /// Unknowns that range over a few values (a SIMD width, the warp size),
@@ -3864,6 +3867,26 @@ private:
           return term;
         }
       }
+    // `static_stride[k]` of a layout type: its `k`th flat stride, or -1
+    // where that is known only at run time. One term per layout and `k`,
+    // which `_access_in_bounds` of a tile of the layout reads too.
+    if (auto bind = dyn_cast<BindParamsAttr>(attr);
+        bind && !sort.isBool && sort.width == 64 &&
+        bind.getParamValues().size() == 1)
+      if (auto witness = dyn_cast<GetWitnessAttr>(bind.getGenerator());
+          witness && witness.getWitnessName() == "static_stride") {
+        std::string k = paramTerm(bind.getParamValues()[0], sort, depth + 1);
+        static llvm::Regex constRe("^\\(_ bv([0-9]+) 64\\)$");
+        SmallVector<StringRef> m;
+        int64_t index;
+        if (constRe.match(k, &m) && !m[1].getAsInteger(10, index)) {
+          auto [it, inserted] = staticStrideTerms.try_emplace(
+              {layoutKey(witness.getTypeValue()), index}, "");
+          if (inserted)
+            it->second = parameterValue(printed(attr), sort);
+          return it->second;
+        }
+      }
     if (auto index = dyn_cast<ParamIndexRefAttr>(attr);
         index && positionalParams && index.getDepth() == 0 &&
         index.getIndex() < positionalParams->size())
@@ -5607,18 +5630,66 @@ private:
       if (!types.consume_front("#kgen.param_list<"))
         return false;
       SmallVector<StringRef> elementTypes = listElements(types);
-      std::string layout = printed(resolveParam(params[3]));
+      ParamFrame *layoutScope = nullptr;
+      TypedAttr layoutAttr = resolveParam(params[3], &layoutScope);
+      std::string layout = printed(layoutAttr);
       SmallVector<StringRef> shape = layoutList(layout, 0);
       SmallVector<StringRef> strides = layoutList(layout, 1);
-      // The engine's element width (`DefaultEngine[element_width=n]`).
+      // A tile of a generic layout: its strides are not a list but the
+      // parent's (`_NestedTileResultStrideTypes[Parent]`, which names the
+      // parent's `__stride_types`), mode for mode where the parent is
+      // flat. Whether the last is 1 is then the parent's `static_stride`.
+      std::string parentUnit;
+      if (!shape.empty() && StringRef(layout).contains("\"__stride_types\"")) {
+        TypedAttr parent;
+        bool one = true;
+        layoutAttr.walk([&](GetWitnessAttr witness) {
+          if (witness.getWitnessName() != "__stride_types")
+            return;
+          if (!parent)
+            parent = witness.getTypeValue();
+          else if (parent != witness.getTypeValue())
+            one = false;
+        });
+        if (!parent || !one)
+          return false;
+        ParamFrame *saved = this->params;
+        this->params = layoutScope;
+        std::string key = layoutKey(parent);
+        this->params = saved;
+        int64_t last = shape.size() - 1;
+        auto [it, inserted] = staticStrideTerms.try_emplace({key, last}, "");
+        if (inserted) {
+          it->second = declare(Sort{false, 64, true}, "p");
+          prelude += "; " + it->second + ": static_stride[" +
+                     std::to_string(last) + "] of " +
+                     StringRef(key).take_front(300).str() + "\n";
+        }
+        const std::string &stride = it->second;
+        // A runtime stride (-1) is not known to be 1, nor is the stride
+        // of a tile of a nested parent.
+        parentUnit =
+            "(ite (and (= " + layoutWitness("flat_rank", key) + " " +
+            layoutWitness("rank", key) + ") (= " + layoutWitness("rank", key) +
+            " " + bvConst(shape.size(), 64) + ")) (or (= " + stride + " " +
+            bvConst(1, 64) + ") (and (bvslt " + stride + " " + bvConst(0, 64) +
+            ") " + declare({true, 1, false}) + ")) " +
+            declare({true, 1, false}) + ")";
+      }
+      // The engine's element width (`DefaultEngine[element_width=n]`); of
+      // another engine (a tile's `OffsetResultType`) it is not known, and
+      // the helper is true where it is not 1.
       static llvm::Regex engineRe(
           "^#kgen.type<!lit.struct<@layout::@tensor_engine::@"
           "(DefaultEngine|DevicePointerEngine)<.*\\{:scalar<index> "
           "([0-9]+)\\}>>> :");
       std::string engine = printed(resolveParam(params[5]));
-      int64_t elementWidth;
-      if (shape.empty() || strides.size() != shape.size() ||
-          !engineRe.match(engine, &m) || m[2].getAsInteger(10, elementWidth))
+      int64_t elementWidth = 1;
+      bool engineKnown =
+          engineRe.match(engine, &m) && !m[2].getAsInteger(10, elementWidth);
+      if (shape.empty() ||
+          (parentUnit.empty() &&
+           (strides.size() != shape.size() || !engineKnown)))
         return false;
       bool nested = llvm::any_of(shape, [](StringRef mode) {
         return mode.starts_with("@std::@utils::@coord::@Coord<");
@@ -5648,10 +5719,13 @@ private:
             "(and (bvsle " + zero + " " + c + ") (bvslt " + c + " " + *d + "))";
         if (k == last) {
           // A runtime stride is not known to be 1.
-          std::optional<int64_t> stride = comptimeIntValue(strides[k]);
-          std::string unit = !stride        ? declare({true, 1, false})
-                             : *stride == 1 ? "true"
-                                            : "false";
+          std::string unit = parentUnit;
+          if (unit.empty()) {
+            std::optional<int64_t> stride = comptimeIntValue(strides[k]);
+            unit = !stride        ? declare({true, 1, false})
+                   : *stride == 1 ? "true"
+                                  : "false";
+          }
           std::string wide = "(and " + unit + " (bvsle " + zero + " " + c +
                              ") (bvsle " + c + " (bvsub " + *d + " " + width +
                              ")))";
@@ -5661,6 +5735,8 @@ private:
           all = "(and " + all + " " + scalar + ")";
         }
       }
+      if (!engineKnown)
+        all = "(or " + declare({true, 1, false}) + " " + all + ")";
       values[result] = define({true, 1, false}, all);
       return true;
     }
