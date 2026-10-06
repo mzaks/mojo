@@ -369,9 +369,13 @@ struct SolverConfig {
   unsigned nonlinearRlimit = 0;
   /// Whether `runCases` splits open queries over finite-domain unknowns.
   bool caseSplit = true;
-  /// Whether an invariant candidate undecided on loop entry is asked again
-  /// with twice its limit.
+  /// Whether an undecided invariant candidate is asked again with four
+  /// times its limit.
   bool invariantRetry = false;
+  /// Whether a query still undecided is asked over the integers with the
+  /// products that provably do not overflow taken exactly
+  /// (`exactIntegers`); with the integer retry.
+  bool exactRetry = false;
   /// The scripts already run, or running, in this run of the pass.
   std::shared_ptr<struct ScriptMemo> memo = {};
 };
@@ -642,8 +646,30 @@ public:
     return out;
   }
 
+  /// A defined term that is a sum, difference or product at the top: its
+  /// translation without the wrapping, its width, and (for a candidate of
+  /// the exact retry) whether it is a product of two terms that are not
+  /// literals, or a sum or difference with such a product as an operand.
+  struct Arithmetic {
+    std::string exact;
+    unsigned width;
+    bool candidate;
+  };
+  /// Those of the commands translated so far, in order.
+  std::vector<std::pair<std::string, Arithmetic>> arithmetic;
+  /// Defined terms translated without the wrapping (see `exactIntegers`).
+  std::set<std::string> exact;
+
+  /// The translation so far.
+  const std::string &text() const { return out; }
+
 private:
   std::string out;
+  /// The body of the definition being translated, and its translation
+  /// without the wrapping if it is arithmetic at the top.
+  const SExpr *top = nullptr;
+  std::string topExact;
+  std::set<std::string> products;
   /// Bit width of each constant and defined term (0: not a bit-vector).
   llvm::StringMap<unsigned> widths;
   /// Result width of each declared function.
@@ -735,10 +761,30 @@ private:
       unsigned w;
       std::optional<std::string> sort = sortText(cmd.list[3], w);
       unsigned bodyWidth;
+      top = &cmd.list[4];
+      topExact.clear();
       std::optional<std::string> body =
           sort ? term(cmd.list[4], bodyWidth) : std::nullopt;
+      top = nullptr;
       if (!body || bodyWidth != w)
         return false;
+      if (!topExact.empty() && w && !depth) {
+        const std::string &name = cmd.list[1].atom;
+        const SExpr &e = cmd.list[4];
+        unsigned lw;
+        size_t terms = 0;
+        bool overProduct = false;
+        for (size_t i = 1; i < e.list.size(); ++i) {
+          terms += !literal(e.list[i], lw);
+          overProduct |= products.count(e.list[i].atom) != 0;
+        }
+        bool product = e.list[0].atom == "bvmul" && terms >= 2;
+        if (product)
+          products.insert(name);
+        arithmetic.push_back({name, {topExact, w, product || overProduct}});
+        if (exact.count(name))
+          body = topExact;
+      }
       widths[cmd.list[1].atom] = w;
       text = "(define-fun " + cmd.list[1].atom + " () " + *sort + " " + *body +
              ")\n";
@@ -971,12 +1017,17 @@ private:
       if (op == "bvuge") return compare(">=", true);
     }
     w = bw;
+    auto arith = [&](const std::string &x) {
+      if (&e == top)
+        topExact = x;
+      return wrap(bw, x);
+    };
     if (op == "bvadd")
-      return wrap(bw, "(+" + joined() + ")");
+      return arith("(+" + joined() + ")");
     if (op == "bvmul")
-      return wrap(bw, "(*" + joined() + ")");
+      return arith("(*" + joined() + ")");
     if (op == "bvsub" && xs.size() == 2)
-      return wrap(bw, "(- " + a + " " + b + ")");
+      return arith("(- " + a + " " + b + ")");
     if (op == "bvneg" && xs.size() == 1)
       return wrap(bw, "(- " + a + ")");
     if (xs.size() == 2 && (op == "bvudiv" || op == "bvurem")) {
@@ -1029,7 +1080,182 @@ private:
       return abstraction(e, bw);
     return std::nullopt;
   }
+
+public:
+  static std::string inRange(unsigned w, const std::string &x) {
+    return range(w, x);
+  }
 };
+
+/// The exact integer retry. Over the integers every sum and product still
+/// wraps (`mod 2^64`), and that is what keeps the solver from a bound like
+/// `row * n + col < k * n`: without the wrapping it is immediate. So, for
+/// each query of `script` (a header, then `query` blocks): first, for each
+/// product of two unknowns the header defines, and each sum over one, is
+/// its exact value in range under the query's assumptions? Then the query
+/// again, with the terms for which that was proven defined without the
+/// wrapping. That is the same query: in every model of the assumptions
+/// those terms have their exact values. Returns which queries are proven.
+std::vector<bool> exactIntegers(const SolverConfig &config, StringRef script,
+                                StringRef name) {
+  StringRef marker = "(echo \"@@\")";
+  size_t first = script.find(marker);
+  if (first == StringRef::npos)
+    return {};
+  StringRef head = script.take_front(first);
+  SmallVector<StringRef> queries;
+  for (StringRef rest = script.drop_front(first); !rest.empty();) {
+    size_t next = rest.find(marker, marker.size());
+    queries.push_back(rest.take_front(next));
+    rest = rest.drop_front(std::min(next, rest.size()));
+  }
+  std::vector<bool> proven(queries.size(), false);
+  IntTranslator wrapped;
+  if (!wrapped.translate(head))
+    return proven;
+  std::vector<std::pair<std::string, IntTranslator::Arithmetic>> candidates;
+  for (auto &entry : wrapped.arithmetic)
+    if (entry.second.candidate)
+      candidates.push_back(entry);
+  if (candidates.empty())
+    return proven;
+  // What each defined term names, to find what a goal depends on.
+  std::map<std::string, std::vector<std::string>> uses;
+  std::function<void(const SExpr &, std::vector<std::string> &)> atoms =
+      [&](const SExpr &e, std::vector<std::string> &into) {
+        if (e.list.empty())
+          into.push_back(e.atom);
+        for (const SExpr &child : e.list)
+          atoms(child, into);
+      };
+  if (std::optional<std::vector<SExpr>> commands = parseSExprs(head))
+    for (const SExpr &cmd : *commands)
+      if (cmd.list.size() == 5 && cmd.list[0].atom == "define-fun")
+        atoms(cmd.list[4], uses[cmd.list[1].atom]);
+  std::set<std::string> candidateNames;
+  for (auto &[term, a] : candidates)
+    candidateNames.insert(term);
+  // A query's candidates: those its goal depends on, and the products of
+  // two terms that are not candidates themselves (the `k * n` of an extent
+  // clause, which is among the assumptions); at most 16.
+  auto relevant = [&](StringRef block) {
+    std::set<std::string> cone;
+    std::vector<std::string> work;
+    size_t goal = block.rfind("(assert (not ");
+    if (goal != StringRef::npos)
+      if (std::optional<std::vector<SExpr>> g =
+              parseSExprs(block.drop_front(goal).take_until(
+                  [](char c) { return c == '\n'; })))
+        for (const SExpr &e : *g)
+          atoms(e, work);
+    while (!work.empty()) {
+      std::string n = work.back();
+      work.pop_back();
+      if (!cone.insert(n).second)
+        continue;
+      if (auto it = uses.find(n); it != uses.end())
+        work.insert(work.end(), it->second.begin(), it->second.end());
+    }
+    std::vector<bool> take;
+    size_t taken = 0;
+    for (auto &[term, a] : candidates) {
+      bool leaf = llvm::none_of(uses[term], [&](const std::string &n) {
+        return candidateNames.count(n) != 0;
+      });
+      take.push_back(taken < 16 && (cone.count(term) || leaf));
+      taken += take.back();
+    }
+    return take;
+  };
+  // Each candidate's exact value, over the exact values of the candidates
+  // it is computed from (`t!x`): a sum over a product is in range only as
+  // the sum over the exact product. It is the term's value where those
+  // are in range too.
+  std::string chained;
+  for (auto &[term, a] : candidates) {
+    std::string body;
+    for (size_t i = 0; i < a.exact.size();) {
+      size_t j = i;
+      while (j < a.exact.size() && a.exact[j] != ' ' && a.exact[j] != '(' &&
+             a.exact[j] != ')')
+        ++j;
+      if (j == i) {
+        body += a.exact[i++];
+        continue;
+      }
+      std::string token = a.exact.substr(i, j - i);
+      body += token + (candidateNames.count(token) ? "!x" : "");
+      i = j;
+    }
+    chained += "(define-fun " + term + "!x () Int " + body + ")\n";
+  }
+  // Each query's block over the integers, and the same block asking for a
+  // candidate's range instead of the goal (the last `(assert (not ...))`).
+  std::string intHead = wrapped.text();
+  std::string ranges = intHead + chained;
+  std::vector<bool> translated(queries.size(), false);
+  std::vector<std::vector<bool>> takes(queries.size());
+  for (auto [q, block] : llvm::enumerate(queries)) {
+    IntTranslator one = wrapped;
+    if (!one.translate(block))
+      continue;
+    std::string text = one.text().substr(intHead.size());
+    size_t goal = text.rfind("(assert (not ");
+    size_t end = goal == std::string::npos ? goal : text.find('\n', goal);
+    if (end == std::string::npos)
+      continue;
+    translated[q] = true;
+    takes[q] = relevant(block);
+    // In range or not is quick to see over the integers, which can
+    // otherwise run long without using up a limit.
+    for (auto [c, candidate] : llvm::enumerate(candidates))
+      if (takes[q][c])
+        ranges += "(set-option :timeout 500)\n" + text.substr(0, goal) +
+                  "(assert (not " +
+                  IntTranslator::inRange(candidate.second.width,
+                                         candidate.first + "!x") +
+                  "))" + text.substr(end);
+  }
+  std::optional<SmallVector<Answer>> inRange =
+      runZ3(config, ranges, (name + ".ranges").str());
+  if (!inRange)
+    return proven;
+  std::string again;
+  SmallVector<size_t> asked;
+  size_t at = 0;
+  for (size_t q = 0; q < queries.size(); ++q) {
+    if (!translated[q])
+      continue;
+    // In definition order: a candidate is exact if it is in range and
+    // the candidates it is computed from are exact.
+    IntTranslator exact;
+    for (auto [c, candidate] : llvm::enumerate(candidates)) {
+      if (!takes[q][c])
+        continue;
+      bool inner = llvm::all_of(uses[candidate.first],
+                                [&](const std::string &n) {
+                                  return !candidateNames.count(n) ||
+                                         exact.exact.count(n);
+                                });
+      if (at < inRange->size() && (*inRange)[at] == Answer::Proven && inner)
+        exact.exact.insert(candidate.first);
+      ++at;
+    }
+    if (exact.exact.empty() || !exact.translate(head) ||
+        !exact.translate(queries[q]))
+      continue;
+    again += (asked.empty() ? "" : "(reset)\n") +
+             std::string("(set-option :timeout 5000)\n") + exact.text();
+    asked.push_back(q);
+  }
+  if (asked.empty())
+    return proven;
+  if (std::optional<SmallVector<Answer>> answers =
+          runZ3(config, again, (name + ".exact").str()))
+    for (auto [i, q] : llvm::enumerate(asked))
+      proven[q] = i < answers->size() && (*answers)[i] == Answer::Proven;
+  return proven;
+}
 
 //===----------------------------------------------------------------------===//
 // Encoding
@@ -1303,8 +1529,8 @@ public:
   /// The declarations and facts the queries share.
   std::string scriptHeader() const { return header(); }
   void solveCases(const std::string &text, SmallVectorImpl<Answer> &answers,
-                  StringRef name, ArrayRef<bool> reask) {
-    runCases(text, answers, name, reask);
+                  StringRef name, ArrayRef<bool> reask, bool exact = false) {
+    runCases(text, answers, name, reask, exact);
   }
   bool obligationDependsOnCases(const Obligation &ob) {
     return dependsOnCases(ob.cond) || dependsOnCases(ob.pc);
@@ -1333,6 +1559,9 @@ public:
       limit = solver.nonlinearRlimit;
     return limit;
   }
+
+  /// Whether `ob`'s goal multiplies or divides two unknowns.
+  bool isNonlinear(const Obligation &ob) { return nonlinear(ob.cond); }
 
   /// Encodes the instantiation that `chain` names: a launched kernel with
   /// its parameters, then the function launching it with the parameters a
@@ -1560,8 +1789,11 @@ private:
   /// constants, so products and quotients by them fold (a bit-vector
   /// product of two unknowns is what z3 cannot decide within its limits).
   /// Only where an answer is unknown, and for at most 64 cases.
+  /// With `exact`, each case is asked with `exactIntegers` instead (and
+  /// the script as it is, where it has no finite-domain unknown).
   void runCases(const std::string &text, SmallVectorImpl<Answer> &answers,
-                StringRef name, ArrayRef<bool> reask = {}) {
+                StringRef name, ArrayRef<bool> reask = {},
+                bool exact = false) {
     // A refuted query may hold with the case facts (an exact quotient where
     // the script only bounds it): asked again where `reask` says it depends
     // on what the cases change.
@@ -1613,6 +1845,13 @@ private:
       }
       if (cases <= 64)
         break;
+    }
+    if (exact && domains.empty()) {
+      std::vector<bool> proven = exactIntegers(solver, text, name);
+      for (auto [i, a] : llvm::enumerate(answers))
+        if (open(i) && i < proven.size() && proven[i])
+          a = Answer::Proven;
+      return;
     }
     if (domains.empty() || cases > 64)
       return;
@@ -1682,6 +1921,22 @@ private:
           asked.push_back(i);
       if (asked.empty())
         break;
+      if (exact) {
+        for (size_t c = first; c < last && !asked.empty(); ++c) {
+          std::vector<bool> proven = exactIntegers(
+              solver, caseScript(c, asked), (name + ".case" + Twine(c)).str());
+          SmallVector<size_t> still;
+          for (auto [j, i] : llvm::enumerate(asked)) {
+            if (j < proven.size() && proven[j])
+              still.push_back(i);
+            else
+              pending[i] = false;
+          }
+          asked = std::move(still);
+        }
+        first = last;
+        continue;
+      }
       std::string t;
       for (size_t c = first; c < last; ++c)
         t += (c == first ? "" : "(reset)\n") + caseScript(c, asked);
@@ -8173,6 +8428,7 @@ struct VerifyContractsPass
                         cacheDir};
     if (intRetry)
       solver.nonlinearRlimit = nonlinearRlimit;
+    solver.exactRetry = intRetry;
     solver.caseSplit = caseSplit;
     solver.invariantRetry = invariantRetry;
     solver.memo = std::make_shared<ScriptMemo>();
@@ -8524,6 +8780,25 @@ struct VerifyContractsPass
         };
         cases();
         retry(/*lowered=*/false, ".int");
+        // Still open with a product in the goal: over the integers with
+        // exact products, in each case of the finite-domain unknowns.
+        if (solver.exactRetry) {
+          SmallVector<size_t> open;
+          std::string text = enc.scriptHeader();
+          for (auto [k, ob] : llvm::enumerate(analyzed))
+            if (k < answers->size() && (*answers)[k] == Answer::Unknown &&
+                enc.isNonlinear(*ob)) {
+              open.push_back(k);
+              text += query({ob->pc}, ob->cond, enc.limitOf(*ob));
+            }
+          if (!open.empty()) {
+            SmallVector<Answer> sub(open.size(), Answer::Unknown);
+            enc.solveCases(text, sub, name + ".exact", {}, /*exact=*/true);
+            for (auto [i, k] : llvm::enumerate(open))
+              if (sub[i] == Answer::Proven)
+                (*answers)[k] = Answer::Proven;
+          }
+        }
         retry(/*lowered=*/true, ".full");
       } else if (answers) {
         cases();
