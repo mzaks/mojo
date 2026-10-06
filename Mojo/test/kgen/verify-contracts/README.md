@@ -77,7 +77,18 @@ unsigned value, division keeps SMT-LIB's results for a zero divisor, and
 shifts, masks, extracts, extensions and concatenations by constants are
 arithmetic; other bit operations become unknowns in range. The
 translation is exact or weaker, so only its proofs are taken (the same
-query: `unsat` in 0.15 s). `int-translate-file=F` writes the translation
+query: `unsat` in 0.15 s). A query with a product in its goal that is
+still open is asked once more with exact products: the wrapping is what
+keeps the solver from `(i * 16 + w) * n + col < k * n`, which takes a
+bound on the row first. For each product of two unknowns, and each sum
+over one, it is first asked whether its exact value is in range under
+the query's assumptions (within 0.5 s each, at most 16 terms: those the
+goal depends on, and the products of plain terms, an extent's `k * n`);
+then the query is asked with the terms that are in range defined without
+`mod 2^w` (within 5 s), in each case of the finite-domain unknowns. That
+is the same query: where the assumptions hold, those terms have their
+exact values. Both steps have time limits, so a loaded machine can leave
+such a query open. `int-translate-file=F` writes the translation
 of the SMT-LIB file `F` to `F.int.smt2` and does nothing else (for
 testing).
 
@@ -373,12 +384,24 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   standard library (`config[1]` of `comptime config = _gemv_config[...]()`) is
   not verified, with a warning at its launch: the verifier does not evaluate
   the function, and with loop counts and tile sizes unknown next to nothing is
-  proven. Launch the kernel with the values written out to verify it for them
+  proven; its launch's clauses, over the same unknown values, are not asked
+  either. Launch the kernel with the values written out to verify it for them
   (`gemv_split_k.mojo`). `generic-launched=true` also verifies such a kernel
   for every value of its parameters first, each query within `generic-rlimit`
   (and each loop-invariant candidate within a twentieth of it), and checks only
   what that leaves open per launch. Kernels that are not launched in the module
   are verified for every value of their parameters.
+- A write through an origin that names no variable (`MutAnyOrigin`, which
+  every kernel tensor has: `c.fill(0)`, `c_ptr[m] += v`) may reach any memory
+  a reference or pointer leads to, so what is known about memory is lost
+  after it, and at the head of a loop that does it. Not lost: a local
+  variable that is only read, assigned, borrowed immutably or passed to a
+  range's own methods (a loop's index, a pointer or a size read before the
+  loop), and the end and step of such a range. That an immutable borrow is
+  not turned into a pointer that is written through is assumed.
+- `t.ptr` of a tensor is the same pointer wherever it is read from the same
+  tensor value, so a clause can state its extent (`where t.ptr._extent() >=
+  n`); nothing else does.
 - Raw pointers: `Pointer._extent()` is how many elements are valid from a
   pointer, for contracts only (it is not computed: `Int.MAX` at run time);
   the pass reads it as an unknown, not negative, per pointer value.

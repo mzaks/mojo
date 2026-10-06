@@ -13,6 +13,7 @@
 # Raw pointers for `verify-contracts`: a pointer's extent (how many elements
 # are valid from it) is stated by `_extent()` clauses; see README.md.
 
+from std.math import ceildiv
 from std.memory import stack_allocation
 from std.memory.alloc import unsafe_alloc
 
@@ -139,6 +140,27 @@ def ok_row_major(
     return 0
 
 
+def ok_blocked_rows(
+    p: Pointer[Float32, MutAnyOrigin],
+    k: Int32,
+    n: Int32 where (
+        k >= 0
+        and n >= 0
+        and Int(k) % 16 == 0
+        and p._extent() >= Int(k) * Int(n)
+    ),
+    w: Int,
+    col: Int,
+) -> Float32:
+    var sum: Float32 = 0
+    if 0 <= w and w < 16 and 0 <= col and col < Int(n):
+        # Every sixteenth row from `w`: below `k`, a multiple of 16. The
+        # product with `n` does not overflow, and is then taken exactly.
+        for i in range(ceildiv(Int(k), 16)):
+            sum += p[unsafe_offset=(i * 16 + w) * Int(n) + col]
+    return sum
+
+
 # --- must stay UNPROVEN ---
 def bad_unstated(p: Pointer[Int, MutAnyOrigin], i: Int) -> Int:
     if 0 <= i and i < 4:
@@ -212,3 +234,18 @@ def bad_row_major(
     if 0 <= row and row < Int(m) and 0 <= col and col <= Int(k):
         return p[unsafe_offset=row * Int(k) + col]  # `col` may be `k`
     return 0
+
+
+def bad_blocked_rows(
+    p: Pointer[Float32, MutAnyOrigin],
+    k: Int32,
+    n: Int32 where k >= 0 and n >= 0 and p._extent() >= Int(k) * Int(n),
+    w: Int,
+    col: Int,
+) -> Float32:
+    var sum: Float32 = 0
+    if 0 <= w and w < 16 and 0 <= col and col < Int(n):
+        for i in range(ceildiv(Int(k), 16)):
+            # the last block runs past `k` unless 16 divides it
+            sum += p[unsafe_offset=(i * 16 + w) * Int(n) + col]
+    return sum

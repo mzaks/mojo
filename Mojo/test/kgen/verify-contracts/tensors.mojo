@@ -282,6 +282,56 @@ def ok_comptime_for_guard[
             t[i, 0] = 0  # the same `i` as in the guard
 
 
+def ok_tensor_pointer(
+    t: TileTensor[mut=False, ...], i: Int where 0 <= i < t.ptr._extent()
+) -> Float32:
+    var p = t.ptr  # the pointer the clause is about
+    return Float32(p[unsafe_offset=i].cast[DType.float32]())
+
+
+def ok_after_fill(
+    c: TileTensor[mut=True, ...],
+    t: TileTensor[mut=False, ...],
+    n: Int where t.ptr._extent() >= n and c.ptr._extent() >= n,
+) -> Float32:
+    var p = t.ptr
+    var q = c.ptr
+    var sum: Float32 = 0
+    # Writes through the tensor, here and in the loop, reach whatever a
+    # pointer leads to: not `p`, `q` and the loop's range, which are never
+    # borrowed.
+    _ = c.fill(0)
+    for i in range(n):
+        sum += Float32(p[unsafe_offset=i].cast[DType.float32]())
+        q[unsafe_offset=i] += 1
+    return sum
+
+
+def ok_matrix_vector(
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[mut=False, ...],
+    b: TileTensor[mut=False, ...] where (
+        Int(a.dim[0]()) < 2147483648
+        and Int(a.dim[1]()) < 2147483648
+        and c.ptr._extent() >= Int(a.dim[0]())
+        and a.ptr._extent() >= Int(a.dim[0]()) * Int(a.dim[1]())
+        and b.ptr._extent() >= Int(a.dim[1]())
+    ),
+):
+    var M = Int(a.dim[0]())
+    var K = Int(a.dim[1]())
+    var c_ptr = c.ptr
+    var a_ptr = a.ptr
+    var b_ptr = b.ptr
+    _ = c.fill(0)
+    for k in range(K):
+        var b_val = b_ptr[unsafe_offset=k].cast[c.dtype]()
+        for m in range(M):
+            # `k` is the outer loop's across the inner loop's writes
+            var a_val = a_ptr[unsafe_offset=m * K + k].cast[c.dtype]()
+            c_ptr[unsafe_offset=m] += a_val * b_val
+
+
 # --- must stay UNPROVEN ---
 def bad_static(t: TileTensor[DType.float32, L8, MutAnyOrigin]) -> Float32:
     return t[8]  # one past the end
@@ -462,3 +512,44 @@ def bad_comptime_for_guard[
             continue
         if Int(t.dim[1]()) > 0:
             t[i, 0] = 0  # row `dim[0]` gets through
+
+
+def bad_tensor_pointer(t: TileTensor[mut=False, ...], i: Int) -> Float32:
+    var p = t.ptr  # nothing states its extent
+    return Float32(p[unsafe_offset=i].cast[DType.float32]())
+
+
+def bad_after_fill(
+    c: TileTensor[mut=True, ...],
+    t: TileTensor[mut=False, ...],
+    n: Int where t.ptr._extent() >= n and c.ptr._extent() >= n,
+) -> Float32:
+    var p = t.ptr
+    var sum: Float32 = 0
+    _ = c.fill(0)
+    for i in range(n):
+        sum += Float32(p[unsafe_offset=i + 1].cast[DType.float32]())  # past
+    return sum
+
+
+def bad_matrix_vector(
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[mut=False, ...],
+    b: TileTensor[mut=False, ...] where (
+        c.ptr._extent() >= Int(a.dim[0]())
+        and a.ptr._extent() >= Int(a.dim[0]()) * Int(a.dim[1]())
+        and b.ptr._extent() >= Int(a.dim[1]())
+    ),
+):
+    var M = Int(a.dim[0]())
+    var K = Int(a.dim[1]())
+    var c_ptr = c.ptr
+    var a_ptr = a.ptr
+    var b_ptr = b.ptr
+    _ = c.fill(0)
+    for k in range(K):
+        var b_val = b_ptr[unsafe_offset=k].cast[c.dtype]()
+        for m in range(M):
+            # nothing bounds the dimensions: `M * K` may wrap
+            var a_val = a_ptr[unsafe_offset=m * K + k].cast[c.dtype]()
+            c_ptr[unsafe_offset=m] += a_val * b_val

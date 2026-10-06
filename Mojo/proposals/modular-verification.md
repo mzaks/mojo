@@ -1782,6 +1782,36 @@ Tensors and GPU kernels:
   Cost, 43 inputs, against the pass before this step: proven 1694 ->
   1845, solver work 6.54B -> 5.42B, summed time 443 -> 291 s; only the
   gemv copies and the examples changed.
+- `gevm_kernel` and `naive_gemv`: their clauses are in the tree, with the
+  dispatcher's for `GEVM_KERNEL`. What they needed:
+  - `b[row * n + col]` with `row = i * warps + warp_id`: valid, and
+    unknown after 60 s over the bit-vectors and over the integers. The
+    integers' `mod 2^64` is in the way: products that are first proven
+    in range are now taken exactly (the exact retry, see the README),
+    and the bound is decided in under a second.
+  - `t.ptr` as one value per tensor, so that a clause can state its
+    extent.
+  - A write through `MutAnyOrigin` (every tensor's) no longer makes the
+    local variables unknown that are never borrowed mutably: the
+    pointers and sizes read before a loop, its range, the index of the
+    loop around it. Assumed: an immutable borrow is not turned into a
+    pointer that is written through.
+  - The launch clauses of a skipped instantiation are not asked.
+  `naive_gemv`'s first clause had no bound on M and K: the verifier's
+  counterexample was `M * K` wrapping.
+  Result with `invariant-retry=true` on the gemv file: 159 of 175, both
+  kernels and the gevm launch proven. Open there: the two skipped
+  launches, the dispatcher's clause at `gemv_gpu`'s call for
+  `GEMV_KERNEL` (transposed `b`, `n == 1`, more than one row), and the
+  `gemm_mma_cpasync` code.
+  Cost, 43 inputs, against the pass before this step, on a loaded
+  machine (so work, not time): proven 1862 -> 1874, solver work 5.92B ->
+  4.67B; the gemv file 1854M -> 1222M (the skipped launches' clauses).
+  Blockwise fp8 proves 9 of 22 where it proved 3, for less work (632M ->
+  474M). Two files cost more with nothing more proven: the AMD ping-pong
+  matmul 130M -> 174M and matmul_mma 196M -> 219M, not looked into. The
+  exact retry's steps are limited by time, so its answers can depend on
+  the machine's load.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now
