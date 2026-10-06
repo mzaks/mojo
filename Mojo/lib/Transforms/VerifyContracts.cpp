@@ -8558,6 +8558,13 @@ struct VerifyContractsPass
         if (auto it = instanceAnswers.find(i); it != instanceAnswers.end())
           for (auto &[instance, answers] : it->second) {
             auto found = answers.find(resultKeys[k]);
+            // An instantiation that has this call but fewer occurrences
+            // of it unrolled a loop fewer times (`tile_n` iterations): it
+            // has nothing to prove for this one.
+            Key first = resultKeys[k];
+            std::get<2>(first) = 0;
+            if (found == answers.end() && answers.count(first))
+              continue;
             perInstance.push_back({instance, found == answers.end()
                                                  ? Answer::NotAnalyzed
                                                  : found->second});
