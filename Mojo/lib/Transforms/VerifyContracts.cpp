@@ -1155,6 +1155,10 @@ struct Candidate {
   /// The candidate is instead that `lhs`, a strided range's cursor, is a
   /// whole number of steps (`rhsLoc`, as on entry) from where it started.
   bool stride = false;
+  /// With `stride`: the candidate is instead that the cursor is as many
+  /// steps from where it started as this variable is above its value on
+  /// entry (a counter the body increments beside a strided loop).
+  std::optional<Loc> counter;
 };
 
 /// A function's postcondition: its `kgen.ensures` clauses, which are
@@ -3113,8 +3117,13 @@ private:
         Loc step{loc.root,
                  StringRef(loc.path).drop_back(strlen("/start")).str() +
                      "/step"};
-        if (before.env.count(step))
+        if (before.env.count(step)) {
           candidates.push_back({loc, "=", step, "", false, "", true});
+          for (const Loc &other : places)
+            if (!(other == loc) && other.root != loc.root && changes(other))
+              candidates.push_back(
+                  {loc, "=", step, "", false, "", true, other});
+        }
       }
       candidates.push_back({loc, "bvsge", std::nullopt, bvConst(0, 64)});
       for (const std::string &t : fixed)
@@ -3129,6 +3138,12 @@ private:
       if (c.stride) {
         std::string start0 = load(c.lhs, before, Sort{false, 64, true});
         std::string step0 = load(*c.rhsLoc, before, Sort{false, 64, true});
+        if (c.counter)
+          return "(= (bvsub " + load(c.lhs, at, Sort{false, 64, true}) + " " +
+                 start0 + ") (bvmul (bvsub " +
+                 load(*c.counter, at, Sort{false, 64, true}) + " " +
+                 load(*c.counter, before, Sort{false, 64, true}) + ") " +
+                 step0 + "))";
         return "(= (bvsrem (bvsub " + load(c.lhs, at, Sort{false, 64, true}) +
                " " + start0 + ") " + step0 + ") " + bvConst(0, 64) + ")";
       }
