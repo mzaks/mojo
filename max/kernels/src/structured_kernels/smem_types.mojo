@@ -236,7 +236,7 @@ struct SMemArray[type: TrivialRegisterPassable, size: Int](
 
     @inline(.always)
     def __init__(
-        out self,
+        out self where self.ptr._extent() >= unsafe_ptr._extent(),
         unsafe_ptr: Self.ptr_type,
     ):
         """Initialize with shared memory pointer.
@@ -246,21 +246,35 @@ struct SMemArray[type: TrivialRegisterPassable, size: Int](
         """
         self.ptr = unsafe_ptr
 
-    def __init__(ref[AddressSpace.SHARED] storage: Self.Storage) -> Self:
+    def __init__(
+        ref[AddressSpace.SHARED] storage: Self.Storage,
+        out result: Self where result.ptr._extent() >= Self.size,
+    ):
         """Initialize from Storage."""
-        return Self(rebind[Self.ptr_type](storage.unsafe_ptr()))
+        result = Self(rebind[Self.ptr_type](storage.unsafe_ptr()))
 
     @inline(.always)
-    def __getitem__[T: Intable](self, index: T) -> Self.ptr_type:
+    def __getitem__[
+        T: Intable
+    ](
+        self,
+        index: T where (
+            0 <= Int(index) < Self.size and self.ptr._extent() >= Self.size
+        ),
+        out result: Self.ptr_type where (
+            result._extent() >= Self.size - Int(index)
+        ),
+    ):
         """Get a pointer to the element at index.
 
         Args:
-            index: Element index.
+            index: Element index, below `size`. The array's own pointer
+                must have `size` elements.
 
         Returns:
-            Pointer to element.
+            Pointer to element, with the elements from it to the end.
         """
-        return self.ptr + Int(index)
+        result = self.ptr + Int(index)
 
     @inline(.always)
     @staticmethod
