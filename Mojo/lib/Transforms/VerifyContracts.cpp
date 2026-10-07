@@ -8567,8 +8567,11 @@ private:
             SmallVectorImpl<Value> &boundRefs) {
     if (isa<LIT::RefType>(blockArg.getType())) {
       std::optional<Loc> loc = placeOf(actual);
+      // A reference to a place that is not tracked (`self` of a struct in
+      // shared memory): left unbound, so what the clause reads through it
+      // is unknown, and the rest of the clause still counts.
       if (!loc)
-        return false;
+        return actual && isa<LIT::RefType>(actual.getType());
       refArgs[blockArg] = *loc;
       boundRefs.push_back(blockArg);
       return true;
