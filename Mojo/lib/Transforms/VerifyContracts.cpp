@@ -1461,9 +1461,13 @@ public:
     // Arguments: integers and Booleans are unknowns of their sort; references
     // are places, whose values at entry are unknowns.
     for (BlockArgument arg : entry.getArguments()) {
-      if (isa<LIT::RefType>(arg.getType()))
+      if (auto ref = dyn_cast<LIT::RefType>(arg.getType())) {
         roots.push_back(arg);
-      else
+        // An immutable borrow (`self` of a method that only reads it):
+        // nothing writes it while the function runs.
+        if (ref.isMutableKnown(false))
+          unborrowed.insert(arg);
+      } else
         values[arg] = declare(sortOf(arg.getType()), "a");
     }
     fn.walk([&](LIT::VarDeclOp decl) {
@@ -2618,6 +2622,7 @@ private:
     // any memory a reference or pointer leads to: not the local variables
     // that are never borrowed, which keep what they hold. A call with
     // `confinedWrites` reaches no memory in the default address space.
+    pinBorrowed(state);
     std::map<Loc, std::string> kept;
     for (auto &[loc, value] : state.env)
       if (unborrowed.count(loc.root) || (confined && genericRoot(loc.root)))
@@ -2629,6 +2634,18 @@ private:
     havocAll(state);
     state.env = std::move(kept);
     state.refs = std::move(keptRefs);
+  }
+
+  /// Gives the immutably borrowed arguments their values in `state` where
+  /// it holds none for them yet (they are read from the entry lazily), so
+  /// that they are among what is kept when everything else is forgotten.
+  void pinBorrowed(State &state) {
+    for (Value root : roots)
+      if (isa<BlockArgument>(root) && unborrowed.count(root)) {
+        Loc loc{root, ""};
+        if (!state.env.count(loc))
+          state.env[loc] = load(loc, state, Sort{false, 64, false});
+      }
   }
 
   void havocAll(State &state) {
@@ -3510,6 +3527,7 @@ private:
       // Anything a reference leads to: not a variable that is never
       // borrowed and that the loop does not write, nor the end and step of
       // such a range that it only advances.
+      pinBorrowed(head);
       std::map<Loc, std::string> kept;
       for (auto &[loc, value] : head.env) {
         if (!unborrowed.count(loc.root))
