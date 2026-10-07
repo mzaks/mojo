@@ -3584,6 +3584,14 @@ private:
             return relevant.contains(name);
           }))
         fixed.push_back(length);
+    // The integer parameters the loop's conditions depend on (`stage_cnt`
+    // in `raw_next == Self.stage_cnt`): bounds as good as a value from
+    // before the loop.
+    for (const auto &[key, name] : parameterValues)
+      if (relevant.contains(name))
+        if (auto it = sorts.find(name);
+            it != sorts.end() && !it->second.isBool && it->second.width == 64)
+          fixed.push_back(name);
     std::sort(fixed.begin(), fixed.end());
     fixed.erase(std::unique(fixed.begin(), fixed.end()), fixed.end());
     // Lists the loop changes and whose lengths it reads: their lengths are
