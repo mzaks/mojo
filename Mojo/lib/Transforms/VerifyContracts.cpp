@@ -6125,6 +6125,48 @@ private:
       values[result] = term(call.getOperands()[0], state);
       return true;
     }
+    // `Int(x)` of a scalar of another integer dtype (`Int(block_idx.x)`, a
+    // `UInt`): its value, widened as its dtype says.
+    if (path.starts_with("std::simd::SIMD::__init__[::DType](::SIMD[") &&
+        call.getNumOperands() == 1 &&
+        !isa<LIT::RefType>(call.getOperands()[0].getType())) {
+      Sort target = sortOf(result.getType());
+      std::string value = term(call.getOperands()[0], state);
+      Sort actual = sortOfTerm(value);
+      std::optional<Sort> source;
+      if (auto simd =
+              dyn_cast<LIT::StructType>(call.getOperands()[0].getType());
+          simd && simd.getParamValues().size() == 2 &&
+          printed(simd.getSymbol()) == "@std::@simd::@SIMD" &&
+          isWidthOne(printed(simd.getParamValues()[1])))
+        source = dtypeSort(printed(resolveParam(simd.getParamValues()[0])));
+      std::optional<Sort> to = dtypeSort(printed(result.getType()));
+      if (source && to && !target.isBool && target.width == 64 &&
+          to->width == 64 && !actual.isBool && actual.width == source->width) {
+        values[result] =
+            source->width == 64
+                ? value
+                : define(target, "((_ " +
+                                     std::string(source->isSigned
+                                                     ? "sign_extend "
+                                                     : "zero_extend ") +
+                                     std::to_string(64 - source->width) + ") " +
+                                     value + ")");
+        return true;
+      }
+    }
+    // `Int(x)` of an `Int` (`Int(block_idx.x)`), the scalar's own
+    // constructor from a scalar of its dtype: `x`.
+    if (path.starts_with("std::simd::SIMD::__init__(::SIMD[$0, 1])") &&
+        call.getNumOperands() == 1 &&
+        !isa<LIT::RefType>(call.getOperands()[0].getType())) {
+      std::string value = term(call.getOperands()[0], state);
+      Sort to = sortOf(result.getType()), from = sortOfTerm(value);
+      if (to.isBool == from.isBool && (to.isBool || to.width == from.width)) {
+        values[result] = value;
+        return true;
+      }
+    }
     // `rebind[T](x)`: the same value under another type.
     if (path.starts_with("std::builtin::rebind::rebind[") &&
         call.getNumOperands() == 1 &&
@@ -6161,6 +6203,28 @@ private:
           return true;
         }
       }
+      // Of another integer scalar (`Int(block_idx.x)`, a `UInt`): its
+      // value, widened as its type says.
+      if (Sort source = sortOf(from);
+          isScalar(from) && !source.isBool && source.width <= 64 &&
+          !target.isBool && target.width == 64) {
+        std::string value = isa<LIT::RefType>(operand.getType())
+                                ? valueThrough(operand, state)
+                                : term(operand, state);
+        Sort actual = sortOfTerm(value);
+        if (!actual.isBool && actual.width == source.width) {
+          values[result] =
+              source.width == 64
+                  ? value
+                  : define(target, "((_ " +
+                                       std::string(source.isSigned
+                                                       ? "sign_extend "
+                                                       : "zero_extend ") +
+                                       std::to_string(64 - source.width) +
+                                       ") " + value + ")");
+          return true;
+        }
+      }
       // Of any other `Intable` value: one result per value (the conversion
       // is assumed to be a function of the value), so a clause's
       // `Int(index)` is the body's.
@@ -6185,8 +6249,9 @@ private:
       Sort field = sortOf(result.getType());
       if (sortOfTerm(tensor).isBool || sortOfTerm(tensor).width != 64)
         return false;
-      auto [it, inserted] = tensorFields.try_emplace(
-          {tensor, printed(call.getCallee())}, "");
+      // `ptr` is the one field this getter reads, whatever the tensor's
+      // type parameters are spelled as (a kernel's and its launcher's).
+      auto [it, inserted] = tensorFields.try_emplace({tensor, "ptr"}, "");
       if (inserted)
         it->second = declare(field);
       values[result] = it->second;
