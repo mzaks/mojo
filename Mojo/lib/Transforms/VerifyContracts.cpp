@@ -4777,6 +4777,10 @@ private:
           if (auto symbol = dyn_cast<SymbolConstantAttr>(ops[0]))
             if (MaybeTerm bytes = dtypeSize(symbol))
               return *bytes;
+        if (ops.size() == 1 && !sort.isBool && sort.width == 64)
+          if (auto symbol = dyn_cast<SymbolConstantAttr>(ops[0]))
+            if (MaybeTerm bytes = typeSize(symbol))
+              return *bytes;
         // `Wrapper(n)` of an integer wrapper (`GEMVAlgorithm.GEMV_KERNEL`
         // is `GEMVAlgorithm(0)`): `n`.
         if (ops.size() == 2 && !sort.isBool)
@@ -4914,6 +4918,47 @@ private:
              .starts_with("std::sys::info::size_of[!kgen.target,::DType,"))
       return std::nullopt;
     return dtypeBytes(ps[1]);
+  }
+
+  /// `size_of[T]()` of a type that is not a dtype (a struct): one unknown
+  /// per type, not negative, as a parameter expression or a call. So a
+  /// clause's `size_of[Smem]()` is the launcher's.
+  MaybeTerm typeSize(SymbolConstantAttr symbol) {
+    std::optional<CalleeName> name = calleeName(symbol);
+    ArrayRef<TypedAttr> ps = symbol.getParamValues();
+    if (!name || ps.size() < 2 ||
+        !StringRef(name->path)
+             .starts_with("std::sys::info::size_of[!kgen.target,::AnyType,"))
+      return std::nullopt;
+    return typeBytes(ps[1]);
+  }
+
+  /// The size in bytes of the type a parameter value names (see `typeSize`).
+  std::string typeBytes(TypedAttr type) {
+    // The type with the parameters inside it resolved (a kernel's
+    // `Smem[a_type, tile_k]` at its launch is the launcher's
+    // `Smem[DType.bfloat16, 128]`).
+    std::function<std::string(TypedAttr, unsigned)> resolved =
+        [&](TypedAttr attr, unsigned depth) -> std::string {
+      attr = unwrapValue(resolveParam(unwrapValue(attr)));
+      if (auto typed = dyn_cast<TypeParamAttr>(attr); typed && depth < 6)
+        if (auto structType = dyn_cast<LIT::StructType>(typed.getTypeValue())) {
+          std::string text = printed(structType.getSymbol()) + "<";
+          for (TypedAttr param : structType.getParamValues())
+            text += resolved(param, depth + 1) + ",";
+          return text + ">";
+        }
+      return layoutKey(attr);
+    };
+    std::string key = "size_of_type|" + resolved(type, 0);
+    auto [it, inserted] = simdWidths.try_emplace(key, "");
+    if (!inserted)
+      return it->second;
+    std::string bytes = declare(Sort{false, 64, true}, "p");
+    prelude += "; " + bytes + ": " + StringRef(key).take_front(300).str() + "\n";
+    facts.push_back("(bvsge " + bytes + " " + bvConst(0, 64) + ")");
+    it->second = bytes;
+    return bytes;
   }
 
   /// The size in bytes of the dtype a parameter value names (see
@@ -5166,6 +5211,8 @@ private:
         MaybeTerm w = simdWidth(symbol);
         if (!w)
           w = dtypeSize(symbol);
+        if (!w)
+          w = typeSize(symbol);
         if (w) {
           values[call->getResult(0)] = *w;
           return;
@@ -7223,6 +7270,48 @@ private:
         !isa<LIT::RefType>(call.getOperands()[0].getType())) {
       values[result] = term(call.getOperands()[0], state);
       return true;
+    }
+    // `p.bitcast[T]()` between scalar element types: the same bytes, so
+    // `extent * size_of[old] // size_of[new]` elements. The extent counted
+    // is capped (2^40 elements), which keeps the product from wrapping and
+    // is still a number of valid elements.
+    if ((path.starts_with("bitcast[") || path.starts_with("unsafe_bitcast[")) &&
+        call.getNumOperands() == 1 &&
+        !isa<LIT::RefType>(call.getOperands()[0].getType())) {
+      auto elementBytes = [&](Type type) -> MaybeTerm {
+        auto pointer = dyn_cast<LIT::StructType>(type);
+        if (!pointer || pointer.getParamValues().size() < 3)
+          return std::nullopt;
+        auto element = dyn_cast<TypeParamAttr>(
+            unwrapValue(resolveParam(pointer.getParamValues()[2])));
+        auto simd = element ? dyn_cast<LIT::StructType>(element.getTypeValue())
+                            : LIT::StructType();
+        if (!element)
+          return std::nullopt;
+        // Any other element type: its `size_of`.
+        if (!simd || simd.getParamValues().size() != 2 ||
+            printed(simd.getSymbol()) != "@std::@simd::@SIMD" ||
+            !isWidthOne(printed(simd.getParamValues()[1])))
+          return typeBytes(element);
+        return dtypeBytes(simd.getParamValues()[0]);
+      };
+      MaybeTerm from = elementBytes(call.getOperands()[0].getType());
+      MaybeTerm to = elementBytes(result.getType());
+      MaybeTerm extent = pointerExtent(call.getOperands()[0], state);
+      if (from && to && extent) {
+        std::string pointer = declare({false, 64, false}, "ptr");
+        std::string cap = bvConst(int64_t(1) << 40, 64);
+        std::string counted = "(ite (bvsgt " + *extent + " " + cap + ") " + cap +
+                              " " + *extent + ")";
+        facts.push_back("(=> (bvsgt " + *to + " " + bvConst(0, 64) +
+                        ") (bvsge " + extentOf(pointer) + " (bvsdiv (bvmul " +
+                        counted + " " + *from + ") " + *to + ")))");
+        // Elements of no size: any number of them.
+        facts.push_back("(=> (= " + *to + " " + bvConst(0, 64) + ") (bvsge " +
+                        extentOf(pointer) + " " + cap + "))");
+        values[result] = pointer;
+        return true;
+      }
     }
     // `Pointer(to=x)` points to at least `x` (an element of an array may
     // have more after it). Not a clause: one on this constructor makes the
