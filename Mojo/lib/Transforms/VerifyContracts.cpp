@@ -5205,6 +5205,8 @@ private:
       return;
     if (name && evalGpuId(call, *name))
       return;
+    if (name && evalExternalMemory(call, *name, state))
+      return;
     if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
         symbol && call.getNumOperands() == 0 && call->getNumResults() == 1)
       if (sortOf(call->getResult(0).getType()).width == 64) {
@@ -7671,6 +7673,17 @@ private:
           dims[std::string(kinds[k]) + axis] = it->second;
       }
     }
+    // `shared_mem_bytes=n`: an operand built by `OptionalReg(n)`.
+    for (Value operand : call.getOperands())
+      if (auto init = operand.getDefiningOp<LIT::CallOp>())
+        if (std::optional<CalleeName> made = calleeName(init.getCallee());
+            made && init.getNumOperands() == 1 &&
+            StringRef(made->path).starts_with(
+                "std::collections::optional::OptionalReg::__init__($0)")) {
+          std::string bytes = term(init.getOperands()[0], state);
+          if (!sortOfTerm(bytes).isBool && sortOfTerm(bytes).width == 64)
+            dims["shared_mem_bytes"] = bytes;
+        }
     ParamFrame frame = paramFrame(kernelSymbol, kernel, 0, ParamFrame{});
     frame.parent = params;
     // A launch whose instantiation is not verified (`opaqueParameter`,
@@ -7908,6 +7921,65 @@ private:
                         bvConst(int64_t(1) << 31, 64) + "))");
     }
     return symbol;
+  }
+
+  /// `external_memory[T, address_space=.SHARED, ...]()`: the dynamic shared
+  /// memory of the launch (`shared_mem_bytes=`), so a pointer to as many
+  /// `T` as fit in it. In a kernel that is one unknown number of bytes, not
+  /// negative; in a kernel's clause at its launch it is the launch's (0 if
+  /// it gives none), so the kernel can state what it needs with
+  /// `external_memory[UInt8, ...]()._extent() >= n`.
+  bool evalExternalMemory(LIT::CallOp call, const CalleeName &name,
+                          State &state) {
+    if (!StringRef(name.path)
+             .starts_with("max::gpu::memory::memory::external_memory[") ||
+        call.getNumOperands() != 0 || call->getNumResults() != 1)
+      return false;
+    Value result = call->getResult(0);
+    auto pointer = dyn_cast<LIT::StructType>(result.getType());
+    if (!pointer || pointer.getParamValues().size() < 3 ||
+        !StringRef(printed(result.getType())).contains("\"SHARED\""))
+      return false;
+    std::string bytes;
+    if (launchDims) {
+      auto it = launchDims->find("shared_mem_bytes");
+      bytes = it != launchDims->end() ? it->second : bvConst(0, 64);
+    } else {
+      bytes = "gpu_shared_mem_bytes";
+      if (gpuIds.insert(bytes).second) {
+        prelude += "(declare-const " + bytes + " (_ BitVec 64))\n";
+        sorts[bytes] = Sort{false, 64, true};
+        facts.push_back("(and (bvsle " + bvConst(0, 64) + " " + bytes +
+                        ") (bvslt " + bytes + " " +
+                        bvConst(int64_t(1) << 31, 64) + "))");
+      }
+    }
+    auto element = dyn_cast<TypeParamAttr>(
+        unwrapValue(resolveParam(pointer.getParamValues()[2])));
+    auto simd = element ? dyn_cast<LIT::StructType>(element.getTypeValue())
+                        : LIT::StructType();
+    if (!element)
+      return false;
+    std::string size =
+        simd && simd.getParamValues().size() == 2 &&
+                printed(simd.getSymbol()) == "@std::@simd::@SIMD" &&
+                isWidthOne(printed(simd.getParamValues()[1]))
+            ? dtypeBytes(simd.getParamValues()[0]).value_or("")
+            : typeBytes(element);
+    if (size.empty())
+      return false;
+    // The same memory at every call: one pointer per element type (and
+    // per launch, in a clause), with exactly as many elements as fit.
+    auto [it, inserted] = simdWidths.try_emplace(
+        "external_memory|" + bytes + "|" + size, "");
+    if (inserted) {
+      it->second = declare({false, 64, false}, "ptr");
+      facts.push_back("(=> (bvsgt " + size + " " + bvConst(0, 64) + ") (= " +
+                      extentOf(it->second) + " (bvsdiv " + bytes + " " + size +
+                      ")))");
+    }
+    values[result] = it->second;
+    return true;
   }
 
   /// GPU ids (`thread_idx.x`, `block_idx.y`, `block_dim.z`, `grid_dim.x`,
