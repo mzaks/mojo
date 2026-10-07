@@ -1473,20 +1473,26 @@ public:
       // lifetime marked), or passed to a range's own methods, which keep no
       // reference: nothing else writes it. That an immutable borrow is not
       // turned into a pointer that is written through is assumed.
-      if (llvm::all_of(root.getUses(), [&](OpOperand &use) {
-            Operation *user = use.getOwner();
-            StringRef op = user->getName().getStringRef();
-            if (auto call = dyn_cast<LIT::CallOp>(user)) {
-              std::optional<CalleeName> name = calleeName(call.getCallee());
-              return name && StringRef(name->path).starts_with(
-                                 "std::builtin::range::");
-            }
-            return isa<LIT::RefLoadOp>(user) || op == "lit.load.consume" ||
-                   op == "lit.ref.immut" ||
-                   op.starts_with("lit.var.lifetime.") ||
-                   op.starts_with("lit.ownership.") ||
-                   (isa<LIT::RefStoreOp>(user) && use.getOperandNumber() == 1);
-          }))
+      // A `kgen.rebind` of the reference is the same reference under
+      // another type: its uses count too.
+      std::function<bool(Value)> plain = [&](Value ref) {
+        return llvm::all_of(ref.getUses(), [&](OpOperand &use) {
+          Operation *user = use.getOwner();
+          StringRef op = user->getName().getStringRef();
+          if (auto call = dyn_cast<LIT::CallOp>(user)) {
+            std::optional<CalleeName> name = calleeName(call.getCallee());
+            return name &&
+                   StringRef(name->path).starts_with("std::builtin::range::");
+          }
+          if (isa<RebindOp>(user))
+            return plain(user->getResult(0));
+          return isa<LIT::RefLoadOp>(user) || op == "lit.load.consume" ||
+                 op == "lit.ref.immut" || op.starts_with("lit.var.lifetime.") ||
+                 op.starts_with("lit.ownership.") ||
+                 (isa<LIT::RefStoreOp>(user) && use.getOperandNumber() == 1);
+        });
+      };
+      if (plain(root))
         unborrowed.insert(root);
     });
     // The function's own constraints on its parameters (`where N <= 8`): the
@@ -2585,7 +2591,7 @@ private:
   }
 
   /// Memory a mutable origin (printed) may reach becomes unknown.
-  void havocOrigin(StringRef origin, State &state) {
+  void havocOrigin(StringRef origin, State &state, bool confined = false) {
     if (std::optional<SmallVector<Value>> named = rootsNamedBy(origin)) {
       for (Value root : *named) {
         Loc loc{root, ""};
@@ -2610,14 +2616,15 @@ private:
     }
     // An origin that names no root (`MutAnyOrigin`, a tensor's) may reach
     // any memory a reference or pointer leads to: not the local variables
-    // that are never borrowed, which keep what they hold.
+    // that are never borrowed, which keep what they hold. A call with
+    // `confinedWrites` reaches no memory in the default address space.
     std::map<Loc, std::string> kept;
     for (auto &[loc, value] : state.env)
-      if (unborrowed.count(loc.root))
+      if (unborrowed.count(loc.root) || (confined && genericRoot(loc.root)))
         kept.insert({loc, value});
     std::map<Loc, Loc> keptRefs;
     for (auto &[loc, target] : state.refs)
-      if (unborrowed.count(loc.root))
+      if (unborrowed.count(loc.root) || (confined && genericRoot(loc.root)))
         keptRefs.insert({loc, target});
     havocAll(state);
     state.env = std::move(kept);
@@ -3148,15 +3155,79 @@ private:
     state = std::move(joined);
   }
 
+  /// Whether a root is memory in the default address space: a local
+  /// variable or an argument, not a reference into shared or global memory
+  /// (`ref[AddressSpace.SHARED] self`, a `ref` local bound to such memory).
+  static bool genericRoot(Value root) {
+    auto generic = [](Type type) {
+      auto ref = dyn_cast<LIT::RefType>(type);
+      if (!ref)
+        return false;
+      auto space = dyn_cast<IntegerAttr>(ref.getAddressSpace());
+      return space && space.getValue().isZero();
+    };
+    if (!generic(root.getType()))
+      return false;
+    Type element = cast<LIT::RefType>(root.getType()).getElementType();
+    return !isa<LIT::RefType>(element) || generic(element);
+  }
+
+  /// Whether what `call` may write through an origin that names no variable
+  /// is confined to other address spaces than the default one: its only
+  /// arguments that can be written through are pointers into shared or
+  /// global memory (`async_copy(src, dst)`, a barrier's `arrive`). Such a
+  /// pointer does not lead to a local variable or an argument.
+  bool confinedWrites(LIT::CallOp call) {
+    static llvm::Regex spaceRe("\\{([0-9]+)\\}\\}\\)?>>$");
+    bool any = false;
+    for (Value operand : call.getOperands()) {
+      Type type = operand.getType();
+      if (auto ref = dyn_cast<LIT::RefType>(type)) {
+        if (ref.isMutableKnown(false))
+          continue;
+        // A mutable reference into shared or global memory (`ptr[]`).
+        auto space = dyn_cast<IntegerAttr>(ref.getAddressSpace());
+        if (!space || space.getValue().isZero())
+          return false;
+        any = true;
+        continue;
+      }
+      std::string text = printed(type);
+      StringRef t(text);
+      if (!t.consume_front("!lit.struct<@std::@memory::@pointer::@Pointer<")) {
+        if (!isScalar(type))
+          return false;
+        continue;
+      }
+      // Immutable: nothing is written through it.
+      if (t.starts_with(
+              ":!lit.struct<@std::@builtin::@bool::@Bool> {:scalar<bool> false}"))
+        continue;
+      SmallVector<StringRef> m;
+      int64_t space;
+      if (!spaceRe.match(text, &m) || m[1].getAsInteger(10, space) || !space)
+        return false;
+      any = true;
+    }
+    return any;
+  }
+
   /// The roots code may write; nullopt if it may write any of them.
   std::optional<llvm::DenseSet<Value>> writtenRoots(Operation *root) {
     llvm::DenseSet<Value> written;
     bool all = false;
+    // Whether the origin being added is of a call with `confinedWrites`.
+    bool confined = false;
     auto addOrigin = [&](StringRef origin) {
-      if (std::optional<SmallVector<Value>> named = rootsNamedBy(origin))
+      if (std::optional<SmallVector<Value>> named = rootsNamedBy(origin)) {
         written.insert(named->begin(), named->end());
-      else
+      } else if (confined) {
+        for (Value r : roots)
+          if (!genericRoot(r))
+            written.insert(r);
+      } else {
         all = true;
+      }
     };
     storedPaths.clear();
     auto addRef = [&](Value ref) {
@@ -3183,6 +3254,7 @@ private:
               closure != closures.end() &&
               seen.insert(closure->second.getOperation()).second)
             work.push_back(closure->second.getOperation());
+          confined = confinedWrites(call);
           for (Value operand : call.getOperands())
             if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
                 ref && !ref.isMutableKnown(false))
@@ -3192,6 +3264,7 @@ private:
           for (StringRef origin : topLevelElements(origins))
             if (!origin.ends_with(": !lit.origin<false>"))
               addOrigin(origin);
+          confined = false;
         } else if (op->getNumRegions() && !seen.count(op) &&
                    !isa<HLCF::IfOp, HLCF::LoopOp, LIT::TryOp, RequiresOp,
                         EnsuresOp, OldOp, ForallOp>(op) &&
@@ -4939,10 +5012,11 @@ private:
       if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
           ref && !ref.isMutableKnown(false) && placeOf(operand))
         covered.insert(printed(ref.getOrigin()));
+    bool confined = confinedWrites(call);
     for (StringRef origin : topLevelElements(origins))
       if (!origin.ends_with(": !lit.origin<false>") &&
           !covered.count(origin.str()))
-        havocOrigin(origin, state);
+        havocOrigin(origin, state, confined);
     for (Value operand : call.getOperands()) {
       auto ref = dyn_cast<LIT::RefType>(operand.getType());
       if (!ref || ref.isMutableKnown(false))
@@ -4950,7 +5024,7 @@ private:
       if (std::optional<Loc> loc = placeOf(operand))
         havoc(*loc, state, ref.getElementType());
       else
-        havocOrigin(printed(ref.getOrigin()), state);
+        havocOrigin(printed(ref.getOrigin()), state, confined);
     }
     evalTraitQuery(call, callee, state);
     if (hasBody) {
