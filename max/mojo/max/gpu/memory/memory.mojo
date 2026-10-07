@@ -496,7 +496,15 @@ def async_copy[
     src: Pointer[Scalar[dtype], _, address_space=.GLOBAL],
     dst: Pointer[mut=True, Scalar[dtype], _, address_space=.SHARED],
     src_size: Int32 = Int32(size),
-    predicate: Bool = False,
+    predicate: Bool where (
+        dst._extent() >= size // size_of[dtype]()
+        and src._extent()
+        >= (
+            Int(src_size) // size_of[dtype]()
+            if (fill and not predicate)
+            else size // size_of[dtype]()
+        )
+    ) = False,
 ):
     """Asynchronously copies data from global memory to shared memory.
 
@@ -523,6 +531,9 @@ def async_copy[
         - Size must be 4, 8, or 16 bytes.
         - Cannot enable both L2 prefetch and L1 bypass.
         - L2 prefetch size must be 64, 128, or 256 bytes.
+        - `dst` must have `size` bytes. `src` must have `size` bytes too,
+          except with a fill value and no predicate, where at most `src_size`
+          bytes of it are read (none on NVIDIA).
     """
     comptime assert (
         not fill or size_of[dtype]() <= size_of[Int32]()

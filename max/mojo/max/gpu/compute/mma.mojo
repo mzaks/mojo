@@ -26,6 +26,7 @@ from std.sys.info import (
     is_apple_m5,
 )
 
+from std._gpu.primitives.id import lane_id
 from std._gpu._utils import (
     _get_llvm_struct_fields,
     array_to_llvm_struct,
@@ -240,7 +241,12 @@ def mma[block_size: Int = 1](mut d: SIMD, a: SIMD, b: SIMD, c: SIMD):
 @inline(.always)
 def ld_matrix[
     dtype: DType, //, simd_width: Int, *, transpose: Bool = False
-](ptr: Pointer[mut=False, Scalar[dtype], ...]) -> SIMD[dtype, simd_width]:
+](
+    ptr: Pointer[mut=False, Scalar[dtype], ...] where (
+        lane_id() >= 8 * (simd_width // (4 // size_of[dtype]()))
+        or ptr._extent() >= 16 // size_of[dtype]()
+    ),
+) -> SIMD[dtype, simd_width]:
     """Loads a matrix from shared memory into registers in a format suitable for tensor core operations.
 
     This function performs a warp-synchronized load from shared memory to registers, formatting the data
@@ -259,6 +265,9 @@ def ld_matrix[
 
     Note:
         - All threads in a warp must execute this operation together.
+        - Each 8x8 matrix is read row by row from the addresses of eight
+          lanes, 16 bytes each: lanes 0 to 7 for x1, 0 to 15 for x2, all for
+          x4. Those lanes' `ptr` must have 16 bytes.
         - For transposed loads, only half precision (float16) is supported.
         - The register width is fixed at 4 bytes (32 bits).
         - Supported configurations:
