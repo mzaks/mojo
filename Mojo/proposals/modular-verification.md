@@ -1812,6 +1812,16 @@ Tensors and GPU kernels:
   matmul 130M -> 174M and matmul_mma 196M -> 219M, not looked into. The
   exact retry's steps are limited by time, so its answers can depend on
   the machine's load.
+- `gemm_mma_cpasync`, first part (the kernel is not done). Its memory
+  accesses are intrinsics and shared-memory types that had no contracts,
+  in loader and computer structs whose methods advance a stage counter.
+  What the pass needed so far, none of it specific to the kernel: a
+  struct's other fields kept when one is written (also at loop heads and
+  joins), fields of struct values, writes into shared or global memory
+  confined to those address spaces, `rebind`, `Int` of an index, the
+  pointer of an array field, a loop's parameters as invariant bounds,
+  and clauses kept when a reference argument is not tracked. See the
+  README. `dump-fn=` prints a function as the pass reads it.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

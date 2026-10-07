@@ -62,7 +62,8 @@ integers, then with the full limit), `case-split=false` turns off case
 splitting (below), `invariant-retry=true` asks a loop-invariant candidate
 left undecided once more with four times its limit (a loop after
 a large body can need it; off by default, since on kernels without
-clauses it costs about half again as much), `dump-dir=` writes the
+clauses it costs about half again as much), `dump-fn=NAME` prints that function's IR as the pass
+reads it (to debug the pass), `dump-dir=` writes the
 SMT-LIB scripts (the directory
 is created; a script the same as one already run is neither run nor
 written again), and `cache-dir=` caches
@@ -398,7 +399,25 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   variable that is only read, assigned, borrowed immutably or passed to a
   range's own methods (a loop's index, a pointer or a size read before the
   loop), and the end and step of such a range. That an immutable borrow is
-  not turned into a pointer that is written through is assumed.
+  not turned into a pointer that is written through is assumed. A call
+  whose only arguments that can be written through are references or
+  pointers into another address space than the default one (shared or
+  global memory: `barrier_ptr[].init(n)`) keeps what is known about local
+  variables and arguments in the default space. A call given a mutable
+  pointer by value makes nothing unknown: its origin is in its type, not
+  among the call's.
+- Structs: writing a field (`self.stage = next`) keeps the struct's other
+  fields, also at the head of a loop that writes only fields, and where two
+  paths join. A field of a struct passed by value is that field of the
+  value, so a callee's clause about `self.ptr` is about the caller's
+  `x.arr.ptr`. A constructor's clause is written on `out self`, or on a named
+  result (`out result: Self where ...`) for one that returns `Self`.
+  `rebind[T](x)` is `x`; `Int(i)` of an `Intable` `i` is `i` where it is an
+  `Int`, else one value per `i` (assumed a function of it); the pointer of an
+  array that is a field has the array's length. A loop's integer parameters
+  are bounds its invariants may use (`stage < Self.stage_cnt`). A clause's
+  reference argument that has no tracked place (a struct in shared memory)
+  is read as unknown; the rest of the clause still counts.
 - `t.ptr` of a tensor is the same pointer wherever it is read from the same
   tensor value, so a clause can state its extent (`where t.ptr._extent() >=
   n`); nothing else does.
@@ -524,4 +543,5 @@ with).
 | `tensors.mojo`       | all `bad_*`        | all `ok_*`       |
 | `kernels.mojo`       | all `bad_*`        | all `ok_*`       |
 | `pointers.mojo`      | all `bad_*`        | all `ok_*`       |
+| `structs.mojo`       | all `bad_*`        | all `ok_*`       |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |
