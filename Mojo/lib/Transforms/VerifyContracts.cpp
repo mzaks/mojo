@@ -3158,18 +3158,35 @@ private:
   /// Whether a root is memory in the default address space: a local
   /// variable or an argument, not a reference into shared or global memory
   /// (`ref[AddressSpace.SHARED] self`, a `ref` local bound to such memory).
+  /// The address space of a reference, where it is a number (also under
+  /// sugar, as `AddressSpace.SHARED` prints).
+  static std::optional<uint64_t> addressSpace(LIT::RefType ref) {
+    Attribute space = ref.getAddressSpace();
+    while (auto sugar = dyn_cast_or_null<SugarAttr>(space))
+      space = sugar.getCanonical();
+    if (auto number = dyn_cast_or_null<IntegerAttr>(space))
+      return number.getValue().getZExtValue();
+    return std::nullopt;
+  }
+
   static bool genericRoot(Value root) {
     auto generic = [](Type type) {
       auto ref = dyn_cast<LIT::RefType>(type);
       if (!ref)
         return false;
-      auto space = dyn_cast<IntegerAttr>(ref.getAddressSpace());
-      return space && space.getValue().isZero();
+      std::optional<uint64_t> space = addressSpace(ref);
+      return space && *space == 0;
     };
     if (!generic(root.getType()))
       return false;
     Type element = cast<LIT::RefType>(root.getType()).getElementType();
     return !isa<LIT::RefType>(element) || generic(element);
+  }
+
+  /// Whether a reference is into another address space than the default.
+  static bool otherSpace(LIT::RefType ref) {
+    std::optional<uint64_t> space = addressSpace(ref);
+    return space && *space != 0;
   }
 
   /// Whether what `call` may write through an origin that names no variable
@@ -3186,8 +3203,7 @@ private:
         if (ref.isMutableKnown(false))
           continue;
         // A mutable reference into shared or global memory (`ptr[]`).
-        auto space = dyn_cast<IntegerAttr>(ref.getAddressSpace());
-        if (!space || space.getValue().isZero())
+        if (!otherSpace(ref))
           return false;
         any = true;
         continue;
@@ -3246,7 +3262,10 @@ private:
     while (!work.empty())
       work.pop_back_val()->walk([&](Operation *op) {
         if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
+          auto ref = dyn_cast<LIT::RefType>(store->getOperand(1).getType());
+          confined = ref && otherSpace(ref);
           addRef(store->getOperand(1));
+          confined = false;
         } else if (auto call = dyn_cast<LIT::CallOp>(op)) {
           ArrayRef<TypedAttr> bound;
           if (auto closure =
@@ -3995,7 +4014,9 @@ private:
       if (std::optional<Loc> loc = placeOf(dest))
         store(*loc, state, term(value, state), value);
       else if (auto ref = dyn_cast<LIT::RefType>(dest.getType()))
-        havocOrigin(printed(ref.getOrigin()), state);
+        // A store through a reference into shared or global memory
+        // (`smem_ptr[i] = v`) writes that memory only.
+        havocOrigin(printed(ref.getOrigin()), state, otherSpace(ref));
       else
         havocAll(state);
       return;
