@@ -1728,6 +1728,9 @@ private:
   /// What the last `writtenRoots` found written by name, also where the
   /// code may write anything a reference leads to.
   llvm::DenseSet<Value> storedRoots;
+  /// The places of those roots it found written (the empty path: the whole
+  /// root). A root declared in the code has none: it is written whole.
+  DenseMap<Value, std::set<std::string>> storedPaths;
   std::string prelude;
   SmallVector<std::string> facts;
   std::map<std::string, Sort> sorts;
@@ -2180,6 +2183,11 @@ private:
   /// tensors' `dim[k]()`, by `layoutKey` and `k`.
   std::map<std::pair<std::string, int64_t>, SmallVector<std::string>>
       staticShapeTerms, dimTerms;
+  /// A struct value made by writing one field of another: the other value
+  /// and the field's path in it.
+  std::map<std::string, std::pair<std::string, std::string>> updates;
+  /// `Int(x)` of each value of a type that is not known to be `Int`.
+  std::map<std::string, std::string> intConversions;
   /// The value of each field read of a tensor (`t.ptr`), by the tensor's
   /// term and the getter.
   std::map<std::pair<std::string, std::string>, std::string> tensorFields;
@@ -2374,6 +2382,47 @@ private:
                       Sort sort) {
     if (auto it = fieldValues.find({value, rest}); it != fieldValues.end())
       return it->second;
+    // A field of a field: the field at the joined path, so that `x.a`
+    // loaded whole and then read at `.b` is `x.a.b`.
+    if (auto it = fieldOwners.find(value); it != fieldOwners.end()) {
+      std::pair<std::string, std::string> owner = it->second;
+      return fieldOf(owner.first, owner.second + rest, sort);
+    }
+    // A value chosen by a condition (where two paths join, one of which
+    // wrote a field): the field chosen by the same condition, which is the
+    // one field where both paths hold the same.
+    if (auto def = definitions.find(value); def != definitions.end()) {
+      StringRef body(def->second);
+      if (body.consume_front("(ite ") && body.consume_back(")")) {
+        size_t b = body.rfind(' ');
+        size_t a = b == StringRef::npos ? b : body.rfind(' ', b - 1);
+        if (a != StringRef::npos) {
+          StringRef cond = body.take_front(a), first = body.slice(a + 1, b),
+                    second = body.drop_front(b + 1);
+          auto plain = [](StringRef t) {
+            return !t.empty() && !t.contains('(') && !t.contains(')');
+          };
+          if (plain(first) && plain(second)) {
+            std::string x = fieldOf(first.str(), rest, sort);
+            std::string y = fieldOf(second.str(), rest, sort);
+            std::string joined =
+                x == y ? x
+                       : define(sort, ("(ite " + cond + " " + x + " " + y + ")")
+                                          .str());
+            fieldValues[{value, rest}] = joined;
+            return joined;
+          }
+        }
+      }
+    }
+    // A value that is another with one field written (`store`): its other
+    // fields are that value's. Not a field the written one is part of.
+    if (auto it = updates.find(value); it != updates.end()) {
+      const std::string &written = it->second.second;
+      if (rest != written && !StringRef(rest).starts_with(written + "/") &&
+          !StringRef(written).starts_with(rest + "/"))
+        return fieldOf(it->second.first, rest, sort);
+    }
     // Through a field a constructor built it with (`/1` of a tuple literal,
     // for `/1/has`).
     for (size_t cut = rest.rfind('/'); cut != 0 && cut != std::string::npos;
@@ -2407,11 +2456,20 @@ private:
         ++it;
     }
     // ... and changes the values of the places containing it (`x` when `x.f`
-    // is written), which become unknown.
+    // is written): each is a new value that differs from the old one in
+    // that field only.
+    SmallVector<std::pair<std::string, std::string>> outer;
     StringRef path(loc.path);
     while (!path.empty()) {
       path = path.take_front(path.rfind('/'));
-      state.env[Loc{loc.root, path.str()}] = declare({false, 64, false}, "h");
+      outer.push_back(
+          {path.str(),
+           load(Loc{loc.root, path.str()}, state, Sort{false, 64, false})});
+    }
+    for (auto &[prefix, old] : outer) {
+      std::string fresh = declare({false, 64, false}, "h");
+      updates[fresh] = {old, loc.path.substr(prefix.size())};
+      state.env[Loc{loc.root, prefix}] = fresh;
     }
     state.env[loc] = std::move(value);
     state.refs.erase(loc);
@@ -2432,6 +2490,32 @@ private:
   }
 
   /// Everything reachable through `loc` becomes unknown.
+  /// The field `loc` (not a root) holds an unknown: as `store`, without a
+  /// value for it, whose sort is its reader's to know (a field's type is
+  /// not tracked). It is then read as that field of its new parent.
+  void forget(const Loc &loc, State &state) {
+    SmallVector<std::pair<std::string, std::string>> outer;
+    StringRef path(loc.path);
+    while (!path.empty()) {
+      path = path.take_front(path.rfind('/'));
+      outer.push_back(
+          {path.str(),
+           load(Loc{loc.root, path.str()}, state, Sort{false, 64, false})});
+    }
+    for (auto it = state.env.begin(); it != state.env.end();)
+      it = it->first.root == loc.root &&
+                   (it->first.path == loc.path ||
+                    StringRef(it->first.path).starts_with(loc.path + "/"))
+               ? state.env.erase(it)
+               : std::next(it);
+    for (auto &[prefix, old] : outer) {
+      std::string fresh = declare({false, 64, false}, "h");
+      updates[fresh] = {old, loc.path.substr(prefix.size())};
+      state.env[Loc{loc.root, prefix}] = fresh;
+    }
+    state.refs.erase(loc);
+  }
+
   void havoc(const Loc &loc, State &state, Type type) {
     store(loc, state, declare(sortOf(type), "h"));
   }
@@ -3074,10 +3158,12 @@ private:
       else
         all = true;
     };
+    storedPaths.clear();
     auto addRef = [&](Value ref) {
-      if (std::optional<Loc> loc = placeOf(ref))
+      if (std::optional<Loc> loc = placeOf(ref)) {
         written.insert(loc->root);
-      else if (auto type = dyn_cast<LIT::RefType>(ref.getType()))
+        storedPaths[loc->root].insert(loc->path);
+      } else if (auto type = dyn_cast<LIT::RefType>(ref.getType()))
         addOrigin(printed(type.getOrigin()));
       else
         all = true;
@@ -3289,6 +3375,9 @@ private:
     // The loop head: what the loop may write holds an unknown there, bound
     // by the invariants found below.
     std::optional<llvm::DenseSet<Value>> written = writtenRoots(loop);
+    DenseMap<Value, std::set<std::string>> fields = storedPaths;
+    // Locals declared in the loop are written whole.
+    loop->walk([&](LIT::VarDeclOp decl) { fields.erase(decl->getResult(0)); });
     State before = state;
     before.yields.clear();
     State head = before;
@@ -3302,6 +3391,15 @@ private:
       });
       for (Value root : sorted) {
         Loc loc{root, ""};
+        // Only fields of it are written (`self.stage = next`): the others
+        // keep their values.
+        if (auto paths = fields.find(root);
+            paths != fields.end() && !paths->second.empty() &&
+            !paths->second.count("")) {
+          for (const std::string &path : paths->second)
+            forget(Loc{root, path}, head);
+          continue;
+        }
         head.env[loc] = declare(sortOf(placeType(loc)), "l");
         for (auto it = head.env.begin(); it != head.env.end();)
           it = it->first.root == root && !it->first.path.empty()
@@ -3827,6 +3925,35 @@ private:
       values[extract.getResult()] = term(extract.getContainer(), state);
       return;
     }
+    // A field of a struct value (`self.ptr` of a struct passed by value):
+    // the field the value was loaded with, else that field of the value,
+    // the same wherever it is read from the same value.
+    if (auto extract = dyn_cast<LIT::StructExtractOp>(op))
+      if (auto field = op->getAttrOfType<StringAttr>("field")) {
+        Value container = extract.getContainer(), result = extract.getResult();
+        std::string path = "/" + field.getValue().str();
+        Sort sort = sortOf(result.getType());
+        std::map<std::string, std::string> inner;
+        std::string known;
+        if (auto it = records.find(container); it != records.end())
+          for (auto &[name, term] : it->second) {
+            if (name == path)
+              known = term;
+            else if (StringRef(name).starts_with(path + "/"))
+              inner[name.substr(path.size())] = term;
+          }
+        std::string container_ = term(container, state);
+        if (known.empty() && !sortOfTerm(container_).isBool &&
+            sortOfTerm(container_).width == 64)
+          known = fieldOf(container_, path, sort);
+        if (!known.empty() && sortOfTerm(known).isBool == sort.isBool &&
+            (sort.isBool || sortOfTerm(known).width == sort.width)) {
+          values[result] = known;
+          if (!inner.empty())
+            records[result] = std::move(inner);
+          return;
+        }
+      }
     if (isa<LIT::RefLoadOp>(op) ||
         op->getName().getStringRef() == "lit.load.consume") {
       Operation *loadOp = op;
