@@ -62,8 +62,8 @@ integers, then with the full limit), `case-split=false` turns off case
 splitting (below), `invariant-retry=true` asks a loop-invariant candidate
 left undecided once more with four times its limit (a loop after
 a large body can need it; off by default, since on kernels without
-clauses it costs about half again as much), `dump-fn=NAME` prints that function's IR as the pass
-reads it (to debug the pass), `dump-dir=` writes the
+clauses it costs about half again as much), `dump-fn=NAME` prints that
+function's IR as the pass reads it (to debug the pass), `dump-dir=` writes the
 SMT-LIB scripts (the directory
 is created; a script the same as one already run is neither run nor
 written again), and `cache-dir=` caches
@@ -417,7 +417,21 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   array that is a field has the array's length. A loop's integer parameters
   are bounds its invariants may use (`stage < Self.stage_cnt`). A clause's
   reference argument that has no tracked place (a struct in shared memory)
-  is read as unknown; the rest of the clause still counts.
+  is read as unknown; the rest of the clause still counts. A direct call of
+  a function in the module forgets only the fields of a mutable argument
+  that its body can write (read from the body, not from a contract; not for
+  calls through a trait). An argument borrowed immutably keeps its value
+  across writes elsewhere, like a never-borrowed local. A field chosen by a
+  `comptime if` (`self.m if Self.swap else self.n`) is read as the chosen
+  one. A clause on `mut self` is a precondition and a postcondition: a
+  method that only reads `self` should take it immutably to state a plain
+  precondition.
+- `p.unsafe_bitcast[T]()` keeps the bytes: `extent * size_of[old] //
+  size_of[T]` elements (of at most 2^40 counted). `size_of[T]()` of a struct
+  is one unknown per type. `external_memory[T, address_space=.SHARED,
+  ...]()` is the launch's dynamic shared memory: as many `T` as fit in its
+  `shared_mem_bytes=`, so a kernel can require
+  `external_memory[UInt8, ...]()._extent() >= n`.
 - `t.ptr` of a tensor is the same pointer wherever it is read from the same
   tensor value, so a clause can state its extent (`where t.ptr._extent() >=
   n`); nothing else does.

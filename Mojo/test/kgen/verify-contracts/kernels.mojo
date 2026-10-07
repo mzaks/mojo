@@ -26,6 +26,7 @@ from max.gpu import (
     warp_id,
 )
 from max.gpu.host import DeviceContext, get_gpu_target
+from max.gpu.memory import external_memory
 import max.gpu.primitives.warp as warp
 from std.math import ceildiv
 from std.math.uutils import udivmod, ufloordiv
@@ -417,6 +418,29 @@ def ok_tile_load[
     return 0
 
 
+def ok_shared_kernel(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin] where (
+        external_memory[
+            UInt8,
+            address_space=.SHARED,
+            alignment=16,
+        ]()._extent()
+        >= 64
+    ),
+):
+    # The launch's dynamic shared memory: what `shared_mem_bytes=` gives.
+    var smem = external_memory[UInt8, address_space=.SHARED, alignment=16]()
+    smem[unsafe_offset=63] = 0
+
+
+def ok_launch_shared(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    ctx.enqueue_function[ok_shared_kernel](
+        t, grid_dim=1, block_dim=1, shared_mem_bytes=64
+    )
+
+
 def ok_gpu_simd_width(xs: List[Int]) -> Int:
     comptime w = simd_width_of[DType.float32, target=get_gpu_target()]()
     if len(xs) == 5:
@@ -740,6 +764,36 @@ def bad_tile_load_past[
         var tile = t.tile[2, 8](i, 0)
         return tile.load[4](Coord(1, 5))[0]  # 5 + 4 > 8
     return 0
+
+
+def bad_shared_kernel(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin] where (
+        external_memory[
+            UInt8,
+            address_space=.SHARED,
+            alignment=16,
+        ]()._extent()
+        >= 64
+    ),
+):
+    var smem = external_memory[UInt8, address_space=.SHARED, alignment=16]()
+    smem[unsafe_offset=64] = 0  # one past what the clause asks for
+
+
+def launch_shared(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    ctx.enqueue_function[bad_shared_kernel](
+        t, grid_dim=1, block_dim=1, shared_mem_bytes=64
+    )
+
+
+def bad_launch_shared_short(
+    ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) raises:
+    ctx.enqueue_function[ok_shared_kernel](
+        t, grid_dim=1, block_dim=1, shared_mem_bytes=32
+    )  # the kernel needs 64 bytes
 
 
 def bad_gpu_simd_width_any[dt: DType](xs: List[Int]) -> Int:

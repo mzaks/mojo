@@ -56,6 +56,18 @@ struct Holder[size: Int]:
     var items: Array[Int, Self.size]
 
 
+struct Buffer:
+    var data: Pointer[Int, MutUntrackedOrigin]
+    var size: Int
+    var other: Int
+
+    def rewind(mut self):
+        self.other = 0
+
+    def shrink(mut self):
+        self.size = self.size - 1
+
+
 def fill_shared(
     dst: Pointer[Int, MutUntrackedOrigin, address_space=AddressSpace.SHARED]
 ):
@@ -130,7 +142,83 @@ def ok_shared_write(
     return r.data[unsafe_offset=r.at]
 
 
+def ok_after_method(
+    mut b: Buffer, i: Int where 0 <= i < b.size and b.data._extent() >= b.size
+) -> Int:
+    b.rewind()  # writes `b.other` only
+    return b.data[unsafe_offset=i]
+
+
+def ok_borrowed(
+    b: Buffer,
+    q: Pointer[Int, MutAnyOrigin],
+    i: Int where (
+        0 <= i < b.size and b.data._extent() >= b.size and q._extent() >= 1
+    ),
+) -> Int:
+    q[unsafe_offset=0] = 7  # may write anything but what is borrowed
+    return b.data[unsafe_offset=i]
+
+
+def ok_chosen[
+    wide: Bool
+](
+    b: Buffer,
+    p: Pointer[Int, MutAnyOrigin] where (
+        1 <= b.size <= 1000
+        and 1 <= b.other <= 1000
+        and p._extent() >= b.size + b.other
+    ),
+) -> Int:
+    var n = b.size if wide else b.other  # a field chosen at compile time
+    return p[unsafe_offset=n - 1]
+
+
+def ok_bitcast(
+    p: Pointer[Int64, MutAnyOrigin], i: Int where 0 <= i < 8 and p._extent() >= 4
+) -> Int32:
+    var q = p.unsafe_bitcast[Int32]()  # four 8-byte elements: eight of 4
+    return q[unsafe_offset=i]
+
+
 # --- must stay UNPROVEN ---
+def bad_after_method(
+    mut b: Buffer, i: Int where 0 <= i < b.size and b.data._extent() >= b.size
+) -> Int:
+    b.shrink()
+    return b.data[unsafe_offset=b.size]  # `size` changed: may be -1 + 1...
+
+
+def bad_mutable(
+    mut b: Buffer,
+    q: Pointer[Int, MutAnyOrigin],
+    i: Int where (
+        0 <= i < b.size and b.data._extent() >= b.size and q._extent() >= 1
+    ),
+) -> Int:
+    q[unsafe_offset=0] = 7  # `b` is not borrowed immutably: may be `b`
+    return b.data[unsafe_offset=i]
+
+
+def bad_chosen[
+    wide: Bool
+](
+    b: Buffer,
+    p: Pointer[Int, MutAnyOrigin] where (
+        1 <= b.size <= 1000 and 1 <= b.other <= 1000 and p._extent() >= b.size
+    ),
+) -> Int:
+    var n = b.size if wide else b.other
+    return p[unsafe_offset=n - 1]  # `other` may be past the extent
+
+
+def bad_bitcast(
+    p: Pointer[Int64, MutAnyOrigin], i: Int where 0 <= i <= 8 and p._extent() >= 4
+) -> Int32:
+    var q = p.unsafe_bitcast[Int32]()
+    return q[unsafe_offset=i]  # the ninth
+
+
 def bad_field_store(
     mut r: Ring,
     i: Int where 0 <= i < r.size and r.data._extent() >= r.size,
