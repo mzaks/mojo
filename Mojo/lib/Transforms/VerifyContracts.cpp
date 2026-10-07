@@ -3977,6 +3977,41 @@ private:
     return header() + queries;
   }
 
+  /// The value loaded through `ref`, a result of a `comptime if` whose
+  /// arms each yield a reference to a known place: the value of the place
+  /// of the first arm whose condition holds (the conditions as
+  /// `walkComptimeIf` evaluates them, so the same choice).
+  MaybeTerm loadChosen(Value ref, State &state, Sort sort) {
+    while (auto rebind = ref.getDefiningOp<RebindOp>())
+      ref = rebind->getOperand(0);
+    Operation *op = ref.getDefiningOp();
+    auto ifOp = op ? dyn_cast<HLCF::ComptimeIfOp>(op) : HLCF::ComptimeIfOp();
+    if (!ifOp || op->getNumRegions() != ifOp.getConds().size() + 1)
+      return std::nullopt;
+    unsigned index = cast<OpResult>(ref).getResultNumber();
+    SmallVector<std::string> loaded;
+    for (Region &region : op->getRegions()) {
+      if (region.empty() || region.front().empty())
+        return std::nullopt;
+      Operation *yield = region.front().getTerminator();
+      if (!yield || index >= yield->getNumOperands())
+        return std::nullopt;
+      std::optional<Loc> loc = placeOf(yield->getOperand(index));
+      if (!loc)
+        return std::nullopt;
+      loaded.push_back(load(*loc, state, sort));
+    }
+    std::string value = loaded.back();
+    for (size_t i = ifOp.getConds().size(); i-- > 0;) {
+      auto typed = dyn_cast<TypedAttr>(ifOp.getConds()[i]);
+      if (!typed)
+        return std::nullopt;
+      value = "(ite " + paramTerm(typed, {true, 1, false}) + " " + loaded[i] +
+              " " + value + ")";
+    }
+    return define(sort, value);
+  }
+
   void bindResults(Operation *op, ArrayRef<std::string> terms) {
     for (auto [i, result] : llvm::enumerate(op->getResults()))
       values[result] = i < terms.size() ? terms[i]
@@ -4184,7 +4219,12 @@ private:
       }
       std::optional<Loc> loc = placeOf(ref);
       if (!loc) {
-        setResultsUnknown(op);
+        // A reference a `comptime if` chose (`self.m if Self.swap else
+        // self.n`): what the chosen place holds.
+        if (MaybeTerm chosen = loadChosen(ref, state, sortOf(result.getType())))
+          values[result] = *chosen;
+        else
+          setResultsUnknown(op);
         return;
       }
       values[result] = load(*loc, state, result.getType());
