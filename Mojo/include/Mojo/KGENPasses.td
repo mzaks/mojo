@@ -97,6 +97,9 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "Wall-clock cap on each z3 process, in seconds">,
     Option<"dumpDir", "dump-dir", "std::string", /*default=*/"\"\"",
            "Directory to write the SMT-LIB scripts to">,
+    Option<"dumpFn", "dump-fn", "std::string", /*default=*/"\"\"",
+           "Print the IR of the function with this name as the pass reads "
+           "it (for debugging the pass)">,
     Option<"cacheDir", "cache-dir", "std::string", /*default=*/"\"\"",
            "Directory to cache solver answers in, by a hash of each script">,
   ];

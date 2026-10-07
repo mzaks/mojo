@@ -8520,6 +8520,11 @@ struct VerifyContractsPass
       emitError(getOperation().getLoc(), "verify-contracts: z3 not found");
       return signalPassFailure();
     }
+    if (!dumpFn.empty())
+      getOperation().walk([&](LIT::FnOp fn) {
+        if (displayName(fn) == dumpFn)
+          fn.print(llvm::errs());
+      });
     SolverConfig solver{z3, rlimit, houdiniRlimit, wallSeconds, dumpDir,
                         cacheDir};
     if (intRetry)
