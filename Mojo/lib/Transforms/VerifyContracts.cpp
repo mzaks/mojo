@@ -3172,6 +3172,104 @@ private:
     state = std::move(joined);
   }
 
+  /// The fields of its `index`th argument, a mutable reference, that
+  /// `callee` may write: the paths it stores to and the paths it passes on
+  /// as mutable references. Null where it may write the whole argument, or
+  /// memory in the default address space through a reference that is
+  /// neither that argument's nor a local variable's (which may then be the
+  /// argument under another name).
+  const std::set<std::string> *writtenFields(LIT::FnOp callee, size_t index,
+                                             size_t operands) {
+    if (!callee || callee.getFunctionBody().empty())
+      return nullptr;
+    Block &entry = callee.getFunctionBody().front();
+    if (entry.getNumArguments() != operands || index >= operands)
+      return nullptr;
+    auto [it, inserted] = calleeWrites.try_emplace(
+        {callee.getOperation(), index}, std::nullopt);
+    if (!inserted)
+      return it->second ? &*it->second : nullptr;
+    Value formal = entry.getArgument(index);
+    // 0: the argument's place (its path in `path`), 1: a local variable's
+    // or another argument's, 2: anything else.
+    std::function<int(Value, std::string &)> rooted =
+        [&](Value ref, std::string &path) -> int {
+      if (ref == formal)
+        return 0;
+      if (isa<BlockArgument>(ref))
+        return ref.getParentRegion() == &callee.getFunctionBody() ? 1 : 2;
+      Operation *def = ref.getDefiningOp();
+      if (!def)
+        return 2;
+      if (isa<LIT::VarDeclOp>(def))
+        return 1;
+      if (isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp>(def))
+        return rooted(def->getOperand(0), path);
+      if (auto gep = dyn_cast<LIT::RefStructGEROp>(def)) {
+        int kind = rooted(gep->getOperand(0), path);
+        if (auto field = gep->getAttrOfType<StringAttr>("field"))
+          path += "/" + field.getValue().str();
+        else
+          path += "/" + printed(gep->getAttrDictionary());
+        return kind;
+      }
+      // A reference a call returns (`self.offsets[v]`, an element of an
+      // array field) is into what its reference arguments lead to: into
+      // the argument's field if one of them is, a local's if all are.
+      if (auto inner = dyn_cast<LIT::CallOp>(def)) {
+        int kind = 2;
+        bool any = false;
+        for (Value operand : inner.getOperands()) {
+          if (!isa<LIT::RefType>(operand.getType()))
+            continue;
+          std::string sub;
+          int k = rooted(operand, sub);
+          if (k == 2)
+            return 2;
+          if (k == 0 && (!any || kind != 0)) {
+            kind = 0;
+            path = sub;
+          } else if (!any) {
+            kind = k;
+          }
+          any = true;
+        }
+        return any ? kind : 2;
+      }
+      return 2;
+    };
+    std::set<std::string> fields;
+    bool whole = false;
+    auto written = [&](Value ref) {
+      auto type = dyn_cast<LIT::RefType>(ref.getType());
+      std::string path;
+      int kind = rooted(ref, path);
+      if (kind == 0) {
+        if (path.empty())
+          whole = true;
+        fields.insert(path);
+      } else if (kind == 2 && !(type && otherSpace(type))) {
+        whole = true;
+      }
+    };
+    callee.walk([&](Operation *op) {
+      if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
+        written(store->getOperand(1));
+      } else if (auto inner = dyn_cast<LIT::CallOp>(op)) {
+        for (Value operand : inner.getOperands())
+          if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
+              ref && !ref.isMutableKnown(false))
+            written(operand);
+      }
+    });
+    if (!whole)
+      it->second = std::move(fields);
+    return it->second ? &*it->second : nullptr;
+  }
+  std::map<std::pair<Operation *, size_t>,
+           std::optional<std::set<std::string>>>
+      calleeWrites;
+
   /// Whether a root is memory in the default address space: a local
   /// variable or an argument, not a reference into shared or global memory
   /// (`ref[AddressSpace.SHARED] self`, a `ref` local bound to such memory).
@@ -5064,14 +5162,27 @@ private:
       if (!origin.ends_with(": !lit.origin<false>") &&
           !covered.count(origin.str()))
         havocOrigin(origin, state, confined);
-    for (Value operand : call.getOperands()) {
+    for (auto [index, operand] : llvm::enumerate(call.getOperands())) {
       auto ref = dyn_cast<LIT::RefType>(operand.getType());
       if (!ref || ref.isMutableKnown(false))
         continue;
-      if (std::optional<Loc> loc = placeOf(operand))
+      if (std::optional<Loc> loc = placeOf(operand)) {
+        // A callee that writes only some fields of the argument (a method
+        // that advances `self.stage`) leaves the others as they are.
+        // Not a call through a trait: its body is the implementation's,
+        // which is not the declaration looked up here.
+        if (const std::set<std::string> *fields =
+                isa<GetWitnessAttr>(call.getCallee())
+                    ? nullptr
+                    : writtenFields(callee, index, call.getNumOperands())) {
+          for (const std::string &field : *fields)
+            forget(Loc{loc->root, loc->path + field}, state);
+          continue;
+        }
         havoc(*loc, state, ref.getElementType());
-      else
+      } else {
         havocOrigin(printed(ref.getOrigin()), state, confined);
+      }
     }
     evalTraitQuery(call, callee, state);
     if (hasBody) {
