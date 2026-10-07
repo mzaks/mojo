@@ -5927,6 +5927,56 @@ private:
       values[result] = term(call.getOperands()[0], state);
       return true;
     }
+    // `rebind[T](x)`: the same value under another type.
+    if (path.starts_with("std::builtin::rebind::rebind[") &&
+        call.getNumOperands() == 1 &&
+        !isa<LIT::RefType>(call.getOperands()[0].getType())) {
+      std::string value = term(call.getOperands()[0], state);
+      Sort to = sortOf(result.getType()), from = sortOfTerm(value);
+      if (to.isBool == from.isBool && (to.isBool || to.width == from.width)) {
+        values[result] = value;
+        if (auto it = records.find(call.getOperands()[0]); it != records.end())
+          records[result] = it->second;
+        return true;
+      }
+    }
+    // `Int(x)` of an `Int` (in a function generic over an `Intable` index):
+    // `x`.
+    if (path.starts_with("std::simd::SIMD::__init__[::Intable") &&
+        call.getNumOperands() == 1) {
+      Value operand = call.getOperands()[0];
+      Type from = operand.getType();
+      if (auto ref = dyn_cast<LIT::RefType>(from))
+        from = ref.getElementType();
+      bool isInt = false;
+      if (auto param = dyn_cast<KGEN::ParamType>(from))
+        isInt = isIntType(resolveParam(param.getParam()));
+      else
+        isInt = isIntPlace(from);
+      Sort target = sortOf(result.getType());
+      if (isInt && !target.isBool && target.width == 64) {
+        std::string value = isa<LIT::RefType>(operand.getType())
+                                ? valueThrough(operand, state)
+                                : term(operand, state);
+        if (!sortOfTerm(value).isBool && sortOfTerm(value).width == 64) {
+          values[result] = value;
+          return true;
+        }
+      }
+      // Of any other `Intable` value: one result per value (the conversion
+      // is assumed to be a function of the value), so a clause's
+      // `Int(index)` is the body's.
+      if (!target.isBool && target.width == 64) {
+        std::string value = isa<LIT::RefType>(operand.getType())
+                                ? valueThrough(operand, state)
+                                : term(operand, state);
+        auto [it, inserted] = intConversions.try_emplace(value, "");
+        if (inserted)
+          it->second = declare(target);
+        values[result] = it->second;
+        return true;
+      }
+    }
     // `t.ptr` (and any other field read through `__getattr_param__`): a
     // function of the tensor's value and the field, so a clause's
     // `t.ptr._extent()` is about the pointer the body reads.
@@ -6874,6 +6924,18 @@ private:
       MaybeTerm n;
       if (loc && loc->path.empty())
         n = arrayLength(*loc);
+      // An array that is a field (`self.a_engine.unsafe_ptr()`): its length
+      // is in the type of the reference it is called on.
+      if (!n)
+        if (auto ref = dyn_cast<LIT::RefType>(call.getOperands()[0].getType()))
+          if (auto type = dyn_cast<LIT::StructType>(ref.getElementType());
+              type && type.getParamValues().size() == 2 &&
+              printed(type.getSymbol()) == "@std::@collections::@array::@Array") {
+            TypedAttr size = type.getParamValues()[1];
+            Sort sort = sortOf(size.getType());
+            if (!sort.isBool && sort.width == 64)
+              n = paramTerm(size, sort);
+          }
       if (!n)
         return false;
       std::string pointer = declare({false, 64, false}, "ptr");
