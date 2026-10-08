@@ -985,7 +985,10 @@ struct SMemTileArray2D[
         Scalar[Self.dtype], MutUntrackedOrigin, address_space=.SHARED
     ]
 
-    def __init__(ref[AddressSpace.SHARED] storage: Self.Storage) -> Self:
+    def __init__(
+        ref[AddressSpace.SHARED] storage: Self.Storage,
+        out result: Self where result.ptr._extent() >= Self.num_elements,
+    ):
         """Initialize from inline storage.
 
         Args:
@@ -994,10 +997,10 @@ struct SMemTileArray2D[
         Returns:
             A new SMemTileArray2D pointing to the storage.
         """
-        return Self(storage.unsafe_ptr())
+        result = Self(storage.unsafe_ptr())
 
     def __init__(
-        out self,
+        out self where self.ptr._extent() >= unsafe_ptr._extent(),
         # TODO: This should correctly propagate mutability
         unsafe_ptr: UnsafePointer[Scalar[Self.dtype], _, address_space=.SHARED],
     ):
@@ -1014,20 +1017,35 @@ struct SMemTileArray2D[
     ]
 
     @inline(.always)
-    def __getitem__[T: Intable](self, index: T) -> Self.Tile:
+    def __getitem__[
+        T: Intable
+    ](
+        self,
+        index: T where (
+            0 <= Int(index) < Self.num_tiles
+            and self.ptr._extent() >= Self.num_elements
+        ),
+        out result: Self.Tile where result.ptr._extent() >= Self.tile_size,
+    ):
         """Get tile at the given index.
 
         Parameters:
             T: Index value type, must be convertible to `Int`.
 
         Args:
-            index: The tile index.
+            index: The tile index, below `num_tiles`. The array's own
+                pointer must have `num_elements` elements.
 
         Returns:
-            A TileTensor-based tile at the given index with swizzled layout.
+            A TileTensor-based tile at the given index with swizzled layout,
+            whose pointer has the tile's `tile_size` elements.
         """
+        # Shared memory holds far less; with these, `num_elements` is exact.
+        comptime assert 1 <= Self.dim0 <= 65536, "dim0 out of range"
+        comptime assert 1 <= Self.dim1 <= 65536, "dim1 out of range"
+        comptime assert 1 <= Self.num_tiles <= 65536, "num_tiles out of range"
         var tile_ptr = self.ptr + Self.tile_size * Int(index)
-        return Self.Tile(
+        result = Self.Tile(
             tile_ptr.as_unsafe_any_origin(),
             Self.tile_layout,
         )
