@@ -93,8 +93,17 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            /*default=*/"\"\"",
            "Testing: translate this SMT-LIB file as the integer retry does, "
            "to <file>.int.smt2, and verify nothing">,
-    Option<"wallSeconds", "wall-seconds", "unsigned", /*default=*/"60",
-           "Wall-clock cap on each z3 process, in seconds">,
+    Option<"intRlimit", "int-rlimit", "unsigned", /*default=*/"1000000",
+           "z3 resource limit of each query of the integer retry (a unit "
+           "of nonlinear integer work takes far longer than a bit-vector "
+           "one)">,
+    Option<"rangeRlimit", "range-rlimit", "unsigned", /*default=*/"300000",
+           "z3 resource limit of each query asking whether a product is "
+           "in range, for the exact integer retry">,
+    Option<"wallSeconds", "wall-seconds", "unsigned", /*default=*/"600",
+           "Wall-clock cap on each z3 process, in seconds: a safety net "
+           "only (every query has a work limit); a run it stops is "
+           "reported, as its result then depends on the machine">,
     Option<"dumpDir", "dump-dir", "std::string", /*default=*/"\"\"",
            "Directory to write the SMT-LIB scripts to">,
     Option<"dumpFn", "dump-fn", "std::string", /*default=*/"\"\"",

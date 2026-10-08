@@ -54,7 +54,9 @@ value of their parameters, `generic-rlimit=` the limit of each such query
 loop-invariant candidate's query (default 1000000, at most a twentieth
 of the query limit; a candidate not decided within it is dropped),
 `wall-seconds=` caps each z3
-process (default 60), `check-division=true` reports integer divisions
+process (default 600: a safety net only, see below), `int-rlimit=` and
+`range-rlimit=` are the limits of the integer retry's queries (defaults
+1000000 and 300000), `check-division=true` reports integer divisions
 by a value that may be 0, `int-retry=false` turns off the integer retry
 (below), `nonlinear-rlimit=` the limit a query whose goal multiplies or
 divides two unknowns is first asked with (default 10000000; then over the
@@ -569,6 +571,17 @@ Not analyzed yet: loops with loop-carried values, and ranges with a step
 obligations inside unsupported control flow are reported as not analyzed.
 `append` does not state the value it adds (a generic `T` has no `==` to state it
 with).
+
+## The same answers on every machine
+
+Every query has a work limit (z3's `rlimit`), none a time limit, so what
+is proven does not depend on how fast or how busy the machine is. Queries
+over the integers have limits of their own (`int-rlimit`, `range-rlimit`):
+a unit of nonlinear integer work can take a thousand times longer than a
+bit-vector one, and z3's own `:timeout` does not stop such a query on
+time. The one clock left is `wall-seconds`, which stops a solver process
+that hangs; a run it stops is reported in the summary (`N solver runs
+were stopped ...`), and its result is then not to be trusted.
 
 ## Expected results
 

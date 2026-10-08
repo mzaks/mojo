@@ -1844,9 +1844,23 @@ Tensors and GPU kernels:
   tried as array-filling ones that could not be, and from helpers
   evaluated that only load through pointers. Still open in this kernel:
   the reads from global memory through `TileTensor._linear_offset`.
-  Also open: one input (the gemv file) gives fewer proofs and takes ten
-  times longer in some runs than in others, with the pass before this
-  step too; the solver work is the same in those runs.
+- No answer depends on the clock any more. The gemv file gave between
+  137 and 155 proven obligations and took 80 to 950 s from run to run,
+  with the same solver work. CPU load did not reproduce it (12 runs with
+  every core busy agreed); freezing the solver processes 80% of the time
+  did: three obligations lost and two solver runs killed at the 60 s
+  cap. The pass had three z3 `:timeout`s (0.5, 1 and 5 s, on the integer
+  retry's queries) and the cap. Measured on the corpus' 916 time-limited
+  queries: those decided need little work (range checks at most 67k
+  units, exact goals 567k, integer retries under 1M for 47 of 49), those
+  not decided burn their whole limit slowly (10M units in a minute), and
+  one ran 314 s under a 60 s `:timeout`. So the timeouts are now work
+  limits (`range-rlimit` 300k, `int-rlimit` 1M, for every integer
+  query), and the cap is a safety net (600 s) whose use is reported.
+  With the solver frozen as before, the gemv file now gives the same
+  diagnostics as on a quiet machine (in 556 s instead of 85). Corpus:
+  1910 obligations proven before and after, pass time 471 s to 440 s.
+  What stalled the original runs is not known.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

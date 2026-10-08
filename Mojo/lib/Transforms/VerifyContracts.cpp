@@ -58,6 +58,7 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/Regex.h"
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -359,7 +360,7 @@ struct SolverConfig {
   /// The limit of each loop-invariant candidate's query (0: a twentieth
   /// of the function's query limit).
   unsigned houdiniRlimit = 0;
-  unsigned wallSeconds = 60;
+  unsigned wallSeconds = 600;
   std::string dumpDir;
   /// Where answers are cached by a hash of the script (empty: no cache).
   std::string cacheDir;
@@ -376,6 +377,8 @@ struct SolverConfig {
   /// products that provably do not overflow taken exactly
   /// (`exactIntegers`); with the integer retry.
   bool exactRetry = false;
+  /// The work limit of each query asking whether a product is in range.
+  unsigned rangeRlimit = 300000;
   /// The scripts already run, or running, in this run of the pass.
   std::shared_ptr<struct ScriptMemo> memo = {};
 };
@@ -426,6 +429,10 @@ struct ScriptMemo {
 
 std::optional<SmallVector<Answer>>
 runScript(const SolverConfig &config, StringRef script, StringRef dumpName);
+
+/// Solver runs stopped at the wall-clock cap, and the queries they left
+/// unanswered: what makes a run's result depend on the machine's load.
+std::atomic<unsigned> stoppedScripts{0}, stoppedQueries{0};
 
 /// Runs z3 on `script` with a wall-clock cap; returns one answer per query
 /// (queries are separated by `(echo "@@")`). A script already run is not
@@ -506,6 +513,7 @@ runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
                       config.wallSeconds);
   if (rc != 0)
     cachePath.clear(); // Stopped (e.g. at the cap): do not cache.
+  bool stopped = rc != 0;
   auto buffer = llvm::MemoryBuffer::getFile(outPath);
   llvm::sys::fs::remove(outPath);
   if (config.dumpDir.empty())
@@ -522,6 +530,10 @@ runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
     answers.push_back(answer == "unsat" ? Answer::Proven
                       : answer == "sat" ? Answer::Unproven
                                         : Answer::Unknown);
+  }
+  if (stopped || answers.size() < expected) {
+    ++stoppedScripts;
+    stoppedQueries += expected - std::min(expected, answers.size());
   }
   if (!cachePath.empty() && answers.size() == expected) {
     std::string text;
@@ -1210,11 +1222,26 @@ std::vector<bool> exactIntegers(const SolverConfig &config, StringRef script,
     // otherwise run long without using up a limit.
     for (auto [c, candidate] : llvm::enumerate(candidates))
       if (takes[q][c])
-        ranges += "(set-option :timeout 500)\n" + text.substr(0, goal) +
+        ranges += text.substr(0, goal) +
                   "(assert (not " +
                   IntTranslator::inRange(candidate.second.width,
                                          candidate.first + "!x") +
                   "))" + text.substr(end);
+  }
+  // Each with a small work limit of its own, not a time limit: what is in
+  // range is seen with little work (at most 67k units on the MAX kernels),
+  // and a query that is not costs the same on every machine.
+  {
+    const std::string option = "(set-option :rlimit ";
+    std::string limit = std::to_string(config.rangeRlimit);
+    for (size_t at = 0;
+         (at = ranges.find(option, at)) != std::string::npos;) {
+      at += option.size();
+      size_t end = ranges.find(')', at);
+      // `:rlimit 0` lifts the limit after a query.
+      if (end != std::string::npos && ranges.compare(at, end - at, "0") != 0)
+        ranges.replace(at, end - at, limit);
+    }
   }
   std::optional<SmallVector<Answer>> inRange =
       runZ3(config, ranges, (name + ".ranges").str());
@@ -1245,7 +1272,7 @@ std::vector<bool> exactIntegers(const SolverConfig &config, StringRef script,
         !exact.translate(queries[q]))
       continue;
     again += (asked.empty() ? "" : "(reset)\n") +
-             std::string("(set-option :timeout 5000)\n") + exact.text();
+             exact.text();
     asked.push_back(q);
   }
   if (asked.empty())
@@ -9824,6 +9851,7 @@ struct VerifyContractsPass
       });
     SolverConfig solver{z3, rlimit, houdiniRlimit, wallSeconds, dumpDir,
                         cacheDir};
+    solver.rangeRlimit = rangeRlimit;
     if (intRetry)
       solver.nonlinearRlimit = nonlinearRlimit;
     solver.exactRetry = intRetry;
@@ -10151,16 +10179,13 @@ struct VerifyContractsPass
                 (lowered && limit == enc.fullLimit()))
               continue;
             open.push_back(k);
-            // Over the integers, nonlinear queries can run for long without
-            // using up their limit; one asked with a lower limit gets 1 s
-            // there, as what stays open is asked again with the full limit.
-            bool capped = !lowered && limit < enc.fullLimit();
-            if (capped)
-              text += "(set-option :timeout 1000)\n";
-            text +=
-                query({ob->pc}, ob->cond, lowered ? enc.fullLimit() : limit);
-            if (capped)
-              text += "(set-option :timeout 0)\n";
+            // Over the integers a unit of work can take a thousand times
+            // longer than over bit-vectors (nonlinear queries: 10M units
+            // in a minute), so these get a limit of their own, not a time
+            // limit: the same answers on every machine.
+            text += query({ob->pc}, ob->cond,
+                          lowered ? enc.fullLimit()
+                                  : std::min<uint64_t>(limit, intRlimit));
           }
           if (open.empty())
             return;
@@ -10451,6 +10476,12 @@ struct VerifyContractsPass
     if (forInstances)
       llvm::errs() << forInstances << " only for the launched instantiations; ";
     llvm::errs() << loops << " loops, " << invariants << " invariants)\n";
+    if (stoppedScripts)
+      llvm::errs() << "verify-contracts: " << stoppedScripts
+                   << " solver runs were stopped at the " << wallSeconds
+                   << " s cap, leaving " << stoppedQueries
+                   << " queries unanswered: this result depends on the "
+                      "machine's load\n";
   }
 };
 
