@@ -74,6 +74,150 @@ def fill_shared(
     pass
 
 
+@always_inline
+def shift_by(a: Int, s: Int) -> Int:
+    # No clauses and one `return`: evaluated where it is called.
+    return a >> s if s > 0 else a << -s
+
+
+struct Mixer(TrivialRegisterPassable):
+    """Moves the `high` bits onto the `low` ones: permutes within blocks."""
+
+    var high: Int
+    var low: Int
+    var shift: Int
+
+    def __init__(out self, shift: Int):
+        self.high = 56 << shift
+        self.low = 56
+        self.shift = shift
+
+    def ok_mix(
+        self,
+        offset: Int,
+        out result: Int where (
+            not (0 < self.shift < 64 and (self.high >> self.shift) == self.low)
+            or (result & ~self.low) == (offset & ~self.low)
+        ),
+    ):
+        result = offset ^ shift_by(offset & self.high, self.shift)
+
+    def bad_mix(
+        self,
+        offset: Int,
+        out result: Int where (result & ~self.low) == (offset & ~self.low),
+    ):
+        # `high >> shift` may reach bits outside `low`.
+        result = offset ^ shift_by(offset & self.high, self.shift)
+
+
+def make_mixer[shift: Int]() -> Mixer:
+    return Mixer(shift)
+
+
+def _below(x: Int, n: Int where 0 <= x < n) -> Int:
+    return x
+
+
+def _take[
+    fill: Optional[Int] = None
+](
+    p: Pointer[Int, MutUntrackedOrigin],
+    n: Int where p._extent() >= (0 if fill else n),
+):
+    pass
+
+
+struct Filler[n: Int]:
+    """Offsets computed once (`prepare`) and read in a loop later."""
+
+    comptime mixer = make_mixer[4]()
+    var base: Int
+    var offsets: Array[Int, Self.n]
+
+    def __init__(out self where self.base == base, base: Int):
+        self.base = base
+        self.offsets = Array[Int, Self.n](uninitialized=True)
+
+    def ok_prepare(
+        mut self where old(0 <= self.base < 64) where (
+            self.base == old(self.base)
+            and all([0 <= self.offsets[v] < 64 * Self.n for v in range(Self.n)])
+        )
+    ):
+        comptime assert 1 <= Self.n <= 65536
+        # What the compiler checks of the comptime value, the clause of
+        # `ok_mix` reads as the fields of the same value.
+        comptime assert Self.mixer.low == 56 and 0 < Self.mixer.shift < 64
+        comptime assert (Self.mixer.high >> Self.mixer.shift) == 56
+        # Each iteration stores its own element, from `v` alone.
+        comptime for v in range(Self.n):
+            self.offsets[v] = Self.mixer.ok_mix(self.base + 64 * v)
+
+    def bad_prepare_any_base(
+        mut self where (
+            self.base == old(self.base)
+            and all([0 <= self.offsets[v] < 64 * Self.n for v in range(Self.n)])
+        )
+    ):
+        comptime assert 1 <= Self.n <= 65536
+        comptime assert Self.mixer.low == 56 and 0 < Self.mixer.shift < 64
+        comptime assert (Self.mixer.high >> Self.mixer.shift) == 56
+        comptime for v in range(Self.n):
+            self.offsets[v] = Self.mixer.ok_mix(self.base + 64 * v)
+
+    def bad_prepare_unchecked_mixer(
+        mut self where old(0 <= self.base < 64) where (
+            self.base == old(self.base)
+            and all([0 <= self.offsets[v] < 64 * Self.n for v in range(Self.n)])
+        )
+    ):
+        comptime assert 1 <= Self.n <= 65536
+        comptime for v in range(Self.n):
+            self.offsets[v] = Self.mixer.ok_mix(self.base + 64 * v)
+
+    def bad_prepare_half(
+        mut self where (
+            self.base == old(self.base)
+            and all([self.offsets[v] == v for v in range(Self.n)])
+        )
+    ):
+        comptime for v in range(Self.n // 2):
+            self.offsets[v] = v
+
+    def bad_prepare_chained(
+        mut self where (
+            self.base == old(self.base)
+            and all([self.offsets[v] == 1 for v in range(Self.n)])
+        )
+    ):
+        # From an element an earlier iteration stored: 1, then 2s.
+        self.offsets[0] = 0
+        comptime for v in range(Self.n):
+            self.offsets[v] = self.offsets[0] + 1
+
+    def ok_sum(
+        self,
+        p: Pointer[Int, MutUntrackedOrigin] where (
+            p._extent() >= 64 * Self.n
+            and all([0 <= self.offsets[v] < 64 * Self.n for v in range(Self.n)])
+        ),
+    ) -> Int:
+        var t = 0
+        comptime for v in range(Self.n):
+            # The offset is read through a reference lent immutably.
+            t += p.unsafe_offset(self.offsets[v])[]
+        return t
+
+    def bad_sum(
+        self, p: Pointer[Int, MutUntrackedOrigin] where p._extent() >= 64 * Self.n
+    ) -> Int:
+        var t = 0
+        comptime for v in range(Self.n):
+            t += p.unsafe_offset(self.offsets[v])[]  # nothing bounds the offsets
+        return t
+
+
 # --- must be PROVEN ---
 def ok_field_store(
     mut r: Ring,
@@ -181,6 +325,16 @@ def ok_bitcast(
     return q[unsafe_offset=i]
 
 
+def ok_prepared(base: Int where 0 <= base < 64) -> Int:
+    var f = Filler[8](base)
+    f.ok_prepare()  # writes `offsets` only: `base` is as constructed
+    return _below(f.offsets[3], 512) + _below(f.base, 64)
+
+
+def ok_filled(p: Pointer[Int, MutUntrackedOrigin]):
+    _take[fill=0](p, 5)  # a fill value: nothing is read
+
+
 # --- must stay UNPROVEN ---
 def bad_after_method(
     mut b: Buffer, i: Int where 0 <= i < b.size and b.data._extent() >= b.size
@@ -259,6 +413,15 @@ def bad_slots(ref storage: Array[Int, 4]) -> Int:
 
 def bad_array_field[size: Int](h: Holder[size]) -> Int:
     return h.items.unsafe_ptr()[unsafe_offset=size]  # one past the end
+
+
+def bad_unprepared(base: Int where 0 <= base < 64) -> Int:
+    var f = Filler[8](base)
+    return _below(f.offsets[3], 512)  # never stored
+
+
+def bad_unfilled(p: Pointer[Int, MutUntrackedOrigin]):
+    _take(p, 5)  # no fill value, and nothing about `p`
 
 
 def main():

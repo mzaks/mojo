@@ -14,6 +14,7 @@
 # Needs the `max` and `layout` packages on the import path (see README.md).
 
 from layout import Idx, TileTensor, row_major, stack_allocation
+from layout.swizzle import make_swizzle
 from max.gpu import block_dim, block_idx, global_idx, thread_idx
 from max.gpu.host import DeviceBuffer, DeviceContext
 from std.utils.coord import Coord, coord
@@ -332,6 +333,29 @@ def ok_matrix_vector(
             c_ptr[unsafe_offset=m] += a_val * b_val
 
 
+def _at_most(x: Int, lim: Int where 0 <= x <= lim) -> Int:
+    return x
+
+
+def ok_tensor_of_pointer(
+    p: Pointer[Float32, MutAnyOrigin] where p._extent() >= 12
+) -> Float32:
+    var t = TileTensor(p, row_major[3, 4]())
+    return t.ptr[unsafe_offset=11]  # the pointer it was built from
+
+
+def ok_swizzled[
+    tile_k: Int
+](lin: Int where 0 <= lin < 16 * tile_k and lin % 8 == 0) -> Int:
+    comptime sw = make_swizzle[8, tile_k, 8]()
+    comptime assert 64 <= tile_k <= 65536 and tile_k % 64 == 0
+    # Checked by the compiler for each `tile_k`: the swizzle moves the bits
+    # of its `yyy_mask` onto bits 3 to 5, so within blocks of 64.
+    comptime assert sw.zzz_mask == 56 and 0 < sw.shift < 64
+    comptime assert (sw.yyy_mask >> sw.shift) == 56
+    return _at_most(sw(lin), 16 * tile_k - 8)
+
+
 # --- must stay UNPROVEN ---
 def bad_static(t: TileTensor[DType.float32, L8, MutAnyOrigin]) -> Float32:
     return t[8]  # one past the end
@@ -553,3 +577,18 @@ def bad_matrix_vector(
             # nothing bounds the dimensions: `M * K` may wrap
             var a_val = a_ptr[unsafe_offset=m * K + k].cast[c.dtype]()
             c_ptr[unsafe_offset=m] += a_val * b_val
+
+
+def bad_tensor_of_pointer(
+    p: Pointer[Float32, MutAnyOrigin] where p._extent() >= 12
+) -> Float32:
+    var t = TileTensor(p, row_major[3, 4]())
+    return t.ptr[unsafe_offset=12]
+
+
+def bad_swizzled[
+    tile_k: Int
+](lin: Int where 0 <= lin < 16 * tile_k and lin % 8 == 0) -> Int:
+    comptime sw = make_swizzle[8, tile_k, 8]()
+    comptime assert 64 <= tile_k <= 65536 and tile_k % 64 == 0
+    return _at_most(sw(lin), 16 * tile_k - 8)  # nothing about its masks

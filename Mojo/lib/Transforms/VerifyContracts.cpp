@@ -1357,6 +1357,9 @@ struct LoopFrame {
   /// Conditions in the body (branches, comparisons, obligations): the
   /// invariants worth finding are about what they depend on.
   SmallVector<std::string> conditions;
+  /// Of `loaded`, the places the body's own code read: not the value a
+  /// store to a field or an element replaces.
+  std::set<Loc> reads;
 };
 
 /// A `lit.try` being walked: the paths that raise into its `except` region.
@@ -2196,6 +2199,8 @@ private:
   /// A struct value made by writing one field of another: the other value
   /// and the field's path in it.
   std::map<std::string, std::pair<std::string, std::string>> updates;
+  /// The pointer each tensor built with `TileTensor(ptr, layout)` holds.
+  std::map<std::string, std::string> tensorPointers;
   /// `Int(x)` of each value of a type that is not known to be `Int`.
   std::map<std::string, std::string> intConversions;
   /// The value of each field read of a tensor (`t.ptr`), by the tensor's
@@ -2351,8 +2356,11 @@ private:
   }
 
   std::string load(const Loc &loc, State &state, Sort sort) {
-    for (LoopFrame *frame : loops)
+    for (LoopFrame *frame : loops) {
       frame->loaded.insert(loc);
+      if (!storing)
+        frame->reads.insert(loc);
+    }
     if (auto it = state.env.find(loc); it != state.env.end())
       return it->second;
     // An element's place: the element, as the collection holds it now.
@@ -2371,10 +2379,14 @@ private:
       std::string rest = StringRef(loc.path).drop_front(path.size()).str();
       return fieldOf(it->second, rest, sort);
     }
-    // A field of a root whose value is unknown: a function of that value.
-    if (!loc.path.empty())
-      return fieldOf(load(Loc{loc.root, ""}, state, Sort{false, 64, false}),
-                     loc.path, sort);
+    // A field of a root whose value is unknown: a function of that value
+    // (which is not read whole).
+    if (!loc.path.empty()) {
+      ++storing;
+      std::string root = load(Loc{loc.root, ""}, state, Sort{false, 64, false});
+      --storing;
+      return fieldOf(root, loc.path, sort);
+    }
     if (state.epoch) {
       auto [it, inserted] = epochValues.try_emplace({loc, state.epoch}, "");
       if (inserted)
@@ -2470,12 +2482,14 @@ private:
     // that field only.
     SmallVector<std::pair<std::string, std::string>> outer;
     StringRef path(loc.path);
+    ++storing;
     while (!path.empty()) {
       path = path.take_front(path.rfind('/'));
       outer.push_back(
           {path.str(),
            load(Loc{loc.root, path.str()}, state, Sort{false, 64, false})});
     }
+    --storing;
     for (auto &[prefix, old] : outer) {
       std::string fresh = declare({false, 64, false}, "h");
       updates[fresh] = {old, loc.path.substr(prefix.size())};
@@ -2506,12 +2520,14 @@ private:
   void forget(const Loc &loc, State &state) {
     SmallVector<std::pair<std::string, std::string>> outer;
     StringRef path(loc.path);
+    ++storing;
     while (!path.empty()) {
       path = path.take_front(path.rfind('/'));
       outer.push_back(
           {path.str(),
            load(Loc{loc.root, path.str()}, state, Sort{false, 64, false})});
     }
+    --storing;
     for (auto it = state.env.begin(); it != state.env.end();)
       it = it->first.root == loc.root &&
                    (it->first.path == loc.path ||
@@ -3129,6 +3145,8 @@ private:
         parameterValues.try_emplace(scope + key + "|" + sort.str(), "");
     if (inserted) {
       it->second = declare(sort, "p");
+      if (key != expr)
+        iterationTerms.insert(it->second);
       // Name it in the script, for `dump-dir` debugging.
       prelude += "; " + it->second + ": " +
                  StringRef(expr).take_front(300).str() + "\n";
@@ -3143,6 +3161,9 @@ private:
     }
     return it->second;
   }
+
+  /// Parameter values that are one iteration's of a `comptime for`.
+  std::set<std::string> iterationTerms;
 
   void walkTry(LIT::TryOp tryOp, State &state) {
     if (tryOp->getNumRegions() < 2 || tryOp->getNumResults()) {
@@ -3253,6 +3274,10 @@ private:
       }
     };
     callee.walk([&](Operation *op) {
+      // A clause writes nothing (`self.offsets[v]` read through `mut self`).
+      if (op->getParentOfType<RequiresOp>() ||
+          op->getParentOfType<EnsuresOp>())
+        return;
       if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
         written(store->getOperand(1));
       } else if (auto inner = dyn_cast<LIT::CallOp>(op)) {
@@ -3269,6 +3294,14 @@ private:
   std::map<std::pair<Operation *, size_t>,
            std::optional<std::set<std::string>>>
       calleeWrites;
+
+  /// Whether a call may write through the implicit origin it is given, as
+  /// printed: not an immutable one, nor a mutable one lent immutably
+  /// (`muttoimm`, for a callee's `imm` reference).
+  static bool mutableOrigin(StringRef origin) {
+    return !origin.ends_with(": !lit.origin<false>") &&
+           !origin.starts_with("muttoimm ");
+  }
 
   /// Whether a root is memory in the default address space: a local
   /// variable or an argument, not a reference into shared or global memory
@@ -3396,7 +3429,7 @@ private:
           // Keep the printed list alive while its elements are used.
           std::string origins = printed(call.getImplicitOriginsAttr());
           for (StringRef origin : topLevelElements(origins))
-            if (!origin.ends_with(": !lit.origin<false>"))
+            if (mutableOrigin(origin))
               addOrigin(origin);
           confined = false;
         } else if (op->getNumRegions() && !seen.count(op) &&
@@ -3464,7 +3497,282 @@ private:
     }
     if (unrollComptimeFor(loop, iterator, count, state))
       return;
+    if (fillComptimeFor(loop, iterator, count, state))
+      return;
     walkLoopBody(loop, loop->getRegion(0).front(), /*comptime=*/true, state);
+  }
+
+  /// Whether the place `ref` refers to may be written through it: stored
+  /// to, or passed on other than as an immutable view.
+  bool writtenThrough(Value ref, int depth = 0) {
+    for (OpOperand &use : ref.getUses()) {
+      Operation *user = use.getOwner();
+      if (isa<LIT::RefImmutOp>(user) ||
+          user->getName().getStringRef() == "lit.ref.load")
+        continue;
+      if (isa<LIT::RefStoreOp>(user)) {
+        if (use.getOperandNumber() == 1)
+          return true;
+        continue;
+      }
+      if (isa<RebindOp, LIT::RefUpcastOp>(user) && depth < 4 &&
+          user->getNumResults() == 1) {
+        if (writtenThrough(user->getResult(0), depth + 1))
+          return true;
+        continue;
+      }
+      // Passed to a callee that takes it immutably (a pointer offset).
+      if (auto call = dyn_cast<LIT::CallOp>(user))
+        if (LIT::FnOp callee = lookup(call);
+            callee && !callee.getFunctionBody().empty()) {
+          Block &entry = callee.getFunctionBody().front();
+          unsigned at = use.getOperandNumber();
+          if (entry.getNumArguments() == call.getNumOperands() &&
+              at < entry.getNumArguments())
+            if (auto formal =
+                    dyn_cast<LIT::RefType>(entry.getArgument(at).getType());
+                formal && formal.isMutableKnown(false))
+              continue;
+        }
+      return true;
+    }
+    return false;
+  }
+  /// While `fillComptimeFor` walks a loop's body.
+  bool fillProbe = false;
+
+  /// A `comptime for v in range(count)` that fills arrays: all its body
+  /// changes outside itself is element `v` of some arrays, which it does
+  /// not read (`self.offsets[v] = f(v)` in a `prepare`). Every iteration
+  /// then starts from the state before the loop, so its body is walked
+  /// once from that state for an arbitrary `v`, and after the loop each
+  /// array holds, at every index in the range, the element that iteration
+  /// stored, as a quantified fact: with the body's path condition (what
+  /// its calls ensure about the values they return), and with each
+  /// unknown the body made (a call's result) as a function of the index.
+  /// Its other elements are as before.
+  bool fillComptimeFor(Operation *loop, const std::string &iterator,
+                       const std::string &count, State &state) {
+    if (iterator.empty() || count.empty() ||
+        comptimeIterations.count(iterator))
+      return false;
+    // Only a loop that writes an element chosen by a comptime index.
+    bool candidate = false;
+    loop->walk([&](LIT::CallOp call) {
+      std::optional<CalleeName> name = calleeName(call.getCallee());
+      if (!name || call->getNumResults() != 1 ||
+          !StringRef(name->path)
+               .starts_with("std::collections::array::Array::"
+                            "__getitem_param__["))
+        return;
+      auto ref = dyn_cast<LIT::RefType>(call->getResult(0).getType());
+      auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+      // At the loop's own index (`xs[v]`, not `xs[base + v]`).
+      auto index = symbol && symbol.getParamValues().size() >= 3
+                       ? dyn_cast<ParamOperatorAttr>(symbol.getParamValues()[2])
+                       : ParamOperatorAttr();
+      candidate = candidate ||
+                  (ref && !ref.isMutableKnown(false) && index &&
+                   index.getOpcode() == POC::ApplyResultSlot &&
+                   StringRef(printed(index)).contains(iterator));
+    });
+    // The body is walked here and, if it is not such a loop, again as any
+    // loop is: not one with loops of its own, whose invariants would be
+    // searched for twice.
+    loop->walk([&](Operation *op) {
+      if (op != loop && (isa<HLCF::LoopOp>(op) ||
+                         op->getName().getStringRef() == "hlcf.comptime.for"))
+        candidate = false;
+    });
+    if (!candidate)
+      return false;
+    size_t recorded = obligations.size();
+    unsigned firstName = counter;
+    Sort index{false, 64, true};
+    std::string k = declare(index, "k");
+    comptimeIterations[iterator] = k;
+    auto forgetConstants = [&] {
+      loop->walk([&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
+    };
+    forgetConstants();
+    LoopFrame frame{labelOf(loop), true, {}, {}, {}, {}, {}};
+    loops.push_back(&frame);
+    State body = state;
+    body.yields.clear();
+    bool outer = fillProbe;
+    fillProbe = true;
+    walkBlock(loop->getRegion(0).front(), body);
+    fillProbe = outer;
+    loops.pop_back();
+    comptimeIterations.erase(iterator);
+    forgetConstants();
+    auto fail = [&] {
+      obligations.truncate(recorded);
+      return false;
+    };
+    // The `break` of the iterator's end is on an arm that is not taken
+    // here; any other leaves iterations out.
+    llvm::erase_if(frame.breaks,
+                   [](const State &exit) { return exit.pc == "false"; });
+    llvm::erase_if(frame.continues,
+                   [](const State &exit) { return exit.pc == "false"; });
+    if (!frame.breaks.empty() || body.alive == !frame.continues.empty() ||
+        frame.continues.size() > 1)
+      return fail();
+    State &end = body.alive ? body : frame.continues.front();
+    if (end.epoch != state.epoch)
+      return fail();
+    // What changed: locals of the body, and one element of each array.
+    SmallVector<std::pair<Loc, ElementStore>> filled;
+    SmallVector<std::pair<Loc, std::string>> holders;
+    for (auto &[loc, value] : end.env) {
+      Operation *def = loc.root.getDefiningOp();
+      if (def && loop->isAncestor(def))
+        continue;
+      if (auto was = state.env.find(loc);
+          was != state.env.end() && was->second == value)
+        continue;
+      // A struct holding such an array: checked below.
+      if (updates.count(value)) {
+        holders.push_back({loc, value});
+        continue;
+      }
+      auto stored = elementStores.find(value);
+      if (stored == elementStores.end() || stored->second.index != k)
+        return fail();
+      State entry = state;
+      if (load(loc, entry, placeType(loc)) != stored->second.old)
+        return fail();
+      filled.push_back({loc, stored->second});
+    }
+    for (auto &[loc, value] : state.env)
+      if (!end.env.count(loc))
+        return fail();
+    if (filled.empty())
+      return fail();
+    // A struct's new value differs from its value before the loop in those
+    // array fields only.
+    for (auto &[loc, value] : holders) {
+      State entry = state;
+      std::string was = load(loc, entry, Sort{false, 64, false});
+      std::string current = value;
+      for (int steps = 0; current != was; ++steps) {
+        auto update = updates.find(current);
+        if (update == updates.end() || steps > 16)
+          return fail();
+        Loc field{loc.root, loc.path + update->second.second};
+        if (llvm::none_of(filled,
+                          [&](auto &entry) { return !(entry.first < field) &&
+                                                    !(field < entry.first); }))
+          return fail();
+        current = update->second.first;
+      }
+    }
+    // Which terms are one iteration's: the index, an unknown the body
+    // made, and what is defined from those. A field read for the first
+    // time (of a value that is not) and a parameter are not.
+    std::map<std::string, bool> variesMemo;
+    std::function<bool(const std::string &)> varies =
+        [&](const std::string &name) -> bool {
+      if (name == k)
+        return true;
+      if (auto it = variesMemo.find(name); it != variesMemo.end())
+        return it->second;
+      variesMemo[name] = false;
+      bool result = false;
+      if (definitions.count(name)) {
+        if (auto it = deps.find(name); it != deps.end())
+          for (const std::string &dep : it->second)
+            result = result || varies(dep);
+      } else if (unsigned id; name.size() > 1 && llvm::isLower(name[0]) &&
+                              !StringRef(name).drop_front().getAsInteger(10,
+                                                                         id) &&
+                              id >= firstName && sorts.count(name)) {
+        if (name[0] == 'f') {
+          auto owner = fieldOwners.find(name);
+          result = owner == fieldOwners.end() || varies(owner->second.first);
+        } else if (name[0] == 'p') {
+          result = iterationTerms.count(name) != 0;
+        } else {
+          result = name[0] != 'e' && name[0] != 'a';
+        }
+      }
+      variesMemo[name] = result;
+      return result;
+    };
+    // The arrays must not be read, whole, in part, or as a part of the
+    // struct holding them: an iteration would see what the ones before it
+    // stored, not the value before the loop.
+    for (Loc read : frame.reads) {
+      if (auto element = elements.find(read.root); element != elements.end())
+        read = element->second.first;
+      for (auto &[loc, st] : filled)
+        if (read.root == loc.root &&
+            (StringRef(loc.path).starts_with(read.path) ||
+             StringRef(read.path).starts_with(loc.path)))
+          return fail();
+    }
+    // `term` over the bound index: definitions that vary inlined, and each
+    // unknown that varies as a function of the index.
+    std::map<std::string, std::string> memo;
+    std::function<std::string(StringRef)> over = [&](StringRef term) {
+      std::string out;
+      for (size_t i = 0; i < term.size();) {
+        if (llvm::isAlpha(term[i]) &&
+            (i == 0 || (!llvm::isAlnum(term[i - 1]) && term[i - 1] != '#'))) {
+          size_t j = i + 1;
+          while (j < term.size() && llvm::isAlnum(term[j]))
+            ++j;
+          std::string name = term.slice(i, j).str();
+          if (name != k && varies(name)) {
+            auto [it, inserted] = memo.try_emplace(name, "");
+            if (inserted) {
+              if (auto def = definitions.find(name); def != definitions.end()) {
+                it->second = over(def->second);
+              } else {
+                std::string fn = "sk" + std::to_string(counter++);
+                prelude += "(declare-fun " + fn + " (" + index.str() + ") " +
+                           sorts[name].str() + ")\n";
+                it->second = "(" + fn + " " + k + ")";
+              }
+            }
+            out += memo[name];
+          } else {
+            out += name;
+          }
+          i = j;
+          continue;
+        }
+        out += term[i++];
+      }
+      return out;
+    };
+    std::string range = "(and (bvsle " + bvConst(0, 64) + " " + k +
+                        ") (bvslt " + k + " " + count + "))";
+    std::string all = over(end.pc);
+    State after = state;
+    for (auto &[loc, st] : filled) {
+      Sort sort = sortOfTerm(st.value);
+      std::string fn = "elem" + std::to_string(sort.isBool ? 1 : sort.width) +
+                       (sort.isBool ? "b" : "");
+      std::string updated = declare({false, 64, false}, "h");
+      elem(updated, k, sort); // Declares the function.
+      facts.push_back("(= " + lenOf(updated) + " " + lenOf(st.old) + ")");
+      facts.push_back("(forall ((j (_ BitVec 64))) (! (=> (not (and (bvsle " +
+                      bvConst(0, 64) + " j) (bvslt j " + count + "))) (= (" +
+                      fn + " " + updated + " j) (" + fn + " " + st.old +
+                      " j))) :pattern ((" + fn + " " + updated + " j))))");
+      all = "(and " + all + " (= (" + fn + " " + updated + " " + k + ") " +
+            over(st.value) + "))";
+      store(loc, after, updated);
+    }
+    after.pc = define({true, 1, false},
+                      "(and " + state.pc + " (forall ((" + k + " " +
+                          index.str() + ")) (=> " + range + " " + all + ")))",
+                      "r");
+    after.yields = state.yields;
+    state = std::move(after);
+    return true;
   }
 
   /// A `comptime for` over `range(count)` with a small constant count: its
@@ -4146,6 +4454,36 @@ private:
       evalConstant(cst);
       return;
     }
+    // A parameter's value at run time (`fill` in a clause). An `Optional`
+    // parameter built from a value, or from `None` (its default), holds
+    // one or not.
+    if (auto materialized = dyn_cast<ParamMaterializeOp>(op);
+        materialized) {
+      Value result = materialized->getResult(0);
+      std::string value =
+          paramTerm(materialized.getValue(), sortOf(result.getType()));
+      values[result] = value;
+      auto built = dyn_cast<ParamOperatorAttr>(
+          resolveParam(materialized.getValue()));
+      if (!built || built.getOpcode() != POC::ApplyResultSlot ||
+          built.getOperands().empty())
+        return;
+      TypedAttr callee = built.getOperands()[0];
+      for (auto rebind = dyn_cast<ParamOperatorAttr>(callee);
+           rebind && rebind.getOpcode() == POC::Rebind &&
+           rebind.getOperands().size() == 1;
+           rebind = dyn_cast<ParamOperatorAttr>(callee))
+        callee = rebind.getOperands()[0];
+      std::optional<CalleeName> name = calleeName(callee);
+      StringRef path = name ? StringRef(name->path) : StringRef();
+      if (path.consume_front("std::collections::optional::Optional::")) {
+        if (path.starts_with("__init__(None)"))
+          fieldValues.try_emplace({value, "/has"}, "false");
+        else if (path.starts_with("__init__($0$)"))
+          fieldValues.try_emplace({value, "/has"}, "true");
+      }
+      return;
+    }
     if (isa<RebindOp>(op)) {
       Value input = op->getOperand(0), result = op->getResult(0);
       values[result] = term(input, state);
@@ -4286,6 +4624,36 @@ private:
       if (intLiteralRe.match(type, &m) && !m[1].getAsInteger(10, v))
         values[result] = bvConst(v, 64);
     }
+    // An integer literal as a scalar of a dtype that is the function's
+    // parameter (`s > 0` for `s: Scalar[a.dtype]`), where a call binds that
+    // dtype to an integer one.
+    if (!values.count(result) && !sort.isBool) {
+      static llvm::Regex genericRe(
+          "__init__\\[!pop\\.int_literal\\]\\(::IntLiteral\\[\\$2\\]\\)\"<"
+          ":!lit\\.struct<@std::@builtin::@dtype::@DType> \\*\"([^\"]*)\", "
+          ":!lit\\.struct<@std::@builtin::@simd_length::@SIMDLength> \\{1\\}, "
+          ":!pop\\.int_literal (-?[0-9]+)>");
+      int64_t v;
+      if (genericRe.match(text, &m) && !m[2].getAsInteger(10, v)) {
+        StringRef dtype = m[1];
+        TypedAttr bound;
+        for (ParamFrame *frame = params; frame; frame = frame->parent) {
+          auto it = frame->values.find(dtype);
+          if (it == frame->values.end())
+            continue;
+          bound = it->second;
+          auto ref = dyn_cast<ParamDeclRefAttr>(bound);
+          if (!ref)
+            break;
+          dtype = ref.getName().getValue();
+          bound = TypedAttr();
+        }
+        if (bound)
+          if (std::optional<Sort> scalar = dtypeSort(printed(bound));
+              scalar && scalar->width == sort.width)
+            values[result] = bvConst(v, sort.width);
+      }
+    }
     // A parameter expression.
     if (!values.count(result))
       values[result] = paramTerm(cst.getValue(), sort);
@@ -4301,6 +4669,17 @@ private:
             break;
           }
     }
+  }
+
+  /// `value << amount` or `value >> amount` (`pop.shl`, `pop.shr`): the
+  /// shift for an amount below the width, an unknown value for any other.
+  std::string shiftTerm(bool left, Sort sort, const std::string &value,
+                        const std::string &amount) {
+    std::string op = left ? "bvshl" : sort.isSigned ? "bvashr" : "bvlshr";
+    std::string other = declare(sort);
+    return define(sort, "(ite (bvult " + amount + " " +
+                            bvConst(sort.width, sort.width) + ") (" + op +
+                            " " + value + " " + amount + ") " + other + ")");
   }
 
   /// An integer or Boolean `SIMD` operator on terms, as its SMT expression.
@@ -4343,6 +4722,10 @@ private:
     if (args.size() == 1 && method == "__neg__") {
       resultSort = sort;
       return "(bvneg " + args[0] + ")";
+    }
+    if (args.size() == 1 && method == "__invert__" && !sort.isBool) {
+      resultSort = sort;
+      return "(bvnot " + args[0] + ")";
     }
     return std::nullopt;
   }
@@ -4669,6 +5052,17 @@ private:
     if (auto extract = dyn_cast<LIT::StructExtractAttr>(attr);
         extract && extract.getField().getValue() == "_mlir_value")
       return paramTerm(extract.getStructValue(), sort, depth + 1);
+    // A field of a struct value that is not a literal (what a comptime call
+    // returned): the field a read of that value at run time has.
+    if (auto extract = dyn_cast<LIT::StructExtractAttr>(attr);
+        extract && depth < 16 &&
+        !isa<LIT::LITStructAttr>(extract.getStructValue()) &&
+        isa<LIT::StructType>(extract.getStructValue().getType()) &&
+        !isScalar(extract.getStructValue().getType())) {
+      TypedAttr base = extract.getStructValue();
+      return fieldOf(paramTerm(base, sortOf(base.getType()), depth + 1),
+                     "/" + extract.getField().getValue().str(), sort);
+    }
     // A dtype's code (`DType.__eq__` compares these).
     if (auto code = dyn_cast<POP::DTypeToUI8Attr>(attr);
         code && !sort.isBool && sort.width == 8)
@@ -4737,6 +5131,12 @@ private:
                                                         : (b ? "xor" : "bvxor");
           return define(sort, fold(smt, sort));
         }
+        break;
+      case POC::Shl:
+      case POC::Shr:
+        if (ops.size() == 2 && !sort.isBool)
+          return shiftTerm(expr.getOpcode() == POC::Shl, sort, sub(0, sort),
+                           sub(1, sort));
         break;
       case POC::EQ:
         if (ops.size() == 2)
@@ -4823,6 +5223,11 @@ private:
                                      .drop_front(strlen("std::simd::SIMD::"))
                                      .take_until([](char c) { return c == '('; });
               Sort resultSort;
+              if (args.size() == 2 && !simdSort->isBool && !sort.isBool &&
+                  sort.width == simdSort->width &&
+                  (method == "__lshift__" || method == "__rshift__"))
+                return shiftTerm(method == "__lshift__", *simdSort, args[0],
+                                 args[1]);
               if (MaybeTerm t = simdOperator(method, *simdSort, args, resultSort);
                   t && resultSort.isBool == sort.isBool &&
                   (sort.isBool || resultSort.width == sort.width))
@@ -5130,6 +5535,108 @@ private:
     return true;
   }
 
+  /// Whether `fn` is a helper that only computes a value: no clauses, no
+  /// loop, nothing raised, and one `return`, the last operation of its
+  /// body (`def shiftr(a, s): return a >> s if s > 0 else a << -s`).
+  bool isExpression(LIT::FnOp fn) {
+    auto [it, inserted] = expressionFns.try_emplace(fn, false);
+    if (!inserted)
+      return it->second;
+    Block &entry = fn.getFunctionBody().front();
+    if (entry.empty() || !isa<HLCF::ReturnOp>(entry.back()) ||
+        entry.back().getNumOperands() != 1)
+      return false;
+    unsigned count = 0, returns = 0;
+    bool plain = true;
+    fn->walk([&](Operation *op) {
+      if (op == fn.getOperation())
+        return;
+      ++count;
+      returns += isa<HLCF::ReturnOp>(op);
+      StringRef opName = op->getName().getStringRef();
+      // Arithmetic only: a call of anything but an integer or Boolean
+      // operator (a load through a pointer, another helper) is not worth
+      // evaluating here (measured: more solver work, nothing proven).
+      if (auto call = dyn_cast<LIT::CallOp>(op)) {
+        std::optional<CalleeName> callee = calleeName(call.getCallee());
+        if (!callee ||
+            !(StringRef(callee->path).starts_with("std::simd::SIMD::__") ||
+              StringRef(callee->path).starts_with("std::builtin::bool::Bool::__")))
+          plain = false;
+      }
+      if (isa<RequiresOp, EnsuresOp, HLCF::LoopOp, LIT::FnOp, ParamAssertOp>(
+              op) ||
+          opName == "lit.error_return" || opName.contains("for") ||
+          opName.contains("while") || opName.contains("try"))
+        plain = false;
+    });
+    bool result = plain && returns == 1 && count <= 64;
+    expressionFns[fn] = result;
+    return result;
+  }
+  DenseMap<Operation *, bool> expressionFns;
+  unsigned transparentDepth = 0;
+
+  /// A call of such a helper, outside the standard library, that is given
+  /// nothing it could write and returns an integer or a Boolean: the value
+  /// its body computes from the arguments here. Its body's own obligations
+  /// are its own (it is verified on its own); only the value is taken.
+  bool evalTransparent(LIT::CallOp call, const CalleeName &name,
+                       LIT::FnOp callee, ParamFrame &frame, State &state) {
+    if (inContract || transparentDepth >= 3 || call->getNumResults() != 1 ||
+        !isScalar(call->getResult(0).getType()) ||
+        !isa<SymbolConstantAttr>(call.getCallee()) ||
+        StringRef(name.path).starts_with("std::") ||
+        StringRef(printed(call.getCallee().getType())).contains(" throws") ||
+        !isExpression(callee))
+      return false;
+    Block &entry = callee.getFunctionBody().front();
+    if (entry.getNumArguments() != call.getNumOperands())
+      return false;
+    for (Value operand : call.getOperands())
+      if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
+          ref && !ref.isMutableKnown(false))
+        return false;
+    std::string origins = printed(call.getImplicitOriginsAttr());
+    for (StringRef origin : topLevelElements(origins))
+      if (mutableOrigin(origin))
+        return false;
+    for (auto [arg, operand] :
+         llvm::zip(entry.getArguments(), call.getOperands())) {
+      if (isa<LIT::RefType>(arg.getType())) {
+        refArgs.erase(arg);
+        if (std::optional<Loc> loc = placeOf(operand))
+          refArgs[arg] = *loc;
+      } else {
+        values[arg] = term(operand, state);
+      }
+    }
+    // Its parameter expressions are this call's.
+    callee->walk([&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
+    size_t recorded = obligations.size();
+    ParamFrame *saved = params;
+    params = &frame;
+    SmallVector<State> exits;
+    closureExits.push_back(&exits);
+    ++transparentDepth;
+    State body = state;
+    body.yields.clear();
+    walkBlock(entry, body);
+    --transparentDepth;
+    closureExits.pop_back();
+    params = saved;
+    obligations.truncate(recorded);
+    if (exits.size() != 1)
+      return false;
+    Value result = call->getResult(0);
+    std::string value = term(entry.back().getOperand(0), exits[0]);
+    Sort sort = sortOf(result.getType()), got = sortOfTerm(value);
+    if (sort.isBool != got.isBool || (!sort.isBool && sort.width != got.width))
+      return false;
+    values[result] = value;
+    return true;
+  }
+
   void evalCall(LIT::CallOp call, State &state) {
     if (inlineClosure(call, state))
       return;
@@ -5226,6 +5733,9 @@ private:
       return;
     if (name && evalElementAccess(call, *name, state))
       return;
+    if (name && hasBody && contract == callee &&
+        evalTransparent(call, *name, callee, frame, state))
+      return;
     // The call's effects: its results are unknown, and so is memory it may
     // write: through its mutable reference arguments, and through the
     // mutable origins it is given (e.g. inside a struct passed by value).
@@ -5248,7 +5758,7 @@ private:
         covered.insert(printed(ref.getOrigin()));
     bool confined = confinedWrites(call);
     for (StringRef origin : topLevelElements(origins))
-      if (!origin.ends_with(": !lit.origin<false>") &&
+      if (mutableOrigin(origin) &&
           !covered.count(origin.str()))
         havocOrigin(origin, state, confined);
     for (auto [index, operand] : llvm::enumerate(call.getOperands())) {
@@ -5617,6 +6127,8 @@ private:
           path.starts_with("std::collections::deque::Deque::__getitem__") ||
           path.starts_with("std::collections::array::Array::__getitem__") ||
           path.starts_with(
+              "std::collections::array::Array::__getitem_param__[") ||
+          path.starts_with(
               "std::collections::linked_list::LinkedList::get_nth[")) ||
         call->getNumResults() != 1 || call.getNumOperands() < 1 ||
         !isa<LIT::RefType>(call->getResult(0).getType()))
@@ -5625,6 +6137,28 @@ private:
     if (!list)
       return false;
     std::string index;
+    // `xs[v]` with a comptime `v` (`__getitem_param__[v]`): the index is the
+    // method's first parameter, after the array's two.
+    if (path.contains("::__getitem_param__[")) {
+      auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+      if (!symbol || symbol.getParamValues().size() < 3 ||
+          call.getNumOperands() != 1)
+        return false;
+      index = paramTerm(symbol.getParamValues()[2], Sort{false, 64, true});
+      if (sortOfTerm(index).isBool || sortOfTerm(index).width != 64)
+        return false;
+      Value result = call->getResult(0);
+      // An element that is written is modelled only where a loop is tried
+      // as one that fills its arrays (`fillComptimeFor`): in any other
+      // loop the store's quantified facts cost the invariant search far
+      // more than they prove (measured on the MAX kernels), and the call
+      // makes the array unknown as before.
+      if (!fillProbe && writtenThrough(result))
+        return false;
+      values[result] = declare({false, 64, false}, "g");
+      elements[result] = {*list, index};
+      return true;
+    }
     // `xs[0]`: the index is a parameter, `!pop.int_literal`.
     static llvm::Regex literalRe("int_literal (-?[0-9]+)|"
                                  "#pop<int_literal (-?[0-9]+)>");
@@ -6298,6 +6832,13 @@ private:
       Sort field = sortOf(result.getType());
       if (sortOfTerm(tensor).isBool || sortOfTerm(tensor).width != 64)
         return false;
+      // The pointer the tensor was built from.
+      if (auto built = tensorPointers.find(tensor);
+          built != tensorPointers.end() && !field.isBool &&
+          field.width == 64) {
+        values[result] = built->second;
+        return true;
+      }
       // `ptr` is the one field this getter reads, whatever the tensor's
       // type parameters are spelled as (a kernel's and its launcher's).
       auto [it, inserted] = tensorFields.try_emplace({tensor, "ptr"}, "");
@@ -6305,6 +6846,28 @@ private:
         it->second = declare(field);
       values[result] = it->second;
       return true;
+    }
+    // `TileTensor(ptr, layout)` over a pointer (the default engine's
+    // storage, passed by reference to the constructor): its `ptr` is that
+    // pointer.
+    if (path.starts_with("layout::tile_tensor::TileTensor::__init__(") &&
+        call.getNumOperands() == 2) {
+      Value storage = call.getOperands()[0];
+      Type type = storage.getType();
+      if (auto ref = dyn_cast<LIT::RefType>(type))
+        type = ref.getElementType();
+      if (StringRef(printed(type))
+              .starts_with("!lit.struct<@std::@memory::@pointer::@Pointer<")) {
+        std::string pointer = isa<LIT::RefType>(storage.getType())
+                                  ? valueThrough(storage, state)
+                                  : term(storage, state);
+        setResultsUnknown(call);
+        std::string tensor = values[result];
+        if (!sortOfTerm(tensor).isBool && sortOfTerm(tensor).width == 64 &&
+            !sortOfTerm(pointer).isBool && sortOfTerm(pointer).width == 64)
+          tensorPointers[tensor] = pointer;
+        return true;
+      }
     }
     // The implicit conversion of a mutable tensor to an immutable one: the
     // same tensor (layout and storage), so the same dimensions.
@@ -8118,7 +8681,9 @@ private:
   /// Writing element `index` of the list at `list` with `value`.
   void storeElement(const Loc &list, StringRef index, StringRef value,
                     State &state) {
+    ++storing;
     std::string old = load(list, state, placeType(list));
+    --storing;
     std::string updated = declare({false, 64, false}, "h");
     Sort sort = sortOfTerm(value);
     std::string fn = "elem" + std::to_string(sort.isBool ? 1 : sort.width) +
@@ -8132,8 +8697,18 @@ private:
                      ")) (= (" + fn + " " + updated + " j) (" + fn + " " + old +
                      " j))) :pattern ((" + fn + " " + updated + " j))))")
                         .str());
+    elementStores[updated] = {old, index.str(), value.str()};
     store(list, state, updated);
   }
+  /// While a store loads the value it replaces a part of, or a field's
+  /// read the value of the place it is a field of.
+  unsigned storing = 0;
+  /// What each collection value made by an element write is: the value
+  /// before, the index, and the element written.
+  struct ElementStore {
+    std::string old, index, value;
+  };
+  std::map<std::string, ElementStore> elementStores;
 
   /// Integer and Boolean operators, `len`, and `range` iteration.
   bool evalBuiltin(LIT::CallOp call, const CalleeName &name, State &state) {
@@ -8324,6 +8899,27 @@ private:
     if (!path.starts_with("std::simd::SIMD::__") || name.params.size() < 2)
       return false;
     std::optional<Sort> sort = dtypeSort(name.params[0]);
+    // A dtype that is the enclosing function's parameter (`Scalar[a.dtype]`
+    // in a helper evaluated at its call): what the call binds it to.
+    std::string boundDtype;
+    if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+        !sort && symbol && !symbol.getParamValues().empty()) {
+      boundDtype = printed(resolveParam(symbol.getParamValues()[0]));
+      sort = dtypeSort(boundDtype);
+      // The operands were given their sorts where the dtype was not known.
+      for (Value v : call.getOperands()) {
+        if (!sort)
+          break;
+        if (isa<LIT::RefType>(v.getType())) {
+          sort.reset();
+          break;
+        }
+        Sort got = sortOfTerm(term(v, state));
+        if (got.isBool != sort->isBool ||
+            (!got.isBool && got.width != sort->width))
+          sort.reset();
+      }
+    }
     if (!sort || !isWidthOne(name.params[1]))
       return false;
     StringRef method = path.drop_front(strlen("std::simd::SIMD::"));
@@ -8392,6 +8988,17 @@ private:
       checkDivisor(call, operand(1), state);
     if (call.getNumOperands() == 1 && method == "__neg__") {
       values[result] = define(*sort, "(bvneg " + operand(0) + ")");
+      return true;
+    }
+    if (call.getNumOperands() == 1 && method == "__invert__" &&
+        !sort->isBool) {
+      values[result] = define(*sort, "(bvnot " + operand(0) + ")");
+      return true;
+    }
+    if (call.getNumOperands() == 2 && !sort->isBool &&
+        (method == "__lshift__" || method == "__rshift__")) {
+      values[result] =
+          shiftTerm(method == "__lshift__", *sort, operand(0), operand(1));
       return true;
     }
     return false;

@@ -531,6 +531,37 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   so what is proven holds for every value of them.
 - `Int.MAX`, `Int.MIN` and the bounds of the other integer dtypes
   (`max_or_inf`, `min_or_neg_inf`) are their values.
+- `x << s`, `x >> s` (arithmetic for a signed dtype) and `~x` of
+  integers; a shift by the width or more is an unknown value.
+- A helper outside the standard library that has no clauses and one
+  `return`, no loop, and is given nothing it could write
+  (`def shiftr(a, s): return a >> s if s > 0 else a << -s`, a struct's
+  `_k_project`) is evaluated where it is called, when it returns an
+  integer or a Boolean and calls nothing but integer and Boolean
+  operators (helpers that load through pointers cost solver work on the
+  MAX kernels and proved nothing). Its own obligations stay its own.
+- A field of a comptime struct value (`Self.swizzle.zzz_mask` in a
+  `comptime assert`) is the field a clause reads of that value at run
+  time (`self.zzz_mask` when `Self.swizzle(x)` is called). So what the
+  compiler checks of a comptime value, a callee's clause can use.
+- `xs[v]` with a comptime `v` (`Array.__getitem_param__`) is the element
+  where it is read. A `comptime for v in range(n)` without loops of its
+  own, whose body changes nothing outside itself but element `v` of some
+  arrays (at the loop's own index), and reads none of them, leaves
+  each with the element the body stores at every index in the range (a
+  quantified fact, for any `n`); what a call in the body returns is one
+  value per index. `all([... self.offsets[v] ... for v in range(n)])` in
+  a clause is then how one method hands such an array to another. Any
+  other store to a comptime-indexed element makes the array unknown.
+- A clause on `mut self` that names `old(...)` is a postcondition only
+  (`self.base == old(self.base) and all([...])`); a method's clauses do
+  not count as writes of the fields they read.
+- A mutable origin lent immutably to a call (`muttoimm`: an `imm`
+  reference to an element, passed as a pointer offset) is not written.
+- An `Optional` comptime parameter built from a value, or left at its
+  `None` default, holds one or not where a clause tests it (`fill` of
+  `async_copy`).
+- `TileTensor(ptr, layout)`: the tensor's `ptr` is that pointer.
 
 Not analyzed yet: loops with loop-carried values, and ranges with a step
 (`range(a, b, c)`) or over other integer types. Lists built from other iterables

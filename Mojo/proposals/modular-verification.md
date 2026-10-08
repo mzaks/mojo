@@ -1822,6 +1822,31 @@ Tensors and GPU kernels:
   pointer of an array field, a loop's parameters as invariant bounds,
   and clauses kept when a reference argument is not tracked. See the
   README. `dump-fn=` prints a function as the pass reads it.
+- `gemm_mma_cpasync`, second part: the shared-memory side. Copies into
+  a tile go to swizzled offsets that one method (`prepare`) stores in an
+  array field and another reads in its loop; the tensor-core loads read
+  at swizzled offsets computed in place. `Swizzle.__call__` now states
+  what it keeps (every bit outside its `zzz_mask`, when a right shift
+  moves the `yyy` bits onto it), proven from its body; the kernel pins
+  the masks of its swizzle with `comptime assert`s, which the compiler
+  checks per instantiation; and `prepare` states its array with a
+  quantified clause. In the pass: shifts and `~`, clause-less helpers
+  with one `return` evaluated at their calls, the fields of a comptime
+  struct value, a `comptime for` that fills an array (a quantified fact
+  for any count, not an unrolling), comptime-indexed array elements,
+  `Optional` comptime parameters, and two fixes to what a call is taken
+  to write (clauses, `muttoimm` origins). The first version of the
+  array rule proved a false example (an iteration reading an element an
+  earlier one stored, which the pass had folded to the stored value);
+  reads are now tracked where they happen. Cost on the 44 corpus inputs:
+  as many obligations proven as before (1892), 5% more solver work
+  (5.83B to 6.14B units); a first version cost 25% more, from loops
+  tried as array-filling ones that could not be, and from helpers
+  evaluated that only load through pointers. Still open in this kernel:
+  the reads from global memory through `TileTensor._linear_offset`.
+  Also open: one input (the gemv file) gives fewer proofs and takes ten
+  times longer in some runs than in others, with the pass before this
+  step too; the solver work is the same in those runs.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now
