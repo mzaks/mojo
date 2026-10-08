@@ -360,7 +360,19 @@ struct Swizzle(Copyable, Deinitable, TrivialRegisterPassable, Writable):
         return self.__call__(index.value())
 
     @inline(.always)
-    def __call__(self, offset: Int) -> Int:
+    def __call__(
+        self,
+        offset: Int,
+        out result: Int where (
+            # A right shift that moves the YYY bits onto the ZZZ bits: only
+            # the ZZZ bits of the offset change.
+            not (
+                0 < self.shift < 64
+                and (self.yyy_mask >> self.shift) == self.zzz_mask
+            )
+            or (result & ~self.zzz_mask) == (offset & ~self.zzz_mask)
+        ),
+    ):
         """Apply swizzle to an integer offset.
 
         Performs the swizzle operation on an integer offset to
@@ -372,7 +384,7 @@ struct Swizzle(Copyable, Deinitable, TrivialRegisterPassable, Writable):
         Returns:
             The swizzled offset value.
         """
-        return offset ^ shiftr(offset & self.yyy_mask, self.shift)
+        result = offset ^ shiftr(offset & self.yyy_mask, self.shift)
 
     @inline(.always)
     def __call__(self, offset: Scalar) -> Scalar[offset.dtype]:
