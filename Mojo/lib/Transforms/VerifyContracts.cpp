@@ -1538,6 +1538,9 @@ public:
           return isa<LIT::RefLoadOp>(user) || op == "lit.load.consume" ||
                  op == "lit.ref.immut" || op.starts_with("lit.var.lifetime.") ||
                  op.starts_with("lit.ownership.") ||
+                 // A package's functions carry debug info, which names
+                 // the variable and does nothing with it.
+                 op.starts_with("debuginfo.") ||
                  (isa<LIT::RefStoreOp>(user) && use.getOperandNumber() == 1);
         });
       };
@@ -2276,6 +2279,41 @@ private:
   }
   llvm::StringMap<bool> nonlinearTerms;
 
+  /// Whether the Boolean `term` is built only from comparisons of a value
+  /// with a constant.
+  bool boundsOnly(StringRef term, int depth = 0) {
+    if (term == "true" || term == "false")
+      return true;
+    auto def = definitions.find(term.str());
+    if (def == definitions.end() || depth > 16)
+      return false;
+    std::optional<std::vector<SExpr>> parsed = parseSExprs(def->second);
+    if (!parsed || parsed->size() != 1)
+      return false;
+    std::function<bool(const SExpr &, int)> ok = [&](const SExpr &e,
+                                                     int d) -> bool {
+      if (e.list.empty())
+        return boundsOnly(e.atom, d + 1);
+      StringRef head = e.list[0].atom;
+      auto constant = [](const SExpr &x) {
+        return x.list.size() == 3 && x.list[0].atom == "_";
+      };
+      if (e.list.size() == 3 &&
+          llvm::is_contained({"bvslt", "bvsle", "bvsgt", "bvsge", "bvult",
+                              "bvule", "bvugt", "bvuge", "="},
+                             head) &&
+          (constant(e.list[1]) || constant(e.list[2])))
+        return true;
+      if (llvm::is_contained({"and", "or", "not", "xor", "ite", "=", "=>"},
+                             head) &&
+          d < 16)
+        return llvm::all_of(ArrayRef(e.list).drop_front(),
+                            [&](const SExpr &x) { return ok(x, d + 1); });
+      return false;
+    };
+    return ok((*parsed)[0], depth);
+  }
+
   /// Whether `term` depends on the compilation target (`target_*`).
   bool mentionsTarget(StringRef term) {
     if (term.contains("target_"))
@@ -2981,7 +3019,11 @@ private:
           finiteDomains[unknown] = choices;
       }
       std::string cond = paramTerm(assertion.getCond(), {true, 1, false});
-      if (!nonlinear(cond))
+      // A nonlinear one that only bounds values by constants (`stage_cnt <=
+      // 65536`, where an instantiation computes `stage_cnt` by a division
+      // of unknowns) is assumed too: it adds no product to a query that
+      // does not already read the value.
+      if (!nonlinear(cond) || boundsOnly(cond))
         state.pc = define({true, 1, false},
                           "(and " + state.pc + " " + cond + ")", "r");
       return;
@@ -5559,15 +5601,28 @@ private:
     // `Smem[DType.bfloat16, 128]`).
     std::function<std::string(TypedAttr, unsigned)> resolved =
         [&](TypedAttr attr, unsigned depth) -> std::string {
-      attr = unwrapValue(resolveParam(unwrapValue(attr)));
-      if (auto typed = dyn_cast<TypeParamAttr>(attr); typed && depth < 6)
-        if (auto structType = dyn_cast<LIT::StructType>(typed.getTypeValue())) {
-          std::string text = printed(structType.getSymbol()) + "<";
-          for (TypedAttr param : structType.getParamValues())
-            text += resolved(param, depth + 1) + ",";
-          return text + ">";
-        }
-      return layoutKey(attr);
+      // What a parameter resolves to is an expression of the frame that
+      // bound it (a kernel's `a_type` is its launcher's `act.dtype`): it
+      // is read, and keyed, there.
+      ParamFrame *scope = nullptr;
+      attr = unwrapValue(resolveParam(unwrapValue(attr), &scope));
+      ParamFrame *saved = params;
+      params = scope;
+      std::string text;
+      auto typed = dyn_cast<TypeParamAttr>(attr);
+      auto structType = typed && depth < 6
+                            ? dyn_cast<LIT::StructType>(typed.getTypeValue())
+                            : LIT::StructType();
+      if (structType) {
+        text = printed(structType.getSymbol()) + "<";
+        for (TypedAttr param : structType.getParamValues())
+          text += resolved(param, depth + 1) + ",";
+        text += ">";
+      } else {
+        text = layoutKey(attr);
+      }
+      params = saved;
+      return text;
     };
     std::string key = "size_of_type|" + resolved(type, 0);
     auto [it, inserted] = simdWidths.try_emplace(key, "");
@@ -6012,6 +6067,7 @@ private:
       recordRowMajor(call, *name, before);
       checkReshape(call, *name, before);
     }
+    recordLayoutExtent(call, before);
     assumeListLiteral(call, name, before, state);
     if (callee)
       assumeCopy(call, callee, before, state);
@@ -6849,6 +6905,12 @@ private:
   MaybeTerm coordElement(StringRef type, const std::string &coord, size_t k) {
     if (std::optional<int64_t> n = comptimeIntValue(type))
       return bvConst(*n, 64);
+    // An extent of another tensor's layout (`t.layout.shape[0]()`).
+    if (auto built = builtFields.find({coord, "/" + std::to_string(k)});
+        built != builtFields.end())
+      if (auto extent = layoutExtents.find(built->second);
+          extent != layoutExtents.end())
+        return extent->second;
     // An integer, or the index of a `comptime for` (the range's `Element`).
     if (!type.starts_with("@std::@simd::@SIMD<") &&
         !type.contains("\"Element\", @std::@simd::@SIMD<"))
@@ -7593,8 +7655,16 @@ private:
           continue;
         }
         if (!place || !isScalar(placeType(*place)) ||
-            sortOf(placeType(*place)).isBool)
+            sortOf(placeType(*place)).isBool) {
+          // An extent of a generic layout (`t.layout.shape[0]()`, of the
+          // layout's own coordinate type).
+          if (place) {
+            std::string value = load(*place, state, Sort{false, 64, false});
+            if (layoutExtents.count(value))
+              setBuiltField(built, "/" + std::to_string(k), value);
+          }
           continue;
+        }
         setBuiltField(built, "/" + std::to_string(k),
                       load(*place, state, sortOf(placeType(*place))));
       }
@@ -7862,6 +7932,39 @@ private:
   }
   std::map<std::string, SmallVector<std::string>> indexLists;
 
+  /// After `t.layout.shape[k]()` (a generic layout's extent, of its own
+  /// coordinate type): the value stands for `t`'s `k`th dimension.
+  void recordLayoutExtent(LIT::CallOp call, State &state) {
+    auto bind = dyn_cast<BindParamsAttr>(call.getCallee());
+    auto witness =
+        bind ? dyn_cast<GetWitnessAttr>(bind.getGenerator()) : GetWitnessAttr();
+    if (!witness || !witness.getWitnessName().getValue().starts_with("shape[") ||
+        bind.getParamValues().size() != 1 || call.getNumOperands() != 1 ||
+        call->getNumResults() != 1 ||
+        !StringRef(printed(witness.getTraitSymbol())).contains("TensorLayout"))
+      return;
+    Sort i64{false, 64, true};
+    std::string k = paramTerm(bind.getParamValues()[0], i64);
+    if (!StringRef(k).starts_with("(_ bv"))
+      return;
+    Value layout = call.getOperands()[0];
+    std::string value = isa<LIT::RefType>(layout.getType())
+                            ? valueThrough(layout, state)
+                            : term(layout, state);
+    auto owner = fieldOwners.find(value);
+    if (owner == fieldOwners.end() || owner->second.second != "/layout")
+      return;
+    if (!tensorDimDeclared) {
+      prelude += "(declare-fun tdim ((_ BitVec 64) (_ BitVec 64)) "
+                 "(_ BitVec 64))\n";
+      tensorDimDeclared = true;
+    }
+    std::string extent = "(tdim " + owner->second.first + " " + k + ")";
+    facts.push_back("(bvsge " + extent + " " + bvConst(0, 64) + ")");
+    layoutExtents[term(call->getResult(0), state)] = define(i64, extent);
+  }
+  std::map<std::string, std::string> layoutExtents;
+
   /// After `row_major(coord)`: the layout's shape is the coordinate's
   /// elements (`Coord(n, k)` built with integers).
   void recordRowMajor(LIT::CallOp call, const CalleeName &name,
@@ -7930,8 +8033,24 @@ private:
       return;
     auto it = layoutShapes.find(tensorTerm(call.getOperands()[1], state));
     std::string view = term(call->getResult(0), state);
-    if (it == layoutShapes.end() || sortOfTerm(view).isBool ||
-        sortOfTerm(view).width != 64)
+    if (sortOfTerm(view).isBool || sortOfTerm(view).width != 64)
+      return;
+    // A view is over the tensor's memory: the same pointer.
+    {
+      std::string source = tensorTerm(call.getOperands()[0], state);
+      std::string pointer;
+      if (auto built = tensorPointers.find(source);
+          built != tensorPointers.end()) {
+        pointer = built->second;
+      } else {
+        auto [field, inserted] = tensorFields.try_emplace({source, "ptr"}, "");
+        if (inserted)
+          field->second = declare(Sort{false, 64, false});
+        pointer = field->second;
+      }
+      tensorPointers.try_emplace(view, pointer);
+    }
+    if (it == layoutShapes.end())
       return;
     if (!tensorDimDeclared) {
       prelude += "(declare-fun tdim ((_ BitVec 64) (_ BitVec 64)) "
@@ -8598,8 +8717,10 @@ private:
             made && init.getNumOperands() == 1 &&
             StringRef(made->path).starts_with(
                 "std::collections::optional::OptionalReg::__init__($0)")) {
+          // Of an `Int`: `func_attribute=` is an optional too.
           std::string bytes = term(init.getOperands()[0], state);
-          if (!sortOfTerm(bytes).isBool && sortOfTerm(bytes).width == 64)
+          if (isInt(init.getOperands()[0].getType()) &&
+              !sortOfTerm(bytes).isBool && sortOfTerm(bytes).width == 64)
             dims["shared_mem_bytes"] = bytes;
         }
     ParamFrame frame = paramFrame(kernelSymbol, kernel, 0, ParamFrame{});

@@ -14,7 +14,14 @@
 # the launches that must establish it, for `verify-contracts`; see README.md.
 # Needs the `max` and `layout` packages on the import path (see README.md).
 
-from layout import Coord, TensorLayout, TileTensor, row_major, stack_allocation
+from layout import (
+    Coord,
+    Idx,
+    TensorLayout,
+    TileTensor,
+    row_major,
+    stack_allocation,
+)
 from max.gpu import (
     WARP_SIZE,
     block_dim,
@@ -472,6 +479,24 @@ def ok_linear_offset[
     return t.ptr.unsafe_offset(Int(offset))[unsafe_offset=3]
 
 
+def _same(a: Int, b: Int where a == b) -> Int:
+    return a
+
+
+def ok_batched_view[
+    L: TensorLayout
+](t: TileTensor[DType.float32, L, MutAnyOrigin]) -> Int:
+    # A view with a batch of 1 in front: the layout's own extents, of its
+    # coordinate types, are the tensor's dimensions.
+    comptime assert L.rank == 2, "rows and columns"
+    var view = t.reshape(
+        row_major(Coord(Idx[1], t.layout.shape[0](), t.layout.shape[1]()))
+    )
+    return _same(Int(view.dim[1]()), Int(t.dim[0]())) + _same(
+        Int(view.dim[0]()), 1
+    )
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -844,3 +869,13 @@ def bad_linear_offset_strided[
     comptime assert L.rank == 2 and L.flat_rank == 2  # any last stride
     var offset = t._linear_offset(Index(i, j))
     return t.ptr.unsafe_offset(Int(offset))[unsafe_offset=3]
+
+
+def bad_batched_view[
+    L: TensorLayout
+](t: TileTensor[DType.float32, L, MutAnyOrigin]) -> Int:
+    comptime assert L.rank == 2, "rows and columns"
+    var view = t.reshape(
+        row_major(Coord(Idx[1], t.layout.shape[0](), t.layout.shape[1]()))
+    )
+    return _same(Int(view.dim[1]()), Int(t.dim[1]()))  # rows, not columns

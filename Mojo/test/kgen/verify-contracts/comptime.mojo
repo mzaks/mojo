@@ -169,6 +169,17 @@ def ok_one_of[n: Int](x: Int where 0 <= x < 2147483648 and x % 8 == 0) -> Int:
     return _below(k // (n // 4), 4) + _below(k % (n // 4), n // 4 - 7)
 
 
+def ok_bounded_quotient[
+    n: Int, d: Int
+](
+    p: Pointer[Int, MutUntrackedOrigin],
+    i: Int where p._extent() >= 131072 and 0 <= i < 2 * (n // d),
+) -> Int:
+    # A quotient of two parameters: only bounded by a constant, so assumed.
+    comptime assert 1 <= n // d <= 65536
+    return p[unsafe_offset=i]
+
+
 # --- must stay UNPROVEN ---
 def bad_param_no_lower[n: Int](xs: List[Int]) -> Int:
     if n < len(xs):
@@ -263,3 +274,12 @@ def bad_one_of[n: Int](x: Int where 0 <= x < 2147483648 and x % 8 == 0) -> Int:
     comptime assert n == 64 or n == 128 or n == 256, "n must be 64, 128 or 256"
     var k = x % n
     return _below(k % (n // 4), n // 4 - 8)  # `n // 4 - 8` is reached
+
+
+def bad_bounded_quotient[
+    n: Int, d: Int
+](
+    p: Pointer[Int, MutUntrackedOrigin],
+    i: Int where p._extent() >= 131072 and 0 <= i < 2 * (n // d),
+) -> Int:
+    return p[unsafe_offset=i]  # nothing bounds the quotient
