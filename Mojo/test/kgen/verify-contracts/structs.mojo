@@ -335,6 +335,34 @@ def ok_filled(p: Pointer[Int, MutUntrackedOrigin]):
     _take[fill=0](p, 5)  # a fill value: nothing is read
 
 
+def _take_unless[
+    fill: Optional[Int] = None
+](
+    p: Pointer[Int, MutUntrackedOrigin],
+    n: Int,
+    flag: Bool where p._extent() >= (0 if (fill and not flag) else n),
+):
+    pass
+
+
+def ok_read_in_loop(base: Int where 0 <= base < 64, n: Int) -> Int:
+    var f = Filler[8](base)
+    f.ok_prepare()
+    var t = 0
+    for _ in range(n):
+        # Another field changes; the array, only read, keeps its elements.
+        t += _below(f.offsets[3], 512)
+        f.base = t
+    return t
+
+
+def ok_fill_and_flag(
+    p: Pointer[Int, MutUntrackedOrigin] where p._extent() >= 5
+):
+    # `fill and not flag` without a fill value: false, so `p` is read.
+    _take_unless[](p, 5, False)
+
+
 # --- must stay UNPROVEN ---
 def bad_after_method(
     mut b: Buffer, i: Int where 0 <= i < b.size and b.data._extent() >= b.size
@@ -422,6 +450,20 @@ def bad_unprepared(base: Int where 0 <= base < 64) -> Int:
 
 def bad_unfilled(p: Pointer[Int, MutUntrackedOrigin]):
     _take(p, 5)  # no fill value, and nothing about `p`
+
+
+def bad_read_in_loop(base: Int where 0 <= base < 64, n: Int) -> Int:
+    var f = Filler[8](base)
+    f.ok_prepare()
+    var t = 0
+    for _ in range(n):
+        t += _below(f.offsets[3], 512)
+        f.offsets[3] = t  # written in the loop: not what `prepare` stored
+    return t
+
+
+def bad_fill_and_flag(p: Pointer[Int, MutUntrackedOrigin]):
+    _take_unless[](p, 5, False)  # nothing about `p`
 
 
 def main():

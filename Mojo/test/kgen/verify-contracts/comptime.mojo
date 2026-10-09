@@ -158,6 +158,17 @@ def ok_dtype_size_any[dt: DType](xs: List[Int]) -> Int:
     return 0
 
 
+def _below(x: Int, n: Int where 0 <= x < n) -> Int:
+    return x
+
+
+def ok_one_of[n: Int](x: Int where 0 <= x < 2147483648 and x % 8 == 0) -> Int:
+    # One of a few values: checked for each, where `x % n` is linear.
+    comptime assert n == 64 or n == 128 or n == 256, "n must be 64, 128 or 256"
+    var k = x % n
+    return _below(k // (n // 4), 4) + _below(k % (n // 4), n // 4 - 7)
+
+
 # --- must stay UNPROVEN ---
 def bad_param_no_lower[n: Int](xs: List[Int]) -> Int:
     if n < len(xs):
@@ -246,3 +257,9 @@ def bad_dtype_size[dt: DType](xs: List[Int]) -> Int:
     if len(xs) == 16:
         return xs[width]  # 16 for a one-byte dtype
     return 0
+
+
+def bad_one_of[n: Int](x: Int where 0 <= x < 2147483648 and x % 8 == 0) -> Int:
+    comptime assert n == 64 or n == 128 or n == 256, "n must be 64, 128 or 256"
+    var k = x % n
+    return _below(k % (n // 4), n // 4 - 8)  # `n // 4 - 8` is reached

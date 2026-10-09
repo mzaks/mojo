@@ -222,6 +222,18 @@ def ok_unrolled(xs: List[Int]) -> Int:
     return sum
 
 
+def ok_scaled_counter(
+    p: Pointer[Int, MutUntrackedOrigin],
+    n: Int where 0 <= n < 1000 and p._extent() >= n * 4,
+) -> Int:
+    var t = 0
+    var off = 0
+    for _ in range(n):
+        t += p[unsafe_offset=off + 3]  # `off` is 4 times the iterations so far
+        off += 4
+    return t
+
+
 # --- must stay UNPROVEN ---
 def bad_one_past(xs: List[Int]) -> Int:
     var s = 0
@@ -382,3 +394,15 @@ def bad_closure_counter(xs: List[Int]) -> Int:
         for _ in range(5):
             step()
     return sum
+
+
+def bad_scaled_counter(
+    p: Pointer[Int, MutUntrackedOrigin],
+    n: Int where 0 <= n < 1000 and p._extent() >= n * 4,
+) -> Int:
+    var t = 0
+    var off = 0
+    for _ in range(n):
+        t += p[unsafe_offset=off + 4]  # one past the last
+        off += 4
+    return t

@@ -1426,6 +1426,10 @@ struct Candidate {
   /// steps from where it started as this variable is above its value on
   /// entry (a counter the body increments beside a strided loop).
   std::optional<Loc> counter;
+  /// The candidate is instead that `lhs` is above its value on entry by
+  /// this term for every step of `rhsLoc`, a unit range's cursor (`off +=
+  /// per_iteration` in each iteration of `for i in range(n)`).
+  std::string scale = "";
 };
 
 /// A function's postcondition: its `kgen.ensures` clauses, which are
@@ -1635,6 +1639,73 @@ public:
 
   /// Whether `ob`'s goal multiplies or divides two unknowns.
   bool isNonlinear(const Obligation &ob) { return nonlinear(ob.cond); }
+  /// Whether `attr` says that one parameter equals one of a few integer
+  /// constants (`n == 64 or n == 128 or ...`): the parameter's term and
+  /// the constants.
+  bool finiteChoice(TypedAttr attr, std::string &unknown,
+                    SmallVector<int64_t> &choices, int depth = 0) {
+    if (depth > 12)
+      return false;
+    if (auto value = dyn_cast<LIT::LITStructAttr>(attr);
+        value && value.getValues().size() == 1)
+      return finiteChoice(std::get<1>(value.getValues()[0]), unknown, choices,
+                          depth + 1);
+    if (auto extract = dyn_cast<LIT::StructExtractAttr>(attr);
+        extract && extract.getField().getValue() == "_mlir_value")
+      return finiteChoice(extract.getStructValue(), unknown, choices,
+                          depth + 1);
+    if (auto sugar = dyn_cast<SugarAttr>(attr))
+      if (auto canonical = dyn_cast<TypedAttr>(sugar.getCanonical()))
+        return finiteChoice(canonical, unknown, choices, depth + 1);
+    auto expr = dyn_cast<ParamOperatorAttr>(attr);
+    auto identical = dyn_cast<ParamIdenticalAttr>(attr);
+    if (!expr && !(identical && identical.getOperands().size() == 2))
+      return false;
+    ArrayRef<TypedAttr> ops =
+        expr ? expr.getOperands() : identical.getOperands();
+    // `a == b` of integers: "the same value", or the call of `__eq__`.
+    bool equality = identical || expr.getOpcode() == POC::EQ;
+    if (expr && expr.getOpcode() == POC::Apply && ops.size() == 3)
+      if (std::optional<CalleeName> callee = calleeName(ops[0]);
+          callee &&
+          StringRef(callee->path).starts_with("std::simd::SIMD::__eq__(")) {
+        ops = ops.drop_front();
+        equality = true;
+      }
+    switch (equality ? POC::EQ : expr.getOpcode()) {
+    case POC::Or:
+      return !ops.empty() && llvm::all_of(ops, [&](TypedAttr op) {
+        return finiteChoice(op, unknown, choices, depth + 1);
+      });
+    case POC::Cond:
+      // `a or b` is `a if a else b`: whichever arm is the value, it holds.
+      return ops.size() == 3 &&
+             finiteChoice(ops[1], unknown, choices, depth + 1) &&
+             finiteChoice(ops[2], unknown, choices, depth + 1);
+    case POC::EQ: {
+      if (ops.size() != 2 || sortOf(ops[0].getType()).isBool ||
+          sortOf(ops[0].getType()).width != 64)
+        return false;
+      Sort i64{false, 64, true};
+      std::string a = paramTerm(ops[0], i64), b = paramTerm(ops[1], i64);
+      static llvm::Regex constRe("^\\(_ bv([0-9]+) 64\\)$");
+      SmallVector<StringRef> m;
+      if (constRe.match(a, &m))
+        std::swap(a, b);
+      int64_t value;
+      if (!constRe.match(b, &m) || m[1].getAsInteger(10, value) ||
+          definitions.count(a) || !sorts.count(a) || a.empty() ||
+          a[0] != 'p' || (!unknown.empty() && unknown != a))
+        return false;
+      unknown = a;
+      choices.push_back(value);
+      return true;
+    }
+    default:
+      return false;
+    }
+  }
+
 
   /// Encodes the instantiation that `chain` names: a launched kernel with
   /// its parameters, then the function launching it with the parameters a
@@ -2897,6 +2968,18 @@ private:
     // unknown parameters in every query's path made a MAX kernel's
     // verification take 18 s instead of 3, with the same results.
     if (auto assertion = dyn_cast<ParamAssertOp>(op)) {
+      // `comptime assert n == 64 or n == 128`: a parameter with a few
+      // values, which the queries are asked for one by one (as for the
+      // SIMD widths): with `n` a constant, quotients and remainders by it
+      // are linear.
+      {
+        std::string unknown;
+        SmallVector<int64_t> choices;
+        if (finiteChoice(assertion.getCond(), unknown, choices) &&
+            choices.size() >= 2 && choices.size() <= 8 &&
+            !finiteDomains.count(unknown))
+          finiteDomains[unknown] = choices;
+      }
       std::string cond = paramTerm(assertion.getCond(), {true, 1, false});
       if (!nonlinear(cond))
         state.pc = define({true, 1, false},
@@ -3459,6 +3542,16 @@ private:
               closure != closures.end() &&
               seen.insert(closure->second.getOperation()).second)
             work.push_back(closure->second.getOperation());
+          // An array element that is only read (`self.offsets[v]` through
+          // `mut self`: the reference is mutable, its uses are not): the
+          // array is not written, and keeps its value around the loop.
+          if (std::optional<CalleeName> name = calleeName(call.getCallee());
+              name && call->getNumResults() == 1 &&
+              StringRef(name->path)
+                  .starts_with("std::collections::array::Array::__getitem") &&
+              isa<LIT::RefType>(call->getResult(0).getType()) &&
+              !writtenThrough(call->getResult(0)))
+            return;
           confined = confinedWrites(call);
           for (Value operand : call.getOperands())
             if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
@@ -3999,6 +4092,7 @@ private:
     if (body.alive) // Falling off the body starts the next iteration.
       frame.continues.push_back(body);
     ++loopsAnalyzed;
+    invariantLoop = loop;
     findInvariants(frame, before, headAtEntry, headReach, written);
     State exit = merge(frame.breaks);
     exit.yields = state.yields;
@@ -4008,6 +4102,33 @@ private:
   /// Houdini: keep the candidate invariants that hold on entry and are kept
   /// by every iteration, assuming all kept candidates; assert them at the
   /// loop head (under its reachability).
+  /// The loop whose invariants are searched for.
+  Operation *invariantLoop = nullptr;
+  /// What the loop adds to the integer variable at `place` in each
+  /// iteration, when that is one `place += c` with a comptime `c`.
+  MaybeTerm incrementOf(Operation *loop, const Loc &place) {
+    MaybeTerm amount;
+    unsigned found = 0;
+    if (!loop)
+      return std::nullopt;
+    loop->walk([&](LIT::CallOp call) {
+      std::optional<CalleeName> name = calleeName(call.getCallee());
+      if (!name || call.getNumOperands() != 2 ||
+          !StringRef(name->path).starts_with("std::simd::SIMD::__iadd__("))
+        return;
+      std::optional<Loc> target = placeOf(call.getOperands()[0]);
+      if (!target || !(*target == place))
+        return;
+      ++found;
+      if (auto cst = call.getOperands()[1].getDefiningOp<ParamConstantOp>()) {
+        std::string c = paramTerm(cst.getValue(), Sort{false, 64, true});
+        if (!sortOfTerm(c).isBool && sortOfTerm(c).width == 64)
+          amount = c;
+      }
+    });
+    return found == 1 ? amount : std::nullopt;
+  }
+
   void findInvariants(const LoopFrame &frame, State &before, State &head,
                       StringRef headReach,
                       const std::optional<llvm::DenseSet<Value>> &written) {
@@ -4143,6 +4264,20 @@ private:
                   {loc, "=", step, "", false, "", true, other});
         }
       }
+      // A variable the body adds a comptime amount to, beside a unit
+      // range: that amount times the iterations so far.
+      if (StringRef(loc.path).ends_with("/curr"))
+        for (const Loc &other : places)
+          if (other.root != loc.root && other.path.empty() && changes(other))
+            // By a constant amount only: by a parameter the relation is a
+            // product of unknowns, and sending every obligation about the
+            // variable through the exact integer retry took a kernel's
+            // loaders from 80 s to over an hour.
+            if (MaybeTerm amount = incrementOf(invariantLoop, other);
+                amount && StringRef(*amount).starts_with("(_ bv"))
+              candidates.push_back(
+                  {other, "=", loc, "", false, "", false, std::nullopt,
+                   *amount});
       candidates.push_back({loc, "bvsge", std::nullopt, bvConst(0, 64)});
       for (const std::string &t : fixed)
         for (const char *op : {"bvsle", "bvslt", "bvsge"})
@@ -4153,6 +4288,47 @@ private:
             candidates.push_back({loc, op, other, ""});
     }
     auto render = [&](const Candidate &c, State &at) {
+      if (!c.scale.empty()) {
+        Sort i64{false, 64, true};
+        std::string start = load(*c.rhsLoc, before, i64);
+        // `(cursor - start) * scale`, with the cursor's step multiplied
+        // out (`(i + 1) * c` as `i * c + c`): the product of two unknowns
+        // is then the same term before and after an iteration, and the
+        // solver need not multiply.
+        std::function<std::string(const std::string &, int)> scaled =
+            [&](const std::string &cursor, int depth) -> std::string {
+          if (auto def = definitions.find(cursor);
+              def != definitions.end() && depth < 4)
+            if (std::optional<std::vector<SExpr>> parsed =
+                    parseSExprs(def->second);
+                parsed && parsed->size() == 1) {
+              const SExpr &e = (*parsed)[0];
+              auto atom = [](const SExpr &x) { return x.list.empty(); };
+              auto constant = [](const SExpr &x) {
+                return x.list.size() == 3 && x.list[0].atom == "_";
+              };
+              if (e.list.size() == 4 && e.list[0].atom == "ite" &&
+                  atom(e.list[1]) && atom(e.list[2]) && atom(e.list[3]))
+                return "(ite " + e.list[1].atom + " " +
+                       scaled(e.list[2].atom, depth + 1) + " " +
+                       scaled(e.list[3].atom, depth + 1) + ")";
+              if (e.list.size() == 3 && e.list[0].atom == "bvadd" &&
+                  atom(e.list[1]) && constant(e.list[2]))
+                return "(bvadd " + scaled(e.list[1].atom, depth + 1) +
+                       " (bvmul (_ " + e.list[2].list[1].atom + " 64) " +
+                       c.scale + "))";
+            }
+          // A term of its own: the exact integer retry looks for the
+          // products the script defines.
+          return define(i64, "(bvmul " +
+                                 define(i64, "(bvsub " + cursor + " " + start +
+                                                 ")") +
+                                 " " + c.scale + ")");
+        };
+        return "(= (bvsub " + load(c.lhs, at, i64) + " " +
+               load(c.lhs, before, i64) + ") " +
+               scaled(load(*c.rhsLoc, at, i64), 0) + ")";
+      }
       if (c.stride) {
         std::string start0 = load(c.lhs, before, Sort{false, 64, true});
         std::string step0 = load(*c.rhsLoc, before, Sort{false, 64, true});
@@ -5832,6 +6008,7 @@ private:
     // may write is unknown after it).
     if (name) {
       recordTile(call, *name, before);
+      recordIndexList(call, *name, before);
       recordRowMajor(call, *name, before);
       checkReshape(call, *name, before);
     }
@@ -6775,6 +6952,14 @@ private:
                                      value + ")");
         return true;
       }
+      // Of a dtype that is not known, for a value whose `Int` is already
+      // named (a tensor's `_linear_offset`): that term.
+      if (!source && to && !target.isBool && target.width == 64 &&
+          to->width == 64)
+        if (auto it = intConversions.find(value); it != intConversions.end()) {
+          values[result] = it->second;
+          return true;
+        }
     }
     // `Int(x)` of an `Int` (`Int(block_idx.x)`), the scalar's own
     // constructor from a scalar of its dtype: `x`.
@@ -6883,6 +7068,117 @@ private:
       if (inserted)
         it->second = declare(field);
       values[result] = it->second;
+      return true;
+    }
+    // `t._linear_offset(Index(i0, ..., in))`: the offset of that element
+    // from `t.ptr`. As for `t[i0, ..., in]` and `load[width]`, a tensor's
+    // elements are taken to be backed (assumption: its dimensions and
+    // strides describe memory its pointer has, and its offsets fit its
+    // index type): for an index within the dimensions, the offset is not
+    // negative, and where the last stride is 1 the rest of that row
+    // follows it.
+    if (path.starts_with("layout::tile_tensor::TileTensor::_linear_offset[") &&
+        call.getNumOperands() == 2) {
+      Value tensor = call.getOperands()[0];
+      Type type = tensor.getType();
+      if (auto ref = dyn_cast<LIT::RefType>(type))
+        type = ref.getElementType();
+      auto st = dyn_cast<LIT::StructType>(type);
+      Value list = call.getOperands()[1];
+      std::string index = isa<LIT::RefType>(list.getType())
+                              ? valueThrough(list, state)
+                              : term(list, state);
+      setResultsUnknown(call);
+      auto elements = indexLists.find(index);
+      if (!st || st.getParamValues().size() < 4 ||
+          elements == indexLists.end() || elements->second.empty())
+        return true;
+      ArrayRef<TypedAttr> params = st.getParamValues();
+      size_t rank = elements->second.size();
+      std::string within = "true";
+      std::string rest;
+      for (size_t k = 0; k < rank; ++k) {
+        MaybeTerm d = tensorDim(params, tensor, k, state);
+        const std::string &i = elements->second[k];
+        if (!d || sortOfTerm(i).isBool || sortOfTerm(i).width != 64)
+          return true;
+        bool last = k + 1 == rank;
+        within = "(and " + within + " (bvsle " + bvConst(0, 64) + " " + i +
+                 ") (" + (last ? "bvsle " : "bvslt ") + i + " " + *d + "))";
+        if (last)
+          rest = "(bvsub " + *d + " " + i + ")";
+      }
+      // The last stride: the layout's own list, or a generic layout's
+      // `static_stride` (flat, of this rank).
+      ParamFrame *layoutScope = nullptr;
+      TypedAttr layoutAttr = resolveParam(params[3], &layoutScope);
+      std::string layout = printed(layoutAttr);
+      SmallVector<StringRef> strides = layoutList(layout, 1);
+      std::string unit;
+      if (strides.size() == rank) {
+        std::optional<int64_t> stride = comptimeIntValue(strides[rank - 1]);
+        if (!stride || *stride != 1)
+          return true;
+        unit = "true";
+      } else {
+        ParamFrame *saved = this->params;
+        this->params = layoutScope;
+        std::string key = layoutKey(layoutAttr);
+        this->params = saved;
+        auto [it, inserted] =
+            staticStrideTerms.try_emplace({key, (int64_t)rank - 1}, "");
+        if (inserted) {
+          it->second = declare(Sort{false, 64, true}, "p");
+          prelude += "; " + it->second + ": static_stride[" +
+                     std::to_string(rank - 1) + "] of " +
+                     StringRef(key).take_front(300).str() + "\n";
+        }
+        unit = "(and (= " + layoutWitness("flat_rank", key) + " " +
+               bvConst(rank, 64) + ") (= " + layoutWitness("rank", key) + " " +
+               bvConst(rank, 64) + ") (= " + it->second + " " +
+               bvConst(1, 64) + "))";
+      }
+      // The offset as an `Int`: what `Int(offset)` gives.
+      std::string offset = values[result];
+      Sort got = sortOfTerm(offset);
+      if (got.isBool)
+        return true;
+      std::string asInt = offset;
+      std::optional<Sort> dtype = dtypeSort(printed(result.getType()));
+      if (!dtype) {
+        auto [it, inserted] = intConversions.try_emplace(offset, "");
+        if (inserted)
+          it->second = declare(Sort{false, 64, true});
+        asInt = it->second;
+      } else if (dtype->width != 64) {
+        if (got.width != dtype->width)
+          return true;
+        asInt = define(Sort{false, 64, true},
+                       "((_ " +
+                           std::string(dtype->isSigned ? "sign_extend "
+                                                       : "zero_extend ") +
+                           std::to_string(64 - dtype->width) + ") " + offset +
+                           ")");
+      }
+      std::string tensorValue = tensorTerm(tensor, state);
+      std::string pointer;
+      if (auto built = tensorPointers.find(tensorValue);
+          built != tensorPointers.end()) {
+        pointer = built->second;
+      } else {
+        auto [it, inserted] =
+            tensorFields.try_emplace({tensorValue, "ptr"}, "");
+        if (inserted)
+          it->second = declare(Sort{false, 64, false});
+        pointer = it->second;
+      }
+      state.pc = define(
+          {true, 1, false},
+          "(and " + state.pc + " (=> (and " + within + " " + unit +
+              ") (and (bvsle " + bvConst(0, 64) + " " + asInt +
+              ") (bvsge (bvsub " + extentOf(pointer) + " " + asInt + ") " +
+              rest + "))))",
+          "r");
       return true;
     }
     // `TileTensor(ptr, layout)` over a pointer (the default engine's
@@ -7544,6 +7840,27 @@ private:
     }
     partialValid[tile] = std::move(valid);
   }
+
+  /// After `Index(a, b, c)` of `Int`s: the list's elements.
+  void recordIndexList(LIT::CallOp call, const CalleeName &name,
+                       State &state) {
+    if (!StringRef(name.path).starts_with("std::utils::index::Index[") ||
+        call.getNumOperands() != 1 || call->getNumResults() != 1 ||
+        !isa<LIT::RefType>(call.getOperands()[0].getType()))
+      return;
+    auto it = packRefs.find(valueThrough(call.getOperands()[0], state));
+    if (it == packRefs.end())
+      return;
+    SmallVector<std::string> elements;
+    for (Value ref : it->second) {
+      auto type = dyn_cast<LIT::RefType>(ref.getType());
+      if (!type || !isInt(type.getElementType()))
+        return;
+      elements.push_back(valueThrough(ref, state));
+    }
+    indexLists[term(call->getResult(0), state)] = std::move(elements);
+  }
+  std::map<std::string, SmallVector<std::string>> indexLists;
 
   /// After `row_major(coord)`: the layout's shape is the coordinate's
   /// elements (`Coord(n, k)` built with integers).
@@ -8757,9 +9074,12 @@ private:
     auto operand = [&](unsigned i) {
       return term(call.getOperands()[i], state);
     };
+    // `Bool(scalar)` too: what `a and b` yields where `a` is false.
     if ((path.starts_with("std::builtin::bool::Bool::__mlir_bool__(") ||
-         path.starts_with("std::builtin::bool::Bool::__bool__(")) &&
-        call.getNumOperands() == 1) {
+         path.starts_with("std::builtin::bool::Bool::__bool__(") ||
+         path.starts_with(
+             "std::builtin::bool::Bool::__init__(!kgen.scalar<bool>)")) &&
+        call.getNumOperands() == 1 && sortOfTerm(operand(0)).isBool) {
       values[result] = operand(0);
       return true;
     }

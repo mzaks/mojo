@@ -30,6 +30,7 @@ from max.gpu.memory import external_memory
 import max.gpu.primitives.warp as warp
 from std.math import ceildiv
 from std.math.uutils import udivmod, ufloordiv
+from std.utils.index import Index
 from std.sys.info import (
     has_amd_gpu_accelerator,
     has_nvidia_gpu_accelerator,
@@ -455,6 +456,22 @@ def ok_gpu_simd_width_any[dt: DType](xs: List[Int]) -> Int:
     return 0
 
 
+def ok_linear_offset[
+    L: TensorLayout
+](
+    t: TileTensor[DType.float32, L, MutAnyOrigin],
+    i: Int,
+    j: Int where 0 <= i < Int(t.dim[0]()) and 0 <= j <= Int(t.dim[1]()) - 4,
+) -> Float32:
+    # The element's offset from `t.ptr`: with contiguous rows, the rest of
+    # the row follows it.
+    comptime assert (
+        L.rank == 2 and L.flat_rank == 2 and L.static_stride[1] == 1
+    ), "rows must be contiguous"
+    var offset = t._linear_offset(Index(i, j))
+    return t.ptr.unsafe_offset(Int(offset))[unsafe_offset=3]
+
+
 # --- must stay UNPROVEN ---
 def bad_unguarded_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin]):
     # Nothing relates the grid to the tensor.
@@ -801,3 +818,29 @@ def bad_gpu_simd_width_any[dt: DType](xs: List[Int]) -> Int:
     if len(xs) == 17:
         return xs[w - 1]  # the width is 0 for a 256-bit dtype
     return 0
+
+
+def bad_linear_offset[
+    L: TensorLayout
+](
+    t: TileTensor[DType.float32, L, MutAnyOrigin],
+    i: Int,
+    j: Int where 0 <= i < Int(t.dim[0]()) and 0 <= j <= Int(t.dim[1]()) - 4,
+) -> Float32:
+    comptime assert (
+        L.rank == 2 and L.flat_rank == 2 and L.static_stride[1] == 1
+    ), "rows must be contiguous"
+    var offset = t._linear_offset(Index(i, j))
+    return t.ptr.unsafe_offset(Int(offset))[unsafe_offset=4]  # past the row
+
+
+def bad_linear_offset_strided[
+    L: TensorLayout
+](
+    t: TileTensor[DType.float32, L, MutAnyOrigin],
+    i: Int,
+    j: Int where 0 <= i < Int(t.dim[0]()) and 0 <= j <= Int(t.dim[1]()) - 4,
+) -> Float32:
+    comptime assert L.rank == 2 and L.flat_rank == 2  # any last stride
+    var offset = t._linear_offset(Index(i, j))
+    return t.ptr.unsafe_offset(Int(offset))[unsafe_offset=3]
