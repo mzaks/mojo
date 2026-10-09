@@ -396,8 +396,14 @@ int runWithCap(StringRef program, ArrayRef<StringRef> args,
       program, args, std::nullopt, redirects, 0, nullptr, &failed);
   if (failed || pi.Pid == llvm::sys::ProcessInfo::InvalidPid)
     return -1;
-  auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+  // The time the process had, not the time that passed: a machine that
+  // sleeps (a laptop's maintenance sleep took 15 minutes out of a 16 s
+  // solver run) stops the process too, and the clock runs on. Each wait
+  // counts for at most a second.
+  auto budget = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::seconds(seconds));
+  auto spent = std::chrono::milliseconds(0);
+  auto last = std::chrono::steady_clock::now();
   auto pause = std::chrono::milliseconds(1);
   int status = 0;
   while (true) {
@@ -406,7 +412,12 @@ int runWithCap(StringRef program, ArrayRef<StringRef> args,
       return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (done == -1 && errno != EINTR)
       return -1;
-    if (std::chrono::steady_clock::now() >= deadline) {
+    auto now = std::chrono::steady_clock::now();
+    spent += std::min(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - last),
+        std::chrono::milliseconds(1000));
+    last = now;
+    if (spent >= budget) {
       ::kill(pi.Pid, SIGKILL);
       while (::waitpid(pi.Pid, &status, 0) == -1 && errno == EINTR) {
       }
