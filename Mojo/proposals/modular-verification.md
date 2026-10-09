@@ -14,9 +14,17 @@ obligations are discharged by a cheap dataflow analysis; only the rest reach
 the SMT solver. Diagnostics are reported on source locations, like the other
 checks at that stage.
 
-It builds on [argument contracts](argument-contracts.md), which already
-states preconditions and postconditions as `where` clauses and keeps them as
-`kgen.requires` and `kgen.ensures` ops.
+It builds on [function contracts](function-contracts.md), which already
+states preconditions and postconditions as `requires` and `ensures` clauses
+and keeps them as `kgen.requires` and `kgen.ensures` ops.
+
+Contracts were first written as `where` clauses on arguments, and moved to
+`requires` and `ensures` clauses on October 9, 2026. The design below uses
+the new spelling. The entries of
+[Implementation status](#implementation-status) are a log: the older ones
+describe clauses as they were written at the time (`i: Int where 0 <= i` for
+`requires 0 <= i`, `out result: Int where result >= 0` for
+`ensures result >= 0`).
 
 ## Background
 
@@ -66,7 +74,7 @@ Post-elaboration checking has other costs too:
 Goals:
 
 - Verify each function once, generically, before elaboration and inlining.
-- State bounds as preconditions (`where` clauses) on the declarations
+- State bounds as preconditions (`requires` clauses) on the declarations
   (`List.__getitem__`, `Span.__getitem__`, ...). A call to such a function
   creates an assertion at the call, with the call's source location.
 - Prove most assertions with dataflow analysis, without the solver.
@@ -149,8 +157,8 @@ Bounds move from `kgen.obligation`s inside `check_bounds` to preconditions on
 the declarations:
 
 ```mojo
-def __getitem__(ref self, idx: Int where 0 <= idx and idx < len(self), /)
-    -> ref[...] Self.T:
+def __getitem__(ref self, idx: Int, /) -> ref[...] Self.T
+    requires 0 <= idx and idx < len(self):
 ```
 
 `check_bounds` stays for its runtime assertion. Since negative indexing has
@@ -159,7 +167,7 @@ been removed, the precondition is the whole requirement.
 Loops over ranges need the iterators to say what they yield. `range(n)`'s
 `__next__` gets a postcondition (`0 <= result and result < self.end`), and the
 iterator's fields a type invariant (`curr <= end`), which the parser can
-already express as `where` clauses on `mut self`.
+already express as clauses about `self`.
 
 Collections that the post-elaboration pass handles through their bodies
 (`List`, `Span`, `String`, `Dict`, `InlineArray`) need contracts on the
@@ -227,9 +235,9 @@ Results are MLIR diagnostics:
   test.mojo:12:14: warning: cannot prove this call's precondition
       return xs[i + 1]
                ^
-  list.mojo:1572:20: note: precondition of 'List.__getitem__'
-      ref self, idx: Int where 0 <= idx and idx < len(self), /
-                         ^
+  list.mojo:1623:18: note: precondition of 'List.__getitem__'
+      requires 0 <= idx and idx < len(self):
+               ^
   ```
 
 - An unproven postcondition is reported at the `return`, with a note at the

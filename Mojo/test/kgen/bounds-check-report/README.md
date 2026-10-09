@@ -147,10 +147,11 @@ and proves its body from it; `bad_call_without_precondition` and
 `bad_check_before_pop` checks that a later precondition does not justify an
 earlier access. `main` calls the examples on one shared list.
 
-`where_clauses.mojo` states preconditions as `where` clauses on arguments
-(see `Mojo/proposals/argument-contracts.md`), as in
-`def ok_get(xs: List[Int], i: Int where 0 <= i and i < len(xs))`. The parser
-lowers each clause to a `kgen.requires` op whose region computes the condition
+`where_clauses.mojo` (named after the first spelling of contracts) states
+preconditions as `requires` clauses (see
+`Mojo/proposals/function-contracts.md`), as in
+`def ok_get(xs: List[Int], i: Int) -> Int requires 0 <= i and i < len(xs)`.
+The parser lowers each clause to a `kgen.requires` op whose region computes the condition
 from block arguments that stand for the function's arguments, so optimizing the
 body cannot fold it away. The analysis
 assumes it in the function (`ok_get` and `ok_window` prove their indices from
@@ -159,14 +160,15 @@ it), checks it at every call to a function that is not inlined (reported as a
 `bad_window_swapped`), and checks an inlined function's clause where it was
 inlined (`ok_at`, `bad_at_unchecked`).
 
-A clause on an `out` or `mut` argument is a postcondition: a `kgen.ensures`
+An `ensures` clause is a postcondition: a `kgen.ensures`
 before every return, proven there (`ok_make_two`, `ok_next`, `ok_push`;
 `bad_push_twice` and `bad_keep_cleared` break theirs) and assumed after calls
 (`ok_after_make_two`, `ok_after_push`). `old(e)` is `e` on entry, computed by a
-`kgen.old` at the start of the function. On a `mut` argument, a clause without
-`old` holds on entry and on exit (`ok_keep`), and one written only in terms of
-`old` is a precondition (`ok_shrink`, whose `pop` needs `old(len(xs)) > 0`;
-`bad_shrink_unchecked` calls it without the check). `ok_make_loop` fills its
+`kgen.old` at the start of the function. A fact about a `mut` argument that
+holds on entry and on exit is stated in both kinds of clause (`ok_keep`), and
+a `requires` clause about one reads its value on entry (`ok_shrink`, whose
+`pop` needs `len(xs) > 0`; `bad_shrink_unchecked` calls it without the
+check). `ok_make_loop` fills its
 result in a loop, and callers get its length from the contract
 (`ok_after_make`, `bad_after_make`). Postconditions are only assumed after
 calls to callees with a single return.

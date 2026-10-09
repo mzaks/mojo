@@ -1,9 +1,10 @@
 # verify-contracts examples
 
 Examples for the `verify-contracts` pass
-(`Mojo/lib/Transforms/VerifyContracts.cpp`), which checks `where` contracts
-right after lifetime checking, before elaboration and inlining. See
-`Mojo/proposals/modular-verification.md`.
+(`Mojo/lib/Transforms/VerifyContracts.cpp`), which checks the `requires` and
+`ensures` clauses of functions right after lifetime checking, before
+elaboration and inlining. See `Mojo/proposals/modular-verification.md`, and
+`Mojo/proposals/function-contracts.md` for the clauses.
 
 ## Running
 
@@ -109,9 +110,9 @@ An unproven precondition is a warning at the call, with a note at the clause:
 straight_line.mojo:78:14: warning: cannot prove the precondition of 'List.__getitem__'
     return xs[i]  # nothing is known about `i`
              ^
-list.mojo:1572:34: note: precondition declared here
-        ref self, idx: Int where 0 <= idx and idx < len(self), /
-                                 ^
+list.mojo:1623:18: note: precondition declared here
+        requires 0 <= idx and idx < len(self):
+                 ^
 ```
 
 To compare a file against its expected results (every call in a `bad_*`
@@ -271,8 +272,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   element and does not write the collection, although its origin may be
   mutable.
 
-- Traits: a trait method's `where` clauses (on a required method, `...`,
-  as on a default) are its contract. A generic call (`t.get(i)` on a
+- Traits: a trait method's `requires` and `ensures` clauses (on a required
+  method, `...`, as on a default) are its contract. A generic call (`t.get(i)` on a
   `T: Counter`) is held to the trait's precondition and assumes its
   postcondition, and so is a call of an inherited default through a
   struct (`f.pick(i)`). Every implementation is checked against the trait:
@@ -360,9 +361,9 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   like; `has_accelerator()` is not enough (an accelerator name the stdlib
   does not recognize has no known GPU triple). Kernels are verified like any
   function, on the host, before they are compiled for a GPU.
-- A kernel states the launch it relies on as `where` clauses on its
-  arguments (`grid_dim.y <= Int(c.dim[0]()) // 16`, `block_dim.x ==
-  256`), which are assumed in its body. At a launch,
+- A kernel states the launch it relies on as `requires` clauses
+  (`grid_dim.y <= Int(c.dim[0]()) // 16`, `block_dim.x == 256`), which are
+  assumed in its body. At a launch,
   `ctx.enqueue_function[kernel](args..., grid_dim=g, block_dim=b)`, they
   are obligations, with the kernel's arguments the launch's and its
   `grid_dim` and `block_dim` the launch's `Dim`s (from `Int`s, literals
@@ -415,8 +416,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   fields, also at the head of a loop that writes only fields, and where two
   paths join. A field of a struct passed by value is that field of the
   value, so a callee's clause about `self.ptr` is about the caller's
-  `x.arr.ptr`. A constructor's clause is written on `out self`, or on a named
-  result (`out result: Self where ...`) for one that returns `Self`.
+  `x.arr.ptr`. A constructor's `ensures` clause is about `self`, or about
+  `result` for one that returns `Self`.
   `rebind[T](x)` is `x`; `Int(i)` of an `Intable` `i` is `i` where it is an
   `Int`, else one value per `i` (assumed a function of it); the pointer of an
   array that is a field has the array's length. A loop's integer parameters
@@ -438,7 +439,7 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `shared_mem_bytes=`, so a kernel can require
   `external_memory[UInt8, ...]()._extent() >= n`.
 - `t.ptr` of a tensor is the same pointer wherever it is read from the same
-  tensor value, so a clause can state its extent (`where t.ptr._extent() >=
+  tensor value, so a clause can state its extent (`requires t.ptr._extent() >=
   n`); nothing else does.
 - Raw pointers: `Pointer._extent()` is how many elements are valid from a
   pointer, for contracts only (it is not computed: `Int.MAX` at run time);
@@ -453,7 +454,7 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   extent), `List.unsafe_ptr()`, `Span.unsafe_ptr()` and
   `Array.unsafe_ptr()` (at least the length), `DeviceBuffer.unsafe_ptr()`
   (the buffer's length, which `enqueue_create_buffer(n)` states), and by a
-  function's own clauses (`n: Int where p._extent() >= n`). Casts of a
+  function's own clauses (`requires p._extent() >= n`). Casts of a
   pointer's origin or address space (the implicit mutable-to-immutable
   conversion, `as_imm()`, `unsafe_origin_cast`, ...) keep its extent;
   `unsafe_bitcast` does not. A `DeviceBuffer` passed for a kernel's
@@ -558,9 +559,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   value per index. `all([... self.offsets[v] ... for v in range(n)])` in
   a clause is then how one method hands such an array to another. Any
   other store to a comptime-indexed element makes the array unknown.
-- A clause on `mut self` that names `old(...)` is a postcondition only
-  (`self.base == old(self.base) and all([...])`); a method's clauses do
-  not count as writes of the fields they read.
+- A method's clauses do not count as writes of the fields they read
+  (`ensures self.base == old(self.base) and all([...])`).
 - A mutable origin lent immutably to a call (`muttoimm`: an `imm`
   reference to an element, passed as a pointer offset) is not written.
 - An `Optional` comptime parameter built from a value, or left at its
