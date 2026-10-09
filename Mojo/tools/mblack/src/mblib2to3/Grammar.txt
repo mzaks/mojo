@@ -17,9 +17,13 @@ decorators: decorator+
 decorated: decorators (classdef | funcdef | async_funcdef | if_stmt | for_stmt | var_stmt NEWLINE | comptime_stmt | import_stmt)
 async_funcdef: ASYNC funcdef
 where_clause: WHERE top_test ['else' test]
+# A function's contract for static verification: preconditions, then
+# postconditions, after its trailing `where` clauses. Soft keywords.
+requires_clause: "requires" top_test ['else' test]
+ensures_clause: "ensures" top_test ['else' test]
 # Mojo terms: metaparams [..] = parameter list; parameters (..) = argument list;
 # captures {..} = capture list (production names kept from black's Python grammar).
-funcdef: ('def' | MLIR_REGION) NAME [metaparams] parameters [named_effect*] [global_effects] [captures] ['->' result_type] (where_clause)* ':' suite
+funcdef: ('def' | MLIR_REGION) NAME [metaparams] parameters [named_effect*] [global_effects] [captures] ['->' result_type] (where_clause)* (requires_clause)* (ensures_clause)* ':' suite
 global_effects: global_effect_keyword*
 global_effect_keyword: 'raises' [raises_type] | 'escaping' | 'capturing'
 # `raises_type` lists allowed shapes after `raises` in global_effects. It
@@ -55,7 +59,7 @@ result_type: [REF '[' test [',' test [',']] ']'] (functype | generatortype | or_
 convention: VAR | (OUT ['[' test [',' test [',']] ']']) | IMM | MUT | DEINIT | (REF ['[' test [',' test [',']] ']'])
 #tname: NAME [metaparams] [':' test]
 
-typedargslist: ((([convention] ['**'|'*'] tfpdef (where_clause)* ['=' test])|'/'|'*'|'//') [','])*
+typedargslist: ((([convention] ['**'|'*'] tfpdef ['=' test])|'/'|'*'|'//') [','])*
 
 tname: NAME [metaparams] [':' (type_test|star_expr)]
 

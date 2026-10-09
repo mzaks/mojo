@@ -87,6 +87,7 @@ class _python_symbols(Symbols):
     dotted_as_names: int
     dotted_name: int
     encoding_decl: int
+    ensures_clause: int
     eval_input: int
     except_clause: int
     exec_stmt: int
@@ -129,6 +130,7 @@ class _python_symbols(Symbols):
     print_stmt: int
     raise_stmt: int
     raises_type: int
+    requires_clause: int
     return_stmt: int
     result_type: int
     shift_expr: int

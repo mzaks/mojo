@@ -224,6 +224,38 @@ def _join_dot_continuation(
     return None
 
 
+def _join_clause_continuation(
+    prev: str, line: str, head_indent: int
+) -> str | None:
+    """Join a trailing clause of a declaration from a continuation line.
+
+    In Mojo, the `where`, `requires` and `ensures` clauses of a declaration
+    may each start a further-indented line::
+
+        def pop(mut self) -> Self.T
+            requires len(self) > 0
+            ensures len(self) == old(len(self)) - 1:
+
+    The lib2to3-based parser requires them on the same logical line.
+    """
+    stripped = line.lstrip()
+    if not any(
+        _starts_with_keyword(stripped, keyword)
+        for keyword in ("where", "requires", "ensures")
+    ):
+        return None
+    cur_indent = len(line) - len(stripped)
+    if (
+        prev
+        and cur_indent > head_indent
+        and not prev.endswith(":")
+        and not prev.endswith("\\")
+        and not prev.lstrip().startswith("#")
+    ):
+        return prev + " " + stripped
+    return None
+
+
 # Normalizers are applied in order; the *first* one that returns a
 # non-None replacement wins and the rest are skipped.  Each receives the
 # previous result line (with any trailing comment already stripped), the
@@ -236,6 +268,7 @@ _MOJO_LINE_NORMALIZERS = [
     _join_trailing_operator,
     _join_string_continuation,
     _join_dot_continuation,
+    _join_clause_continuation,
 ]
 
 

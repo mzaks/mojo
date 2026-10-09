@@ -1170,7 +1170,11 @@ def _is_where_clause_tuple_element(leaf: Leaf) -> bool:
     if atom is None or atom.type != syms.atom:
         return False
     where = atom.parent
-    return where is not None and where.type == syms.where_clause
+    return where is not None and where.type in (
+        syms.where_clause,
+        syms.requires_clause,
+        syms.ensures_clause,
+    )
 
 
 def iter_fexpr_spans(s: str) -> Iterator[tuple[int, int]]:

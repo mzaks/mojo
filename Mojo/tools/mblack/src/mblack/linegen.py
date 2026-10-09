@@ -690,10 +690,16 @@ class LineGenerator(Visitor[Line]):
 
     def visit_where_clause(self, node: Node) -> Iterator[Line]:
         normalize_invisible_parens(
-            node, parens_after={"where"}, preview=self.mode.preview
+            node,
+            parens_after={"where", "requires", "ensures"},
+            preview=self.mode.preview,
         )
         for child in node.children:
             yield from self.visit_default(child)
+
+    # A function's contract clauses share the form of a `where` clause.
+    visit_requires_clause = visit_where_clause
+    visit_ensures_clause = visit_where_clause
 
 
 def transform_line(
@@ -736,6 +742,12 @@ def transform_line(
             transformers = [string_merge, string_paren_strip]
         else:
             transformers = []
+    elif line.is_def and any(
+        _starts_contract_clause(leaf) for leaf in line.leaves
+    ):
+        # A header with a contract that does not fit gives each clause its
+        # own line; what is left of the header is split as usual.
+        transformers = [contract_clause_split]
     elif line.is_def:
         transformers = [left_hand_split]
     else:
@@ -821,6 +833,63 @@ def transform_line(
 
     else:
         yield line
+
+
+def _starts_contract_clause(leaf: Leaf) -> bool:
+    """Is `leaf` the `requires` or `ensures` keyword of a contract clause?"""
+    clause = leaf.parent
+    return (
+        clause is not None
+        and clause.type in (syms.requires_clause, syms.ensures_clause)
+        and clause.children[0] is leaf
+    )
+
+
+def contract_clause_split(
+    line: Line, features: Collection[Feature] = ()
+) -> Iterator[Line]:
+    """Split a function header before each of its contract clauses.
+
+    Every `requires` and `ensures` clause gets a line of its own, indented
+    once under the `def`, so a reader finds a function's preconditions and
+    postconditions at a glance. The function's own `where` clauses line up
+    with them:
+
+        def pop(mut self) -> Self.T
+            where conforms_to(Self.T, Movable)
+            requires len(self) > 0
+            ensures len(self) == old(len(self)) - 1:
+    """
+    if not any(_starts_contract_clause(leaf) for leaf in line.leaves):
+        raise CannotSplit("No contract clauses found")
+
+    def starts_clause(leaf: Leaf) -> bool:
+        if _starts_contract_clause(leaf):
+            return True
+        clause = leaf.parent
+        return (
+            clause is not None
+            and clause.type == syms.where_clause
+            and clause.children[0] is leaf
+            and clause.parent is not None
+            and clause.parent.type == syms.funcdef
+        )
+
+    starts = [
+        index for index, leaf in enumerate(line.leaves) if starts_clause(leaf)
+    ]
+
+    bounds = [0, *starts, len(line.leaves)]
+    for part, (begin, end) in enumerate(zip(bounds, bounds[1:])):
+        result = Line(mode=line.mode, depth=line.depth + (1 if part else 0))
+        for leaf in line.leaves[begin:end]:
+            if not result.leaves:
+                leaf.prefix = ""
+            result.append(leaf, preformatted=True)
+            for comment_after in line.comments_after(leaf):
+                result.append(comment_after, preformatted=True)
+        if result:
+            yield result
 
 
 class _BracketSplitComponent(Enum):
@@ -915,7 +984,11 @@ def _closes_where_condition_with_message(closing_bracket: Leaf) -> bool:
     if atom is None or atom.type != syms.atom:
         return False
     clause = atom.parent
-    if clause is None or clause.type != syms.where_clause:
+    if clause is None or clause.type not in (
+        syms.where_clause,
+        syms.requires_clause,
+        syms.ensures_clause,
+    ):
         return False
     return any(
         isinstance(child, Leaf)
