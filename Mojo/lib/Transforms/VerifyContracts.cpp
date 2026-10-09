@@ -4584,7 +4584,10 @@ private:
 
   /// The function's own postcondition, where it returns.
   void proveEnsures(EnsuresOp ensures, State &state) {
+    // Reported at the return: the op after the function's last clause.
     Operation *next = ensures->getNextNode();
+    while (next && isa<EnsuresOp>(next))
+      next = next->getNextNode();
     Location at = next ? next->getLoc() : ensures.getLoc();
     Obligation ob{state.pc, "false", at, ensures.getLoc(), displayName(fn)};
     ob.postcondition = true;
