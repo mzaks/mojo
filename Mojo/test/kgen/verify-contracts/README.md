@@ -20,7 +20,8 @@ bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
 ```
 
 `tensors.mojo` and `kernels.mojo` import the `max` and `layout` packages:
-build them and add them to the import path. `gemv_split_k.mojo` launches a
+build them and add them to the import path. `gemm_mma_cpasync.mojo` (with `invariant-retry=true`) and
+`gemv_split_k.mojo` each launch a
 kernel of `linalg`: it needs every kernel package on the import path and
 `packages=linalg`, and is compiled too (`-elaborate` without
 `--verify-contracts`), which checks its `comptime assert`s.
@@ -564,6 +565,25 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `None` default, holds one or not where a clause tests it (`fill` of
   `async_copy`).
 - `TileTensor(ptr, layout)`: the tensor's `ptr` is that pointer.
+- `t._linear_offset(Index(i0, ..., in))`: the element's offset from
+  `t.ptr`. As for `t[i0, ..., in]`, a tensor's elements are taken to be
+  backed (assumption: its dimensions and strides describe memory its
+  pointer has, and its offsets fit its index type). For an index within
+  the dimensions the offset is not negative, and where the last stride is
+  1 (the layout's own, or `comptime assert L.static_stride[n] == 1` of a
+  generic one) the rest of that row follows it: `t.ptr + Int(offset)`
+  has `dim[n] - in` elements.
+- `comptime assert n == 64 or n == 128 or n == 256` (at most 8 values of
+  one integer parameter): the queries are asked once per value, as for
+  the SIMD widths. With `n` a constant, quotients and remainders by it
+  are linear; a helper generic over a tile size that does not prove for
+  every size may prove for each of the sizes it is used with.
+- A loop that only reads an array through a mutable reference
+  (`self.offsets[v]` in a method of `mut self`) keeps the array's value.
+- A variable the body adds a constant to, once, beside `for _ in
+  range(n)`, is that constant times the iterations so far (a candidate
+  invariant). Not for a parameter amount: write `i * step` then.
+- `Bool(scalar)`: what `a and b` yields where `a` is false.
 
 Not analyzed yet: loops with loop-carried values, and ranges with a step
 (`range(a, b, c)`) or over other integer types. Lists built from other iterables
@@ -581,7 +601,9 @@ a unit of nonlinear integer work can take a thousand times longer than a
 bit-vector one, and z3's own `:timeout` does not stop such a query on
 time. The one clock left is `wall-seconds`, which stops a solver process
 that hangs; a run it stops is reported in the summary (`N solver runs
-were stopped ...`), and its result is then not to be trusted.
+were stopped ...`), and its result is then not to be trusted. The cap
+counts the time the process could run, not the time that passed: a
+machine that sleeps stops the solver too.
 
 ## Expected results
 
@@ -603,3 +625,4 @@ were stopped ...`), and its result is then not to be trusted.
 | `pointers.mojo`      | all `bad_*`        | all `ok_*`       |
 | `structs.mojo`       | all `bad_*`        | all `ok_*`       |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |
+| `gemm_mma_cpasync.mojo` | (none)          | all `ok_*`       |

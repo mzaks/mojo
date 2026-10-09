@@ -1860,7 +1860,31 @@ Tensors and GPU kernels:
   With the solver frozen as before, the gemv file now gives the same
   diagnostics as on a quiet machine (in 556 s instead of 85). Corpus:
   1910 obligations proven before and after, pass time 471 s to 440 s.
-  What stalled the original runs is not known.
+  What stalled the original runs was the machine: it slept, every
+  quarter of an hour (one 16 s solver run took 917 s, of which the
+  power log shows 903 s asleep), and the cap, on a clock that runs on
+  through sleep, then killed solver runs that had hardly started. The
+  cap now counts only the time a process could run. Run times here are
+  CPU seconds since.
+- `gemm_mma_cpasync`, third part: the reads from global memory, and the
+  kernel's clauses in the source. `TileTensor._linear_offset` is modelled
+  on the assumption `t[i, j]` already rests on (a tensor's elements are
+  backed): in bounds and with contiguous rows, the row's rest follows
+  the offset. The K column a vector reads was the hard part: chunk index
+  times chunk size plus iteration times `tile_k // 4`, for any `tile_k`.
+  In the loop this did not prove at any cost tried. It is now a helper
+  (`_gmem_k`, replacing an offset the loop carried) with a contract, and
+  the kernel asserts `tile_k` is 64, 128, 256 or 512, which the pass
+  checks one by one: the helper's contract proves in 2 s, and the loop
+  only establishes its precondition. Tried and dropped: an invariant
+  for a variable incremented by a parameter amount (needs the exact
+  integer retry for every obligation about it), and divisibility facts
+  for `%` by a symbolic divisor (cost proofs elsewhere). A launch of
+  the kernel with `tile_k` 128 and two stages is fully proven
+  (`gemm_mma_cpasync.mojo`); with the linalg package, 54 of 55 in 172
+  CPU seconds. Open: the generic launcher `gemm_mma_cpasync` states no
+  clauses, so its four launches (2-D or batched, with or without
+  `swapAB`) are reported.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

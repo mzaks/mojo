@@ -1994,6 +1994,42 @@ struct _MmaCpAsyncGmemLoaderA[
             tile_k_idx % Self.per_warp_k
         )
 
+    @inline(.always)
+    def _gmem_k(
+        self,
+        linear: Int,
+        loop_idx: Int where (
+            0 <= linear < 2147483648
+            and linear % Self.VEC_ELEMS == 0
+            and 0 <= loop_idx < 2147483648
+            and 0 <= self.k_each_chunk < 2147483648
+            and (loop_idx + 1) * Self.per_warp_k <= self.k_each_chunk
+        ),
+        out result: Int where (
+            0 <= result <= 4 * self.k_each_chunk - Self.VEC_ELEMS
+        ),
+    ):
+        """The first K column a vector reads in one iteration of the main loop.
+
+        Args:
+            linear: The vector's first element in the tile, row-major.
+            loop_idx: The iteration.
+
+        Returns:
+            The column: its chunk's start, the iteration's `per_warp_k`
+            columns in, plus its place in the tile's quarter.
+        """
+        comptime assert Self.VEC_ELEMS == 8, "16-bit operands"
+        comptime assert (
+            Self.tile_k == 64
+            or Self.tile_k == 128
+            or Self.tile_k == 256
+            or Self.tile_k == 512
+        ), "tile_k must be 64, 128, 256 or 512"
+        result = (
+            self._k_project(linear % Self.tile_k) + loop_idx * Self.per_warp_k
+        )
+
     var act: Self.ActTensor
     var smem_a: Self.SmemTiles
     var smem_barrier: Self.Barriers
@@ -2009,7 +2045,19 @@ struct _MmaCpAsyncGmemLoaderA[
     var preds: Array[Bool, Self.vec_per_iter]
 
     def __init__(
-        out self,
+        out self where (
+            self.stage == 0
+            and self.smem_barrier.ptr._extent() >= smem_barrier.ptr._extent()
+            and self.smem_a.ptr._extent() >= smem_a.ptr._extent()
+            and self.local_tid == local_tid
+            and self.batch_idx == batch_idx
+            and self.cta_m == cta_m
+            and self.gemm_m == gemm_m
+            and self.k_each_chunk == k_each_chunk
+            and Int(self.act.dim[0]()) == Int(act.dim[0]())
+            and Int(self.act.dim[1]()) == Int(act.dim[1]())
+            and Int(self.act.dim[2]()) == Int(act.dim[2]())
+        ),
         act: Self.ActTensor,
         smem_a: Self.SmemTiles,
         smem_barrier: Self.Barriers,
@@ -2033,7 +2081,40 @@ struct _MmaCpAsyncGmemLoaderA[
         self.smem_offsets = Array[Int, Self.vec_per_iter](uninitialized=True)
         self.preds = Array[Bool, Self.vec_per_iter](fill=False)
 
-    def prepare(mut self):
+    def prepare(
+        mut self where old(0 <= self.local_tid < Self.LOAD_THREADS) where (
+            self.local_tid == old(self.local_tid)
+            and all(
+                [
+                    0
+                    <= self.smem_offsets[v]
+                    <= Self.SmemTiles.tile_size - Self.VEC_ELEMS
+                    for v in range(Self.vec_per_iter)
+                ]
+            )
+            and all(
+                [
+                    not self.preds[v]
+                    or self.cta_m
+                    + (
+                        self.local_tid * Self.VEC_ELEMS
+                        + v * Self.LOAD_THREADS * Self.VEC_ELEMS
+                    )
+                    // Self.tile_k
+                    < self.gemm_m
+                    for v in range(Self.vec_per_iter)
+                ]
+            )
+        )
+    ):
+        comptime assert Self.tile_m == 16, "tile_m must be 16"
+        comptime assert Self.VEC_ELEMS == 8, "16-bit operands"
+        comptime assert 64 <= Self.tile_k <= 65536, "tile_k out of range"
+        comptime assert Self.tile_k % 64 == 0, "tile_k must be a multiple of 64"
+        # The swizzle permutes whole vectors within 64-element blocks.
+        comptime assert Self.swizzle.zzz_mask == 56
+        comptime assert 0 < Self.swizzle.shift < 64
+        comptime assert (Self.swizzle.yyy_mask >> Self.swizzle.shift) == 56
         comptime for v in range(Self.vec_per_iter):
             var linear = (
                 self.local_tid * Self.VEC_ELEMS
@@ -2043,8 +2124,59 @@ struct _MmaCpAsyncGmemLoaderA[
             self.smem_offsets[v] = Self.swizzle(linear)
             self.preds[v] = self.cta_m + m_idx < self.gemm_m
 
-    def issue_mainloop(mut self, k_iters: Int):
-        var gmem_a_off = 0
+    def issue_mainloop(
+        mut self,
+        k_iters: Int where (
+            self.smem_barrier.ptr._extent() >= Self.stage_cnt * 2
+            and 0 <= self.stage < Self.stage_cnt
+            and self.smem_a.ptr._extent() >= Self.SmemTiles.num_elements
+            and all(
+                [
+                    0
+                    <= self.smem_offsets[v]
+                    <= Self.SmemTiles.tile_size - Self.VEC_ELEMS
+                    for v in range(Self.vec_per_iter)
+                ]
+            )
+            and all(
+                [
+                    not self.preds[v]
+                    or self.cta_m
+                    + (
+                        self.local_tid * Self.VEC_ELEMS
+                        + v * Self.LOAD_THREADS * Self.VEC_ELEMS
+                    )
+                    // Self.tile_k
+                    < self.gemm_m
+                    for v in range(Self.vec_per_iter)
+                ]
+            )
+            # The global tensor: (batch, rows, K), K split in four chunks,
+            # of which each iteration reads `per_warp_k` columns.
+            and 0 <= self.local_tid < Self.LOAD_THREADS
+            and 0 <= self.batch_idx < Int(self.act.dim[0]())
+            and 0 <= self.cta_m < 2147483648
+            and 0 <= self.gemm_m <= Int(self.act.dim[1]())
+            and 0 <= k_iters < 2147483648
+            and 0 <= self.k_each_chunk < 2147483648
+            and k_iters * Self.per_warp_k <= self.k_each_chunk
+            and 4 * self.k_each_chunk <= Int(self.act.dim[2]())
+        ),
+    ):
+        # Far above what shared memory holds; keeps `stage * 2` from wrapping.
+        comptime assert Self.stage_cnt <= 65536, "stage_cnt out of range"
+        comptime assert Self.VEC_ELEMS == 8, "16-bit operands"
+        comptime assert (
+            Self.tile_k == 64
+            or Self.tile_k == 128
+            or Self.tile_k == 256
+            or Self.tile_k == 512
+        ), "tile_k must be 64, 128, 256 or 512"
+        comptime assert Self.tile_m == 16, "tile_m must be 16"
+        # Rows of K contiguous elements.
+        comptime assert Self.a_layout.rank == 3, "(batch, rows, K)"
+        comptime assert Self.a_layout.flat_rank == 3, "(batch, rows, K)"
+        comptime assert Self.a_layout.static_stride[2] == 1, "contiguous rows"
         for loop_idx in range(k_iters):
             if self.need_wait:
                 self.smem_barrier[1 + self.stage * 2][].wait(self.phase)
@@ -2067,8 +2199,7 @@ struct _MmaCpAsyncGmemLoaderA[
                     + v * Self.LOAD_THREADS * Self.VEC_ELEMS
                 )
                 var m_idx = linear // Self.tile_k
-                var k_idx = linear % Self.tile_k
-                var gmem_k = self._k_project(k_idx) + gmem_a_off
+                var gmem_k = self._gmem_k(linear, loop_idx)
                 if self.preds[v]:
                     var offset = self.act._linear_offset(
                         Index(self.batch_idx, self.cta_m + m_idx, gmem_k)
@@ -2093,7 +2224,6 @@ struct _MmaCpAsyncGmemLoaderA[
 
             async_copy_arrive[noinc=True](self.smem_barrier[self.stage * 2])
 
-            gmem_a_off += Self.per_warp_k
             self.stage = next_stage
             self.phase = next_phase
 
@@ -2135,6 +2265,42 @@ struct _MmaCpAsyncGmemLoaderB[
             tile_k_idx % Self.per_warp_k
         )
 
+    @inline(.always)
+    def _gmem_k(
+        self,
+        linear: Int,
+        loop_idx: Int where (
+            0 <= linear < 2147483648
+            and linear % Self.VEC_ELEMS == 0
+            and 0 <= loop_idx < 2147483648
+            and 0 <= self.k_each_chunk < 2147483648
+            and (loop_idx + 1) * Self.per_warp_k <= self.k_each_chunk
+        ),
+        out result: Int where (
+            0 <= result <= 4 * self.k_each_chunk - Self.VEC_ELEMS
+        ),
+    ):
+        """The first K column a vector reads in one iteration of the main loop.
+
+        Args:
+            linear: The vector's first element in the tile, row-major.
+            loop_idx: The iteration.
+
+        Returns:
+            The column: its chunk's start, the iteration's `per_warp_k`
+            columns in, plus its place in the tile's quarter.
+        """
+        comptime assert Self.VEC_ELEMS == 8, "16-bit operands"
+        comptime assert (
+            Self.tile_k == 64
+            or Self.tile_k == 128
+            or Self.tile_k == 256
+            or Self.tile_k == 512
+        ), "tile_k must be 64, 128, 256 or 512"
+        result = (
+            self._k_project(linear % Self.tile_k) + loop_idx * Self.per_warp_k
+        )
+
     var weight: Self.WeightTensor
     var smem_b: Self.SmemTiles
     var smem_barrier: Self.Barriers
@@ -2150,7 +2316,19 @@ struct _MmaCpAsyncGmemLoaderB[
     var preds: Array[Bool, Self.vec_per_iter]
 
     def __init__(
-        out self,
+        out self where (
+            self.stage == 0
+            and self.smem_barrier.ptr._extent() >= smem_barrier.ptr._extent()
+            and self.smem_b.ptr._extent() >= smem_b.ptr._extent()
+            and self.local_tid == local_tid
+            and self.batch_idx == batch_idx
+            and self.cta_n == cta_n
+            and self.gemm_n == gemm_n
+            and self.k_each_chunk == k_each_chunk
+            and Int(self.weight.dim[0]()) == Int(weight.dim[0]())
+            and Int(self.weight.dim[1]()) == Int(weight.dim[1]())
+            and Int(self.weight.dim[2]()) == Int(weight.dim[2]())
+        ),
         weight: Self.WeightTensor,
         smem_b: Self.SmemTiles,
         smem_barrier: Self.Barriers,
@@ -2174,7 +2352,40 @@ struct _MmaCpAsyncGmemLoaderB[
         self.smem_offsets = Array[Int, Self.vec_per_iter](uninitialized=True)
         self.preds = Array[Bool, Self.vec_per_iter](fill=False)
 
-    def prepare(mut self):
+    def prepare(
+        mut self where old(0 <= self.local_tid < Self.LOAD_THREADS) where (
+            self.local_tid == old(self.local_tid)
+            and all(
+                [
+                    0
+                    <= self.smem_offsets[v]
+                    <= Self.SmemTiles.tile_size - Self.VEC_ELEMS
+                    for v in range(Self.vec_per_iter)
+                ]
+            )
+            and all(
+                [
+                    not self.preds[v]
+                    or self.cta_n
+                    + (
+                        self.local_tid * Self.VEC_ELEMS
+                        + v * Self.LOAD_THREADS * Self.VEC_ELEMS
+                    )
+                    // Self.tile_k
+                    < self.gemm_n
+                    for v in range(Self.vec_per_iter)
+                ]
+            )
+        )
+    ):
+        comptime assert Self.tile_n == 8, "tile_n must be 8"
+        comptime assert Self.VEC_ELEMS == 8, "16-bit operands"
+        comptime assert 64 <= Self.tile_k <= 65536, "tile_k out of range"
+        comptime assert Self.tile_k % 64 == 0, "tile_k must be a multiple of 64"
+        # The swizzle permutes whole vectors within 64-element blocks.
+        comptime assert Self.swizzle.zzz_mask == 56
+        comptime assert 0 < Self.swizzle.shift < 64
+        comptime assert (Self.swizzle.yyy_mask >> Self.swizzle.shift) == 56
         comptime for v in range(Self.vec_per_iter):
             var linear = (
                 self.local_tid * Self.VEC_ELEMS
@@ -2184,8 +2395,59 @@ struct _MmaCpAsyncGmemLoaderB[
             self.smem_offsets[v] = Self.swizzle(linear)
             self.preds[v] = self.cta_n + n_idx < self.gemm_n
 
-    def issue_mainloop(mut self, k_iters: Int):
-        var gmem_b_off = 0
+    def issue_mainloop(
+        mut self,
+        k_iters: Int where (
+            self.smem_barrier.ptr._extent() >= Self.stage_cnt * 2
+            and 0 <= self.stage < Self.stage_cnt
+            and self.smem_b.ptr._extent() >= Self.SmemTiles.num_elements
+            and all(
+                [
+                    0
+                    <= self.smem_offsets[v]
+                    <= Self.SmemTiles.tile_size - Self.VEC_ELEMS
+                    for v in range(Self.vec_per_iter)
+                ]
+            )
+            and all(
+                [
+                    not self.preds[v]
+                    or self.cta_n
+                    + (
+                        self.local_tid * Self.VEC_ELEMS
+                        + v * Self.LOAD_THREADS * Self.VEC_ELEMS
+                    )
+                    // Self.tile_k
+                    < self.gemm_n
+                    for v in range(Self.vec_per_iter)
+                ]
+            )
+            # The global tensor: (batch, rows, K), K split in four chunks,
+            # of which each iteration reads `per_warp_k` columns.
+            and 0 <= self.local_tid < Self.LOAD_THREADS
+            and 0 <= self.batch_idx < Int(self.weight.dim[0]())
+            and 0 <= self.cta_n < 2147483648
+            and 0 <= self.gemm_n <= Int(self.weight.dim[1]())
+            and 0 <= k_iters < 2147483648
+            and 0 <= self.k_each_chunk < 2147483648
+            and k_iters * Self.per_warp_k <= self.k_each_chunk
+            and 4 * self.k_each_chunk <= Int(self.weight.dim[2]())
+        ),
+    ):
+        # Far above what shared memory holds; keeps `stage * 2` from wrapping.
+        comptime assert Self.stage_cnt <= 65536, "stage_cnt out of range"
+        comptime assert Self.VEC_ELEMS == 8, "16-bit operands"
+        comptime assert (
+            Self.tile_k == 64
+            or Self.tile_k == 128
+            or Self.tile_k == 256
+            or Self.tile_k == 512
+        ), "tile_k must be 64, 128, 256 or 512"
+        comptime assert Self.tile_n == 8, "tile_n must be 8"
+        # Rows of K contiguous elements.
+        comptime assert Self.b_layout.rank == 3, "(batch, rows, K)"
+        comptime assert Self.b_layout.flat_rank == 3, "(batch, rows, K)"
+        comptime assert Self.b_layout.static_stride[2] == 1, "contiguous rows"
         for loop_idx in range(k_iters):
             if self.need_wait:
                 self.smem_barrier[1 + self.stage * 2][].wait(self.phase)
@@ -2208,8 +2470,7 @@ struct _MmaCpAsyncGmemLoaderB[
                     + v * Self.LOAD_THREADS * Self.VEC_ELEMS
                 )
                 var n_idx = linear // Self.tile_k
-                var k_idx = linear % Self.tile_k
-                var gmem_k = self._k_project(k_idx) + gmem_b_off
+                var gmem_k = self._gmem_k(linear, loop_idx)
                 if self.preds[v]:
                     var offset = self.weight._linear_offset(
                         Index(self.batch_idx, self.cta_n + n_idx, gmem_k)
@@ -2231,7 +2492,6 @@ struct _MmaCpAsyncGmemLoaderB[
 
             async_copy_arrive[noinc=True](self.smem_barrier[self.stage * 2])
 
-            gmem_b_off += Self.per_warp_k
             self.stage = next_stage
             self.phase = next_phase
 
@@ -2282,7 +2542,20 @@ struct _MmaCpAsyncMmaComputer[
     var acc: SIMD[Self.accum_type, 4]
 
     def __init__(
-        out self,
+        out self where (
+            self.stage == 0
+            and self.smem_barrier.ptr._extent() >= smem_barrier.ptr._extent()
+            and self.smem_a.ptr._extent() >= smem_a.ptr._extent()
+            and self.smem_b.ptr._extent() >= smem_b.ptr._extent()
+            and self.out_ptr._extent() >= out_ptr._extent()
+            and self.compute_warp == compute_warp
+            and self.lane_idx == lane_idx
+            and self.warp_k_off == warp_k_off
+            and self.cta_m == cta_m
+            and self.cta_n == cta_n
+            and self.gemm_m == gemm_m
+            and self.gemm_n == gemm_n
+        ),
         smem_a: Self.SmemTilesA,
         smem_b: Self.SmemTilesB,
         smem_barrier: Self.Barriers,
@@ -2310,7 +2583,32 @@ struct _MmaCpAsyncMmaComputer[
         self.phase = UInt32(0)
         self.acc = SIMD[Self.accum_type, 4](0)
 
-    def issue_mainloop(mut self, k_iters: Int):
+    def issue_mainloop(
+        mut self,
+        k_iters: Int where (
+            self.smem_barrier.ptr._extent() >= Self.stage_cnt * 2
+            and 0 <= self.stage < Self.stage_cnt
+            and self.smem_a.ptr._extent() >= Self.SmemTilesA.num_elements
+            and self.smem_b.ptr._extent() >= Self.SmemTilesB.num_elements
+            and 0 <= self.lane_idx < 32
+            and 0 <= self.warp_k_off < Self.tile_k
+            and self.warp_k_off % Self.per_warp_k == 0
+        ),
+    ):
+        # Far above what shared memory holds; keeps `stage * 2` from wrapping.
+        comptime assert Self.stage_cnt <= 65536, "stage_cnt out of range"
+        comptime assert Self.tile_m == 16 and Self.tile_n == 8
+        comptime assert size_of[Self.a_type]() == 2, "16-bit operands"
+        comptime assert size_of[Self.b_type]() == 2, "16-bit operands"
+        comptime assert 64 <= Self.tile_k <= 65536, "tile_k out of range"
+        comptime assert Self.tile_k % 64 == 0, "tile_k must be a multiple of 64"
+        # The swizzles permute whole vectors within 64-element blocks.
+        comptime assert Self.swizzle_a.zzz_mask == 56
+        comptime assert 0 < Self.swizzle_a.shift < 64
+        comptime assert (Self.swizzle_a.yyy_mask >> Self.swizzle_a.shift) == 56
+        comptime assert Self.swizzle_b.zzz_mask == 56
+        comptime assert 0 < Self.swizzle_b.shift < 64
+        comptime assert (Self.swizzle_b.yyy_mask >> Self.swizzle_b.shift) == 56
         for loop_idx in range(k_iters):
             self.smem_barrier[self.stage * 2][].wait(self.phase)
 
@@ -2350,7 +2648,18 @@ struct _MmaCpAsyncMmaComputer[
             )
             self.stage = 0 if raw_next == Self.stage_cnt else raw_next
 
-    def epi(mut self):
+    def epi(
+        self where (
+            0 <= self.lane_idx < 32
+            and 0 <= self.compute_warp < 4
+            and 0 <= self.cta_m < 2147483648
+            and 0 <= self.cta_n < 2147483648
+            and 0 <= self.gemm_m < 2147483648
+            and 0 <= self.gemm_n < 2147483648
+            and self.out_ptr._extent() >= self.gemm_m * self.gemm_n
+            and self.smem_a.ptr._extent() >= Self.SmemTilesA.num_elements
+        ),
+    ):
         """Epilogue: reduce acc across 4 compute-warp partials, write the C tile.
 
         The output buffer is always row-major `[M, N]`. When `swapAB`, the
@@ -2359,6 +2668,12 @@ struct _MmaCpAsyncMmaComputer[
         and M in the n-direction; the store transposes index order back into the
         row-major `[M, N]` buffer (row stride = N = `gemm_m`).
         """
+        # The A tiles are the scratch area of the four partial sums: m16n8
+        # outputs of four warps, in `accum_type`.
+        comptime assert Self.tile_m == 16 and Self.tile_n == 8
+        comptime assert 64 <= Self.tile_k <= 65536
+        comptime assert 1 <= Self.stage_cnt <= 65536
+        comptime assert size_of[Self.accum_type]() <= 2 * size_of[Self.a_type]()
         var smem_epi = self.smem_a.ptr.bitcast[Scalar[Self.accum_type]]()
         var base_off = self.compute_warp * Self.tile_m * Self.tile_n
         var m0 = self.lane_idx // 4
@@ -2434,16 +2749,31 @@ struct _MmaCpAsyncSmem[
     var barrier_storage: Self.Barriers.Storage
 
     @inline(.always)
-    def a_tiles(ref[AddressSpace.SHARED] self) -> Self.SmemA:
-        return Self.SmemA(self.a_engine.unsafe_ptr())
+    def a_tiles(
+        ref[AddressSpace.SHARED] self,
+        out result: Self.SmemA where (
+            result.ptr._extent() >= Self.SmemA.num_elements
+        ),
+    ):
+        result = Self.SmemA(self.a_engine.unsafe_ptr())
 
     @inline(.always)
-    def b_tiles(ref[AddressSpace.SHARED] self) -> Self.SmemB:
-        return Self.SmemB(self.b_engine.unsafe_ptr())
+    def b_tiles(
+        ref[AddressSpace.SHARED] self,
+        out result: Self.SmemB where (
+            result.ptr._extent() >= Self.SmemB.num_elements
+        ),
+    ):
+        result = Self.SmemB(self.b_engine.unsafe_ptr())
 
     @inline(.always)
-    def barriers(ref[AddressSpace.SHARED] self) -> Self.Barriers:
-        return Self.Barriers(self.barrier_storage)
+    def barriers(
+        ref[AddressSpace.SHARED] self,
+        out result: Self.Barriers where (
+            result.ptr._extent() >= Self.stage_cnt * 2
+        ),
+    ):
+        result = Self.Barriers(self.barrier_storage)
 
 
 @__llvm_metadata(
@@ -2478,17 +2808,46 @@ def gemm_mma_cpasync_kernel[
     gemm_m: Int32,
     gemm_k: Int32,
     gemm_n: Int32,
-    batch_size: Int32,
+    batch_size: Int32 where (
+        gemm_m >= 0
+        and gemm_k >= 0
+        and gemm_n >= 0
+        and batch_size >= 0
+        and grid_dim.z <= Int(batch_size)
+        and grid_dim.x * tile_m < 2147483648
+        and grid_dim.y * tile_n < 2147483648
+        and block_dim.x == 256
+        # Keeps `batch * m * n` within 64 bits.
+        and Int(batch_size) * Int(gemm_m) < 2147483648
+        and output.ptr._extent()
+        >= Int(batch_size) * Int(gemm_m) * Int(gemm_n)
+        # The operands hold what the kernel reads: (batch, M, K), (batch, N, K).
+        and Int(act.dim[0]()) >= Int(batch_size)
+        and Int(act.dim[1]()) >= Int(gemm_m)
+        and Int(act.dim[2]()) >= Int(gemm_k)
+        and Int(weight.dim[0]()) >= Int(batch_size)
+        and Int(weight.dim[1]()) >= Int(gemm_n)
+        and Int(weight.dim[2]()) >= Int(gemm_k)
+        and external_memory[
+            UInt8,
+            address_space=.SHARED,
+            alignment=128,
+        ]()._extent()
+        >= size_of[_MmaCpAsyncSmem[a_type, tile_m, tile_n, tile_k, stage_cnt]]()
+    ),
 ):
     var _gemm_m = Int(gemm_m)
     var _gemm_k = Int(gemm_k)
     var _gemm_n = Int(gemm_n)
     var _batch_size = Int(batch_size)
     comptime assert _is_sm_100x(), "gemm_mma_cpasync requires B200 (sm_100x)"
+    # Two warps load each operand and four compute: 64 + 64 + 128 threads.
+    comptime assert WARP_SIZE == 32, "warps of 32 threads"
     comptime assert tile_m == 16, "tile_m must be 16 for m16n8k16 MMA"
     comptime assert tile_n == 8, "tile_n must be 8 for m16n8k16 MMA"
     comptime assert tile_k % 64 == 0, "tile_k must be a multiple of 64"
     comptime assert stage_cnt >= 1, "stage_cnt must be at least 1"
+    comptime assert stage_cnt <= 65536, "stage_cnt out of range"
 
     comptime LOAD_THREADS = 64
     comptime COMPUTE_THREADS = 128
