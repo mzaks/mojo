@@ -23,7 +23,12 @@ from std.sys import (
     llvm_intrinsic,
     simd_width_of,
 )
-from std.sys.info import _is_amd_mi250x, _is_sm_100x, size_of
+from std.sys.info import (
+    _is_amd_mi250x,
+    _is_sm_100x,
+    has_nvidia_gpu_accelerator,
+    size_of,
+)
 from max.gpu.compute.mma import ld_matrix, mma
 from max.gpu.sync import async_copy_arrive, named_barrier
 from layout.tma_async import SharedMemBarrier
@@ -2990,7 +2995,34 @@ def gemm_mma_cpasync[
     gemm_k: Int,
     gemm_n: Int,
     batch_size: Int,
-    ctx: DeviceContext,
+    ctx: DeviceContext where (
+        # The grid's rows and columns, in whole tiles, fit `Int32`.
+        0 <= gemm_m <= 2147483648 - 16
+        and 0 <= gemm_n <= 2147483648 - 16
+        and 0 <= gemm_k < 2147483648
+        and (
+            (
+                1 <= batch_size < 2147483648
+                and batch_size * gemm_m < 2147483648
+                and batch_size * gemm_n < 2147483648
+                and c.ptr._extent() >= batch_size * gemm_m * gemm_n
+                and Int(act.dim[0]()) >= batch_size
+                and Int(act.dim[1]()) >= gemm_m
+                and Int(act.dim[2]()) >= gemm_k
+                and Int(weight.dim[0]()) >= batch_size
+                and Int(weight.dim[1]()) >= gemm_n
+                and Int(weight.dim[2]()) >= gemm_k
+            )
+            if comptime (act.rank == 3)
+            else (
+                c.ptr._extent() >= gemm_m * gemm_n
+                and Int(act.dim[0]()) >= gemm_m
+                and Int(act.dim[1]()) >= gemm_k
+                and Int(weight.dim[0]()) >= gemm_n
+                and Int(weight.dim[1]()) >= gemm_k
+            )
+        )
+    ),
 ) raises:
     """Launch the batched GEMM tensor-core kernel.
 
@@ -3046,6 +3078,8 @@ def gemm_mma_cpasync[
     comptime assert (
         ctx.default_device_info.compute == B200.compute
     ), "This kernel is only supported on SM100"
+    # The kernel's warps are of 32 threads.
+    comptime assert has_nvidia_gpu_accelerator(), "an NVIDIA accelerator"
 
     comptime tile_m = 16
     comptime tile_n = 8

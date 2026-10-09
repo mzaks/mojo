@@ -1882,9 +1882,19 @@ Tensors and GPU kernels:
   for `%` by a symbolic divisor (cost proofs elsewhere). A launch of
   the kernel with `tile_k` 128 and two stages is fully proven
   (`gemm_mma_cpasync.mojo`); with the linalg package, 54 of 55 in 172
-  CPU seconds. Open: the generic launcher `gemm_mma_cpasync` states no
-  clauses, so its four launches (2-D or batched, with or without
-  `swapAB`) are reported.
+  CPU seconds.
+- `gemm_mma_cpasync`, the launcher: clauses on its sizes and, by the
+  operands' rank, on the batch, the output's extent and the operands'
+  dimensions; `_to_batched_3d` states what its view is. With these all
+  four launches establish the kernel's clause and the kernel is verified
+  for each: 72 of 72 obligations with the linalg and structured-kernels
+  packages. Found on the way: the launcher was never verified before (a
+  package's function is loaded only if the file verified uses it; the
+  example now calls it); a local named by debug info counted as
+  borrowed, so package code forgot locals that the same code as a main
+  file kept; the launch's shared-memory size was taken from the wrong
+  optional argument; and a kernel's `stage_cnt <= 65536` was not assumed
+  where a launcher computes `stage_cnt` by a division.
 - Not covered yet: a runtime last stride, tensors
   whose runtime size comes from a scalar (`row_major(n)`: `dim` is not related
   to `n`), and kernels in MAX's own packages, which are now

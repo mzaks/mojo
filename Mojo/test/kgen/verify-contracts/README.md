@@ -20,7 +20,9 @@ bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
 ```
 
 `tensors.mojo` and `kernels.mojo` import the `max` and `layout` packages:
-build them and add them to the import path. `gemm_mma_cpasync.mojo` (with `invariant-retry=true`) and
+build them and add them to the import path. `gemm_mma_cpasync.mojo` (with `packages=linalg,structured_kernels
+invariant-retry=true`; it also calls the kernel's launcher, which is
+verified only when something in the file uses it) and
 `gemv_split_k.mojo` each launch a
 kernel of `linalg`: it needs every kernel package on the import path and
 `packages=linalg`, and is compiled too (`-elaborate` without
@@ -584,6 +586,20 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   range(n)`, is that constant times the iterations so far (a candidate
   invariant). Not for a parameter amount: write `i * step` then.
 - `Bool(scalar)`: what `a and b` yields where `a` is false.
+- A `comptime assert` whose condition multiplies or divides unknowns is
+  assumed where it only bounds values by constants (`comptime assert
+  n // d <= 65536`, or `stage_cnt <= 65536` in a kernel that a launcher
+  instantiates with a quotient); any other nonlinear one is not.
+- `t.layout.shape[k]()` of a generic layout, as an element of a `Coord`,
+  is `t`'s `k`th dimension: `t.reshape(row_major(Coord(Idx[1],
+  t.layout.shape[0](), t.layout.shape[1]())))` has dimensions 1 and
+  `t`'s. A reshaped view has the tensor's pointer.
+- A local variable that debug info names (in a package's functions) is
+  not borrowed by that: it keeps its value across writes it cannot be
+  reached by, as in the file being compiled.
+- A launch's `shared_mem_bytes=` is read from its integer argument, not
+  from another optional one (`func_attribute=`); `size_of[S[...]]()` of a
+  struct whose parameters a launcher gives is the launcher's.
 
 Not analyzed yet: loops with loop-carried values, and ranges with a step
 (`range(a, b, c)`) or over other integer types. Lists built from other iterables
