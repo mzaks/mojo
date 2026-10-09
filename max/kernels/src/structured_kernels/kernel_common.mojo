@@ -657,14 +657,23 @@ comptime _Batched3DLayout[L: TensorLayout] = RowMajorLayout[
 
 def _to_batched_3d(
     tensor: TileTensor,
-) -> tensor.ViewType[_Batched3DLayout[type_of(tensor).LayoutType]]:
+    out result: tensor.ViewType[
+        _Batched3DLayout[type_of(tensor).LayoutType]
+    ] where (
+        Int(result.dim[0]()) == 1
+        and Int(result.dim[1]()) == Int(tensor.dim[0]())
+        and Int(result.dim[2]()) == Int(tensor.dim[1]())
+        and result.ptr._extent() >= tensor.ptr._extent()
+    ),
+):
     """Reshape 2D TileTensor to 3D by prepending batch=1: (M, K) -> (1, M, K).
 
     The input must be rank 2. Shape types (static/dynamic) are preserved.
+    The view has the tensor's rows and columns, over the same memory.
     """
     comptime L = type_of(tensor).LayoutType
     comptime assert L.rank == 2, "expected rank-2 TileTensor"
-    return tensor.reshape(
+    result = tensor.reshape(
         row_major(
             Coord(
                 Idx[1],
