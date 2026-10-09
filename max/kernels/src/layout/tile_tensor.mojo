@@ -1008,12 +1008,8 @@ struct TileTensor[
         ](self._unsafe_storage_cast[to_mut=True](), offset, value)
 
     @inline(.nodebug)
-    def __getitem__(
-        self,
-        i0: Some[CoordLike] where Self.rank != 1 or _coord_in_bounds(
-            i0, self._valid_dim[0]()
-        ),
-    ) -> Self.ElementType:
+    def __getitem__(self, i0: Some[CoordLike]) -> Self.ElementType
+        requires Self.rank != 1 or _coord_in_bounds(i0, self._valid_dim[0]()):
         """Retrieve the element at the given index or coordinate.
 
         Args:
@@ -1029,12 +1025,10 @@ struct TileTensor[
 
     @inline(.nodebug)
     def __getitem__(
-        self,
-        i0: Some[CoordLike] where _coord_in_bounds(i0, self._valid_dim[0]()),
-        i1: Some[CoordLike] where Self.rank != 2 or _coord_in_bounds(
-            i1, self._valid_dim[1]()
-        ),
-    ) -> Self.ElementType:
+        self, i0: Some[CoordLike], i1: Some[CoordLike]
+    ) -> Self.ElementType
+        requires _coord_in_bounds(i0, self._valid_dim[0]())
+        requires Self.rank != 2 or _coord_in_bounds(i1, self._valid_dim[1]()):
         """Retrieve the element at the given indices.
 
         Args:
@@ -1374,11 +1368,9 @@ struct TileTensor[
     @inline(.nodebug)
     def __setitem__[
         *IndexTypes: Indexer & Copyable
-    ](
-        self,
-        *items: *IndexTypes,
-        value: Self.ElementType where self._indices_in_bounds(*items),
-    ) where (IndexTypes.length == Self.flat_rank) & Self.mut:
+    ](self, *items: *IndexTypes, value: Self.ElementType)
+        where (IndexTypes.length == Self.flat_rank) & Self.mut
+        requires self._indices_in_bounds(*items):
         """Sets a single element in the tensor at the specified indices.
 
         Uses flat indexing based on flat_rank. For non-nested layouts,
@@ -1470,9 +1462,8 @@ struct TileTensor[
         ]() if is_gpu() else align_of[Self.dtype](),
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](
-        self, coord: Coord where self._access_in_bounds[width](coord)
-    ) -> SIMD[Self.dtype, width]:
+    ](self, coord: Coord) -> SIMD[Self.dtype, width]
+        requires self._access_in_bounds[width](coord):
         """Load elements from the tensor at the specified coordinates.
 
         Supports both hierarchical indexing (rank indices) and flat indexing
@@ -1512,13 +1503,9 @@ struct TileTensor[
             SIMD[Self.dtype, width]
         ]() if is_gpu() else align_of[Self.dtype](),
         non_temporal: Bool = False,
-    ](
-        self,
-        coord: Coord,
-        value: SIMD[Self.dtype, width] where self._access_in_bounds[width](
-            coord
-        ),
-    ) where Self.mut:
+    ](self, coord: Coord, value: SIMD[Self.dtype, width])
+        where Self.mut
+        requires self._access_in_bounds[width](coord):
         """Store elements to the tensor at the specified coordinates.
 
         Supports both hierarchical indexing (rank indices) and flat indexing
@@ -2275,23 +2262,17 @@ struct TileTensor[
                 ):
                     var size = Int(tile_shape[i].value())
                     var c = Int(coordinates[i].value())
-                    if size > 0 and (
-                        c < 0 or c >= Int(self.dim[i]()) // size
-                    ):
+                    if size > 0 and (c < 0 or c >= Int(self.dim[i]()) // size):
                         return False
             return True
 
     @inline(.nodebug)
     def tile[
         *tile_sizes: Int
-    ](
-        self,
-        coordinates: Coord where self._tile_coords_in_bounds[*tile_sizes](
-            coordinates
-        ),
-    ) -> Self.TileResultType[
+    ](self, coordinates: Coord) -> Self.TileResultType[
         _IntToComptimeInt[*tile_sizes], linear_idx_type=Self.linear_idx_type
-    ]:
+    ]
+        requires self._tile_coords_in_bounds[*tile_sizes](coordinates):
         """Extract a sub-tile (CuTe `local_tile`). Works on both flat
         and nested parent layouts.
 
@@ -2320,18 +2301,14 @@ struct TileTensor[
     @inline(.nodebug)
     def tile[
         *tile_sizes: Int, stride_layout: TensorLayout
-    ](
-        self,
-        coordinates: Coord where self._tile_coords_in_bounds[*tile_sizes](
-            coordinates
-        ),
-    ) -> Self.OffsetViewType[
+    ](self, coordinates: Coord) -> Self.OffsetViewType[
         TypeList.of[Scalar[Self.linear_idx_type]](),
         Layout[
             shape_types=_IntToComptimeInt[*tile_sizes],
             stride_types=stride_layout._shape_types,
         ],
-    ]:
+    ]
+        requires self._tile_coords_in_bounds[*tile_sizes](coordinates):
         """Tile with explicit static strides (flat parents only).
 
         Use when the parent tensor has dynamic (Scalar) strides but
@@ -2369,14 +2346,11 @@ struct TileTensor[
         tile_shape_types: TypeList[Trait=CoordLike, ...],
         //,
     ](
-        self,
-        tile_shape: Coord[*tile_shape_types],
-        coordinates: Coord where self._tile_shape_in_bounds(
-            tile_shape, coordinates
-        ),
+        self, tile_shape: Coord[*tile_shape_types], coordinates: Coord
     ) -> Self.TileResultType[
         tile_shape_types, linear_idx_type=Self.linear_idx_type
-    ]:
+    ]
+        requires self._tile_shape_in_bounds(tile_shape, coordinates):
         """Extract a tile (sub-tensor) with shape specified as a Coord argument.
 
         This overload accepts the tile shape as a Coord value rather than
@@ -2416,12 +2390,7 @@ struct TileTensor[
     @inline(.nodebug)
     def tile_with_offset[
         *tile_sizes: Int
-    ](
-        self,
-        coordinates: Coord where self._tile_coords_in_bounds[*tile_sizes](
-            coordinates
-        ),
-    ) -> Tuple[
+    ](self, coordinates: Coord) -> Tuple[
         Self.OffsetViewType[
             TypeList.of[Int](),
             Layout[
@@ -2431,7 +2400,8 @@ struct TileTensor[
         ],
         IndexList[coordinates.element_types.length],
         Int,
-    ]:
+    ]
+        requires self._tile_coords_in_bounds[*tile_sizes](coordinates):
         """Like tile(), but also returns corner coordinates and linear
         offset. Flat-layout parents only.
 
@@ -2453,12 +2423,7 @@ struct TileTensor[
     @inline(.nodebug)
     def tile_with_offset[
         *tile_sizes: Int, stride_layout: TensorLayout
-    ](
-        self,
-        coordinates: Coord where self._tile_coords_in_bounds[*tile_sizes](
-            coordinates
-        ),
-    ) -> Tuple[
+    ](self, coordinates: Coord) -> Tuple[
         Self.OffsetViewType[
             TypeList.of[Int](),
             Layout[
@@ -2468,7 +2433,8 @@ struct TileTensor[
         ],
         IndexList[coordinates.element_types.length],
         Int,
-    ]:
+    ]
+        requires self._tile_coords_in_bounds[*tile_sizes](coordinates):
         """Like tile(), but with explicit static strides. Flat-layout parents
         only.
 
@@ -2619,14 +2585,10 @@ struct TileTensor[
     @inline(.nodebug)
     def tile[
         *tile_sizes: Int
-    ](
-        self,
-        *tile_coords: Int where self._tile_in_bounds[*tile_sizes](
-            *tile_coords
-        ),
-    ) -> Self.TileResultType[
+    ](self, *tile_coords: Int) -> Self.TileResultType[
         _IntToComptimeInt[*tile_sizes], linear_idx_type=Self.linear_idx_type
-    ]:
+    ]
+        requires self._tile_in_bounds[*tile_sizes](*tile_coords):
         """Variadic-`Int`-coords form of `.tile[]`. Works on both flat
         and nested parents: see the `Coord`-arg sibling above.
 
@@ -3294,9 +3256,8 @@ struct TileTensor[
     @inline(.nodebug)
     def vectorize[
         *vector_shape: Int
-    ](
-        self where self._vectorize_in_bounds[*vector_shape](),
-    ) -> Self.VectorizedType[*vector_shape]:
+    ](self) -> Self.VectorizedType[*vector_shape]
+        requires self._vectorize_in_bounds[*vector_shape]():
         """Reshape a tensor into a vectorized form for efficient SIMD operations.
 
         This method transforms the tensor's logical layout to enable efficient
@@ -3339,9 +3300,8 @@ struct TileTensor[
         return _vectorize(self, coord[*vector_shape])
 
     @inline(.nodebug)
-    def vectorize(
-        self where self._vectorize_in_bounds[1, simd_width_of[Self.dtype]()](),
-    ) -> Self.VectorizedType[1, simd_width_of[Self.dtype]()]:
+    def vectorize(self) -> Self.VectorizedType[1, simd_width_of[Self.dtype]()]
+        requires self._vectorize_in_bounds[1, simd_width_of[Self.dtype]()]():
         """Return a SIMD-width vectorized view of this tensor.
 
         This is a convenience method that vectorizes along the last dimension
@@ -3781,12 +3741,8 @@ struct TileTensor[
         }
 
     @inline(.always)
-    def to_device_buffer(
-        self,
-        ctx: DeviceContext,
-        out result: DeviceBuffer[Self.dtype] where len(result)
-        == self.num_elements(),
-    ):
+    def to_device_buffer(self, ctx: DeviceContext) -> DeviceBuffer[Self.dtype]
+        ensures len(result) == self.num_elements():
         """Convert the tensor to a `DeviceBuffer`.
 
         Works for tensors backed by either `DefaultEngine` or

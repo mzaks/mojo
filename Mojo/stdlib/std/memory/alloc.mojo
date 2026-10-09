@@ -743,13 +743,10 @@ def _alloc_bytes(
 @inline(.always)
 def alloc[
     type: AnyType, /
-](
-    count: Int,
-    *,
-    alignment: Int = align_of[type](),
-    out result: Pointer[type, MutUntrackedOrigin] where result._extent()
-    == count,
-):
+](count: Int, *, alignment: Int = align_of[type]()) -> Pointer[
+    type, MutUntrackedOrigin
+]
+    ensures result._extent() == count:
     """Allocates contiguous storage for `count` elements of `type` with
     alignment `alignment`.
 
@@ -769,13 +766,10 @@ def alloc[
 @inline(.always)
 def unsafe_alloc[
     type: AnyType, /
-](
-    count: Int,
-    *,
-    alignment: Int = align_of[type](),
-    out result: Pointer[type, MutUntrackedOrigin] where result._extent()
-    == count,
-):
+](count: Int, *, alignment: Int = align_of[type]()) -> Pointer[
+    type, MutUntrackedOrigin
+]
+    ensures result._extent() == count:
     """Allocates contiguous storage for `count` elements of `type` with
     alignment `alignment`.
 

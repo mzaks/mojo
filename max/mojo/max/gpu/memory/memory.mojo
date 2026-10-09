@@ -496,16 +496,13 @@ def async_copy[
     src: Pointer[Scalar[dtype], _, address_space=.GLOBAL],
     dst: Pointer[mut=True, Scalar[dtype], _, address_space=.SHARED],
     src_size: Int32 = Int32(size),
-    predicate: Bool where (
-        dst._extent() >= size // size_of[dtype]()
-        and src._extent()
-        >= (
-            Int(src_size) // size_of[dtype]()
-            if (fill and not predicate)
-            else size // size_of[dtype]()
-        )
-    ) = False,
-):
+    predicate: Bool = False,
+)
+    requires dst._extent() >= size // size_of[dtype]() and src._extent() >= (
+        Int(src_size)
+        // size_of[dtype]() if (fill and not predicate) else size
+        // size_of[dtype]()
+    ):
     """Asynchronously copies data from global memory to shared memory.
 
     This function provides a high-performance asynchronous memory copy operation with

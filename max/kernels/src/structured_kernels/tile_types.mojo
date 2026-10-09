@@ -985,10 +985,8 @@ struct SMemTileArray2D[
         Scalar[Self.dtype], MutUntrackedOrigin, address_space=.SHARED
     ]
 
-    def __init__(
-        ref[AddressSpace.SHARED] storage: Self.Storage,
-        out result: Self where result.ptr._extent() >= Self.num_elements,
-    ):
+    def __init__(ref[AddressSpace.SHARED] storage: Self.Storage) -> Self
+        ensures result.ptr._extent() >= Self.num_elements:
         """Initialize from inline storage.
 
         Args:
@@ -997,13 +995,14 @@ struct SMemTileArray2D[
         Returns:
             A new SMemTileArray2D pointing to the storage.
         """
-        result = Self(storage.unsafe_ptr())
+        return Self(storage.unsafe_ptr())
 
     def __init__(
-        out self where self.ptr._extent() >= unsafe_ptr._extent(),
+        out self,
         # TODO: This should correctly propagate mutability
         unsafe_ptr: UnsafePointer[Scalar[Self.dtype], _, address_space=.SHARED],
-    ):
+    )
+        ensures self.ptr._extent() >= unsafe_ptr._extent():
         """Initialize with a shared memory pointer.
 
         Args:
@@ -1017,16 +1016,12 @@ struct SMemTileArray2D[
     ]
 
     @inline(.always)
-    def __getitem__[
-        T: Intable
-    ](
-        self,
-        index: T where (
+    def __getitem__[T: Intable](self, index: T) -> Self.Tile
+        requires (
             0 <= Int(index) < Self.num_tiles
             and self.ptr._extent() >= Self.num_elements
-        ),
-        out result: Self.Tile where result.ptr._extent() >= Self.tile_size,
-    ):
+        )
+        ensures result.ptr._extent() >= Self.tile_size:
         """Get tile at the given index.
 
         Parameters:
@@ -1045,7 +1040,7 @@ struct SMemTileArray2D[
         comptime assert 1 <= Self.dim1 <= 65536, "dim1 out of range"
         comptime assert 1 <= Self.num_tiles <= 65536, "num_tiles out of range"
         var tile_ptr = self.ptr + Self.tile_size * Int(index)
-        result = Self.Tile(
+        return Self.Tile(
             tile_ptr.as_unsafe_any_origin(),
             Self.tile_layout,
         )

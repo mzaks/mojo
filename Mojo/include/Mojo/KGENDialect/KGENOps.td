@@ -1434,7 +1434,7 @@ def KGEN_RequiresOp : KGENOp<"requires", [
   let summary = "a precondition of the enclosing function";
   let description = [{
     The `kgen.requires` operation states a precondition of the function it is
-    written in, from a `where` clause on one of its arguments. `args` are the
+    written in, from a `requires` clause of its signature. `args` are the
     function's arguments; the single block of `body` has an argument for each
     of them and yields the condition with a `kgen.contract.yield`.
 
@@ -1487,9 +1487,9 @@ def KGEN_EnsuresOp : KGENOp<"ensures", [
   let summary = "a postcondition of the enclosing function";
   let description = [{
     The `kgen.ensures` operation states a postcondition of the function it is
-    written in, from a `where` clause on an `out` or `mut` argument. It sits
+    written in, from an `ensures` clause of its signature. It sits
     right before each return of the function. `args` are the function's
-    arguments, then the function's named result in a register (if any), then
+    arguments, then the function's result in a register (if any), then
     the `kgen.old` values the clause uses; the single block of `body` has an
     argument for each of them and yields the condition with a
     `kgen.contract.yield`. Memory the region reads through its arguments is

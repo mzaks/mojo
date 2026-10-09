@@ -11,25 +11,25 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-# `where` clauses on runtime arguments are contracts for static verification
-# (see Mojo/proposals/argument-contracts.md). They have no runtime effect: the
+# `requires` and `ensures` clauses are contracts for static verification
+# (see Mojo/proposals/function-contracts.md). They have no runtime effect: the
 # program compiles and runs as without them, even when a call violates one.
 
 # RUN: %mojo %s | FileCheck %s
 
 
 @inline(.never)
-def get(xs: List[Int], i: Int where 0 <= i and i < len(xs)) -> Int:
+def get(xs: List[Int], i: Int) -> Int requires 0 <= i and i < len(xs):
     return xs[i]
 
 
 @always_inline
-def doubled(a: Int where a > 0 else "a must be positive") -> Int:
+def doubled(a: Int) -> Int requires a > 0 else "a must be positive":
     return a * 2
 
 
 @inline(.never)
-def first[T: Copyable](xs: List[T] where len(xs) > 0) -> T:
+def first[T: Copyable](xs: List[T]) -> T requires len(xs) > 0:
     return xs[0].copy()
 
 
@@ -40,7 +40,7 @@ struct Counter:
         self.count = count
 
     @inline(.never)
-    def minus(self where self.count >= n, n: Int where n >= 0) -> Int:
+    def minus(self, n: Int) -> Int requires self.count >= n requires n >= 0:
         return self.count - n
 
 
@@ -62,36 +62,38 @@ def main():
 
 # Postconditions, including `old(e)`, have no runtime effect either.
 @inline(.never)
-def make(n: Int where n >= 0, out result: List[Int] where len(result) == n):
+def make(n: Int, out result: List[Int])
+    requires n >= 0
+    ensures len(result) == n:
     result = List[Int](capacity=n)
     for i in range(n):
         result.append(i)
 
 
 @inline(.never)
-def push(mut xs: List[Int] where len(xs) == old(len(xs)) + 1, v: Int):
+def push(mut xs: List[Int], v: Int) ensures len(xs) == old(len(xs)) + 1:
     xs.append(v)
 
 
 @inline(.never)
-def shrink(
-    mut xs: List[Int] where old(len(xs)) > 0 where len(xs) == old(len(xs)) - 1,
-):
+def shrink(mut xs: List[Int])
+    requires len(xs) > 0
+    ensures len(xs) == old(len(xs)) - 1:
     _ = xs.pop()
 
 
 @always_inline
-def bump(mut a: Int where a == old(a) + 1):
+def bump(mut a: Int) ensures a == old(a) + 1:
     a += 1
 
 
 # Quantifiers too.
 @inline(.never)
-def swap_front(
-    mut xs: List[Int] where old(len(xs)) >= 2 where len(xs) == old(
-        len(xs)
-    ) and all([xs[i] == old(xs[i]) for i in range(2, len(xs))])
-):
+def swap_front(mut xs: List[Int])
+    requires len(xs) >= 2
+    ensures len(xs) == old(len(xs)) and all(
+        [xs[i] == old(xs[i]) for i in range(2, len(xs))]
+    ):
     var t = xs[0]
     xs[0] = xs[1]
     xs[1] = t

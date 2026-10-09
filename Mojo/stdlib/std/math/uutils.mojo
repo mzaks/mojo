@@ -42,7 +42,7 @@ def ufloordiv(a: Int, b: Int) -> Int:
 
 
 @inline(.nodebug)
-def udiv_unchecked(a: Int, b: Int where b > 0) -> Int:
+def udiv_unchecked(a: Int, b: Int) -> Int requires b > 0:
     """Unsigned division without zero-guard.
 
     Unlike `ufloordiv`, this uses `UInt.__truediv__` (`pop.div`) which emits
@@ -116,7 +116,7 @@ def udivmod(a: Int, b: Int) -> Tuple[Int, Int]:
 
 
 @inline(.nodebug)
-def udivmod_unchecked(a: Int, b: Int where b > 0) -> Tuple[Int, Int]:
+def udivmod_unchecked(a: Int, b: Int) -> Tuple[Int, Int] requires b > 0:
     """Unsigned divmod without zero-guard.
 
     Unlike `udivmod`, this uses `UInt.__truediv__` (`pop.div`) which emits

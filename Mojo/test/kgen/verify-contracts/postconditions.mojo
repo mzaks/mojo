@@ -17,37 +17,36 @@ from std.builtin._verification import _same_elements
 
 
 # --- must be PROVEN (their postconditions, and their callers' calls) ---
-def ok_next(a: Int where a < 1000, out r: Int where r > a):
+def ok_next(a: Int, out r: Int) requires a < 1000 ensures r > a:
     r = a + 1
 
 
-def ok_push(mut xs: List[Int] where len(xs) == old(len(xs)) + 1, v: Int):
+def ok_push(mut xs: List[Int], v: Int) ensures len(xs) == old(len(xs)) + 1:
     xs.append(v)  # from `List.append`'s postcondition
 
 
-def ok_reset_first(
-    mut xs: List[Int] where old(len(xs)) > 0 where len(xs) == old(
-        len(xs)
-    ) and all([xs[i] == old(xs[i]) for i in range(1, len(xs))])
-):
+def ok_reset_first(mut xs: List[Int])
+    requires len(xs) > 0
+    ensures len(xs) == old(len(xs)) and all(
+        [xs[i] == old(xs[i]) for i in range(1, len(xs))]
+    ):
     xs[0] = 7  # an element write keeps the length and the other elements
 
 
-def ok_swap_front(
-    mut xs: List[Int] where old(len(xs)) >= 2 where len(xs) == old(
-        len(xs)
-    ) and all([xs[i] == old(xs[i]) for i in range(2, len(xs))])
-):
+def ok_swap_front(mut xs: List[Int])
+    requires len(xs) >= 2
+    ensures len(xs) == old(len(xs)) and all(
+        [xs[i] == old(xs[i]) for i in range(2, len(xs))]
+    ):
     var t = xs[0]
     xs[0] = xs[1]
     xs[1] = t
 
 
-def ok_push_keep(
-    mut xs: List[Int] where len(xs) == old(len(xs)) + 1 and _same_elements(
+def ok_push_keep(mut xs: List[Int])
+    ensures len(xs) == old(len(xs)) + 1 and _same_elements(
         xs._data, old(xs._data), old(len(xs))
-    )
-):
+    ):
     xs.append(9)  # `List.append` keeps the elements it had
 
 
@@ -86,19 +85,18 @@ def ok_append_in_loop(mut xs: List[Int]) -> Int:
 
 
 # --- must stay UNPROVEN ---
-def bad_push_twice(mut xs: List[Int] where len(xs) == old(len(xs)) + 2, v: Int):
+def bad_push_twice(mut xs: List[Int], v: Int)
+    ensures len(xs) == old(len(xs)) + 2:
     xs.append(v)
 
 
-def bad_swap_touches_rest(
-    mut xs: List[Int] where old(len(xs)) >= 3 where all(
-        [xs[i] == old(xs[i]) for i in range(2, len(xs))]
-    )
-):
+def bad_swap_touches_rest(mut xs: List[Int])
+    requires len(xs) >= 3
+    ensures all([xs[i] == old(xs[i]) for i in range(2, len(xs))]):
     xs[2] = xs[0]
 
 
-def bad_next_equal(a: Int, out r: Int where r > a):
+def bad_next_equal(a: Int, out r: Int) ensures r > a:
     r = a
 
 

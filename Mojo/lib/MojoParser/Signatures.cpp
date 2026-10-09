@@ -393,28 +393,17 @@ ParseResult ParsedArgument::parse(ParserBase &p, KWArgMarkerInfo &markerInfo,
     name = StringAttr::get(p.getContext());
 
   // Parse optional where clauses.
-  SmallVector<ParsedConstraint, 1> argClauses;
   while (p.getToken().isIdentifier() && p.getToken().getSpelling() == "where") {
     SMLoc whereLoc = p.consumeIdentifier().getLoc();
-    // On a runtime argument, a clause is a contract for static verification
-    // rather than a parse-time constraint: a precondition on an input, a
-    // postcondition (or both) on a `mut` or `out` argument.
-    if (kind == ArgListKind::kArgList) {
-      if (convention == kConventionRef || convention == kConventionDeinit) {
-        p.emitError(whereLoc, "'where' clauses are not supported on 'ref' "
-                              "and 'deinit' arguments");
-        return failure();
-      }
-      ParsedConstraint clause;
-      if (clause.parse(p, /*stmtIndent=*/std::nullopt))
-        return failure();
-      argClauses.push_back(clause);
-      continue;
-    }
-    if (kind == ArgListKind::kFnTypeArgList) {
-      p.emitError(loc,
-                  "'where' clauses must be used with parameters and cannot "
-                  "be used with arguments");
+    if (kind == ArgListKind::kArgList || kind == ArgListKind::kFnTypeArgList) {
+      auto diag = p.emitError(
+          loc, "'where' clauses must be used with parameters and cannot "
+               "be used with arguments");
+      // A fact about a runtime argument is a contract of the function.
+      if (kind == ArgListKind::kArgList)
+        diag.attachNote(whereLoc)
+            << "to state a precondition or a postcondition, use a 'requires' "
+               "or an 'ensures' clause after the signature";
       return failure();
     }
     if (kind == ArgListKind::kParamList ||
@@ -442,9 +431,6 @@ ParseResult ParsedArgument::parse(ParserBase &p, KWArgMarkerInfo &markerInfo,
     if (p.consumeIf(Token::kw_else) && p.parseExpression(discarded))
       return failure();
   }
-  whereClauses =
-      p.shared.getPersistentCopy(ArrayRef<ParsedConstraint>(argClauses));
-
   // Parse an optional default argument value: `"=" expression`.
   SMLoc equalLoc;
   if (p.consumeIf(Token::equal, &equalLoc)) {
@@ -1327,7 +1313,8 @@ PogListAttr TypeCheckedParamList::getParamListAttr() const {
 //===----------------------------------------------------------------------===//
 
 ParseResult ParsedConstraint::parse(ParserBase &p,
-                                    std::optional<size_t> stmtIndent) {
+                                    std::optional<size_t> stmtIndent,
+                                    StringRef keyword) {
   loc = p.getToken().getLoc();
 
   // Parse the constraint expression into a local; the two message spellings
@@ -1339,13 +1326,15 @@ ParseResult ParsedConstraint::parse(ParserBase &p,
   // A message is written either `where (condition, "message")` -- which the
   // expression parser produces as a parenthesized two-element tuple -- or
   // `where condition else "message"`, whose `else` is left for us to consume.
-  if (extractParenthesizedMessage(p, parsed))
+  if (extractParenthesizedMessage(p, parsed, keyword))
     return failure();
-  return parseElseMessage(p, stmtIndent);
+  return parseElseMessage(p, stmtIndent, ("a '" + keyword + "' clause").str(),
+                          keyword);
 }
 
-ParseResult ParsedConstraint::extractParenthesizedMessage(ParserBase &p,
-                                                          ExprNode *parsed) {
+ParseResult
+ParsedConstraint::extractParenthesizedMessage(ParserBase &p, ExprNode *parsed,
+                                              StringRef keyword) {
   // A message clause has the shape `where (condition, "message")`. The
   // expression parser produces a ParenNode wrapping a two-element TupleNode
   // for this. Anything else (a bare condition, or a parenthesized condition
@@ -1367,8 +1356,10 @@ ParseResult ParsedConstraint::extractParenthesizedMessage(ParserBase &p,
   // fall through to a generic "not scalar<bool>" error.
   if (tuple->exprs.size() != 2)
     return p.emitError(tuple->getLoc(),
-                       "a 'where' clause takes a condition and an optional "
-                       "message: 'where (condition, \"message\")'");
+                       "a '" + keyword +
+                           "' clause takes a condition and an optional "
+                           "message: '" +
+                           keyword + " (condition, \"message\")'");
 
   // The second element is the message. For now only string literals are
   // supported: a `where` message must be available in the parser, but a
@@ -1378,8 +1369,8 @@ ParseResult ParsedConstraint::extractParenthesizedMessage(ParserBase &p,
   auto *strLit = dyn_cast<StringLiteralNode>(msgExpr);
   if (!strLit)
     return p.emitError(msgExpr->getLoc(),
-                       "the message in a 'where' clause must be a string "
-                       "literal");
+                       "the message in a '" + keyword +
+                           "' clause must be a string literal");
 
   // `getValue()` already handles adjacent string-literal concatenation.
   message = StringAttr::get(p.getContext(), strLit->getValue());
@@ -1389,15 +1380,18 @@ ParseResult ParsedConstraint::extractParenthesizedMessage(ParserBase &p,
 
 ParseResult ParsedConstraint::parseElseMessage(ParserBase &p,
                                                std::optional<size_t> stmtIndent,
-                                               StringRef what) {
+                                               StringRef what,
+                                               StringRef keyword) {
   // Watch out for an `else` dedented onto its own line.
   SMLoc elseLoc = p.getToken().getLoc();
   if (!p.isTokenInCurrentStatement(stmtIndent) || !p.consumeIf(Token::kw_else))
     return success();
 
   if (message)
-    return p.emitError(elseLoc, "a 'where' clause takes at most one message: "
-                                "prefer 'where condition else \"message\"'");
+    return p.emitError(elseLoc,
+                       "a '" + keyword +
+                           "' clause takes at most one message: prefer '" +
+                           keyword + " condition else \"message\"'");
 
   // A clause terminator right after `else` means the message was left out;
   // catch common mistakes rather than letting the expression parser report the
@@ -1459,6 +1453,38 @@ ParseResult ParsedParamList::parseTrailingConstraintsIfPresent(
 
     bodyConstraints.push_back(constraint);
   }
+  return success();
+}
+
+ParseResult
+ParsedArgumentList::parseContractsIfPresent(ParserBase &p,
+                                            std::optional<size_t> stmtIndent) {
+  SmallVector<ParsedConstraint, 2> pre, post;
+  // Watch out for a dedented clause on a new line.
+  while (p.isTokenInCurrentStatement(stmtIndent) &&
+         p.getToken().isIdentifier()) {
+    StringRef keyword = p.getTokenSpelling();
+    SMLoc loc = p.getToken().getLoc();
+    bool isRequires = keyword == "requires";
+    // The order is fixed, from what the parser checks to what the verifier
+    // proves at the calls and then at the returns.
+    if (keyword == "where" && !(pre.empty() && post.empty()))
+      return p.emitError(loc, "'where' clauses must come before 'requires' "
+                              "and 'ensures' clauses");
+    if (!isRequires && keyword != "ensures")
+      break;
+    if (isRequires && !post.empty())
+      return p.emitError(
+          loc, "'requires' clauses must come before 'ensures' clauses");
+    p.consumeIdentifier();
+
+    ParsedConstraint clause;
+    if (clause.parse(p, stmtIndent, keyword))
+      return failure();
+    (isRequires ? pre : post).push_back(clause);
+  }
+  requiresClauses = p.shared.getPersistentCopy(ArrayRef<ParsedConstraint>(pre));
+  ensuresClauses = p.shared.getPersistentCopy(ArrayRef<ParsedConstraint>(post));
   return success();
 }
 
@@ -1602,7 +1628,10 @@ ParseResult ParsedArgumentList::parseArgumentListAndEffects(ParserBase &p,
     return spelling == "raises" || spelling == "capturing" ||
            spelling == "escaping" || spelling == "thin" ||
            spelling == "register_passable" || spelling == "abi" ||
-           spelling == "where";
+           spelling == "where" ||
+           // A function declaration's contract clauses follow its effects.
+           (kind == ArgListKind::kArgList &&
+            (spelling == "requires" || spelling == "ensures"));
   };
 
   // If the client supports function effects, parse them as well.
@@ -1730,7 +1759,9 @@ ParseResult ParsedArgumentList::parseArgumentListAndEffects(ParserBase &p,
       // explicit but leaves the CABI bit unset.
       continue; // tokens already consumed; skip bottom p.consumeIdentifier()
     } else {
-      assert(spelling == "where" && "isEffectKeywordOrWhere unknown keyword");
+      assert((spelling == "where" || spelling == "requires" ||
+              spelling == "ensures") &&
+             "isEffectKeywordOrWhere unknown keyword");
       break;
     }
 

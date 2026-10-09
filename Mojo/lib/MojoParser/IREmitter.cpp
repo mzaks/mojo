@@ -1886,8 +1886,10 @@ AnyValue IREmitter::emitOldCall(const ExprNode *call, const ExprNode *operand,
                                 ExprDest &dest) {
   if (oldCalls->mode == OldCalls::Evaluate)
     return getDeclResolver().emitOldValue(*this, call, operand, dest);
-  AnyValue value = emitExpr(operand, EC_OperatorOperandValue);
-  return value ? emitResult(value, call, dest) : AnyValue();
+  emitError(call->getLoc())
+      << "'old' has no meaning in a 'requires' clause, which reads the "
+         "values on entry; use it in an 'ensures' clause";
+  return {};
 }
 
 AnyValue IREmitter::emitForall(const ExprNode *call, const ExprNode *cond,
@@ -2011,9 +2013,26 @@ void IREmitter::emitNormalReturn(Location loc, Value value, bool emitEndFunc) {
   // Postconditions hold when the function returns: check them before the
   // result is moved out.
   if (builder)
-    if (auto func = getBlockParentOfType<FnOp>(builder->getInsertionBlock()))
+    if (auto func = getBlockParentOfType<FnOp>(builder->getInsertionBlock())) {
+      // An unnamed result in a register passes through the local the
+      // postconditions read as `result`.
+      Value resultVar = getDeclResolver().contractResults.lookup(func);
+      auto *funcDecl = declScope.getNearestDeclOfType<FnOp>();
+      SyntheticNode exprTmp(funcDecl ? funcDecl->getLoc() : SMLoc());
+      if (resultVar && value && funcDecl) {
+        if (!emitStoreToLValue({RValue(SRValue(value)), &exprTmp},
+                               MLValue(resultVar), EC_ReturnValue))
+          return;
+      }
       if (failed(getDeclResolver().emitPostconditions(func, *this)))
         return;
+      if (resultVar && value && funcDecl) {
+        value = emitSRValue({MRValue(resultVar), &exprTmp}, EC_ReturnValue,
+                            func.getMLIRResultType());
+        if (!value)
+          return;
+      }
+    }
 
   // If this function returns in a register, load the result value from the
   // result slot temp. We compile things like:

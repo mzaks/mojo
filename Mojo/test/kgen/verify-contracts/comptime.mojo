@@ -105,9 +105,8 @@ def ok_dtype_in[dt: DType](xs: List[Int]) -> Int:
     return 0
 
 
-def ok_comptime_expression[
-    flag: Bool
-](xs: List[Int], n: Int where n >= 0 and n < 1000) -> Int:
+def ok_comptime_expression[flag: Bool](xs: List[Int], n: Int) -> Int
+    requires n >= 0 and n < 1000:
     var k = (n + 1) if comptime (flag) else (n + 2)
     if len(xs) > n + 2:
         return xs[k]  # either arm's value is below n + 3
@@ -127,7 +126,7 @@ def ok_closure_parameter(xs: List[Int]) -> Int:
     return total
 
 
-def at_most[limit: Int](x: Int where x <= limit) -> Int:
+def at_most[limit: Int](x: Int) -> Int requires x <= limit:
     return x
 
 
@@ -158,11 +157,12 @@ def ok_dtype_size_any[dt: DType](xs: List[Int]) -> Int:
     return 0
 
 
-def _below(x: Int, n: Int where 0 <= x < n) -> Int:
+def _below(x: Int, n: Int) -> Int requires 0 <= x < n:
     return x
 
 
-def ok_one_of[n: Int](x: Int where 0 <= x < 2147483648 and x % 8 == 0) -> Int:
+def ok_one_of[n: Int](x: Int) -> Int
+    requires 0 <= x < 2147483648 and x % 8 == 0:
     # One of a few values: checked for each, where `x % n` is linear.
     comptime assert n == 64 or n == 128 or n == 256, "n must be 64, 128 or 256"
     var k = x % n
@@ -171,10 +171,8 @@ def ok_one_of[n: Int](x: Int where 0 <= x < 2147483648 and x % 8 == 0) -> Int:
 
 def ok_bounded_quotient[
     n: Int, d: Int
-](
-    p: Pointer[Int, MutUntrackedOrigin],
-    i: Int where p._extent() >= 131072 and 0 <= i < 2 * (n // d),
-) -> Int:
+](p: Pointer[Int, MutUntrackedOrigin], i: Int) -> Int
+    requires p._extent() >= 131072 and 0 <= i < 2 * (n // d):
     # A quotient of two parameters: only bounded by a constant, so assumed.
     comptime assert 1 <= n // d <= 65536
     return p[unsafe_offset=i]
@@ -241,9 +239,8 @@ def bad_dtype_in[dt: DType](xs: List[Int]) -> Int:
     return 0
 
 
-def bad_comptime_expression[
-    flag: Bool
-](xs: List[Int], n: Int where n >= 0 and n < 1000) -> Int:
+def bad_comptime_expression[flag: Bool](xs: List[Int], n: Int) -> Int
+    requires n >= 0 and n < 1000:
     var k = n if comptime (flag) else (n + 3)
     if len(xs) > n + 2:
         return xs[k]  # n + 3 when `flag` is False
@@ -270,7 +267,8 @@ def bad_dtype_size[dt: DType](xs: List[Int]) -> Int:
     return 0
 
 
-def bad_one_of[n: Int](x: Int where 0 <= x < 2147483648 and x % 8 == 0) -> Int:
+def bad_one_of[n: Int](x: Int) -> Int
+    requires 0 <= x < 2147483648 and x % 8 == 0:
     comptime assert n == 64 or n == 128 or n == 256, "n must be 64, 128 or 256"
     var k = x % n
     return _below(k % (n // 4), n // 4 - 8)  # `n // 4 - 8` is reached
@@ -278,8 +276,6 @@ def bad_one_of[n: Int](x: Int where 0 <= x < 2147483648 and x % 8 == 0) -> Int:
 
 def bad_bounded_quotient[
     n: Int, d: Int
-](
-    p: Pointer[Int, MutUntrackedOrigin],
-    i: Int where p._extent() >= 131072 and 0 <= i < 2 * (n // d),
-) -> Int:
+](p: Pointer[Int, MutUntrackedOrigin], i: Int) -> Int
+    requires p._extent() >= 131072 and 0 <= i < 2 * (n // d):
     return p[unsafe_offset=i]  # nothing bounds the quotient

@@ -149,12 +149,8 @@ trait Iterator(Deinitable, Movable):
         """
         ...
 
-    def bounds(
-        self,
-        out result: Tuple[Int, Optional[Int]] where result[0] >= 0 and result[
-            1
-        ].or_else(result[0]) >= result[0],
-    ):
+    def bounds(self) -> Tuple[Int, Optional[Int]]
+        ensures result[0] >= 0 and result[1].or_else(result[0]) >= result[0]:
         """Returns bounds `[lower, upper]` for the remaining iterator length.
 
         This helps collections pre-allocate memory when constructed from iterators.
@@ -182,9 +178,9 @@ trait Iterator(Deinitable, Movable):
             return List[Int](capacity=lower)
         ```
         """
-        result = (0, None)
+        return (0, None)
 
-    def nth(var self, n: Int where n >= 0) -> Optional[Self.Element]:
+    def nth(var self, n: Int) -> Optional[Self.Element] requires n >= 0:
         """Advances the iterator by `n` elements (destroying them) and returns
         the next element, or `None` if the iterator is exhausted first.
 

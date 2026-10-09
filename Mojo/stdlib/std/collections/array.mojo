@@ -672,9 +672,8 @@ struct Array[T: AnyType, length: Int](
 
     @stable(since="1.0")
     @inline(.always)
-    def __getitem__(
-        ref self, idx: Int where 0 <= idx and idx < len(self), /
-    ) -> ref[self] Self.T:
+    def __getitem__(ref self, idx: Int, /) -> ref[self] Self.T
+        requires 0 <= idx and idx < len(self):
         """Gets a reference to the element at the given index.
 
         Args:

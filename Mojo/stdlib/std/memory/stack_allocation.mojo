@@ -32,12 +32,8 @@ def unsafe_stack_allocation[
     /,
     alignment: Int = align_of[dtype](),
     address_space: AddressSpace = .GENERIC,
-](
-    out result: Pointer[
-        Scalar[dtype], MutUntrackedOrigin, address_space=address_space
-    ] where result._extent()
-    == count,
-):
+]() -> Pointer[Scalar[dtype], MutUntrackedOrigin, address_space=address_space]
+    ensures result._extent() == count:
     """Allocates data buffer space on the stack given a data type and number of
     elements.
 
@@ -74,12 +70,8 @@ def unsafe_stack_allocation[
     name: Optional[StaticString] = None,
     alignment: Int = align_of[type](),
     address_space: AddressSpace = .GENERIC,
-](
-    out result: Pointer[
-        type, MutUntrackedOrigin, address_space=address_space
-    ] where result._extent()
-    == count,
-):
+]() -> Pointer[type, MutUntrackedOrigin, address_space=address_space]
+    ensures result._extent() == count:
     """Allocates data buffer space on the stack given a data type and number of
     elements.
 
@@ -167,12 +159,8 @@ def stack_allocation[
     /,
     alignment: Int = align_of[dtype](),
     address_space: AddressSpace = .GENERIC,
-](
-    out result: Pointer[
-        Scalar[dtype], MutUntrackedOrigin, address_space=address_space
-    ] where result._extent()
-    == count,
-):
+]() -> Pointer[Scalar[dtype], MutUntrackedOrigin, address_space=address_space]
+    ensures result._extent() == count:
     """Allocates data buffer space on the stack given a data type and number of
     elements.
 
@@ -202,12 +190,8 @@ def stack_allocation[
     name: Optional[StaticString] = None,
     alignment: Int = align_of[type](),
     address_space: AddressSpace = .GENERIC,
-](
-    out result: Pointer[
-        type, MutUntrackedOrigin, address_space=address_space
-    ] where result._extent()
-    == count,
-):
+]() -> Pointer[type, MutUntrackedOrigin, address_space=address_space]
+    ensures result._extent() == count:
     """Allocates data buffer space on the stack given a data type and number of
     elements.
 

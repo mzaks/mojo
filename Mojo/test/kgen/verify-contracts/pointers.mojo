@@ -19,11 +19,8 @@ from std.memory.alloc import unsafe_alloc
 
 
 # --- must be PROVEN ---
-def ok_stated(
-    p: Pointer[Int, MutAnyOrigin],
-    n: Int where p._extent() >= n,
-    i: Int,
-) -> Int:
+def ok_stated(p: Pointer[Int, MutAnyOrigin], n: Int, i: Int) -> Int
+    requires p._extent() >= n:
     if 0 <= i and i < n:
         return p[unsafe_offset=i]  # the caller states the extent
     return 0
@@ -44,20 +41,16 @@ def ok_offset(n: Int, i: Int) -> Int:
 
 
 def ok_load(
-    p: Pointer[Float32, MutAnyOrigin],
-    n: Int where n >= 0 and p._extent() >= n,
-    i: Int,
-) -> SIMD[DType.float32, 4]:
+    p: Pointer[Float32, MutAnyOrigin], n: Int, i: Int
+) -> SIMD[DType.float32, 4]
+    requires n >= 0 and p._extent() >= n:
     if 0 <= i and i <= n - 4:
         return p.unsafe_load[width=4](i)
     return 0
 
 
-def ok_store(
-    p: Pointer[Float32, MutAnyOrigin],
-    n: Int where n >= 0 and p._extent() >= n,
-    i: Int,
-):
+def ok_store(p: Pointer[Float32, MutAnyOrigin], n: Int, i: Int)
+    requires n >= 0 and p._extent() >= n:
     if 0 <= i and i <= n - 4:
         p.unsafe_store(i, SIMD[DType.float32, 4](0))
 
@@ -76,10 +69,8 @@ def ok_deref(n: Int) -> Int:
     return 0
 
 
-def ok_load_first(
-    p: Pointer[Float32, MutAnyOrigin],
-    n: Int where p._extent() >= n,
-) -> Float32:
+def ok_load_first(p: Pointer[Float32, MutAnyOrigin], n: Int) -> Float32
+    requires p._extent() >= n:
     if n >= 4:
         p.unsafe_store(SIMD[DType.float32, 4](1))
         return p.unsafe_load[width=4]().reduce_add()
@@ -91,16 +82,13 @@ def ok_to(x: Int) -> Int:
     return Pointer(to=y)[]  # a pointer to one value
 
 
-def first(
-    p: ImmPointer[Int, _], n: Int where p._extent() >= n and n >= 1
-) -> Int:
+def first(p: ImmPointer[Int, _], n: Int) -> Int
+    requires p._extent() >= n and n >= 1:
     return p[]
 
 
-def ok_immutable(
-    p: Pointer[Int, MutAnyOrigin],
-    n: Int where p._extent() >= n,
-) -> Int:
+def ok_immutable(p: Pointer[Int, MutAnyOrigin], n: Int) -> Int
+    requires p._extent() >= n:
     if n >= 1:
         return first(p, n)  # converted to immutable: the same pointer
     return 0
@@ -129,29 +117,23 @@ def ok_array(i: Int) -> Int:
 
 
 def ok_row_major(
-    p: Pointer[Float32, MutAnyOrigin],
-    m: Int32,
-    k: Int32 where m >= 0 and k >= 0 and p._extent() >= Int(m) * Int(k),
-    row: Int,
-    col: Int,
-) -> Float32:
+    p: Pointer[Float32, MutAnyOrigin], m: Int32, k: Int32, row: Int, col: Int
+) -> Float32
+    requires m >= 0 and k >= 0 and p._extent() >= Int(m) * Int(k):
     if 0 <= row and row < Int(m) and 0 <= col and col < Int(k):
         return p[unsafe_offset=row * Int(k) + col]  # over the integers
     return 0
 
 
 def ok_blocked_rows(
-    p: Pointer[Float32, MutAnyOrigin],
-    k: Int32,
-    n: Int32 where (
+    p: Pointer[Float32, MutAnyOrigin], k: Int32, n: Int32, w: Int, col: Int
+) -> Float32
+    requires (
         k >= 0
         and n >= 0
         and Int(k) % 16 == 0
         and p._extent() >= Int(k) * Int(n)
-    ),
-    w: Int,
-    col: Int,
-) -> Float32:
+    ):
     var sum: Float32 = 0
     if 0 <= w and w < 16 and 0 <= col and col < Int(n):
         # Every sixteenth row from `w`: below `k`, a multiple of 16. The
@@ -190,10 +172,9 @@ def bad_backwards(n: Int) -> Int:
 
 
 def bad_load(
-    p: Pointer[Float32, MutAnyOrigin],
-    n: Int where n >= 0 and p._extent() >= n,
-    i: Int,
-) -> SIMD[DType.float32, 4]:
+    p: Pointer[Float32, MutAnyOrigin], n: Int, i: Int
+) -> SIMD[DType.float32, 4]
+    requires n >= 0 and p._extent() >= n:
     if 0 <= i and i < n:
         return p.unsafe_load[width=4](i)  # the last 3 lanes may pass `n`
     return 0
@@ -203,10 +184,8 @@ def bad_deref(p: Pointer[Int, MutAnyOrigin]) -> Int:
     return p[]  # may point to nothing
 
 
-def bad_load_first(
-    p: Pointer[Float32, MutAnyOrigin],
-    n: Int where p._extent() >= n,
-) -> Float32:
+def bad_load_first(p: Pointer[Float32, MutAnyOrigin], n: Int) -> Float32
+    requires p._extent() >= n:
     if n >= 3:
         return p.unsafe_load[width=4]().reduce_add()  # three may be all
     return 0
@@ -225,24 +204,18 @@ def bad_list(xs: List[Int], i: Int) -> Int:
 
 
 def bad_row_major(
-    p: Pointer[Float32, MutAnyOrigin],
-    m: Int32,
-    k: Int32 where m >= 0 and k >= 0 and p._extent() >= Int(m) * Int(k),
-    row: Int,
-    col: Int,
-) -> Float32:
+    p: Pointer[Float32, MutAnyOrigin], m: Int32, k: Int32, row: Int, col: Int
+) -> Float32
+    requires m >= 0 and k >= 0 and p._extent() >= Int(m) * Int(k):
     if 0 <= row and row < Int(m) and 0 <= col and col <= Int(k):
         return p[unsafe_offset=row * Int(k) + col]  # `col` may be `k`
     return 0
 
 
 def bad_blocked_rows(
-    p: Pointer[Float32, MutAnyOrigin],
-    k: Int32,
-    n: Int32 where k >= 0 and n >= 0 and p._extent() >= Int(k) * Int(n),
-    w: Int,
-    col: Int,
-) -> Float32:
+    p: Pointer[Float32, MutAnyOrigin], k: Int32, n: Int32, w: Int, col: Int
+) -> Float32
+    requires k >= 0 and n >= 0 and p._extent() >= Int(k) * Int(n):
     var sum: Float32 = 0
     if 0 <= w and w < 16 and 0 <= col and col < Int(n):
         for i in range(ceildiv(Int(k), 16)):

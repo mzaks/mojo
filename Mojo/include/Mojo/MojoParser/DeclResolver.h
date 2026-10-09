@@ -56,12 +56,11 @@ class IREmitter;
 class ExprDest;
 class BaseDLValue;
 
-/// A `where` clause on a runtime argument (see `emitArgumentContracts`).
-struct ArgumentContract {
+/// A contract clause of a function's signature (see `emitContracts`): a
+/// precondition (`requires`) or a postcondition (`ensures`).
+struct ContractClause {
   const ParsedConstraint *clause;
-  /// The kind of argument it is written on: an input's clause is a
-  /// precondition; a `mut` or `out` argument's may be a postcondition.
-  enum Kind : uint8_t { Input, Mut, Out } kind;
+  enum Kind : uint8_t { Requires, Ensures } kind;
 };
 
 /// A postcondition to emit before each return of a function.
@@ -238,6 +237,10 @@ public:
   /// Emit the postconditions of the function being emitted before one of its
   /// returns, at the emitter's insertion point.
   LogicalResult emitPostconditions(FnOp op, IREmitter &emitter);
+  /// For a function with postconditions that returns an unnamed result in a
+  /// register, while its body is emitted: the local that holds the result
+  /// while the postconditions read it (`result` in an `ensures` clause).
+  llvm::DenseMap<mlir::Operation *, mlir::Value> contractResults;
 
   /// Emit `old(operand)` in a postcondition as a `kgen.old` at the emitter's
   /// insertion point (see `IREmitter::OldCalls`).
@@ -412,16 +415,13 @@ private:
   LogicalResult resolveSignature(FnOp op, Lexer &lexer, ASTDecl &decl);
   ParseResult resolveBody(FnOp op, Lexer &lexer, ASTDecl &decl);
 
-  /// Emit the `where` clauses on a function's runtime arguments at the start
-  /// of its body: preconditions as `kgen.requires` ops, the values on entry of
-  /// postconditions as `kgen.old` ops, and record the postconditions for its
-  /// returns.
-  LogicalResult emitArgumentContracts(FnOp op, ASTDecl &decl,
-                                      IREmitter &emitter);
-  /// The `where` clauses on runtime arguments, recorded with a function's
-  /// signature for its body (persistently allocated).
-  llvm::DenseMap<mlir::Operation *, ArrayRef<ArgumentContract>>
-      argumentContracts;
+  /// Emit a function's contract at the start of its body: preconditions as
+  /// `kgen.requires` ops, the values on entry of postconditions as `kgen.old`
+  /// ops, and record the postconditions for its returns.
+  LogicalResult emitContracts(FnOp op, ASTDecl &decl, IREmitter &emitter);
+  /// The contract clauses of functions, recorded with a function's signature
+  /// for its body (persistently allocated).
+  llvm::DenseMap<mlir::Operation *, ArrayRef<ContractClause>> contractClauses;
   /// The postconditions of functions whose bodies are being emitted.
   llvm::DenseMap<mlir::Operation *, SmallVector<PostconditionClause, 1>>
       postconditions;

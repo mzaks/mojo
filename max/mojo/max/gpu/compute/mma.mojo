@@ -241,12 +241,11 @@ def mma[block_size: Int = 1](mut d: SIMD, a: SIMD, b: SIMD, c: SIMD):
 @inline(.always)
 def ld_matrix[
     dtype: DType, //, simd_width: Int, *, transpose: Bool = False
-](
-    ptr: Pointer[mut=False, Scalar[dtype], ...] where (
+](ptr: Pointer[mut=False, Scalar[dtype], ...]) -> SIMD[dtype, simd_width]
+    requires (
         lane_id() >= 8 * (simd_width // (4 // size_of[dtype]()))
         or ptr._extent() >= 16 // size_of[dtype]()
-    ),
-) -> SIMD[dtype, simd_width]:
+    ):
     """Loads a matrix from shared memory into registers in a format suitable for tensor core operations.
 
     This function performs a warp-synchronized load from shared memory to registers, formatting the data

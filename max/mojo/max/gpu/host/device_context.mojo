@@ -2000,11 +2000,8 @@ struct DeviceBuffer[dtype: DType](
         mut: Bool,
         //,
         origin: Origin[mut=mut],
-    ](
-        ref[origin] self,
-        out result: Pointer[Scalar[Self.dtype], origin] where result._extent()
-        == old(len(self)),
-    ):
+    ](ref[origin] self) -> Pointer[Scalar[Self.dtype], origin]
+        ensures result._extent() == old(len(self)):
         """Returns the raw device pointer without transferring ownership.
 
         This method provides direct access to the underlying device pointer
@@ -4422,9 +4419,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
     def enqueue_create_buffer[
         dtype: DType
-    ](
-        self, size: Int, out result: DeviceBuffer[dtype] where len(result) == size
-    ) raises:
+    ](self, size: Int) raises -> DeviceBuffer[dtype]
+        ensures len(result) == size:
         """Enqueues a buffer creation using the `DeviceBuffer` constructor.
 
         For GPU devices, the space is allocated in the device's global memory.

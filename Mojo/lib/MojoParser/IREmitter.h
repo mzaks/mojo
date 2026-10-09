@@ -129,14 +129,16 @@ public:
   /// This is scope to resolve declaration references against.
   ASTDecl &declScope;
 
-  /// While emitting a `where` clause, how calls to `old(e)` are handled (see
-  /// `DeclResolver::emitArgumentContracts`).
+  /// While emitting a contract clause, how calls to `old(e)` are handled
+  /// (see `DeclResolver::emitContracts`).
   struct OldCalls {
     enum Mode {
-      /// `old(e)` is `e`: the clause is evaluated on entry.
-      Plain,
-      /// `old(e)` becomes a `kgen.old` where it is, evaluated at `entry`.
+      /// In an `ensures` clause: `old(e)` becomes a `kgen.old` where it is,
+      /// evaluated at `entry`.
       Evaluate,
+      /// In a `requires` clause: `old(e)` is an error, since the clause only
+      /// sees the entry.
+      Reject,
     } mode;
     /// The `kgen.contract.entry` token (Evaluate mode).
     Value entry;
@@ -148,11 +150,11 @@ public:
   };
   OldCalls *oldCalls = nullptr;
 
-  /// Emit a call to `old(operand)` in a `where` clause (see `oldCalls`).
+  /// Emit a call to `old(operand)` in a contract clause (see `oldCalls`).
   AnyValue emitOldCall(const ExprNode *call, const ExprNode *operand,
                        ExprDest &dest);
 
-  /// Whether a `where` clause on an argument is being emitted: there,
+  /// Whether a contract clause is being emitted: there,
   /// `all([cond for i in range(...)])` is a quantifier (see `emitForall`).
   bool inContract = false;
 

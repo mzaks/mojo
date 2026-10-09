@@ -599,11 +599,8 @@ struct Pointer[
     @inline(.nodebug)
     def __getitem__[
         I: Indexer
-    ](
-        self,
-        *,
-        unsafe_offset: I where self._offset_in_bounds[1](index(unsafe_offset)),
-    ) -> ref[Self.origin, Self.address_space] Self.T:
+    ](self, *, unsafe_offset: I) -> ref[Self.origin, Self.address_space] Self.T
+        requires self._offset_in_bounds[1](index(unsafe_offset)):
         """Return a reference to the underlying data, offset by the given index.
 
         Parameters:
@@ -633,9 +630,8 @@ struct Pointer[
     )
     def __getitem__[
         I: Indexer, //
-    ](
-        self, offset: I where self._offset_in_bounds[1](index(offset))
-    ) -> ref[Self.origin, Self.address_space] Self.T:
+    ](self, offset: I) -> ref[Self.origin, Self.address_space] Self.T
+        requires self._offset_in_bounds[1](index(offset)):
         """Return a reference to the underlying data, offset by the given index.
 
         Parameters:
@@ -723,14 +719,10 @@ struct Pointer[
     @doc_hidden
     @inline(.nodebug)
     @deprecated(use=unsafe_offset)
-    def __add__[
-        I: Indexer, //
-    ](
-        self,
-        offset: I,
-        out result: Self where index(offset) < 0
-        or result._extent() == self._extent() - index(offset),
-    ):
+    def __add__[I: Indexer, //](self, offset: I) -> Self
+        ensures index(offset) < 0 or result._extent() == self._extent() - index(
+            offset
+        ):
         """Return a pointer at an offset from the current one.
 
         Parameters:
@@ -747,14 +739,10 @@ struct Pointer[
     @doc_hidden
     @inline(.always)
     @deprecated(use=unsafe_offset)
-    def __sub__[
-        I: Indexer, //
-    ](
-        self,
-        offset: I,
-        out result: Self where index(offset) > 0
-        or result._extent() == self._extent() + index(offset),
-    ):
+    def __sub__[I: Indexer, //](self, offset: I) -> Self
+        ensures index(offset) > 0 or result._extent() == self._extent() + index(
+            offset
+        ):
         """Return a pointer at an offset from the current one.
 
         Parameters:
@@ -771,13 +759,10 @@ struct Pointer[
     @doc_hidden
     @inline(.always)
     @deprecated(use=unsafe_offset)
-    def __iadd__[
-        I: Indexer, //
-    ](
-        mut self where index(offset) < 0
-        or self._extent() == old(self._extent()) - index(offset),
-        offset: I,
-    ):
+    def __iadd__[I: Indexer, //](mut self, offset: I)
+        ensures index(offset) < 0 or self._extent() == old(
+            self._extent()
+        ) - index(offset):
         """Add an offset to this pointer.
 
         Parameters:
@@ -791,13 +776,10 @@ struct Pointer[
     @doc_hidden
     @inline(.always)
     @deprecated(use=unsafe_offset)
-    def __isub__[
-        I: Indexer, //
-    ](
-        mut self where index(offset) > 0
-        or self._extent() == old(self._extent()) + index(offset),
-        offset: I,
-    ):
+    def __isub__[I: Indexer, //](mut self, offset: I)
+        ensures index(offset) > 0 or self._extent() == old(
+            self._extent()
+        ) + index(offset):
         """Subtract an offset from this pointer.
 
         Parameters:
@@ -1198,15 +1180,10 @@ struct Pointer[
         return 0 <= offset and offset <= self._extent() - width
 
     @inline(.nodebug)
-    def unsafe_offset[
-        I: Indexer
-    ](
-        self,
-        offset: I,
-        /,
-        out result: Self where index(offset) < 0
-        or result._extent() == self._extent() - index(offset),
-    ):
+    def unsafe_offset[I: Indexer](self, offset: I, /) -> Self
+        ensures index(offset) < 0 or result._extent() == self._extent() - index(
+            offset
+        ):
         """Return a pointer at an offset from the current one.
 
         Parameters:
@@ -1423,9 +1400,8 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](
-        self: Pointer[Scalar[dtype], ...] where self._offset_in_bounds[width](0)
-    ) -> SIMD[dtype, width]:
+    ](self: Pointer[Scalar[dtype], ...]) -> SIMD[dtype, width]
+        requires self._offset_in_bounds[width](0):
         """Loads `width` elements from the value the pointer points to.
 
         Use `alignment` to specify minimal known alignment in bytes; pass a
@@ -1539,9 +1515,8 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](
-        self: Pointer[Scalar[dtype], ...] where self._offset_in_bounds[width](0)
-    ) -> SIMD[dtype, width]:
+    ](self: Pointer[Scalar[dtype], ...]) -> SIMD[dtype, width]
+        requires self._offset_in_bounds[width](0):
         return self.unsafe_load[
             width=width,
             alignment=alignment,
@@ -1561,10 +1536,8 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](
-        self: Pointer[Scalar[dtype], ...],
-        offset: Scalar where self._offset_in_bounds[width](Int(offset)),
-    ) -> SIMD[dtype, width]:
+    ](self: Pointer[Scalar[dtype], ...], offset: Scalar) -> SIMD[dtype, width]
+        requires self._offset_in_bounds[width](Int(offset)):
         """Loads the value the pointer points to with the given offset.
 
         Constraints:
@@ -1615,10 +1588,8 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](
-        self: Pointer[Scalar[dtype], ...],
-        offset: Scalar where self._offset_in_bounds[width](Int(offset)),
-    ) -> SIMD[dtype, width]:
+    ](self: Pointer[Scalar[dtype], ...], offset: Scalar) -> SIMD[dtype, width]
+        requires self._offset_in_bounds[width](Int(offset)):
         return self.unsafe_load[
             width=width,
             alignment=alignment,
@@ -1639,10 +1610,8 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](
-        self: Pointer[Scalar[dtype], ...],
-        offset: I where self._offset_in_bounds[width](index(offset)),
-    ) -> SIMD[dtype, width]:
+    ](self: Pointer[Scalar[dtype], ...], offset: I) -> SIMD[dtype, width]
+        requires self._offset_in_bounds[width](index(offset)):
         """Loads the value the pointer points to with the given offset.
 
         Constraints:
@@ -1693,10 +1662,8 @@ struct Pointer[
         volatile: Bool = False,
         invariant: Bool = _default_invariant[Self.mut](),
         non_temporal: Bool = False,
-    ](
-        self: Pointer[Scalar[dtype], ...],
-        offset: I where self._offset_in_bounds[width](index(offset)),
-    ) -> SIMD[dtype, width]:
+    ](self: Pointer[Scalar[dtype], ...], offset: I) -> SIMD[dtype, width]
+        requires self._offset_in_bounds[width](index(offset)):
         return self.unsafe_load[
             width=width,
             alignment=alignment,
@@ -1716,13 +1683,8 @@ struct Pointer[
         alignment: Int = align_of[dtype](),
         volatile: Bool = False,
         non_temporal: Bool = False,
-    ](
-        self: MutPointer[Scalar[dtype], ...],
-        offset: I,
-        val: SIMD[dtype, width] where self._offset_in_bounds[Int(width)](
-            index(offset)
-        ),
-    ):
+    ](self: MutPointer[Scalar[dtype], ...], offset: I, val: SIMD[dtype, width])
+        requires self._offset_in_bounds[Int(width)](index(offset)):
         """Stores a single element value at the given offset.
 
         Constraints:
@@ -1767,10 +1729,9 @@ struct Pointer[
     ](
         self: MutPointer[Scalar[dtype], ...],
         offset: Scalar[offset_type],
-        val: SIMD[dtype, width] where self._offset_in_bounds[width](
-            Int(offset)
-        ),
-    ):
+        val: SIMD[dtype, width],
+    )
+        requires self._offset_in_bounds[width](Int(offset)):
         """Stores a single element value at the given offset.
 
         Constraints:
@@ -1811,10 +1772,8 @@ struct Pointer[
         alignment: Int = align_of[dtype](),
         volatile: Bool = False,
         non_temporal: Bool = False,
-    ](
-        self: MutPointer[Scalar[dtype], ...],
-        val: SIMD[dtype, width] where self._offset_in_bounds[Int(width)](0),
-    ):
+    ](self: MutPointer[Scalar[dtype], ...], val: SIMD[dtype, width])
+        requires self._offset_in_bounds[Int(width)](0):
         """Stores a single element value `val` at element offset 0.
 
         Specify `alignment` when writing to packed/unaligned memory. Requires a
@@ -1873,13 +1832,8 @@ struct Pointer[
         alignment: Int = align_of[dtype](),
         volatile: Bool = False,
         non_temporal: Bool = False,
-    ](
-        self: MutPointer[Scalar[dtype], ...],
-        offset: I,
-        val: SIMD[dtype, width] where self._offset_in_bounds[Int(width)](
-            index(offset)
-        ),
-    ):
+    ](self: MutPointer[Scalar[dtype], ...], offset: I, val: SIMD[dtype, width])
+        requires self._offset_in_bounds[Int(width)](index(offset)):
         self.unsafe_store[
             width,
             alignment=alignment,
@@ -1903,10 +1857,9 @@ struct Pointer[
     ](
         self: MutPointer[Scalar[dtype], ...],
         offset: Scalar[offset_type],
-        val: SIMD[dtype, width] where self._offset_in_bounds[width](
-            Int(offset)
-        ),
-    ):
+        val: SIMD[dtype, width],
+    )
+        requires self._offset_in_bounds[width](Int(offset)):
         self.unsafe_store[
             width,
             alignment=alignment,
@@ -1926,10 +1879,8 @@ struct Pointer[
         alignment: Int = align_of[dtype](),
         volatile: Bool = False,
         non_temporal: Bool = False,
-    ](
-        self: MutPointer[Scalar[dtype], ...],
-        val: SIMD[dtype, width] where self._offset_in_bounds[Int(width)](0),
-    ):
+    ](self: MutPointer[Scalar[dtype], ...], val: SIMD[dtype, width])
+        requires self._offset_in_bounds[Int(width)](0):
         self.unsafe_store[
             width,
             alignment=alignment,

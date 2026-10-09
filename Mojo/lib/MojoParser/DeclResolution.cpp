@@ -2456,6 +2456,12 @@ LogicalResult DeclResolver::resolveSignature(FnOp funcOp, Lexer &lexer,
           p, decl.getIndentation())))
     return failure();
 
+  // Parse the contract clauses if present. A trait method may have them:
+  // they are what every implementation requires at most and ensures at
+  // least.
+  if (failed(fnSignature.parseContractsIfPresent(p, decl.getIndentation())))
+    return failure();
+
   // Reject where clauses on trait methods. Users almost certainly expect
   // availability semantics (method absent when constraint fails), but `where`
   // gives callability (method exists, constraint checked at call site). To be
@@ -2517,29 +2523,15 @@ LogicalResult DeclResolver::resolveSignature(FnOp funcOp, Lexer &lexer,
   // Propagate errors and the parsed decls in the signature.
   decl.takeDecls(sigDecl);
 
-  // Keep the contracts on runtime arguments for the body, which emits them.
-  SmallVector<ArgumentContract, 2> contracts;
-  for (ParsedArgument &arg : fnSignature.parsedArgs) {
-    auto kind = arg.convention == ParsedArgument::kConventionMut
-                    ? ArgumentContract::Mut
-                : arg.convention == ParsedArgument::kConventionOut ||
-                        arg.convention == ParsedArgument::kConventionByRefResult
-                    ? ArgumentContract::Out
-                    : ArgumentContract::Input;
-    for (const ParsedConstraint &clause : arg.whereClauses)
-      contracts.push_back({&clause, kind});
-  }
-  // An `out` argument returned in a register is only the result argument (a
-  // memory-only one is also the result slot, collected above).
-  if (!llvm::any_of(contracts, [&](const ArgumentContract &contract) {
-        return !fnSignature.resultArg.whereClauses.empty() &&
-               contract.clause == &fnSignature.resultArg.whereClauses.front();
-      }))
-    for (const ParsedConstraint &clause : fnSignature.resultArg.whereClauses)
-      contracts.push_back({&clause, ArgumentContract::Out});
+  // Keep the contract clauses for the body, which emits them.
+  SmallVector<ContractClause, 2> contracts;
+  for (const ParsedConstraint &clause : fnSignature.requiresClauses)
+    contracts.push_back({&clause, ContractClause::Requires});
+  for (const ParsedConstraint &clause : fnSignature.ensuresClauses)
+    contracts.push_back({&clause, ContractClause::Ensures});
   if (!contracts.empty())
-    argumentContracts[funcOp] =
-        shared.getPersistentCopy(ArrayRef<ArgumentContract>(contracts));
+    contractClauses[funcOp] =
+        shared.getPersistentCopy(ArrayRef<ContractClause>(contracts));
 
   // Now that all the structural properties are determined, perform any
   // name-binding specific checks over the declaration.  This happens after
@@ -2710,12 +2702,15 @@ LogicalResult DeclResolver::resolveSyntheticBody(FnOp fn, ASTDecl &decl) {
   }
 }
 
-/// The named result of a function returned in a register: the local variable
-/// holding it (see `resolveBody`), or null.
-static Value namedRegisterResult(FnOp funcOp, ASTDecl &decl) {
-  if (!funcOp.getNamedResultAttr() ||
-      funcOp.getFuncTypeGenerator().hasMemoryOnlyResult())
+/// The result of a function returned in a register, as its contract reads
+/// it: the local variable holding a named result (see `resolveBody`) or an
+/// unnamed one (see `DeclResolver::contractResults`), or null.
+static Value registerResult(DeclResolver &resolver, FnOp funcOp,
+                            ASTDecl &decl) {
+  if (funcOp.getFuncTypeGenerator().hasMemoryOnlyResult())
     return {};
+  if (!funcOp.getNamedResultAttr())
+    return resolver.contractResults.lookup(funcOp);
   ArrayRef<ASTDecl *> resultDecls =
       decl.lookupInCurrentScope(funcOp.getNamedResultAttr());
   if (resultDecls.size() != 1)
@@ -2723,14 +2718,27 @@ static Value namedRegisterResult(FnOp funcOp, ASTDecl &decl) {
   return resultDecls[0]->getIfIRValue().getIfMLValue();
 }
 
+/// Whether a function has an argument or a named result called `name`.
+static bool hasArgumentNamed(FnOp funcOp, StringRef name) {
+  FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
+  for (unsigned i = 0, e = funcSignature.getArgConventions().size(); i != e;
+       ++i)
+    if (StringAttr argName = funcSignature.getArgName(i);
+        argName && argName.getValue() == name)
+      return true;
+  StringAttr resultName = funcOp.getNamedResultAttr();
+  return resultName && resultName.getValue() == name;
+}
+
 /// The operands of a contract op, which its region's block arguments stand
 /// for: the function's arguments, then (for a postcondition) its named result
 /// in a register.
-static SmallVector<Value> contractOperands(FnOp funcOp, ASTDecl &decl,
+static SmallVector<Value> contractOperands(DeclResolver &resolver,
+                                           FnOp funcOp, ASTDecl &decl,
                                            bool withResult) {
   SmallVector<Value> operands(funcOp.getBody()->getArguments());
   if (withResult)
-    if (Value result = namedRegisterResult(funcOp, decl))
+    if (Value result = registerResult(resolver, funcOp, decl))
       operands.push_back(result);
   return operands;
 }
@@ -2761,7 +2769,7 @@ static void bindFunctionArguments(DeclResolver &resolver, FnOp funcOp,
   }
 }
 
-/// Emit the condition of a `where` clause into the region of the contract op
+/// Emit the condition of a contract clause into the region of the contract op
 /// `op`, whose operands are `operands` (see `contractOperands`). A scope binds
 /// the function's argument names (and a named result) to the region's block
 /// arguments; `olds` handles the clause's `old(e)` calls. Returns the region's
@@ -2785,12 +2793,29 @@ static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
       resolver.addFullyResolvedDecl(nullptr, StringAttr(), clause.loc, &decl);
   bindFunctionArguments(resolver, funcOp, scope, *block, clause.loc,
                         /*withResultSlot=*/true);
-  // A named result in a register follows the arguments.
+  // A result in a register follows the arguments. In a postcondition,
+  // `result` names the function's result, unless an argument has that name.
   unsigned numArgs = funcOp.getBody()->getNumArguments();
-  if (withResult && namedRegisterResult(funcOp, decl))
-    resolver.addFullyResolvedDecl(
-        CValue::getMValueForRef(block->getArgument(numArgs)),
-        funcOp.getNamedResultAttr(), clause.loc, &scope);
+  StringAttr resultKeyword;
+  if (withResult && !hasArgumentNamed(funcOp, "result"))
+    resultKeyword = StringAttr::get(resolver.getContext(), "result");
+  if (withResult && registerResult(resolver, funcOp, decl)) {
+    CValue result = CValue::getMValueForRef(block->getArgument(numArgs));
+    if (StringAttr resultName = funcOp.getNamedResultAttr())
+      resolver.addFullyResolvedDecl(result, resultName, clause.loc, &scope);
+    if (resultKeyword)
+      resolver.addFullyResolvedDecl(result, resultKeyword, clause.loc, &scope);
+  } else if (resultKeyword) {
+    // A result in memory is the function's result slot argument.
+    FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
+    for (auto [argIdx, convention] :
+         llvm::enumerate(funcSignature.getArgConventions()))
+      if (convention == ArgConvention::ByRefResult &&
+          !ASTType(funcOp.getUserResultType()).isNoneType())
+        resolver.addFullyResolvedDecl(
+            CValue::getMValueForRef(block->getArgument(argIdx)), resultKeyword,
+            clause.loc, &scope);
+  }
 
   IREmitter clauseEmitter(scope, regionBuilder);
   clauseEmitter.oldCalls = olds;
@@ -2860,84 +2885,88 @@ static KGEN::SourceLocOp emitCallLocation(OpBuilder &builder, Location loc) {
   return KGEN::SourceLocOp::create(builder, loc, builder.getIndexAttr(0));
 }
 
-LogicalResult DeclResolver::emitArgumentContracts(FnOp funcOp, ASTDecl &decl,
-                                                  IREmitter &emitter) {
-  auto it = argumentContracts.find(funcOp);
-  if (it == argumentContracts.end() || !emitter.builder)
+LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
+                                          IREmitter &emitter) {
+  auto it = contractClauses.find(funcOp);
+  if (it == contractClauses.end() || !emitter.builder)
     return success();
-  ArrayRef<ArgumentContract> contracts = it->second;
-  argumentContracts.erase(it);
+  ArrayRef<ContractClause> contracts = it->second;
+  contractClauses.erase(it);
 
   OpBuilder &builder = *emitter.builder;
   Location funcLoc = shared.translateLocation(decl.getLoc());
   auto callLoc = emitCallLocation(builder, funcLoc);
-  auto emitRequires = [&](const ParsedConstraint &clause,
-                          IREmitter::OldCalls *olds) -> LogicalResult {
-    SmallVector<Value> operands =
-        contractOperands(funcOp, decl, /*withResult=*/false);
-    auto requiresOp =
-        KGEN::RequiresOp::create(builder, shared.translateLocation(clause.loc),
-                                 operands, callLoc.getLine(), callLoc.getCol(),
-                                 callLoc.getFileName(), clause.message);
-    return mlir::success(emitContractCondition(*this, funcOp, decl, clause,
-                                               requiresOp, operands,
-                                               /*withResult=*/false, olds));
-  };
+  FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
+
+  // The result of a function that returns it unnamed in a register: a local
+  // the returns fill for the postconditions, like a named `out` result.
+  bool hasEnsures = llvm::any_of(contracts, [](const ContractClause &c) {
+    return c.kind == ContractClause::Ensures;
+  });
+  if (hasEnsures && !funcOp.getNamedResultAttr() &&
+      !funcSignature.hasMemoryOnlyResult() && !funcSignature.isRefResult() &&
+      !ASTType(funcOp.getUserResultType()).isNoneType())
+    if (VarDeclOp resultVar =
+            emitter.emitVarDecl("result", funcOp.getUserResultType(),
+                                funcOp.getLoc(), VarDeclKind::Arg))
+      contractResults[funcOp] = resultVar;
 
   // The entry marker for `old(e)` in postconditions, made on demand.
   KGEN::ContractEntryOp entry;
-  FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
   SmallVector<PostconditionClause, 1> posts;
   bool needsEntry = false;
-  for (const ArgumentContract &contract : contracts) {
+  for (const ContractClause &contract : contracts) {
     const ParsedConstraint &clause = *contract.clause;
-    // An input's clause is a precondition; `old` has no meaning there.
-    if (contract.kind == ArgumentContract::Input) {
-      if (failed(emitRequires(clause, /*olds=*/nullptr)))
+    Location loc = shared.translateLocation(clause.loc);
+
+    // A precondition reads the values on entry, where `old` has no meaning
+    // and the function's result has no value.
+    if (contract.kind == ContractClause::Requires) {
+      IREmitter::OldCalls reject{IREmitter::OldCalls::Reject, {}, {}, 0};
+      SmallVector<Value> operands =
+          contractOperands(*this, funcOp, decl, /*withResult=*/false);
+      auto requiresOp = KGEN::RequiresOp::create(
+          builder, loc, operands, callLoc.getLine(), callLoc.getCol(),
+          callLoc.getFileName(), clause.message);
+      Block *condition =
+          emitContractCondition(*this, funcOp, decl, clause, requiresOp,
+                                operands, /*withResult=*/false, &reject);
+      if (!condition)
         return failure();
+      Value result = registerResult(*this, funcOp, decl);
+      bool usesResult =
+          result && llvm::any_of(result.getUsers(), [&](Operation *user) {
+            return requiresOp->isAncestor(user);
+          });
+      for (auto [argIdx, convention] :
+           llvm::enumerate(funcSignature.getArgConventions()))
+        usesResult |= convention == ArgConvention::ByRefResult &&
+                      !condition->getArgument(argIdx).use_empty();
+      if (usesResult) {
+        shared.emitError(clause.loc)
+            << "a 'requires' clause cannot use the function's result; state "
+               "it in an 'ensures' clause";
+        return failure();
+      }
       continue;
     }
 
-    // Classify a `mut` or `out` clause by a trial postcondition: a clause on a
-    // `mut` argument without `old` holds on entry and on exit; one that uses
-    // no `mut` or `out` argument's value on exit is a precondition.
+    // A postcondition is emitted before every return. Emit it here once
+    // too, and drop it, to see whether it uses `old`: its `kgen.old` ops need
+    // the function's entry marker.
     if (!entry)
       entry = KGEN::ContractEntryOp::create(builder, funcLoc);
-    Location loc = shared.translateLocation(clause.loc);
     IREmitter::OldCalls olds{
         IREmitter::OldCalls::Evaluate, entry.getToken(), {}, 0};
-    SmallVector<Value> postOperands =
-        contractOperands(funcOp, decl, /*withResult=*/true);
-    auto trial = KGEN::EnsuresOp::create(builder, loc, postOperands,
+    SmallVector<Value> operands =
+        contractOperands(*this, funcOp, decl, /*withResult=*/true);
+    auto trial = KGEN::EnsuresOp::create(builder, loc, operands,
                                          callLoc.getLine(), callLoc.getCol(),
                                          callLoc.getFileName(), clause.message);
-    Block *trialBlock =
-        emitContractCondition(*this, funcOp, decl, clause, trial, postOperands,
-                              /*withResult=*/true, &olds);
-    if (!trialBlock)
+    if (!emitContractCondition(*this, funcOp, decl, clause, trial, operands,
+                               /*withResult=*/true, &olds))
       return failure();
-    bool usesExit = false;
-    for (auto [argIdx, convention] :
-         llvm::enumerate(funcSignature.getArgConventions()))
-      if (convention == ArgConvention::Mut ||
-          convention == ArgConvention::MutRef ||
-          convention == ArgConvention::ByRefResult)
-        usesExit |= !trialBlock->getArgument(argIdx).use_empty();
-    unsigned numArgs = funcOp.getBody()->getNumArguments();
-    if (postOperands.size() > numArgs)
-      usesExit |= !trialBlock->getArgument(numArgs).use_empty();
     trial.erase();
-
-    bool isPost = usesExit || contract.kind == ArgumentContract::Out;
-    bool isPre = contract.kind == ArgumentContract::Mut &&
-                 (olds.count == 0 || !usesExit);
-    if (isPre) {
-      IREmitter::OldCalls plain{IREmitter::OldCalls::Plain, {}, {}, 0};
-      if (failed(emitRequires(clause, &plain)))
-        return failure();
-    }
-    if (!isPost)
-      continue;
     needsEntry |= olds.count != 0;
     posts.push_back({&clause, entry.getToken()});
   }
@@ -2962,7 +2991,7 @@ LogicalResult DeclResolver::emitPostconditions(FnOp funcOp,
   for (const PostconditionClause &post : it->second) {
     IREmitter::OldCalls olds{IREmitter::OldCalls::Evaluate, post.entry, {}, 0};
     SmallVector<Value> operands =
-        contractOperands(funcOp, *decl, /*withResult=*/true);
+        contractOperands(*this, funcOp, *decl, /*withResult=*/true);
     auto ensuresOp = KGEN::EnsuresOp::create(
         builder, shared.translateLocation(post.clause->loc), operands,
         callLoc.getLine(), callLoc.getCol(), callLoc.getFileName(),
@@ -3000,7 +3029,7 @@ ParseResult DeclResolver::resolveBody(FnOp funcOp, Lexer &lexer,
   bool isUnavailableFn = funcOp.isUnavailable();
   bool isTraitFn =
       isa_and_nonnull<TraitDeclOp>(decl.getParentDecl()->getIfOperation());
-  // A required trait method with `where` clauses keeps them: its body is the
+  // A required trait method with a contract keeps it: its body is the
   // contract ops, then `hlcf.unreachable`.
   bool contractOnly = false;
   if (isTraitFn || funcOp.isExternal() || isUnavailableFn) {
@@ -3012,7 +3041,7 @@ ParseResult DeclResolver::resolveBody(FnOp funcOp, Lexer &lexer,
     // arguments or any other setup logic.
     bool ellipsis = p.consumeIf(Token::dot_dot_dot);
     contractOnly = ellipsis && isTraitFn && !isUnavailableFn &&
-                   argumentContracts.count(funcOp);
+                   contractClauses.count(funcOp);
     if (ellipsis && !contractOnly) {
       body.front().erase(); // Remove the lit.endfn op to replace it.
       auto builder = OpBuilder::atBlockEnd(&body);
@@ -3143,9 +3172,11 @@ ParseResult DeclResolver::resolveBody(FnOp funcOp, Lexer &lexer,
 
   // The postconditions recorded for the returns are only needed while the
   // body is emitted.
-  auto dropPostconditions =
-      llvm::scope_exit([&] { postconditions.erase(funcOp); });
-  if (failed(emitArgumentContracts(funcOp, decl, emitter)))
+  auto dropPostconditions = llvm::scope_exit([&] {
+    postconditions.erase(funcOp);
+    contractResults.erase(funcOp);
+  });
+  if (failed(emitContracts(funcOp, decl, emitter)))
     return failure();
 
   // A required trait method has no return: its postconditions follow the

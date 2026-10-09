@@ -17,15 +17,14 @@ from std.math import ceildiv, max, min
 from std.math.uutils import udiv_unchecked
 
 
-def ok_get(xs: List[Int], i: Int where 0 <= i and i < len(xs)) -> Int:
+def ok_get(xs: List[Int], i: Int) -> Int requires 0 <= i and i < len(xs):
     return xs[i]  # from the precondition
 
 
-def ok_window(
-    xs: List[Int],
-    lo: Int where 0 <= lo,
-    hi: Int where lo <= hi where hi < len(xs),
-) -> Int:
+def ok_window(xs: List[Int], lo: Int, hi: Int) -> Int
+    requires 0 <= lo
+    requires lo <= hi
+    requires hi < len(xs):
     return xs[hi] - xs[lo]
 
 
@@ -70,9 +69,8 @@ struct Mode(Equatable, TrivialRegisterPassable):
         return self != other
 
 
-def run(
-    mode: Mode, xs: List[Int] where mode is not Mode.FAST or len(xs) > 0
-) -> Int:
+def run(mode: Mode, xs: List[Int]) -> Int
+    requires mode is not Mode.FAST or len(xs) > 0:
     if mode is Mode.FAST:
         return xs[0]  # FAST needs a non-empty list
     return 0

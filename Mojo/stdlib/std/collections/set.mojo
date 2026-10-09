@@ -111,16 +111,14 @@ struct Set[
     # Life cycle methods
     # ===-------------------------------------------------------------------===#
 
-    def __init__(out self where len(self) == 0):
+    def __init__(out self) ensures len(self) == 0:
         """Construct an empty set."""
         self._data = Dict[Self.T, NoneType, Self.H]()
 
-    def __init__(
-        # Repeated elements collapse.
-        out self where len(self) <= len(ts),
-        *ts: Self.T,
-        __set_literal__: NoneType = None,
-    ) where conforms_to(Self.T, Copyable) and conforms_to(Self.T, Deinitable):
+    # Repeated elements collapse.
+    def __init__(out self, *ts: Self.T, __set_literal__: NoneType = None)
+        where conforms_to(Self.T, Copyable) and conforms_to(Self.T, Deinitable)
+        ensures len(self) <= len(ts):
         """Construct a set from initial elements.
 
         Args:
@@ -134,9 +132,9 @@ struct Set[
             self.add(t.copy())
 
     # TODO: Should take the list owned so we can transfer the elements out.
-    def __init__(
-        out self where len(self) <= len(elements), elements: List[Self.T]
-    ) where conforms_to(Self.T, Copyable) and conforms_to(Self.T, Deinitable):
+    def __init__(out self, elements: List[Self.T])
+        where conforms_to(Self.T, Copyable) and conforms_to(Self.T, Deinitable)
+        ensures len(self) <= len(elements):
         """Construct a set from a List of elements.
 
         Args:
@@ -516,15 +514,14 @@ struct Set[
             )
         )
 
-    def add(
-        # One longer for a new element, as long for an existing one.
-        mut self where (
+    # One longer for a new element, as long for an existing one.
+    def add(mut self, var t: Self.T)
+        where conforms_to(Self.T, Deinitable)
+        ensures (
             len(self) >= 1
             and len(self) - old(len(self)) >= 0
             and len(self) - old(len(self)) <= 1
-        ),
-        var t: Self.T,
-    ) where conforms_to(Self.T, Deinitable):
+        ):
         """Add an element to the set.
 
         Constraints:
@@ -556,9 +553,9 @@ struct Set[
 
         return self._data.insert(t^, None).map(reap)
 
-    def remove(
-        mut self where len(self) == old(len(self)) - 1, t: Self.T
-    ) raises where conforms_to(Self.T, Deinitable):
+    def remove(mut self, t: Self.T) raises
+        where conforms_to(Self.T, Deinitable)
+        ensures len(self) == old(len(self)) - 1:
         """Remove an element from the set.
 
         Constraints:
@@ -584,9 +581,7 @@ struct Set[
             ]
         ](Pointer(to=self._data))[].pop(t)
 
-    def pop(
-        mut self where len(self) == old(len(self)) - 1,
-    ) raises -> Self.T:
+    def pop(mut self) raises -> Self.T ensures len(self) == old(len(self)) - 1:
         """Remove any one item from the set, and return it.
 
         As an implementation detail this will remove the last item
@@ -813,13 +808,12 @@ struct Set[
         """
         self = self.symmetric_difference(other)
 
-    def discard(
-        # One shorter if the value was there.
-        mut self where (
+    # One shorter if the value was there.
+    def discard(mut self, value: Self.T)
+        where conforms_to(Self.T, Deinitable)
+        ensures (
             old(len(self)) - len(self) >= 0 and old(len(self)) - len(self) <= 1
-        ),
-        value: Self.T,
-    ) where conforms_to(Self.T, Deinitable):
+        ):
         """Remove a value from the set if it exists. Pass otherwise.
 
         Constraints:
@@ -834,11 +828,9 @@ struct Set[
         except:
             pass
 
-    def clear(
-        # The `old` makes the clause a postcondition only (a `mut` clause
-        # without one holds on entry too); lengths are never negative.
-        mut self where len(self) == 0 and old(len(self)) >= 0,
-    ) where conforms_to(Self.T, Deinitable):
+    def clear(mut self)
+        where conforms_to(Self.T, Deinitable)
+        ensures len(self) == 0:
         """Removes all elements from the set.
 
         This method modifies the set in-place, removing all of its elements.

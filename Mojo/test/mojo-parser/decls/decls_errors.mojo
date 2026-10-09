@@ -342,8 +342,33 @@ def always_inline_builtin_4(a: Bool):
   if a:
      pass
 
-# expected-error @+1 {{'where' clauses are not supported on 'ref' and 'deinit' arguments}}
-def illegal_runtime_where[x: Int](ref a: Int where a > 1):
+# expected-error @+2 {{'where' clauses must be used with parameters and cannot be used with arguments}}
+# expected-note @+1 {{to state a precondition or a postcondition, use a 'requires' or an 'ensures' clause after the signature}}
+def illegal_runtime_where[x: Int](a: Int where a > 1):
+  pass
+
+# expected-error @+1 {{'old' has no meaning in a 'requires' clause, which reads the values on entry; use it in an 'ensures' clause}}
+def old_in_requires(mut a: Int) requires old(a) > 1:
+  pass
+
+# expected-error @+1 {{a 'requires' clause cannot use the function's result; state it in an 'ensures' clause}}
+def out_in_requires(a: Int, out r: Int) requires r > a:
+  r = a
+
+# expected-error @+1 {{use of unknown declaration 'result'}}
+def result_in_requires(a: Int) -> Int requires result > a:
+  return a
+
+# expected-error @+1 {{'requires' clauses must come before 'ensures' clauses}}
+def requires_after_ensures(a: Int) -> Int ensures result > 0 requires a > 0:
+  return a
+
+# expected-error @+1 {{'where' clauses must come before 'requires' and 'ensures' clauses}}
+def where_after_requires[x: Int](a: Int) requires a > 0 where x > 1:
+  pass
+
+# expected-error @+1 {{a 'requires' clause takes at most one message: prefer 'requires condition else "message"'}}
+def two_messages(a: Int) requires (a > 0, "positive") else "positive":
   pass
 
 # expected-note @+1 {{function declared here}}

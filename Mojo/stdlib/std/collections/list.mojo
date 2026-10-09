@@ -430,14 +430,14 @@ struct List[T: AnyType, /](
     # ===-------------------------------------------------------------------===#
 
     @stable(since="1.0")
-    def __init__(out self where len(self) == 0):
+    def __init__(out self) ensures len(self) == 0:
         """Constructs an empty list."""
         self._data = Self._PointerType.unsafe_dangling()
         self._len = 0
         self._capacity = 0
 
     @stable(since="1.0")
-    def __init__(out self where len(self) == 0, *, capacity: Int):
+    def __init__(out self, *, capacity: Int) ensures len(self) == 0:
         """Constructs a list with the given capacity.
 
         Args:
@@ -452,12 +452,10 @@ struct List[T: AnyType, /](
         self._annotate_new()
 
     @stable(since="1.0")
-    def __init__(
-        out self where len(self) == length,
-        *,
-        length: Int where length >= 0,
-        fill: Self.T,
-    ) where conforms_to(Self.T, Copyable):
+    def __init__(out self, *, length: Int, fill: Self.T)
+        where conforms_to(Self.T, Copyable)
+        requires length >= 0
+        ensures len(self) == length:
         """Constructs a list with the given length.
 
         Args:
@@ -468,12 +466,9 @@ struct List[T: AnyType, /](
         self._unchecked_grow(length, fill)
 
     @inline(.always)
-    def __init__(
-        out self where len(self) == length,
-        *,
-        length: Int where length >= 0,
-        fill_with: Some[def(Int) -> Self.T],
-    ):
+    def __init__(out self, *, length: Int, fill_with: Some[def(Int) -> Self.T])
+        requires length >= 0
+        ensures len(self) == length:
         """Constructs a list by calling `fill_with(i)` for each index `i`.
 
         Args:
@@ -498,11 +493,9 @@ struct List[T: AnyType, /](
             )
 
     @inline(.always)
-    def __init__(
-        out self where len(self) == old(len(values)),
-        var *values: Self.T,
-        __list_literal__: NoneType,
-    ) where conforms_to(Self.T, Movable):
+    def __init__(out self, var *values: Self.T, __list_literal__: NoneType)
+        where conforms_to(Self.T, Movable)
+        ensures len(self) == old(len(values)):
         """Constructs a list from the given values.
 
         Args:
@@ -546,10 +539,9 @@ struct List[T: AnyType, /](
         # list has exactly that many elements.
         _ensures(not upper or upper.value() != lower or len(self) == lower)
 
-    def __init__(
-        out self where len(self) == len(span),
-        span: Span[Self.T, _],
-    ) where conforms_to(Self.T, Copyable):
+    def __init__(out self, span: Span[Self.T, _])
+        where conforms_to(Self.T, Copyable)
+        ensures len(self) == len(span):
         """Constructs a list by copying the elements of a span.
 
         Unlike the constructor from an arbitrary iterable, it states the new
@@ -562,11 +554,9 @@ struct List[T: AnyType, /](
         self.extend(span)
 
     @inline(.always)
-    def __init__(
-        out self where len(self) == unsafe_uninit_length,
-        *,
-        unsafe_uninit_length: Int where unsafe_uninit_length >= 0,
-    ):
+    def __init__(out self, *, unsafe_uninit_length: Int)
+        requires unsafe_uninit_length >= 0
+        ensures len(self) == unsafe_uninit_length:
         """Construct a list with the specified length, with uninitialized
         memory. This is unsafe, as it relies on the caller initializing the
         elements with unsafe operations, not assigning over the uninitialized
@@ -580,9 +570,9 @@ struct List[T: AnyType, /](
         self._len = unsafe_uninit_length
 
     @stable(since="1.0")
-    def __init__(
-        out self where len(self) == len(copy), *, copy: Self
-    ) where conforms_to(Self.T, Copyable):
+    def __init__(out self, *, copy: Self)
+        where conforms_to(Self.T, Copyable)
+        ensures len(self) == len(copy):
         """Creates a deep copy of the given list.
 
         Args:
@@ -910,14 +900,13 @@ struct List[T: AnyType, /](
         return self._capacity
 
     @inline(.never)
-    def _realloc(
-        mut self where (
+    def _realloc(mut self, new_capacity: Int)
+        where conforms_to(Self.T, Movable)
+        ensures (
             len(self) == old(len(self))
             and self._capacity == new_capacity
             and _same_elements(self._data, old(self._data), len(self))
-        ),
-        new_capacity: Int,
-    ) where conforms_to(Self.T, Movable):
+        ):
         var new_data = alloc(Layout[Self.T](count=new_capacity)).unsafe_leak()
 
         unsafe_uninit_move_n[overlapping=False](
@@ -961,13 +950,11 @@ struct List[T: AnyType, /](
     # mutable origins.
     @__unsafe_nested_origins_read_only
     @stable(since="1.1")
-    def append(
-        mut self where len(self) == old(len(self)) + 1 and _same_elements(
+    def append(mut self, var value: Self.T, /)
+        where conforms_to(Self.T, Movable)
+        ensures len(self) == old(len(self)) + 1 and _same_elements(
             self._data, old(self._data), old(len(self))
-        ),
-        var value: Self.T,
-        /,
-    ) where conforms_to(Self.T, Movable):
+        ):
         """Appends a value to this list.
 
         Args:
@@ -995,12 +982,10 @@ struct List[T: AnyType, /](
         self._len += 1
 
     @inline(.always)
-    def insert(
-        mut self where len(self) == old(len(self)) + 1,
-        i: Int where 0 <= i and i <= len(self),
-        var value: Self.T,
-        /,
-    ) where conforms_to(Self.T, Movable):
+    def insert(mut self, i: Int, var value: Self.T, /)
+        where conforms_to(Self.T, Movable)
+        requires 0 <= i and i <= len(self)
+        ensures len(self) == old(len(self)) + 1:
         """Inserts a value to the list at the given index.
         `a.insert(len(a), value)` is equivalent to `a.append(value)`.
 
@@ -1033,10 +1018,9 @@ struct List[T: AnyType, /](
         self._len = old_len + 1
 
     @stable(since="1.0")
-    def extend(
-        mut self where len(self) == old(len(self)) + old(len(other)),
-        var other: Self,
-    ) where conforms_to(Self.T, Movable):
+    def extend(mut self, var other: Self)
+        where conforms_to(Self.T, Movable)
+        ensures len(self) == old(len(self)) + old(len(other)):
         """Extends this list by consuming the elements of `other`.
 
         Args:
@@ -1072,10 +1056,9 @@ struct List[T: AnyType, /](
         # its elements as they were moved into `self`.
         other^._unsafe_assume_destroyed_and_deallocate()
 
-    def extend(
-        mut self where len(self) == old(len(self)) + len(elements),
-        elements: Span[Self.T, _],
-    ) where conforms_to(Self.T, Copyable):
+    def extend(mut self, elements: Span[Self.T, _])
+        where conforms_to(Self.T, Copyable)
+        ensures len(self) == old(len(self)) + len(elements):
         """Extend this list by copying elements from a `Span`.
 
         The resulting list will have the length `len(self) + len(elements)`.
@@ -1176,11 +1159,12 @@ struct List[T: AnyType, /](
         )
         self._len += count
 
-    def pop(
-        mut self where old(len(self)) > 0 where len(self) == old(
-            len(self)
-        ) - 1 and _same_elements(self._data, old(self._data), len(self)),
-    ) -> Self.T where conforms_to(Self.T, Movable):
+    def pop(mut self) -> Self.T
+        where conforms_to(Self.T, Movable)
+        requires len(self) > 0
+        ensures len(self) == old(len(self)) - 1 and _same_elements(
+            self._data, old(self._data), len(self)
+        ):
         """Pops the last value from the list.
 
         Returns:
@@ -1198,8 +1182,10 @@ struct List[T: AnyType, /](
         return ret_val^
 
     @inline(.always)
-    def pop(
-        mut self where (
+    def pop(mut self, i: Int) -> Self.T
+        where conforms_to(Self.T, Movable)
+        requires 0 <= i and i < len(self)
+        ensures (
             len(self) == old(len(self)) - 1
             and _same_elements(self._data, old(self._data), i)
             and _same_elements(
@@ -1207,9 +1193,7 @@ struct List[T: AnyType, /](
                 old(self._data).unsafe_offset(i + 1),
                 len(self) - i,
             )
-        ),
-        i: Int where 0 <= i and i < len(self),
-    ) -> Self.T where conforms_to(Self.T, Movable):
+        ):
         """Pops a value from the list at the given index.
 
         Args:
@@ -1253,12 +1237,10 @@ struct List[T: AnyType, /](
         self._realloc(capacity)
 
     @stable(since="1.0")
-    def resize(
-        # The `old` makes the clause a postcondition only.
-        mut self where len(self) == length and old(len(self)) >= 0,
-        length: Int where length >= 0,
-        fill: Self.T,
-    ) where conforms_to(Self.T, Copyable & Deinitable):
+    def resize(mut self, length: Int, fill: Self.T)
+        where conforms_to(Self.T, Copyable & Deinitable)
+        requires length >= 0
+        ensures len(self) == length:
         """Resizes the list to the given new length.
 
         Args:
@@ -1296,14 +1278,10 @@ struct List[T: AnyType, /](
             self._data.unsafe_offset(i).unsafe_write(copy=fill)
         self._len = new_length
 
-    def resize(
-        # The `old` makes the clause a postcondition only.
-        mut self where (
-            len(self) == unsafe_uninit_length and old(len(self)) >= 0
-        ),
-        *,
-        unsafe_uninit_length: Int where unsafe_uninit_length >= 0,
-    ) where conforms_to(Self.T, Deinitable & Movable):
+    def resize(mut self, *, unsafe_uninit_length: Int)
+        where conforms_to(Self.T, Deinitable & Movable)
+        requires unsafe_uninit_length >= 0
+        ensures len(self) == unsafe_uninit_length:
         """Resizes the list to the given new size leaving any new elements
         uninitialized.
 
@@ -1367,9 +1345,9 @@ struct List[T: AnyType, /](
         self._len = new_length
         self._annotate_shrink(old_length)
 
-    def reverse(
-        mut self where len(self) == old(len(self)),
-    ) where conforms_to(Self.T, Movable):
+    def reverse(mut self)
+        where conforms_to(Self.T, Movable)
+        ensures len(self) == old(len(self)):
         """Reverses the elements of the list.
 
         Examples:
@@ -1480,11 +1458,9 @@ struct List[T: AnyType, /](
             raise "ValueError: Given element is not in list"
         return result.value()
 
-    def clear(
-        # The `old` makes the clause a postcondition only (a `mut` clause
-        # without one holds on entry too); lengths are never negative.
-        mut self where len(self) == 0 and old(len(self)) >= 0,
-    ) where conforms_to(Self.T, Deinitable):
+    def clear(mut self)
+        where conforms_to(Self.T, Deinitable)
+        ensures len(self) == 0:
         """Clears the elements in the list.
 
         Examples:
@@ -1543,11 +1519,9 @@ struct List[T: AnyType, /](
         self._capacity = 0
         return ThinAllocation(unsafe_owned_ptr=ptr).unsafe_with_layout(layout)
 
-    def __getitem__(
-        self,
-        slice: StridedSlice,
-        out result: Self where len(result) == slice._length(len(self)),
-    ) where conforms_to(Self.T, Copyable):
+    def __getitem__(self, slice: StridedSlice) -> Self
+        where conforms_to(Self.T, Copyable)
+        ensures len(result) == slice._length(len(self)):
         """Gets the sequence of elements at the specified positions.
 
         Args:
@@ -1560,40 +1534,31 @@ struct List[T: AnyType, /](
         var r = range(start, end, step)
 
         if not len(r):
-            result = Self()
-        else:
-            result = Self(
-                length=len(r),
-                fill_with=lambda (idx: Int) -> Self.T: self[
-                    start + idx * step
-                ].copy(),
-            )
-        _ensures(len(result) == len(r))
+            return Self()
+
+        return Self(
+            length=len(r),
+            fill_with=lambda (idx: Int) -> Self.T: self[
+                start + idx * step
+            ].copy(),
+        )
 
     @__unsafe_nested_origins_read_only
     @stable(since="1.0")
     @inline(.always)
+    # `self` may be a mutable reference, so the clause also says its
+    # length is kept.
     def __getitem__(
-        ref self,
-        slice: ContiguousSlice where (
+        ref self, slice: ContiguousSlice
+    ) -> Span[Self.T, Self._InteriorOrigin[origin_of(self)]]
+        requires (
             0 <= slice.start.or_else(0)
             and slice.start.or_else(0) <= slice.end.or_else(len(self))
             and slice.end.or_else(len(self)) <= len(self)
-        ),
-        # `self` may be a mutable reference, so the clause also says its
-        # length is kept.
-        out result: Span[
-            Self.T, Self._InteriorOrigin[origin_of(self)]
-        ] where len(result) == slice.end.or_else(
+        )
+        ensures len(result) == slice.end.or_else(
             len(self)
-        ) - slice.start.or_else(
-            0
-        ) and len(
-            self
-        ) == old(
-            len(self)
-        ),
-    ):
+        ) - slice.start.or_else(0) and len(self) == old(len(self)):
         """Gets the sequence of elements at the specified positions.
 
         Aborts if `slice`'s start or end index is out of bounds (valid range
@@ -1607,7 +1572,7 @@ struct List[T: AnyType, /](
             A span over the specified slice.
         """
         var start, end = check_slice_bounds(slice, len(self))
-        result = {
+        return {
             unsafe_ptr = self._unsafe_interior_ptr().unsafe_offset(start),
             length = end - start,
         }
@@ -1615,8 +1580,9 @@ struct List[T: AnyType, /](
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
-        ref self, idx: IntLiteral where Int(idx) < len(self), /
-    ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T:
+        ref self, idx: IntLiteral, /
+    ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T
+        requires Int(idx) < len(self):
         """Gets the list element at the given index.
 
         Args:
@@ -1635,8 +1601,9 @@ struct List[T: AnyType, /](
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
-        ref self, idx: Int where 0 <= idx and idx < len(self), /
-    ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T:
+        ref self, idx: Int, /
+    ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T
+        requires 0 <= idx and idx < len(self):
         """Gets the list element at the given index.
 
         Unlike when subscripting using slices negative indices are
@@ -1675,8 +1642,9 @@ struct List[T: AnyType, /](
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def unsafe_get(
-        ref self, idx: Int where 0 <= idx and idx < len(self)
-    ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T:
+        ref self, idx: Int
+    ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T
+        requires 0 <= idx and idx < len(self):
         """Get a reference to an element of self without checking index bounds.
 
         Args:
@@ -1699,11 +1667,10 @@ struct List[T: AnyType, /](
         return self._unsafe_interior_ptr().unsafe_offset(idx)[]
 
     @inline(.always)
-    def unsafe_set(
-        mut self where len(self) == old(len(self)),
-        idx: Int where 0 <= idx and idx < len(self),
-        var value: Self.T,
-    ) where conforms_to(Self.T, Deinitable & Movable):
+    def unsafe_set(mut self, idx: Int, var value: Self.T)
+        where conforms_to(Self.T, Deinitable & Movable)
+        requires 0 <= idx and idx < len(self)
+        ensures len(self) == old(len(self)):
         """Write a value to a given location without checking index bounds.
 
         Args:

@@ -304,7 +304,7 @@ struct String(
 
     @stable(since="1.1")
     @inline(.nodebug)
-    def __init__(out self where self.byte_length() == 0):
+    def __init__(out self) ensures self.byte_length() == 0:
         """Construct an empty string."""
         # this is UB if we ever touch the pointer, but so is
         # an uninitialized pointer
@@ -314,9 +314,8 @@ struct String(
 
     @stable(since="1.1")
     @inline(.nodebug)
-    def __init__(
-        out self where self.byte_length() == 0, *, capacity_bytes: Int
-    ):
+    def __init__(out self, *, capacity_bytes: Int)
+        ensures self.byte_length() == 0:
         """Construct an empty string with at least a given capacity.
 
         Args:
@@ -333,11 +332,8 @@ struct String(
     @inline(.nodebug)
     @stable(since="1.0")
     @implicit  # does not allocate.
-    def __init__(
-        out self where self.byte_length() == data.byte_length(),
-        data: StaticString,
-        /,
-    ):
+    def __init__(out self, data: StaticString, /)
+        ensures self.byte_length() == data.byte_length():
         """Construct a `String` from a `StaticString` without allocating.
 
         Args:
@@ -807,8 +803,9 @@ struct String(
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
-        self, *, byte: Int where 0 <= byte and byte < self.byte_length()
-    ) -> StringSlice[origin_of(self)._get_owned_interior["bytes"]]:
+        self, *, byte: Int
+    ) -> StringSlice[origin_of(self)._get_owned_interior["bytes"]]
+        requires 0 <= byte and byte < self.byte_length():
         """Gets a single byte at the specified byte index.
 
         This performs byte-level indexing, not character (codepoint) indexing.
@@ -831,11 +828,10 @@ struct String(
     @inline(.always)
     def __getitem__[
         I: Indexer, //
-    ](
-        self,
-        *,
-        byte: I where 0 <= index(byte) and index(byte) < self.byte_length(),
-    ) -> StringSlice[origin_of(self)._get_owned_interior["bytes"]]:
+    ](self, *, byte: I) -> StringSlice[
+        origin_of(self)._get_owned_interior["bytes"]
+    ]
+        requires 0 <= index(byte) and index(byte) < self.byte_length():
         """Gets a single byte at the specified byte index.
 
         This performs byte-level indexing, not character (codepoint) indexing.
@@ -860,8 +856,9 @@ struct String(
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
-        self, *, byte: IntLiteral where Int(byte) < self.byte_length()
-    ) -> StringSlice[origin_of(self)._get_owned_interior["bytes"]]:
+        self, *, byte: IntLiteral
+    ) -> StringSlice[origin_of(self)._get_owned_interior["bytes"]]
+        requires Int(byte) < self.byte_length():
         """Gets a single byte at the specified byte index.
 
         This performs byte-level indexing, not character (codepoint) indexing.
@@ -886,21 +883,16 @@ struct String(
     @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
-        self,
-        *,
-        byte: ContiguousSlice where (
+        self, *, byte: ContiguousSlice
+    ) -> StringSlice[origin_of(self)._get_owned_interior["bytes"]]
+        requires (
             0 <= byte.start.or_else(0)
             and byte.start.or_else(0) <= byte.end.or_else(self.byte_length())
             and byte.end.or_else(self.byte_length()) <= self.byte_length()
-        ),
-        out result: StringSlice[
-            origin_of(self)._get_owned_interior["bytes"]
-        ] where result.byte_length() == byte.end.or_else(
+        )
+        ensures result.byte_length() == byte.end.or_else(
             self.byte_length()
-        ) - byte.start.or_else(
-            0
-        ),
-    ):
+        ) - byte.start.or_else(0):
         """Gets a substring at the specified byte positions.
 
         This performs byte-level slicing, not character (codepoint) slicing.
@@ -919,7 +911,7 @@ struct String(
             A StringSlice containing the bytes in the specified range.
         """
         _ = check_slice_bounds(byte, self.byte_length(), call_location())
-        result = self._interior_slice()[byte=byte]
+        return self._interior_slice()[byte=byte]
 
     @__unsafe_nested_origins_read_only
     def __getitem__[
@@ -1114,12 +1106,10 @@ struct String(
         self._set_byte_length(new_len)
         self._clear_nul_terminator()
 
-    def __iadd__(
-        mut self where (
+    def __iadd__(mut self, other: StringSlice[_])
+        ensures (
             self.byte_length() == old(self.byte_length()) + other.byte_length()
-        ),
-        other: StringSlice[_],
-    ):
+        ):
         """Appends another string slice to this string.
 
         Args:
@@ -1514,16 +1504,14 @@ struct String(
         )
 
     @__unsafe_nested_origins_read_only
+    # `self` may be a mutable reference, so the clause also says its
+    # length is kept.
     def as_bytes(
         ref self,
-        # `self` may be a mutable reference, so the clause also says its
-        # length is kept.
-        out result: Span[
-            Byte, origin_of(self)._get_owned_interior["bytes"]
-        ] where len(result) == self.byte_length() and self.byte_length() == old(
+    ) -> Span[Byte, origin_of(self)._get_owned_interior["bytes"]]
+        ensures len(result) == self.byte_length() and self.byte_length() == old(
             self.byte_length()
-        ),
-    ):
+        ):
         """Returns a contiguous slice of the bytes owned by this string.
 
         Returns:
@@ -1535,7 +1523,7 @@ struct String(
             invalidates the span at compile time.
         """
 
-        result = Span(
+        return Span(
             unsafe_ptr=Pointer(
                 to=self.unsafe_ptr()._get_ref_with_unsafe_interior_origin[
                     "bytes", origin_of(self)
@@ -1555,11 +1543,10 @@ struct String(
 
     @__unsafe_nested_origins_read_only
     def unsafe_as_bytes_mut(
-        mut self where self.byte_length() == old(self.byte_length()),
-        out result: Span[
-            Byte, origin_of(self)._get_owned_interior["bytes"]
-        ] where (len(result) == self.byte_length()),
-    ):
+        mut self,
+    ) -> Span[Byte, origin_of(self)._get_owned_interior["bytes"]]
+        ensures self.byte_length() == old(self.byte_length())
+        ensures len(result) == self.byte_length():
         """Returns a mutable contiguous slice of the bytes owned by this string.
         This name has a _mut suffix so the as_bytes() method doesn't have to
         guarantee mutability.
@@ -1571,7 +1558,7 @@ struct String(
             - Any mutation of the byte slice must uphold UTF-8 validity of the
               overall string.
         """
-        result = Span(
+        return Span(
             unsafe_ptr=Pointer(
                 to=self.unsafe_ptr_mut()._get_ref_with_unsafe_interior_origin[
                     "bytes", origin_of(self)

@@ -18,19 +18,17 @@
 
 
 trait Counter:
-    def count(self, out result: Int where result >= 0):
+    def count(self, out result: Int) ensures result >= 0:
         ...
 
-    def get(self, i: Int where 0 <= i and i < self.count()) -> Int:
+    def get(self, i: Int) -> Int requires 0 <= i and i < self.count():
         ...
 
     # Two clauses: a precondition (it only reads `self` on entry) and a
     # postcondition. Without the first, `n += 1` could wrap at `Int.MAX`.
-    def bump(
-        mut self where old(self.count()) < Int.MAX where self.count() == old(
-            self.count()
-        ) + 1
-    ):
+    def bump(mut self)
+        requires self.count() < Int.MAX
+        ensures self.count() == old(self.count()) + 1:
         ...
 
     def reset(mut self):
@@ -38,7 +36,7 @@ trait Counter:
 
     # A default: its clauses hold for every conforming struct, which calls
     # it through a wrapper of its own.
-    def pick(self, i: Int where i >= 0) -> Int:
+    def pick(self, i: Int) -> Int requires i >= 0:
         return i
 
 
@@ -51,18 +49,16 @@ struct Tally(Counter):
     def __init__(out self, n: Int):
         self.n = n
 
-    def count(
-        self,
-        out result: Int where (self.n >= 0 and result == self.n) or (
+    def count(self, out result: Int)
+        ensures (self.n >= 0 and result == self.n) or (
             self.n < 0 and result == 0
-        ),
-    ):
+        ):
         if self.n >= 0:
             result = self.n
         else:
             result = 0
 
-    def get(self, i: Int where i >= 0) -> Int:  # weaker than the trait's
+    def get(self, i: Int) -> Int requires i >= 0:  # weaker than the trait's
         return i
 
     def bump(mut self):
@@ -84,7 +80,7 @@ struct BadCount(Counter):
     def count(self, out result: Int):
         result = -1  # breaks `result >= 0`
 
-    def get(self, i: Int where i < 3) -> Int:  # not implied by the trait's
+    def get(self, i: Int) -> Int requires i < 3:  # not implied by the trait's
         return i
 
     def bump(mut self):  # `count()` says nothing about `n`

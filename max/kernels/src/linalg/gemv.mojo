@@ -176,12 +176,14 @@ def gemv_kernel[
     c: UnsafePointer[Scalar[c_type], AnyOrigin[mut=True]],
     a: UnsafePointer[Scalar[a_type], ImmUnsafeAnyOrigin],
     b: UnsafePointer[Scalar[b_type], ImmUnsafeAnyOrigin],
-    m: Int32 where m >= 0 and c._extent() >= Int(m),
+    m: Int32,
     n: Int32,
-    k: Int32 where (
+    k: Int32,
+)
+    requires m >= 0 and c._extent() >= Int(m)
+    requires (
         k >= 0 and a._extent() >= Int(m) * Int(k) and b._extent() >= Int(k)
-    ),
-):
+    ):
     var _m = Int(m)
     var _n = Int(n)
     var _k = Int(k)
@@ -247,7 +249,11 @@ def gemv_kernel_vector[
     c: TileTensor[c_type, c_layout, MutAnyOrigin, Engine=c_engine],  # m
     a: TileTensor[a_type, a_layout, ImmutAnyOrigin, Engine=a_engine],  # m * k
     b: TileTensor[b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],  # 1 * k
-    m: Int32 where (
+    m: Int32,
+    n: Int32,
+    k: Int32,
+)
+    requires (
         m >= 0
         and Int(a.dim[0]()) >= Int(m)
         and (
@@ -257,16 +263,14 @@ def gemv_kernel_vector[
             not transpose_b
             or (Int(c.dim[0]()) >= 1 and Int(c.dim[1]()) >= Int(m))
         )
-    ),
-    n: Int32,
-    k: Int32 where (
+    )
+    requires (
         k >= 0
         and Int(k) % simd_width == 0
         and Int(a.dim[1]()) >= Int(k)
         and Int(b.dim[0]()) >= 1
         and Int(b.dim[1]()) >= Int(k)
-    ),
-):
+    ):
     var _m = Int(m)
     var _k = Int(k)
     comptime assert c.flat_rank == 2, "c must be of rank 2"
@@ -368,7 +372,11 @@ def gemv_kernel_vector_multirow[
     c: TileTensor[c_type, c_layout, MutAnyOrigin, Engine=c_engine],  # m
     a: TileTensor[a_type, a_layout, ImmutAnyOrigin, Engine=a_engine],  # m * k
     b: TileTensor[b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],  # 1 * k
-    m: Int32 where (
+    m: Int32,
+    n: Int32,
+    k: Int32,
+)
+    requires (
         m >= 0
         and Int(a.dim[0]()) >= Int(m)
         and (
@@ -378,16 +386,14 @@ def gemv_kernel_vector_multirow[
             not transpose_b
             or (Int(c.dim[0]()) >= 1 and Int(c.dim[1]()) >= Int(m))
         )
-    ),
-    n: Int32,
-    k: Int32 where (
+    )
+    requires (
         k >= 0
         and Int(k) % simd_width == 0
         and Int(a.dim[1]()) >= Int(k)
         and Int(b.dim[0]()) >= 1
         and Int(b.dim[1]()) >= Int(k)
-    ),
-):
+    ):
     var _m = Int(m)
     var _k = Int(k)
     comptime assert c.flat_rank == 2, "c must be of rank 2"
@@ -562,26 +568,29 @@ def gemv_split_k[
     output: TileTensor[c_type, c_layout, MutAnyOrigin, Engine=c_engine],
     act: TileTensor[a_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
     weight: TileTensor[b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],
-    m: Int32 where (
+    m: Int32,
+    n: Int32,
+    k: Int32,
+)
+    requires (
         m >= 0
         and Int(act.dim[0]()) >= Int(m)
         and Int(output.dim[0]()) >= Int(m)
         and (check_bounds_m or grid_dim.x * tile_m <= Int(m))
-    ),
-    n: Int32 where (
+    )
+    requires (
         n >= 0
         and Int(weight.dim[0]()) >= Int(n)
         and Int(output.dim[1]()) >= Int(n)
         and (check_bounds_n or grid_dim.y * tile_n <= Int(n))
-    ),
-    k: Int32 where (
+    )
+    requires (
         k >= 0
         and Int(k) % simd_width == 0
         and Int(act.dim[1]()) >= Int(k)
         and Int(weight.dim[1]()) >= Int(k)
         and block_dim.x == num_threads
-    ),
-):
+    ):
     """GEMV with tiling in K dimension.
     Assuming the B (weight) matrix is transposed i.e. row major N x K, this kernel
     implements a vector (1 x K) times a matrix (N x K).
@@ -836,7 +845,9 @@ def router_gate_mixed_gemv[
     m: Int,
     n: Int,
     k: Int,
-    ctx: DeviceContext where (
+    ctx: DeviceContext,
+) raises
+    requires (
         m >= 0
         and m < 2147483648
         and k >= 0
@@ -851,8 +862,7 @@ def router_gate_mixed_gemv[
         and Int(a.dim[1]()) >= k
         and Int(b.dim[1]()) >= k
         and k % (16 // size_of[DType.float32]()) == 0
-    ),
-) raises:
+    ):
     """Launches the mixed bf16-activation × fp32-weight router-gate GEMV.
 
     Fuses the standalone bf16→fp32 activation cast into the router GEMV: `a` is
@@ -959,20 +969,20 @@ def gevm_kernel[
     a: UnsafePointer[Scalar[a_type], ImmUnsafeAnyOrigin],
     b: UnsafePointer[Scalar[b_type], ImmUnsafeAnyOrigin],
     m: Int32,
-    n: Int32 where (
-        n >= 0
-        and c._extent() >= Int(n)
-        and grid_dim.x * WARP_SIZE <= Int(n)
-    ),
-    k: Int32 where (
+    n: Int32,
+    k: Int32,
+)
+    requires (
+        n >= 0 and c._extent() >= Int(n) and grid_dim.x * WARP_SIZE <= Int(n)
+    )
+    requires (
         k >= 0
         and Int(k) % (tile_size // WARP_SIZE) == 0
         and a._extent() >= Int(k)
         and b._extent() >= Int(k) * Int(n)
         and block_dim.x == tile_size
         and tile_size % WARP_SIZE == 0
-    ),
-):
+    ):
     var _k = Int(k)
     var _n = Int(n)
     comptime warps_per_block = tile_size // WARP_SIZE
@@ -1203,17 +1213,16 @@ def is_minimax_router_gemm[
     b_type: DType,
     static_N: Int,
     static_K: Int,
-](
-    out result: Bool where result == (
+]() -> Bool
+    ensures result == (
         a_type == .float32
         and b_type == .float32
         and c_type == .float32
         and static_N == 128
         and static_K == 6144
-    )
-):
+    ):
     """Returns whether a GEMM has the MiniMax-M3 fp32 router signature."""
-    result = (
+    return (
         a_type == .float32
         and b_type == .float32
         and c_type == .float32
@@ -1233,7 +1242,9 @@ def gemv_gpu_dispatch[
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, ...],
     b: TileTensor[mut=False, ...],
-    ctx: DeviceContext where (
+    ctx: DeviceContext,
+) raises
+    requires (
         Int(a.dim[0]()) == Int(c.dim[0]())
         and Int(c.dim[0]()) < 2147483648
         and Int(c.dim[1]()) < 2147483648
@@ -1293,8 +1304,7 @@ def gemv_gpu_dispatch[
                 == 0
             )
         )
-    ),
-) raises:
+    ):
     """Launches the GPU GEMV kernel indicated by kernel_func with appropriate grid and block dims.
 
     Translates a `GEMVAlgorithm` variant into a concrete kernel call with shape-derived
@@ -1728,7 +1738,9 @@ def gemv_gpu[
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, ...],
     b: TileTensor[mut=False, ...],
-    ctx: DeviceContext where (
+    ctx: DeviceContext,
+) raises
+    requires (
         Int(a.dim[0]()) == Int(c.dim[0]())
         and Int(c.dim[0]()) < 2147483648
         and Int(c.dim[1]()) < 2147483648
@@ -1752,8 +1764,7 @@ def gemv_gpu[
         # The MiniMax test reads K from `a.static_shape[1]`, a flattened extent:
         # it is `a.dim[1]()` only where `a`'s layout is not nested.
         and a.LayoutType.flat_rank == a.rank
-    ),
-) raises:
+    ):
     """Selects and dispatches the appropriate GPU GEMV kernel based on shape and hardware.
 
     Examines runtime dimensions M, N, K and static shape information to choose among
@@ -1929,14 +1940,15 @@ def gemv[
 def naive_gemv(
     c_buf: TileTensor[mut=True, ...],
     a_buf: TileTensor[mut=False, ...],
-    b_buf: TileTensor[mut=False, ...] where (
+    b_buf: TileTensor[mut=False, ...],
+)
+    requires (
         Int(a_buf.dim[0]()) < 2147483648
         and Int(a_buf.dim[1]()) < 2147483648
         and c_buf.ptr._extent() >= Int(a_buf.dim[0]())
         and a_buf.ptr._extent() >= Int(a_buf.dim[0]()) * Int(a_buf.dim[1]())
         and b_buf.ptr._extent() >= Int(a_buf.dim[1]())
-    ),
-):
+    ):
     """Computes a reference matrix-vector product C = A * b using a scalar nested loop.
 
     Iterates over K then M, accumulating each A[m, k] * b[k] into c[m]. Intended for
@@ -2000,20 +2012,15 @@ struct _MmaCpAsyncGmemLoaderA[
         )
 
     @inline(.always)
-    def _gmem_k(
-        self,
-        linear: Int,
-        loop_idx: Int where (
+    def _gmem_k(self, linear: Int, loop_idx: Int) -> Int
+        requires (
             0 <= linear < 2147483648
             and linear % Self.VEC_ELEMS == 0
             and 0 <= loop_idx < 2147483648
             and 0 <= self.k_each_chunk < 2147483648
             and (loop_idx + 1) * Self.per_warp_k <= self.k_each_chunk
-        ),
-        out result: Int where (
-            0 <= result <= 4 * self.k_each_chunk - Self.VEC_ELEMS
-        ),
-    ):
+        )
+        ensures 0 <= result <= 4 * self.k_each_chunk - Self.VEC_ELEMS:
         """The first K column a vector reads in one iteration of the main loop.
 
         Args:
@@ -2031,7 +2038,7 @@ struct _MmaCpAsyncGmemLoaderA[
             or Self.tile_k == 256
             or Self.tile_k == 512
         ), "tile_k must be 64, 128, 256 or 512"
-        result = (
+        return (
             self._k_project(linear % Self.tile_k) + loop_idx * Self.per_warp_k
         )
 
@@ -2050,7 +2057,17 @@ struct _MmaCpAsyncGmemLoaderA[
     var preds: Array[Bool, Self.vec_per_iter]
 
     def __init__(
-        out self where (
+        out self,
+        act: Self.ActTensor,
+        smem_a: Self.SmemTiles,
+        smem_barrier: Self.Barriers,
+        local_tid: Int,
+        batch_idx: Int,
+        cta_m: Int,
+        gemm_m: Int,
+        k_each_chunk: Int,
+    )
+        ensures (
             self.stage == 0
             and self.smem_barrier.ptr._extent() >= smem_barrier.ptr._extent()
             and self.smem_a.ptr._extent() >= smem_a.ptr._extent()
@@ -2062,16 +2079,7 @@ struct _MmaCpAsyncGmemLoaderA[
             and Int(self.act.dim[0]()) == Int(act.dim[0]())
             and Int(self.act.dim[1]()) == Int(act.dim[1]())
             and Int(self.act.dim[2]()) == Int(act.dim[2]())
-        ),
-        act: Self.ActTensor,
-        smem_a: Self.SmemTiles,
-        smem_barrier: Self.Barriers,
-        local_tid: Int,
-        batch_idx: Int,
-        cta_m: Int,
-        gemm_m: Int,
-        k_each_chunk: Int,
-    ):
+        ):
         self.act = act
         self.smem_a = smem_a
         self.smem_barrier = smem_barrier
@@ -2086,8 +2094,9 @@ struct _MmaCpAsyncGmemLoaderA[
         self.smem_offsets = Array[Int, Self.vec_per_iter](uninitialized=True)
         self.preds = Array[Bool, Self.vec_per_iter](fill=False)
 
-    def prepare(
-        mut self where old(0 <= self.local_tid < Self.LOAD_THREADS) where (
+    def prepare(mut self)
+        requires 0 <= self.local_tid < Self.LOAD_THREADS
+        ensures (
             self.local_tid == old(self.local_tid)
             and all(
                 [
@@ -2110,8 +2119,7 @@ struct _MmaCpAsyncGmemLoaderA[
                     for v in range(Self.vec_per_iter)
                 ]
             )
-        )
-    ):
+        ):
         comptime assert Self.tile_m == 16, "tile_m must be 16"
         comptime assert Self.VEC_ELEMS == 8, "16-bit operands"
         comptime assert 64 <= Self.tile_k <= 65536, "tile_k out of range"
@@ -2129,9 +2137,8 @@ struct _MmaCpAsyncGmemLoaderA[
             self.smem_offsets[v] = Self.swizzle(linear)
             self.preds[v] = self.cta_m + m_idx < self.gemm_m
 
-    def issue_mainloop(
-        mut self,
-        k_iters: Int where (
+    def issue_mainloop(mut self, k_iters: Int,)
+        requires (
             self.smem_barrier.ptr._extent() >= Self.stage_cnt * 2
             and 0 <= self.stage < Self.stage_cnt
             and self.smem_a.ptr._extent() >= Self.SmemTiles.num_elements
@@ -2166,8 +2173,7 @@ struct _MmaCpAsyncGmemLoaderA[
             and 0 <= self.k_each_chunk < 2147483648
             and k_iters * Self.per_warp_k <= self.k_each_chunk
             and 4 * self.k_each_chunk <= Int(self.act.dim[2]())
-        ),
-    ):
+        ):
         # Far above what shared memory holds; keeps `stage * 2` from wrapping.
         comptime assert Self.stage_cnt <= 65536, "stage_cnt out of range"
         comptime assert Self.VEC_ELEMS == 8, "16-bit operands"
@@ -2271,20 +2277,15 @@ struct _MmaCpAsyncGmemLoaderB[
         )
 
     @inline(.always)
-    def _gmem_k(
-        self,
-        linear: Int,
-        loop_idx: Int where (
+    def _gmem_k(self, linear: Int, loop_idx: Int) -> Int
+        requires (
             0 <= linear < 2147483648
             and linear % Self.VEC_ELEMS == 0
             and 0 <= loop_idx < 2147483648
             and 0 <= self.k_each_chunk < 2147483648
             and (loop_idx + 1) * Self.per_warp_k <= self.k_each_chunk
-        ),
-        out result: Int where (
-            0 <= result <= 4 * self.k_each_chunk - Self.VEC_ELEMS
-        ),
-    ):
+        )
+        ensures 0 <= result <= 4 * self.k_each_chunk - Self.VEC_ELEMS:
         """The first K column a vector reads in one iteration of the main loop.
 
         Args:
@@ -2302,7 +2303,7 @@ struct _MmaCpAsyncGmemLoaderB[
             or Self.tile_k == 256
             or Self.tile_k == 512
         ), "tile_k must be 64, 128, 256 or 512"
-        result = (
+        return (
             self._k_project(linear % Self.tile_k) + loop_idx * Self.per_warp_k
         )
 
@@ -2321,7 +2322,17 @@ struct _MmaCpAsyncGmemLoaderB[
     var preds: Array[Bool, Self.vec_per_iter]
 
     def __init__(
-        out self where (
+        out self,
+        weight: Self.WeightTensor,
+        smem_b: Self.SmemTiles,
+        smem_barrier: Self.Barriers,
+        local_tid: Int,
+        batch_idx: Int,
+        cta_n: Int,
+        gemm_n: Int,
+        k_each_chunk: Int,
+    )
+        ensures (
             self.stage == 0
             and self.smem_barrier.ptr._extent() >= smem_barrier.ptr._extent()
             and self.smem_b.ptr._extent() >= smem_b.ptr._extent()
@@ -2333,16 +2344,7 @@ struct _MmaCpAsyncGmemLoaderB[
             and Int(self.weight.dim[0]()) == Int(weight.dim[0]())
             and Int(self.weight.dim[1]()) == Int(weight.dim[1]())
             and Int(self.weight.dim[2]()) == Int(weight.dim[2]())
-        ),
-        weight: Self.WeightTensor,
-        smem_b: Self.SmemTiles,
-        smem_barrier: Self.Barriers,
-        local_tid: Int,
-        batch_idx: Int,
-        cta_n: Int,
-        gemm_n: Int,
-        k_each_chunk: Int,
-    ):
+        ):
         self.weight = weight
         self.smem_b = smem_b
         self.smem_barrier = smem_barrier
@@ -2357,8 +2359,9 @@ struct _MmaCpAsyncGmemLoaderB[
         self.smem_offsets = Array[Int, Self.vec_per_iter](uninitialized=True)
         self.preds = Array[Bool, Self.vec_per_iter](fill=False)
 
-    def prepare(
-        mut self where old(0 <= self.local_tid < Self.LOAD_THREADS) where (
+    def prepare(mut self)
+        requires 0 <= self.local_tid < Self.LOAD_THREADS
+        ensures (
             self.local_tid == old(self.local_tid)
             and all(
                 [
@@ -2381,8 +2384,7 @@ struct _MmaCpAsyncGmemLoaderB[
                     for v in range(Self.vec_per_iter)
                 ]
             )
-        )
-    ):
+        ):
         comptime assert Self.tile_n == 8, "tile_n must be 8"
         comptime assert Self.VEC_ELEMS == 8, "16-bit operands"
         comptime assert 64 <= Self.tile_k <= 65536, "tile_k out of range"
@@ -2400,9 +2402,8 @@ struct _MmaCpAsyncGmemLoaderB[
             self.smem_offsets[v] = Self.swizzle(linear)
             self.preds[v] = self.cta_n + n_idx < self.gemm_n
 
-    def issue_mainloop(
-        mut self,
-        k_iters: Int where (
+    def issue_mainloop(mut self, k_iters: Int,)
+        requires (
             self.smem_barrier.ptr._extent() >= Self.stage_cnt * 2
             and 0 <= self.stage < Self.stage_cnt
             and self.smem_b.ptr._extent() >= Self.SmemTiles.num_elements
@@ -2437,8 +2438,7 @@ struct _MmaCpAsyncGmemLoaderB[
             and 0 <= self.k_each_chunk < 2147483648
             and k_iters * Self.per_warp_k <= self.k_each_chunk
             and 4 * self.k_each_chunk <= Int(self.weight.dim[2]())
-        ),
-    ):
+        ):
         # Far above what shared memory holds; keeps `stage * 2` from wrapping.
         comptime assert Self.stage_cnt <= 65536, "stage_cnt out of range"
         comptime assert Self.VEC_ELEMS == 8, "16-bit operands"
@@ -2547,7 +2547,20 @@ struct _MmaCpAsyncMmaComputer[
     var acc: SIMD[Self.accum_type, 4]
 
     def __init__(
-        out self where (
+        out self,
+        smem_a: Self.SmemTilesA,
+        smem_b: Self.SmemTilesB,
+        smem_barrier: Self.Barriers,
+        out_ptr: UnsafePointer[Scalar[Self.c_type], Self.out_origin],
+        compute_warp: Int,
+        lane_idx: Int,
+        warp_k_off: Int,
+        cta_m: Int,
+        cta_n: Int,
+        gemm_m: Int,
+        gemm_n: Int,
+    )
+        ensures (
             self.stage == 0
             and self.smem_barrier.ptr._extent() >= smem_barrier.ptr._extent()
             and self.smem_a.ptr._extent() >= smem_a.ptr._extent()
@@ -2560,19 +2573,7 @@ struct _MmaCpAsyncMmaComputer[
             and self.cta_n == cta_n
             and self.gemm_m == gemm_m
             and self.gemm_n == gemm_n
-        ),
-        smem_a: Self.SmemTilesA,
-        smem_b: Self.SmemTilesB,
-        smem_barrier: Self.Barriers,
-        out_ptr: UnsafePointer[Scalar[Self.c_type], Self.out_origin],
-        compute_warp: Int,
-        lane_idx: Int,
-        warp_k_off: Int,
-        cta_m: Int,
-        cta_n: Int,
-        gemm_m: Int,
-        gemm_n: Int,
-    ):
+        ):
         self.smem_a = smem_a
         self.smem_b = smem_b
         self.smem_barrier = smem_barrier
@@ -2588,9 +2589,8 @@ struct _MmaCpAsyncMmaComputer[
         self.phase = UInt32(0)
         self.acc = SIMD[Self.accum_type, 4](0)
 
-    def issue_mainloop(
-        mut self,
-        k_iters: Int where (
+    def issue_mainloop(mut self, k_iters: Int)
+        requires (
             self.smem_barrier.ptr._extent() >= Self.stage_cnt * 2
             and 0 <= self.stage < Self.stage_cnt
             and self.smem_a.ptr._extent() >= Self.SmemTilesA.num_elements
@@ -2598,8 +2598,7 @@ struct _MmaCpAsyncMmaComputer[
             and 0 <= self.lane_idx < 32
             and 0 <= self.warp_k_off < Self.tile_k
             and self.warp_k_off % Self.per_warp_k == 0
-        ),
-    ):
+        ):
         # Far above what shared memory holds; keeps `stage * 2` from wrapping.
         comptime assert Self.stage_cnt <= 65536, "stage_cnt out of range"
         comptime assert Self.tile_m == 16 and Self.tile_n == 8
@@ -2653,8 +2652,8 @@ struct _MmaCpAsyncMmaComputer[
             )
             self.stage = 0 if raw_next == Self.stage_cnt else raw_next
 
-    def epi(
-        self where (
+    def epi(self)
+        requires (
             0 <= self.lane_idx < 32
             and 0 <= self.compute_warp < 4
             and 0 <= self.cta_m < 2147483648
@@ -2663,8 +2662,7 @@ struct _MmaCpAsyncMmaComputer[
             and 0 <= self.gemm_n < 2147483648
             and self.out_ptr._extent() >= self.gemm_m * self.gemm_n
             and self.smem_a.ptr._extent() >= Self.SmemTilesA.num_elements
-        ),
-    ):
+        ):
         """Epilogue: reduce acc across 4 compute-warp partials, write the C tile.
 
         The output buffer is always row-major `[M, N]`. When `swapAB`, the
@@ -2754,31 +2752,19 @@ struct _MmaCpAsyncSmem[
     var barrier_storage: Self.Barriers.Storage
 
     @inline(.always)
-    def a_tiles(
-        ref[AddressSpace.SHARED] self,
-        out result: Self.SmemA where (
-            result.ptr._extent() >= Self.SmemA.num_elements
-        ),
-    ):
-        result = Self.SmemA(self.a_engine.unsafe_ptr())
+    def a_tiles(ref[AddressSpace.SHARED] self) -> Self.SmemA
+        ensures result.ptr._extent() >= Self.SmemA.num_elements:
+        return Self.SmemA(self.a_engine.unsafe_ptr())
 
     @inline(.always)
-    def b_tiles(
-        ref[AddressSpace.SHARED] self,
-        out result: Self.SmemB where (
-            result.ptr._extent() >= Self.SmemB.num_elements
-        ),
-    ):
-        result = Self.SmemB(self.b_engine.unsafe_ptr())
+    def b_tiles(ref[AddressSpace.SHARED] self) -> Self.SmemB
+        ensures result.ptr._extent() >= Self.SmemB.num_elements:
+        return Self.SmemB(self.b_engine.unsafe_ptr())
 
     @inline(.always)
-    def barriers(
-        ref[AddressSpace.SHARED] self,
-        out result: Self.Barriers where (
-            result.ptr._extent() >= Self.stage_cnt * 2
-        ),
-    ):
-        result = Self.Barriers(self.barrier_storage)
+    def barriers(ref[AddressSpace.SHARED] self) -> Self.Barriers
+        ensures result.ptr._extent() >= Self.stage_cnt * 2:
+        return Self.Barriers(self.barrier_storage)
 
 
 @__llvm_metadata(
@@ -2813,7 +2799,9 @@ def gemm_mma_cpasync_kernel[
     gemm_m: Int32,
     gemm_k: Int32,
     gemm_n: Int32,
-    batch_size: Int32 where (
+    batch_size: Int32,
+)
+    requires (
         gemm_m >= 0
         and gemm_k >= 0
         and gemm_n >= 0
@@ -2824,8 +2812,7 @@ def gemm_mma_cpasync_kernel[
         and block_dim.x == 256
         # Keeps `batch * m * n` within 64 bits.
         and Int(batch_size) * Int(gemm_m) < 2147483648
-        and output.ptr._extent()
-        >= Int(batch_size) * Int(gemm_m) * Int(gemm_n)
+        and output.ptr._extent() >= Int(batch_size) * Int(gemm_m) * Int(gemm_n)
         # The operands hold what the kernel reads: (batch, M, K), (batch, N, K).
         and Int(act.dim[0]()) >= Int(batch_size)
         and Int(act.dim[1]()) >= Int(gemm_m)
@@ -2839,8 +2826,7 @@ def gemm_mma_cpasync_kernel[
             alignment=128,
         ]()._extent()
         >= size_of[_MmaCpAsyncSmem[a_type, tile_m, tile_n, tile_k, stage_cnt]]()
-    ),
-):
+    ):
     var _gemm_m = Int(gemm_m)
     var _gemm_k = Int(gemm_k)
     var _gemm_n = Int(gemm_n)
@@ -2995,7 +2981,9 @@ def gemm_mma_cpasync[
     gemm_k: Int,
     gemm_n: Int,
     batch_size: Int,
-    ctx: DeviceContext where (
+    ctx: DeviceContext,
+) raises
+    requires (
         # The grid's rows and columns, in whole tiles, fit `Int32`.
         0 <= gemm_m <= 2147483648 - 16
         and 0 <= gemm_n <= 2147483648 - 16
@@ -3012,9 +3000,7 @@ def gemm_mma_cpasync[
                 and Int(weight.dim[0]()) >= batch_size
                 and Int(weight.dim[1]()) >= gemm_n
                 and Int(weight.dim[2]()) >= gemm_k
-            )
-            if comptime (act.rank == 3)
-            else (
+            ) if comptime (act.rank == 3) else (
                 c.ptr._extent() >= gemm_m * gemm_n
                 and Int(act.dim[0]()) >= gemm_m
                 and Int(act.dim[1]()) >= gemm_k
@@ -3022,8 +3008,7 @@ def gemm_mma_cpasync[
                 and Int(weight.dim[1]()) >= gemm_k
             )
         )
-    ),
-) raises:
+    ):
     """Launch the batched GEMM tensor-core kernel.
 
     C[gemm_m, gemm_n] = act[gemm_m, K] x weight[gemm_n, K]^T.

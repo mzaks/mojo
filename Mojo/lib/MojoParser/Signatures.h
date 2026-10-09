@@ -94,8 +94,11 @@ struct ParsedConstraint {
   /// form. Null if no message was written.
   StringAttr message;
 
-  /// Parse a `where` clause's condition and its optional message.
-  ParseResult parse(ParserBase &p, std::optional<size_t> stmtIndent);
+  /// Parse a `where` clause's condition and its optional message. `keyword`
+  /// is the clause's own (`requires` and `ensures` clauses share the
+  /// grammar), for diagnostics.
+  ParseResult parse(ParserBase &p, std::optional<size_t> stmtIndent,
+                    StringRef keyword = "where");
 
   /// Split the already-parsed `where` expression into `propExpr` (the
   /// condition) and `message`. `parsed` carries a message when it has the
@@ -107,13 +110,15 @@ struct ParsedConstraint {
   /// The other spelling, `where condition else "message"`, is left to
   /// `parseElseMessage`: the `else` suffix is shared with the `not Trait`
   /// conformance opt-out, so the two are parsed separately.
-  ParseResult extractParenthesizedMessage(ParserBase &p, ExprNode *parsed);
+  ParseResult extractParenthesizedMessage(ParserBase &p, ExprNode *parsed,
+                                          StringRef keyword = "where");
 
   /// Consume an optional `else "message"` suffix into `message`. An already
   /// set `message` means a parenthesized message was written too, which is an
   /// error. `what` names the construct carrying the message, for diagnostics.
   ParseResult parseElseMessage(ParserBase &p, std::optional<size_t> stmtIndent,
-                               StringRef what = "a 'where' clause");
+                               StringRef what = "a 'where' clause",
+                               StringRef keyword = "where");
 
   /// Print the constraint for debugging.
   void print(mlir::raw_indented_ostream &os) const;
@@ -160,10 +165,6 @@ struct ParsedArgument {
   ExprNode *initExpr = nullptr;
   // If this is a ref convention, this specifies the origin expression.
   ExprNode *refOriginExpr = nullptr;
-  /// `where` clauses on a runtime argument: contracts for static
-  /// verification (see Mojo/proposals/argument-contracts.md). Persistently
-  /// allocated.
-  ArrayRef<ParsedConstraint> whereClauses;
 
   /// This gets set to true when there is a /diagnosed/ error that should
   /// prevent subsequent references to this argument.
@@ -285,6 +286,20 @@ public:
   /// absence of any abi annotation.
   bool hasExplicitABI = false;
   ExprNode *thrownTypeExpr = nullptr;
+
+  /// The contract of a function declaration, for static verification (see
+  /// Mojo/proposals/function-contracts.md): its `requires` clauses
+  /// (preconditions) and `ensures` clauses (postconditions). Persistently
+  /// allocated.
+  ArrayRef<ParsedConstraint> requiresClauses;
+  ArrayRef<ParsedConstraint> ensuresClauses;
+
+  /// Parse the contract clauses of a function declaration if present. They
+  /// follow the trailing `where` clauses and share their grammar.
+  ///
+  /// contract_clauses ::= ("requires" constraint)* ("ensures" constraint)*
+  ParseResult parseContractsIfPresent(ParserBase &p,
+                                      std::optional<size_t> stmtIndent);
 
   /// Parse an argument list, including the parentheses around them. This also
   /// parses 'raises' and other effects.

@@ -16,6 +16,7 @@
 
 from std.math import align_down
 
+
 def change(mut xs: List[Int]):
     xs.clear()
 
@@ -135,7 +136,7 @@ def ok_filled_then_read(n: Int) -> Int:
     return t
 
 
-def small(x: Int where 0 <= x and x < 64) -> Int:
+def small(x: Int) -> Int requires 0 <= x and x < 64:
     return x
 
 
@@ -222,10 +223,8 @@ def ok_unrolled(xs: List[Int]) -> Int:
     return sum
 
 
-def ok_scaled_counter(
-    p: Pointer[Int, MutUntrackedOrigin],
-    n: Int where 0 <= n < 1000 and p._extent() >= n * 4,
-) -> Int:
+def ok_scaled_counter(p: Pointer[Int, MutUntrackedOrigin], n: Int) -> Int
+    requires 0 <= n < 1000 and p._extent() >= n * 4:
     var t = 0
     var off = 0
     for _ in range(n):
@@ -396,10 +395,8 @@ def bad_closure_counter(xs: List[Int]) -> Int:
     return sum
 
 
-def bad_scaled_counter(
-    p: Pointer[Int, MutUntrackedOrigin],
-    n: Int where 0 <= n < 1000 and p._extent() >= n * 4,
-) -> Int:
+def bad_scaled_counter(p: Pointer[Int, MutUntrackedOrigin], n: Int) -> Int
+    requires 0 <= n < 1000 and p._extent() >= n * 4:
     var t = 0
     var off = 0
     for _ in range(n):

@@ -104,7 +104,7 @@ def _same_elements[
     """States, in a postcondition, that the `count` elements at `dst` on exit
     are the elements that were at `src` on entry.
 
-    Use it in a `where` clause on a `mut` or `out` argument, typically with
+    Use it in an `ensures` clause, typically with
     `src` an `old(...)` pointer, to say that a function keeps or moves elements
     it does not otherwise change. Unlike comparing elements with `==` in a
     quantifier, it works for any element type. It has no runtime effect.

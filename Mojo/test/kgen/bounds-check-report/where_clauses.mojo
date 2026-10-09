@@ -10,32 +10,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# Contracts written as `where` clauses on arguments, for
+# Contracts written as `requires` and `ensures` clauses, for
 # `bounds-check-report`; see README.md and
-# Mojo/proposals/argument-contracts.md.
+# Mojo/proposals/function-contracts.md. (The file is named after the first
+# spelling of contracts, `where` clauses on arguments.)
 
 
 # A function whose precondition proves its own index. Not inlined, so every
 # call is checked against the clause.
 @inline(.never)
-def ok_get(xs: List[Int], i: Int where 0 <= i and i < len(xs)) -> Int:
+def ok_get(xs: List[Int], i: Int) -> Int requires 0 <= i and i < len(xs):
     return xs[i]  # proven from the precondition
 
 
-# A precondition on one argument may use the others, and an argument may have
-# several clauses.
+# A precondition may use several arguments, and a function may have several
+# clauses.
 @inline(.never)
-def ok_window(
-    xs: List[Int],
-    lo: Int where 0 <= lo,
-    hi: Int where lo <= hi where hi < len(xs) else "hi must be an index",
-) -> Int:
+def ok_window(xs: List[Int], lo: Int, hi: Int) -> Int
+    requires 0 <= lo
+    requires lo <= hi
+    requires hi < len(xs) else "hi must be an index":
     return xs[hi] - xs[lo]
 
 
 # Inlined into its callers: its clause becomes their obligation.
 @always_inline
-def ok_at(xs: List[Int], i: Int where 0 <= i and i < len(xs)) -> Int:
+def ok_at(xs: List[Int], i: Int) -> Int requires 0 <= i and i < len(xs):
     return xs[i]
 
 
@@ -91,44 +91,44 @@ def ok_at_checked(xs: List[Int]) -> Int:
     return 0
 
 
-# --- Postconditions: clauses on `out` and `mut` arguments ---
+# --- Postconditions: `ensures` clauses ---
 # Proven from the body, and assumed after calls.
 @inline(.never)
-def ok_make_two(out result: List[Int] where len(result) == 2):
+def ok_make_two(out result: List[Int]) ensures len(result) == 2:
     result = List[Int]()
     result.append(1)
     result.append(2)
 
 
 @inline(.never)
-def ok_next(a: Int where a < 1000, out r: Int where r > a):
+def ok_next(a: Int, out r: Int) requires a < 1000 ensures r > a:
     r = a + 1
 
 
 @inline(.never)
-def ok_push(mut xs: List[Int] where len(xs) == old(len(xs)) + 1, v: Int):
+def ok_push(mut xs: List[Int], v: Int) ensures len(xs) == old(len(xs)) + 1:
     xs.append(v)
 
 
-# A clause only in terms of `old` is a precondition: `pop` needs it.
+# A precondition on a `mut` argument reads its value on entry: `pop` needs it.
 @inline(.never)
-def ok_shrink(
-    mut xs: List[Int] where old(len(xs)) > 0 where len(xs) == old(len(xs)) - 1,
-):
+def ok_shrink(mut xs: List[Int])
+    requires len(xs) > 0
+    ensures len(xs) == old(len(xs)) - 1:
     _ = xs.pop()
 
 
-# Without `old`, a `mut` clause holds on entry and on exit.
+# A fact that holds on entry and on exit is stated in both kinds of clause.
 @inline(.never)
-def ok_keep(mut xs: List[Int] where len(xs) >= 1):
+def ok_keep(mut xs: List[Int]) requires len(xs) >= 1 ensures len(xs) >= 1:
     xs[0] = 5
 
 
 # A loop fills the result; the length follows from a loop invariant.
 @inline(.never)
-def ok_make_loop(
-    n: Int where n >= 0, out result: List[Int] where len(result) == n
-):
+def ok_make_loop(n: Int, out result: List[Int])
+    requires n >= 0
+    ensures len(result) == n:
     result = List[Int](capacity=n)
     for i in range(n):
         result.append(i)
@@ -136,32 +136,29 @@ def ok_make_loop(
 
 # Quantifiers: `all([cond for i in range(lo, hi)])`.
 @inline(.never)
-def ok_swap_front(
-    mut xs: List[Int] where old(len(xs)) >= 2 where len(xs) == old(
-        len(xs)
-    ) and all([xs[i] == old(xs[i]) for i in range(2, len(xs))])
-):
+def ok_swap_front(mut xs: List[Int])
+    requires len(xs) >= 2
+    ensures len(xs) == old(len(xs)) and all(
+        [xs[i] == old(xs[i]) for i in range(2, len(xs))]
+    ):
     var t = xs[0]
     xs[0] = xs[1]
     xs[1] = t
 
 
 @inline(.never)
-def ok_first_nonneg(
-    xs: List[Int] where len(xs) > 0 and all(
-        [xs[i] >= 0 for i in range(len(xs))]
-    ),
-) -> Int:
+def ok_first_nonneg(xs: List[Int]) -> Int
+    requires len(xs) > 0 and all([xs[i] >= 0 for i in range(len(xs))]):
     return xs[0]
 
 
 # --- must stay UNPROVEN ---
 @inline(.never)
-def bad_swap_touches_rest(
-    mut xs: List[Int] where old(len(xs)) >= 4 where len(xs) == old(
-        len(xs)
-    ) and all([xs[i] == old(xs[i]) for i in range(2, len(xs))])
-):
+def bad_swap_touches_rest(mut xs: List[Int])
+    requires len(xs) >= 4
+    ensures len(xs) == old(len(xs)) and all(
+        [xs[i] == old(xs[i]) for i in range(2, len(xs))]
+    ):
     var t = xs[0]
     xs[0] = xs[1]
     xs[1] = t
@@ -177,12 +174,15 @@ def bad_first_negative() -> Int:
 
 
 @inline(.never)
-def bad_push_twice(mut xs: List[Int] where len(xs) == old(len(xs)) + 2, v: Int):
+def bad_push_twice(mut xs: List[Int], v: Int)
+    ensures len(xs) == old(len(xs)) + 2:
     xs.append(v)  # grows by one
 
 
 @inline(.never)
-def bad_keep_cleared(mut xs: List[Int] where len(xs) >= 1):
+def bad_keep_cleared(mut xs: List[Int])
+    requires len(xs) >= 1
+    ensures len(xs) >= 1:
     xs.clear()  # empty on exit
 
 

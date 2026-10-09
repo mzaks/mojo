@@ -70,13 +70,17 @@ def ok_kernel(
         dst[tid] = a[tid]  # a read and a write
 
 
-def ok_kernel_global(a: TileTensor[DType.float32, L1000, MutAnyOrigin]) -> Float32:
+def ok_kernel_global(
+    a: TileTensor[DType.float32, L1000, MutAnyOrigin]
+) -> Float32:
     if global_idx.x < Int(a.dim[0]()):
         return a[global_idx.x]
     return 0
 
 
-def ok_thread_only(a: TileTensor[DType.float32, L1024, MutAnyOrigin]) -> Float32:
+def ok_thread_only(
+    a: TileTensor[DType.float32, L1024, MutAnyOrigin]
+) -> Float32:
     return a[thread_idx.x]  # a block has at most 1024 threads
 
 
@@ -190,9 +194,7 @@ def ok_tile_tuple(
     return 0
 
 
-def ok_distribute(
-    t: TileTensor[DType.float32, L88, MutAnyOrigin]
-) -> Float32:
+def ok_distribute(t: TileTensor[DType.float32, L88, MutAnyOrigin]) -> Float32:
     # 2 x 4 threads: each gets 4 x 2 elements, for any thread id.
     var v = t.distribute[row_major[2, 4]()](thread_idx.x)
     return v[3, 1]
@@ -212,9 +214,7 @@ def ok_vectorize_distribute(
     t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int
 ) -> SIMD[DType.float32, 4]:
     if Int(t.dim[1]()) % 4 == 0 and Int(t.dim[1]()) >= 32:
-        var v = t.vectorize[1, 4]().distribute[row_major[1, 8]()](
-            thread_idx.x
-        )
+        var v = t.vectorize[1, 4]().distribute[row_major[1, 8]()](thread_idx.x)
         if 0 <= i and i < Int(t.dim[0]()):
             return v[i, 0]
     return 0
@@ -225,24 +225,21 @@ def ok_distribute_with_offset(
 ) -> SIMD[DType.float32, 2]:
     if Int(t.dim[1]()) % 2 == 0 and Int(t.dim[1]()) >= 8:
         # As kernels write it: a vectorized view, distributed, destructured.
-        var v, coords, offset = t.vectorize[
-            1, 2
-        ]().distribute_with_offset[row_major[1, 4]()](thread_idx.x)
+        var v, coords, offset = t.vectorize[1, 2]().distribute_with_offset[
+            row_major[1, 4]()
+        ](thread_idx.x)
         if 0 <= i and i < Int(t.dim[0]()):
             return v[i, 0]
     return 0
 
 
-def buffer_of(
-    buf: DeviceBuffer[DType.float32], n: Int where len(buf) == n
-) -> Int:
+def buffer_of(buf: DeviceBuffer[DType.float32], n: Int) -> Int
+    requires len(buf) == n:
     return n
 
 
-def rows_of(
-    t: TileTensor[mut=False, DType.float32, ...],
-    n: Int where Int(t.dim[0]()) == n,
-) -> Int:
+def rows_of(t: TileTensor[mut=False, DType.float32, ...], n: Int) -> Int
+    requires Int(t.dim[0]()) == n:
     return n
 
 
@@ -263,9 +260,7 @@ def ok_comptime_for_write[N: Int]() -> Float32:
     return t[0, 0]
 
 
-def ok_store_width[
-    N: Int, W: Int
-](v: SIMD[DType.float32, W]) -> Float32:
+def ok_store_width[N: Int, W: Int](v: SIMD[DType.float32, W]) -> Float32:
     comptime assert W > 0
     var t = stack_allocation[dtype=DType.float32](row_major[N, W]())
     comptime for i in range(N):
@@ -283,18 +278,16 @@ def ok_comptime_for_guard[
             t[i, 0] = 0  # the same `i` as in the guard
 
 
-def ok_tensor_pointer(
-    t: TileTensor[mut=False, ...], i: Int where 0 <= i < t.ptr._extent()
-) -> Float32:
+def ok_tensor_pointer(t: TileTensor[mut=False, ...], i: Int) -> Float32
+    requires 0 <= i < t.ptr._extent():
     var p = t.ptr  # the pointer the clause is about
     return Float32(p[unsafe_offset=i].cast[DType.float32]())
 
 
 def ok_after_fill(
-    c: TileTensor[mut=True, ...],
-    t: TileTensor[mut=False, ...],
-    n: Int where t.ptr._extent() >= n and c.ptr._extent() >= n,
-) -> Float32:
+    c: TileTensor[mut=True, ...], t: TileTensor[mut=False, ...], n: Int
+) -> Float32
+    requires t.ptr._extent() >= n and c.ptr._extent() >= n:
     var p = t.ptr
     var q = c.ptr
     var sum: Float32 = 0
@@ -311,14 +304,15 @@ def ok_after_fill(
 def ok_matrix_vector(
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, ...],
-    b: TileTensor[mut=False, ...] where (
+    b: TileTensor[mut=False, ...],
+)
+    requires (
         Int(a.dim[0]()) < 2147483648
         and Int(a.dim[1]()) < 2147483648
         and c.ptr._extent() >= Int(a.dim[0]())
         and a.ptr._extent() >= Int(a.dim[0]()) * Int(a.dim[1]())
         and b.ptr._extent() >= Int(a.dim[1]())
-    ),
-):
+    ):
     var M = Int(a.dim[0]())
     var K = Int(a.dim[1]())
     var c_ptr = c.ptr
@@ -333,20 +327,18 @@ def ok_matrix_vector(
             c_ptr[unsafe_offset=m] += a_val * b_val
 
 
-def _at_most(x: Int, lim: Int where 0 <= x <= lim) -> Int:
+def _at_most(x: Int, lim: Int) -> Int requires 0 <= x <= lim:
     return x
 
 
-def ok_tensor_of_pointer(
-    p: Pointer[Float32, MutAnyOrigin] where p._extent() >= 12
-) -> Float32:
+def ok_tensor_of_pointer(p: Pointer[Float32, MutAnyOrigin]) -> Float32
+    requires p._extent() >= 12:
     var t = TileTensor(p, row_major[3, 4]())
     return t.ptr[unsafe_offset=11]  # the pointer it was built from
 
 
-def ok_swizzled[
-    tile_k: Int
-](lin: Int where 0 <= lin < 16 * tile_k and lin % 8 == 0) -> Int:
+def ok_swizzled[tile_k: Int](lin: Int) -> Int
+    requires 0 <= lin < 16 * tile_k and lin % 8 == 0:
     comptime sw = make_swizzle[8, tile_k, 8]()
     comptime assert 64 <= tile_k <= 65536 and tile_k % 64 == 0
     # Checked by the compiler for each `tile_k`: the swizzle moves the bits
@@ -381,7 +373,9 @@ def bad_kernel_write(dst: TileTensor[DType.float32, L1000, MutAnyOrigin]):
         dst[tid] = 1.0  # `tid` may be 1000
 
 
-def bad_thread_only(a: TileTensor[DType.float32, L512, MutAnyOrigin]) -> Float32:
+def bad_thread_only(
+    a: TileTensor[DType.float32, L512, MutAnyOrigin]
+) -> Float32:
     return a[thread_idx.x]  # a block may have more than 512 threads
 
 
@@ -467,9 +461,7 @@ def bad_load_narrow(
     return 0
 
 
-def bad_tile_coords(
-    t: TileTensor[DType.float32, L88, MutAnyOrigin]
-) -> Float32:
+def bad_tile_coords(t: TileTensor[DType.float32, L88, MutAnyOrigin]) -> Float32:
     return t.tile[2, 4](Coord(4, 0))[0, 0]  # 4 tiles per column
 
 
@@ -481,9 +473,7 @@ def bad_tile_shape(
     return 0
 
 
-def bad_distribute(
-    t: TileTensor[DType.float32, L86, MutAnyOrigin]
-) -> Float32:
+def bad_distribute(t: TileTensor[DType.float32, L86, MutAnyOrigin]) -> Float32:
     var v = t.distribute[row_major[1, 4]()](thread_idx.x)
     return v[7, 1]  # 6 // 4 = 1 column per thread
 
@@ -518,9 +508,7 @@ def bad_comptime_for_write[N: Int]() -> Float32:
     return t[0, 0]
 
 
-def bad_store_width[
-    N: Int, W: Int
-](v: SIMD[DType.float32, W]) -> Float32:
+def bad_store_width[N: Int, W: Int](v: SIMD[DType.float32, W]) -> Float32:
     comptime assert W > 0
     var t = stack_allocation[dtype=DType.float32](row_major[N, W]())
     comptime for i in range(N):
@@ -544,10 +532,9 @@ def bad_tensor_pointer(t: TileTensor[mut=False, ...], i: Int) -> Float32:
 
 
 def bad_after_fill(
-    c: TileTensor[mut=True, ...],
-    t: TileTensor[mut=False, ...],
-    n: Int where t.ptr._extent() >= n and c.ptr._extent() >= n,
-) -> Float32:
+    c: TileTensor[mut=True, ...], t: TileTensor[mut=False, ...], n: Int
+) -> Float32
+    requires t.ptr._extent() >= n and c.ptr._extent() >= n:
     var p = t.ptr
     var sum: Float32 = 0
     _ = c.fill(0)
@@ -559,12 +546,13 @@ def bad_after_fill(
 def bad_matrix_vector(
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, ...],
-    b: TileTensor[mut=False, ...] where (
+    b: TileTensor[mut=False, ...],
+)
+    requires (
         c.ptr._extent() >= Int(a.dim[0]())
         and a.ptr._extent() >= Int(a.dim[0]()) * Int(a.dim[1]())
         and b.ptr._extent() >= Int(a.dim[1]())
-    ),
-):
+    ):
     var M = Int(a.dim[0]())
     var K = Int(a.dim[1]())
     var c_ptr = c.ptr
@@ -579,16 +567,14 @@ def bad_matrix_vector(
             c_ptr[unsafe_offset=m] += a_val * b_val
 
 
-def bad_tensor_of_pointer(
-    p: Pointer[Float32, MutAnyOrigin] where p._extent() >= 12
-) -> Float32:
+def bad_tensor_of_pointer(p: Pointer[Float32, MutAnyOrigin]) -> Float32
+    requires p._extent() >= 12:
     var t = TileTensor(p, row_major[3, 4]())
     return t.ptr[unsafe_offset=12]
 
 
-def bad_swizzled[
-    tile_k: Int
-](lin: Int where 0 <= lin < 16 * tile_k and lin % 8 == 0) -> Int:
+def bad_swizzled[tile_k: Int](lin: Int) -> Int
+    requires 0 <= lin < 16 * tile_k and lin % 8 == 0:
     comptime sw = make_swizzle[8, tile_k, 8]()
     comptime assert 64 <= tile_k <= 65536 and tile_k % 64 == 0
     return _at_most(sw(lin), 16 * tile_k - 8)  # nothing about its masks

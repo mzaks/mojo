@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# GPU kernels that state their launch configuration as `where` clauses, and
+# GPU kernels that state their launch configuration as `requires` clauses, and
 # the launches that must establish it, for `verify-contracts`; see README.md.
 # Needs the `max` and `layout` packages on the import path (see README.md).
 
@@ -52,13 +52,12 @@ comptime L88 = type_of(row_major[8, 8]())
 
 
 # --- must be PROVEN ---
-def ok_tiled_kernel(
-    c: TileTensor[DType.float32, LD, MutAnyOrigin] where (
+def ok_tiled_kernel(c: TileTensor[DType.float32, LD, MutAnyOrigin])
+    requires (
         grid_dim.y <= Int(c.dim[0]()) // 16
         and grid_dim.x <= Int(c.dim[1]()) // 16
         and block_dim.x == 256
-    ),
-):
+    ):
     # One 16 x 16 tile per block, one element per thread.
     var dst = c.tile[16, 16](block_idx.y, block_idx.x)
     var row, col = udivmod(thread_idx.x, 16)
@@ -67,13 +66,12 @@ def ok_tiled_kernel(
 
 def ok_generic_kernel[
     L: TensorLayout, BM: Int, BN: Int
-](
-    c: TileTensor[DType.float32, L, MutAnyOrigin] where (
+](c: TileTensor[DType.float32, L, MutAnyOrigin])
+    requires (
         grid_dim.y <= Int(c.dim[0]()) // BM
         and grid_dim.x <= Int(c.dim[1]()) // BN
         and block_dim.x == BM * BN
-    ),
-):
+    ):
     # The tile sizes are parameters: proven for every `BM` and `BN`.
     var dst = c.tile[BM, BN](block_idx.y, block_idx.x)
     var row, col = udivmod(thread_idx.x, BN)
@@ -184,12 +182,8 @@ def ok_launch_ceildiv(
 
 def ok_host_kernel[
     F: ImplicitlyCopyable & def(Int) -> Float32
-](
-    c: TileTensor[DType.float32, LD, MutAnyOrigin] where grid_dim.x <= Int(
-        c.dim[0]()
-    ) and Int(c.dim[1]()) > 0,
-    f: F,
-):
+](c: TileTensor[DType.float32, LD, MutAnyOrigin], f: F)
+    requires grid_dim.x <= Int(c.dim[0]()) and Int(c.dim[1]()) > 0:
     c[block_idx.x, 0] = f(block_idx.x)
 
 
@@ -211,8 +205,9 @@ def ok_launch_host_arg(
 def ok_pointer_kernel(
     dst: Pointer[Float32, MutAnyOrigin],
     src: Pointer[Float32, MutAnyOrigin],
-    n: Int where n >= 0 and dst._extent() >= n and src._extent() >= n,
-):
+    n: Int,
+)
+    requires n >= 0 and dst._extent() >= n and src._extent() >= n:
     # Raw pointers with their extent stated as a precondition.
     var i = global_idx.x
     if i < n:
@@ -242,18 +237,16 @@ def ok_launch_unsafe_ptrs(ctx: DeviceContext, n: Int) raises:
         )
 
 
-def ok_warp_size_on_gpu(
-    p: Pointer[Float32, MutAnyOrigin], n: Int where p._extent() >= n
-) -> Float32:
+def ok_warp_size_on_gpu(p: Pointer[Float32, MutAnyOrigin], n: Int) -> Float32
+    requires p._extent() >= n:
     comptime assert is_gpu(), "a GPU function"
     if n >= 64:
         return p[unsafe_offset=WARP_SIZE - 1]  # 32 or 64 on a GPU
     return 0
 
 
-def nvidia_kernel(
-    dst: Pointer[Int, MutAnyOrigin], n: Int where dst._extent() >= n
-):
+def nvidia_kernel(dst: Pointer[Int, MutAnyOrigin], n: Int)
+    requires dst._extent() >= n:
     comptime assert is_nvidia_gpu(), "uses NVIDIA's warp of 32"
     comptime assert WARP_SIZE == 32
     if thread_idx.x < n:
@@ -268,16 +261,14 @@ def ok_launch_on_nvidia(ctx: DeviceContext) raises:
         )  # the build's accelerator is NVIDIA's
 
 
-def warp_rows(
-    out_rows: Pointer[Float32, MutAnyOrigin],
-    m: Int where out_rows._extent() >= m,
-):
+def warp_rows(out_rows: Pointer[Float32, MutAnyOrigin], m: Int)
+    requires out_rows._extent() >= m:
     var row = warp.broadcast(ufloordiv(global_idx.x, WARP_SIZE))
     if row < m:
         out_rows[unsafe_offset=row] = 0  # lane 0's row: also >= 0
 
 
-def holds(claim: Bool where claim):
+def holds(claim: Bool) requires claim:
     pass
 
 
@@ -293,9 +284,8 @@ def ok_static_extent(a: TileTensor[mut=False, ...]):
         holds(Int(a.dim[1]()) == a.static_shape[1])
 
 
-def is_router[
-    dtype: DType, static_K: Int
-](out result: Bool where result == (dtype == .float32 and static_K == 6144)):
+def is_router[dtype: DType, static_K: Int](out result: Bool)
+    ensures result == (dtype == .float32 and static_K == 6144):
     result = dtype == .float32 and static_K == 6144
 
 
@@ -369,7 +359,8 @@ def ok_launch_in_closure(
 
 def ok_per_warp_kernel[
     threads: Int
-](c: TileTensor[DType.float32, LD, MutAnyOrigin] where block_dim.x == threads):
+](c: TileTensor[DType.float32, LD, MutAnyOrigin])
+    requires block_dim.x == threads:
     # One slot per warp of the block: `warp_id()` is `thread_idx.x` over the
     # warp size (of the GPU it is launched on).
     var s = stack_allocation[dtype=DType.float32](
@@ -381,9 +372,7 @@ def ok_per_warp_kernel[
 def ok_launch_per_warp(
     ctx: DeviceContext, c: TileTensor[DType.float32, LD, MutAnyOrigin]
 ) raises:
-    ctx.enqueue_function[ok_per_warp_kernel[128]](
-        c, grid_dim=1, block_dim=128
-    )
+    ctx.enqueue_function[ok_per_warp_kernel[128]](c, grid_dim=1, block_dim=128)
 
 
 def ok_unrolled_kernel[n: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
@@ -402,9 +391,8 @@ def ok_launch_unrolled(
     ctx.enqueue_function[ok_unrolled_kernel[4]](t, grid_dim=1, block_dim=1)
 
 
-def ok_size_of_call(
-    xs: List[Int], k: Int where 0 <= k < 16 // size_of[DType.float32]()
-) -> Int:
+def ok_size_of_call(xs: List[Int], k: Int) -> Int
+    requires 0 <= k < 16 // size_of[DType.float32]():
     # A clause calls `size_of`; the body's `comptime` is the same 4 bytes.
     comptime w = 16 // size_of[DType.float32]()
     if len(xs) == w:
@@ -426,16 +414,15 @@ def ok_tile_load[
     return 0
 
 
-def ok_shared_kernel(
-    t: TileTensor[DType.float32, L88, MutAnyOrigin] where (
+def ok_shared_kernel(t: TileTensor[DType.float32, L88, MutAnyOrigin])
+    requires (
         external_memory[
             UInt8,
             address_space=.SHARED,
             alignment=16,
         ]()._extent()
         >= 64
-    ),
-):
+    ):
     # The launch's dynamic shared memory: what `shared_mem_bytes=` gives.
     var smem = external_memory[UInt8, address_space=.SHARED, alignment=16]()
     smem[unsafe_offset=63] = 0
@@ -465,11 +452,8 @@ def ok_gpu_simd_width_any[dt: DType](xs: List[Int]) -> Int:
 
 def ok_linear_offset[
     L: TensorLayout
-](
-    t: TileTensor[DType.float32, L, MutAnyOrigin],
-    i: Int,
-    j: Int where 0 <= i < Int(t.dim[0]()) and 0 <= j <= Int(t.dim[1]()) - 4,
-) -> Float32:
+](t: TileTensor[DType.float32, L, MutAnyOrigin], i: Int, j: Int) -> Float32
+    requires 0 <= i < Int(t.dim[0]()) and 0 <= j <= Int(t.dim[1]()) - 4:
     # The element's offset from `t.ptr`: with contiguous rows, the rest of
     # the row follows it.
     comptime assert (
@@ -479,7 +463,7 @@ def ok_linear_offset[
     return t.ptr.unsafe_offset(Int(offset))[unsafe_offset=3]
 
 
-def _same(a: Int, b: Int where a == b) -> Int:
+def _same(a: Int, b: Int) -> Int requires a == b:
     return a
 
 
@@ -535,7 +519,9 @@ def bad_launch_swapped(
     )
 
 
-def bad_comptime_for(t: TileTensor[DType.float32, L88, MutAnyOrigin]) -> Float32:
+def bad_comptime_for(
+    t: TileTensor[DType.float32, L88, MutAnyOrigin]
+) -> Float32:
     var sum: Float32 = 0
     comptime for k in range(9):
         sum += t[7, k]
@@ -593,9 +579,9 @@ def bad_launch_compiled(
     ctx.enqueue_function(f, c, grid_dim=(n // 16 + 1, m // 16), block_dim=256)
 
 
-def bad_compiled_kernel[N: Int](
-    t: TileTensor[DType.float32, L88, MutAnyOrigin]
-):
+def bad_compiled_kernel[
+    N: Int
+](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
     t[7, N - 1] = 0  # compiled with 9 below
 
 
@@ -635,9 +621,8 @@ def bad_launch_short_buffer(ctx: DeviceContext, n: Int) raises:
         )
 
 
-def bad_warp_size_anywhere(
-    p: Pointer[Float32, MutAnyOrigin], n: Int where p._extent() >= n
-) -> Float32:
+def bad_warp_size_anywhere(p: Pointer[Float32, MutAnyOrigin], n: Int) -> Float32
+    requires p._extent() >= n:
     if n >= 64:
         return p[unsafe_offset=WARP_SIZE - 1]  # 0 on a host: offset -1
     return 0
@@ -663,9 +648,8 @@ def bad_broadcast_own_value():
     holds(t == thread_idx.x)  # lane 0's, not this thread's
 
 
-def bad_broadcast_load(
-    p: Pointer[Int, MutAnyOrigin], n: Int where p._extent() >= n
-):
+def bad_broadcast_load(p: Pointer[Int, MutAnyOrigin], n: Int)
+    requires p._extent() >= n:
     if n > 0:
         var v = warp.broadcast(p[unsafe_offset=0])
         holds(v == p[unsafe_offset=0])  # memory is not copied
@@ -727,7 +711,8 @@ def bad_launch_in_closure(
 
 def bad_per_warp_kernel[
     threads: Int
-](c: TileTensor[DType.float32, LD, MutAnyOrigin] where block_dim.x == threads):
+](c: TileTensor[DType.float32, LD, MutAnyOrigin])
+    requires block_dim.x == threads:
     var s = stack_allocation[dtype=DType.float32](
         row_major[1, threads // WARP_SIZE - 1]()
     )
@@ -737,12 +722,12 @@ def bad_per_warp_kernel[
 def launch_short_per_warp(
     ctx: DeviceContext, c: TileTensor[DType.float32, LD, MutAnyOrigin]
 ) raises:
-    ctx.enqueue_function[bad_per_warp_kernel[128]](
-        c, grid_dim=1, block_dim=128
-    )
+    ctx.enqueue_function[bad_per_warp_kernel[128]](c, grid_dim=1, block_dim=128)
 
 
-def bad_unrolled_kernel[n: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
+def bad_unrolled_kernel[
+    n: Int
+](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
     var row = 0
     comptime for _ in range(n):
         t[row, 0] = 0  # the fifth iteration writes row 8 of 8
@@ -756,9 +741,8 @@ def launch_unrolled_past(
     ctx.enqueue_function[bad_unrolled_kernel[5]](t, grid_dim=1, block_dim=1)
 
 
-def bad_size_of_call(
-    xs: List[Int], k: Int where 0 <= k <= 16 // size_of[DType.float32]()
-) -> Int:
+def bad_size_of_call(xs: List[Int], k: Int) -> Int
+    requires 0 <= k <= 16 // size_of[DType.float32]():
     comptime w = 16 // size_of[DType.float32]()
     if len(xs) == w:
         return xs[k]  # k may be 4
@@ -781,9 +765,7 @@ def bad_launch_opaque(
     # `rows` is computed by a function the verifier does not evaluate: the
     # kernel is not verified for this launch, which is reported here.
     comptime rows = _pick_rows()
-    ctx.enqueue_function[opaque_rows_kernel[rows]](
-        t, grid_dim=1, block_dim=1
-    )
+    ctx.enqueue_function[opaque_rows_kernel[rows]](t, grid_dim=1, block_dim=1)
 
 
 def bad_tile_load[
@@ -808,16 +790,15 @@ def bad_tile_load_past[
     return 0
 
 
-def bad_shared_kernel(
-    t: TileTensor[DType.float32, L88, MutAnyOrigin] where (
+def bad_shared_kernel(t: TileTensor[DType.float32, L88, MutAnyOrigin])
+    requires (
         external_memory[
             UInt8,
             address_space=.SHARED,
             alignment=16,
         ]()._extent()
         >= 64
-    ),
-):
+    ):
     var smem = external_memory[UInt8, address_space=.SHARED, alignment=16]()
     smem[unsafe_offset=64] = 0  # one past what the clause asks for
 
@@ -847,11 +828,8 @@ def bad_gpu_simd_width_any[dt: DType](xs: List[Int]) -> Int:
 
 def bad_linear_offset[
     L: TensorLayout
-](
-    t: TileTensor[DType.float32, L, MutAnyOrigin],
-    i: Int,
-    j: Int where 0 <= i < Int(t.dim[0]()) and 0 <= j <= Int(t.dim[1]()) - 4,
-) -> Float32:
+](t: TileTensor[DType.float32, L, MutAnyOrigin], i: Int, j: Int) -> Float32
+    requires 0 <= i < Int(t.dim[0]()) and 0 <= j <= Int(t.dim[1]()) - 4:
     comptime assert (
         L.rank == 2 and L.flat_rank == 2 and L.static_stride[1] == 1
     ), "rows must be contiguous"
@@ -861,11 +839,8 @@ def bad_linear_offset[
 
 def bad_linear_offset_strided[
     L: TensorLayout
-](
-    t: TileTensor[DType.float32, L, MutAnyOrigin],
-    i: Int,
-    j: Int where 0 <= i < Int(t.dim[0]()) and 0 <= j <= Int(t.dim[1]()) - 4,
-) -> Float32:
+](t: TileTensor[DType.float32, L, MutAnyOrigin], i: Int, j: Int) -> Float32
+    requires 0 <= i < Int(t.dim[0]()) and 0 <= j <= Int(t.dim[1]()) - 4:
     comptime assert L.rank == 2 and L.flat_rank == 2  # any last stride
     var offset = t._linear_offset(Index(i, j))
     return t.ptr.unsafe_offset(Int(offset))[unsafe_offset=3]

@@ -18,29 +18,28 @@ from std.builtin._verification import _same_elements
 
 # Resets the first element and keeps the others: the quantifier says so.
 @inline(.never)
-def ok_reset_first(
-    mut xs: List[Int] where old(len(xs)) > 0 where len(xs) == old(
-        len(xs)
-    ) and all([xs[i] == old(xs[i]) for i in range(1, len(xs))])
-):
+def ok_reset_first(mut xs: List[Int])
+    requires len(xs) > 0
+    ensures len(xs) == old(len(xs)) and all(
+        [xs[i] == old(xs[i]) for i in range(1, len(xs))]
+    ):
     xs[0] = 7
 
 
 # Resets the first element; its contract only states the length.
 @inline(.never)
-def ok_reset_first_length_only(
-    mut xs: List[Int] where old(len(xs)) > 0 where len(xs) == old(len(xs)),
-):
+def ok_reset_first_length_only(mut xs: List[Int])
+    requires len(xs) > 0
+    ensures len(xs) == old(len(xs)):
     xs[0] = 7
 
 
 # Appends and keeps the elements it had: `_same_elements` says so.
 @inline(.never)
-def ok_push_keep(
-    mut xs: List[Int] where len(xs) == old(len(xs)) + 1 and _same_elements(
+def ok_push_keep(mut xs: List[Int])
+    ensures len(xs) == old(len(xs)) + 1 and _same_elements(
         xs._data, old(xs._data), old(len(xs))
-    )
-):
+    ):
     xs.append(9)
 
 
