@@ -1331,17 +1331,20 @@ ParseResult ParsedConstraint::parse(ParserBase &p,
       return failure();
   } else {
     // A contract clause has one spelling for its message, the `else` one.
+    StringRef article = keyword == "ensures" ? "an" : "a";
     if (auto *paren = dyn_cast<ParenNode>(parsed))
       if (auto *tuple = dyn_cast<TupleNode>(paren->subExpr);
           tuple && tuple->exprs.size() == 2 &&
           isa<StringLiteralNode>(tuple->exprs[1]))
         return p.emitError(tuple->exprs[1]->getLoc(),
-                           "the message of a '" + keyword +
+                           "the message of " + article + " '" + keyword +
                                "' clause follows 'else': '" + keyword +
                                " condition else \"message\"'");
     propExpr = parsed;
   }
-  return parseElseMessage(p, stmtIndent, ("a '" + keyword + "' clause").str(),
+  StringRef article = keyword == "ensures" ? "an" : "a";
+  return parseElseMessage(p, stmtIndent,
+                          (article + " '" + keyword + "' clause").str(),
                           keyword);
 }
 

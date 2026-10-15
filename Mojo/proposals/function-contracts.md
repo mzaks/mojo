@@ -235,10 +235,13 @@ A `where` clause on an argument is an error, with a note that points to
 
 Contract expressions are not executed by default (see
 [Runtime checking](#runtime-checking)). The verifier reads them as
-specifications, so they must be pure: calls may only take their arguments as
-`imm` or by value, must not raise, and must not write memory other than
-their own locals. The parser can enforce the first two; the third is part of
-what the verifier assumes, like the other stdlib trust assumptions.
+specifications, so they must be pure: calls must not take a `mut` argument,
+must not raise, and must not write memory other than their own locals. The
+parser enforces the first two: a clause that calls such a function is an
+error that names it. The third is part of what the verifier assumes, like
+the other stdlib trust assumptions: a callee can still write through a
+pointer it is given, and the parser does not look into callees' bodies.
+A `ref` argument is allowed, since reading an element (`xs[i]`) takes one.
 
 Calls inside a contract are evaluated transparently: the verifier reads the
 body of `len`, `capacity` or a user predicate like `is_sorted(xs)`. Such
@@ -404,7 +407,9 @@ Implemented, on the `mojo-bounds-verifier` branch:
   preconditions become `kgen.requires` at the start of the body,
   postconditions a `kgen.ensures` before every return, and the `old(e)`
   values they use a `kgen.old` at the start. A `where` clause on an argument
-  is an error that points to the new clauses.
+  is an error that points to the new clauses. A clause that calls a function taking a
+  `mut` argument, or one that can raise, is an error (see
+  [Contract expressions](#contract-expressions)).
 - `result` in an `ensures` clause. A named `out` result and a result in
   memory are what the clause reads. An unnamed result in a register goes
   through a local of the function at each return, which the clause reads, so
@@ -586,9 +591,9 @@ time, and cannot refer to runtime arguments.
 
 ## Open questions
 
-- Contract expressions call functions. How much purity should the parser
-  enforce, and should predicates used in contracts be marked (like Dafny's
-  `function`, as opposed to `method`)?
+- Contract expressions call functions. The parser rejects calls with a `mut`
+  argument or that raise; should it go further, and should predicates used
+  in contracts be marked (like Dafny's `function`, as opposed to `method`)?
 - Can elaboration keep the contract ops of a function it specializes but
   never calls? Today the verifier only sees specializations that some caller
   reaches, which is fine for callers, but a library would want its functions

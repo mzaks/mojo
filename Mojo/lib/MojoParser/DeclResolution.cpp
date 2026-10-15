@@ -2885,6 +2885,42 @@ static KGEN::SourceLocOp emitCallLocation(OpBuilder &builder, Location loc) {
   return KGEN::SourceLocOp::create(builder, loc, builder.getIndexAttr(0));
 }
 
+/// Checks that a contract clause, emitted into `op`'s region, only calls
+/// functions that cannot change their arguments or raise: a contract is read
+/// as a specification and never run, so a call with an effect would make it
+/// say something the program does not do. Writes through pointers are not
+/// seen here; they stay a trusted assumption.
+static LogicalResult checkContractCalls(SharedState &shared, Operation *op,
+                                        const ParsedConstraint &clause,
+                                        StringRef keyword) {
+  LogicalResult result = success();
+  op->walk([&](LIT::CallOp call) {
+    if (failed(result))
+      return WalkResult::interrupt();
+    FnTypeGeneratorType callee = call.getCalleeType();
+    StringRef effect;
+    if (callee.isThrows())
+      effect = "can raise";
+    else if (llvm::is_contained(callee.getArgConventions(), ArgConvention::Mut))
+      effect = "takes a 'mut' argument";
+    if (effect.empty())
+      return WalkResult::advance();
+    std::string name = "a function";
+    if (SymbolRefAttr symbol = call.getDirectCallee())
+      name = ("'" + symbol.getLeafReference().getValue().split('(').first +
+              "'")
+                 .str();
+    shared.emitError(clause.loc)
+        << (keyword == "ensures" ? "an '" : "a '") << keyword
+        << "' clause cannot call " << name
+        << ", which " << effect
+        << "; a contract may only call functions without effects";
+    result = failure();
+    return WalkResult::interrupt();
+  });
+  return result;
+}
+
 LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
                                           IREmitter &emitter) {
   auto it = contractClauses.find(funcOp);
@@ -2931,7 +2967,8 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
       Block *condition =
           emitContractCondition(*this, funcOp, decl, clause, requiresOp,
                                 operands, /*withResult=*/false, &reject);
-      if (!condition)
+      if (!condition ||
+          failed(checkContractCalls(shared, requiresOp, clause, "requires")))
         return failure();
       Value result = registerResult(*this, funcOp, decl);
       bool usesResult =
@@ -2964,7 +3001,8 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
                                          callLoc.getLine(), callLoc.getCol(),
                                          callLoc.getFileName(), clause.message);
     if (!emitContractCondition(*this, funcOp, decl, clause, trial, operands,
-                               /*withResult=*/true, &olds))
+                               /*withResult=*/true, &olds) ||
+        failed(checkContractCalls(shared, trial, clause, "ensures")))
       return failure();
     trial.erase();
     needsEntry |= olds.count != 0;

@@ -371,6 +371,21 @@ def where_after_requires[x: Int](a: Int) requires a > 0 where x > 1:
 def paren_message(a: Int) requires (a > 0, "positive"):
   pass
 
+def raising_helper(a: Int) raises -> Int:
+  return a
+
+# expected-error @+1 {{a 'requires' clause cannot call 'raising_helper', which can raise; a contract may only call functions without effects}}
+def calls_raising(a: Int) raises requires raising_helper(a) > 0:
+  pass
+
+def bump_helper(mut a: Int) -> Int:
+  a += 1
+  return a
+
+# expected-error @+1 {{an 'ensures' clause cannot call 'bump_helper', which takes a 'mut' argument; a contract may only call functions without effects}}
+def calls_mut(mut a: Int) ensures bump_helper(a) > 0:
+  a = 1
+
 # expected-note @+1 {{function declared here}}
 def simple_constraints[x: Int, y: Int]()
   # expected-note @+1 {{constraint declared here}}
