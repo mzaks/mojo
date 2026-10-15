@@ -95,8 +95,8 @@ struct ParsedConstraint {
   StringAttr message;
 
   /// Parse a `where` clause's condition and its optional message. `keyword`
-  /// is the clause's own (`requires` and `ensures` clauses share the
-  /// grammar), for diagnostics.
+  /// is the clause's own: `requires` and `ensures` clauses share the grammar,
+  /// but take a message only in the `else` spelling.
   ParseResult parse(ParserBase &p, std::optional<size_t> stmtIndent,
                     StringRef keyword = "where");
 

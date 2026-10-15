@@ -114,12 +114,14 @@ The grammar of a clause is the one `where` clauses already have:
   One fact per clause gives the most precise reports: the verifier names the
   clause it could not prove.
 
-- A clause may carry a message, in either spelling `where` clauses accept:
+- A clause may carry a message, after `else`:
 
   ```mojo
   def f(a: Int) requires a >= 0 else "a must not be negative": ...
-  def g(a: Int) requires (a >= 0, "a must not be negative"): ...
   ```
+
+  `where` clauses also accept `where (condition, "message")`. Contract
+  clauses do not: one spelling is enough, and the parser points to it.
 
 - The expression may use every argument of the function and its parameters.
   It may call functions (`len(xs)`), which must not have side effects (see

@@ -367,8 +367,8 @@ def requires_after_ensures(a: Int) -> Int ensures result > 0 requires a > 0:
 def where_after_requires[x: Int](a: Int) requires a > 0 where x > 1:
   pass
 
-# expected-error @+1 {{a 'requires' clause takes at most one message: prefer 'requires condition else "message"'}}
-def two_messages(a: Int) requires (a > 0, "positive") else "positive":
+# expected-error @+1 {{the message of a 'requires' clause follows 'else': 'requires condition else "message"'}}
+def paren_message(a: Int) requires (a > 0, "positive"):
   pass
 
 # expected-note @+1 {{function declared here}}

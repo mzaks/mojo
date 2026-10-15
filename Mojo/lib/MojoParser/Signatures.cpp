@@ -1326,8 +1326,21 @@ ParseResult ParsedConstraint::parse(ParserBase &p,
   // A message is written either `where (condition, "message")` -- which the
   // expression parser produces as a parenthesized two-element tuple -- or
   // `where condition else "message"`, whose `else` is left for us to consume.
-  if (extractParenthesizedMessage(p, parsed, keyword))
-    return failure();
+  if (keyword == "where") {
+    if (extractParenthesizedMessage(p, parsed, keyword))
+      return failure();
+  } else {
+    // A contract clause has one spelling for its message, the `else` one.
+    if (auto *paren = dyn_cast<ParenNode>(parsed))
+      if (auto *tuple = dyn_cast<TupleNode>(paren->subExpr);
+          tuple && tuple->exprs.size() == 2 &&
+          isa<StringLiteralNode>(tuple->exprs[1]))
+        return p.emitError(tuple->exprs[1]->getLoc(),
+                           "the message of a '" + keyword +
+                               "' clause follows 'else': '" + keyword +
+                               " condition else \"message\"'");
+    propExpr = parsed;
+  }
   return parseElseMessage(p, stmtIndent, ("a '" + keyword + "' clause").str(),
                           keyword);
 }

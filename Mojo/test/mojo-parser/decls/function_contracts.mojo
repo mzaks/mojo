@@ -36,12 +36,6 @@ def with_message(b: Int) requires b > 0 else "b must be positive":
     pass
 
 
-# CHECK-LABEL: lit.fn @"paren_message
-# CHECK: kgen.requires({{.*}}) at({{.*}}) {message = "b must be positive"}
-def paren_message(b: Int) requires (b > 0, "b must be positive"):
-    pass
-
-
 # A clause may use every argument, and a function may have several clauses:
 # one op per clause, each over all the function's arguments. A clause may
 # start a new line.

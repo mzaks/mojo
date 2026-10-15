@@ -15,8 +15,7 @@
 
 These are contracts for static verification (see
 Mojo/proposals/function-contracts.md): `requires` and `ensures` clauses after
-a function's trailing `where` clauses, with the same forms, including a
-message.
+a function's trailing `where` clauses, with a message after `else`.
 """
 
 from tests.util import assert_mojo_format
@@ -75,12 +74,12 @@ def test_where_clauses_line_up_with_contract():
 def test_contract_clauses_with_messages():
     source = (
         'def f(a: Int, b: Int) requires a >= 0 else "a must not be negative"'
-        ' requires (b > a, "b must exceed a"): pass'
+        ' ensures b > a else "b must exceed a": pass'
     )
     expected = (
         "def f(a: Int, b: Int)\n"
         '    requires a >= 0 else "a must not be negative"\n'
-        '    requires (b > a, "b must exceed a"):\n'
+        '    ensures b > a else "b must exceed a":\n'
         "    pass\n"
     )
     assert_mojo_format(source, expected)
