@@ -623,9 +623,9 @@ struct List[T: AnyType, /](
 
     @stable(since="1.0")
     @inline(.always)
-    def __eq__(
-        self, other: Self, /
-    ) -> Bool where conforms_to(Self.T, Equatable):
+    def __eq__(self, other: Self, /) -> Bool
+        where conforms_to(Self.T, Equatable)
+        ensures not result or len(self) == len(other):
         """Checks if two lists are equal.
 
         Args:

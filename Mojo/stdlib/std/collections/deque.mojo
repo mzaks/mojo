@@ -51,8 +51,10 @@ struct Deque[ElementType: Movable](
     Writable where conforms_to(ElementType, Writable),
 )
     invariant self._capacity > 0 and self._data._extent() >= self._capacity
+    invariant self._capacity & (self._capacity - 1) == 0
     invariant 0 <= self._head and self._head < self._capacity
-    invariant 0 <= self._tail and self._tail < self._capacity:
+    invariant 0 <= self._tail and self._tail < self._capacity
+    invariant len(self) == (self._tail - self._head) & (self._capacity - 1):
     """Implements a double-ended queue.
 
     It supports pushing and popping from both ends in O(1) time resizing the
@@ -142,6 +144,16 @@ struct Deque[ElementType: Movable](
         where conforms_to(Self.ElementType, Deinitable)
         ensures self._maxlen == (maxlen if maxlen > 0 else -1) and (
             old(elements.__bool__()) or len(self) == 0
+        )
+        ensures (
+            not old(elements.__bool__())
+            or maxlen > 0
+            or len(self) == old(len(elements.value()))
+        )
+        ensures (
+            not old(elements.__bool__())
+            or maxlen <= 0
+            or len(self) == min(old(len(elements.value())), maxlen)
         ):
         """Constructs a deque.
 
