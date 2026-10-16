@@ -1449,6 +1449,13 @@ def KGEN_RequiresOp : KGENOp<"requires", [
     a caller, which is how analyses tell the function's own precondition from
     an inlined callee's. `message` is the clause's optional failure message.
 
+    `invariant`, if present, names the struct whose invariant the clause is
+    (an `invariant` clause of the struct's header, for one of the function's
+    arguments of that type). Such a precondition is free: analyses assume it
+    in the function, and callers do not have to establish it, since every
+    value of the struct was built and last changed by functions that ensure
+    it.
+
     Like `kgen.obligation`, the op writes to a dedicated abstract resource so
     that it is not removed as dead code, without acting as a barrier for memory
     optimizations.
@@ -1467,7 +1474,8 @@ def KGEN_RequiresOp : KGENOp<"requires", [
 
   let arguments = (ins Variadic<AnyType>:$args, Index:$line, Index:$col,
                        KGEN_StringType:$fileName,
-                       OptionalAttr<StrAttr>:$message);
+                       OptionalAttr<StrAttr>:$message,
+                       OptionalAttr<StrAttr>:$invariant);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
     `(` ($args^ `:` type($args))? `)`
@@ -1501,6 +1509,10 @@ def KGEN_EnsuresOp : KGENOp<"ensures", [
     function (`kgen.source_loc[0]`), which tells the function's own
     postcondition from an inlined callee's.
 
+    `invariant`, if present, names the struct whose invariant the clause is,
+    for an argument the function initializes or changes (see
+    `kgen.requires`).
+
     Example:
     ```mlir
     kgen.ensures(%self, %old : !kgen.pointer<...>, !kgen.scalar<index>)
@@ -1514,7 +1526,8 @@ def KGEN_EnsuresOp : KGENOp<"ensures", [
 
   let arguments = (ins Variadic<AnyType>:$args, Index:$line, Index:$col,
                        KGEN_StringType:$fileName,
-                       OptionalAttr<StrAttr>:$message);
+                       OptionalAttr<StrAttr>:$message,
+                       OptionalAttr<StrAttr>:$invariant);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
     `(` ($args^ `:` type($args))? `)`

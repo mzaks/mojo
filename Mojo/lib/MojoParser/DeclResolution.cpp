@@ -3090,7 +3090,7 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
           contractOperands(*this, funcOp, decl, /*withResult=*/false);
       auto requiresOp = KGEN::RequiresOp::create(
           builder, loc, operands, callLoc.getLine(), callLoc.getCol(),
-          callLoc.getFileName(), clause.message);
+          callLoc.getFileName(), clause.message, /*invariant=*/StringAttr());
       Block *condition =
           emitContractCondition(*this, funcOp, decl, clause, requiresOp,
                                 operands, /*withResult=*/false, &reject);
@@ -3129,7 +3129,8 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
         contractOperands(*this, funcOp, decl, /*withResult=*/true);
     auto trial = KGEN::EnsuresOp::create(builder, loc, operands,
                                          callLoc.getLine(), callLoc.getCol(),
-                                         callLoc.getFileName(), clause.message);
+                                         callLoc.getFileName(), clause.message,
+                                         /*invariant=*/StringAttr());
     if (!emitContractCondition(*this, funcOp, decl, clause, trial, operands,
                                /*withResult=*/true, &olds) ||
         failed(checkContractCalls(shared, trial, clause, "ensures")))
@@ -3186,7 +3187,7 @@ LogicalResult DeclResolver::emitPostconditions(FnOp funcOp,
     auto ensuresOp = KGEN::EnsuresOp::create(
         builder, shared.translateLocation(post.clause->loc), operands,
         callLoc.getLine(), callLoc.getCol(), callLoc.getFileName(),
-        post.clause->message);
+        post.clause->message, /*invariant=*/StringAttr());
     if (!emitContractCondition(*this, funcOp, *decl, *post.clause, ensuresOp,
                                operands, /*withResult=*/true, &olds))
       return failure();

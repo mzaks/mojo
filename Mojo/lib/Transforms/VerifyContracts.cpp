@@ -1375,6 +1375,9 @@ struct Obligation {
   bool analyzed = true;
   /// The function's own postcondition, at a return (`callLoc`).
   bool postcondition = false;
+  /// For a postcondition that is a struct's invariant, the struct (`callee`
+  /// is then the function).
+  std::string invariant;
   /// For a refinement check, the implementation of the trait method
   /// `callee` that is held to its clauses.
   std::string implementation;
@@ -1572,7 +1575,7 @@ public:
                               /*assumed=*/true))
             facts.push_back(*cond);
       for (Operation &op : entry)
-        if (auto req = dyn_cast<RequiresOp>(&op)) {
+        if (auto req = dyn_cast<RequiresOp>(&op); req && !req.getInvariant()) {
           Obligation ob{state.pc, "false", fn.getLoc(), req.getLoc(),
                         displayName(refines)};
           ob.implementation = displayName(fn);
@@ -4621,6 +4624,8 @@ private:
     Location at = next ? next->getLoc() : ensures.getLoc();
     Obligation ob{state.pc, "false", at, ensures.getLoc(), displayName(fn)};
     ob.postcondition = true;
+    if (std::optional<StringRef> invariant = ensures.getInvariant())
+      ob.invariant = invariant->str();
     State *old = entryState ? &*entryState : nullptr;
     if (MaybeTerm cond = instantiate(ensures.getBody(), ensures.getArgs(),
                                      state, {}, {}, old, /*assumed=*/false))
@@ -4661,7 +4666,8 @@ private:
       if (LIT::FnOp callee = lookup(call))
         if (!callee.getFunctionBody().empty())
           for (Operation &calleeOp : callee.getFunctionBody().front())
-            if (auto req = dyn_cast<RequiresOp>(&calleeOp))
+            if (auto req = dyn_cast<RequiresOp>(&calleeOp);
+                req && !req.getInvariant())
               obligations.push_back({state.pc, "true", call.getLoc(),
                                      req.getLoc(), displayName(callee),
                                      /*analyzed=*/false});
@@ -5959,11 +5965,12 @@ private:
         contractFrame = &forwarded;
       }
     bool hasBody = contract && !contract.getFunctionBody().empty();
-    // A call to a function with preconditions: they are obligations here.
+    // A call to a function with preconditions: they are obligations here,
+    // except for a struct's invariant, which holds for every value of it.
     if (hasBody && !inContract) {
       for (Operation &calleeOp : contract.getFunctionBody().front()) {
         auto req = dyn_cast<RequiresOp>(&calleeOp);
-        if (!req)
+        if (!req || req.getInvariant())
           continue;
         Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
                       displayName(contract)};
@@ -8771,6 +8778,8 @@ private:
     }
     for (RequiresOp req :
          kernel.getFunctionBody().front().getOps<RequiresOp>()) {
+      if (req.getInvariant())
+        continue;
       Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
                     displayName(kernel)};
       MaybeTerm cond;
@@ -10863,12 +10872,17 @@ struct VerifyContractsPass
       for (auto [k, ob, answer] :
            llvm::enumerate(result.obligations, result.answers)) {
         ++total;
-        StringRef what = ob.postcondition ? "postcondition" : "precondition";
+        StringRef what = !ob.invariant.empty() ? "invariant"
+                         : ob.postcondition    ? "postcondition"
+                                               : "precondition";
         // A refinement: `Box.get`'s precondition follows from
         // `Counter.get`'s; `Box.bump` establishes `Counter.bump`'s
         // postcondition.
+        // `Deque.append` keeps the invariant of `Deque`.
         std::string claim =
-            !ob.claim.empty()             ? ob.claim
+            !ob.claim.empty()           ? ob.claim
+            : !ob.invariant.empty()     ? "the invariant of '" + ob.invariant +
+                                              "' where '" + ob.callee + "' returns"
             : ob.implementation.empty() ? ""
             : ob.postcondition
                 ? "that '" + ob.implementation + "' establishes the " +
