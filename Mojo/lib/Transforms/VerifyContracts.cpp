@@ -47,16 +47,17 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Support/xxhash.h"
-#include "llvm/ADT/ScopeExit.h"
-#include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/Regex.h"
+#include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/xxhash.h"
 
 #include <atomic>
 #include <chrono>
@@ -469,6 +470,56 @@ std::optional<SmallVector<Answer>> runZ3(const SolverConfig &config,
   return answers;
 }
 
+/// The directory the `cache-dir` option names: by default the user's cache
+/// directory (on macOS the per-user one, `getconf DARWIN_USER_CACHE_DIR`,
+/// where clang keeps its module cache; elsewhere `$XDG_CACHE_HOME` or
+/// `~/.cache`), under `mojo/verify-contracts`; `none` for no cache. Empty
+/// for no cache.
+std::string cacheDirectory(StringRef option) {
+  if (option == "none")
+    return "";
+  if (!option.empty())
+    return option.str();
+  SmallString<128> dir;
+  if (!llvm::sys::path::cache_directory(dir))
+    return "";
+  llvm::sys::path::append(dir, "mojo", "verify-contracts");
+  return std::string(dir);
+}
+
+/// Removes the answers not used for 30 days, at most once a day (a marker
+/// file holds the time of the last pruning). A cache hit refreshes its
+/// file's time. Errors are ignored: the cache is only an optimization.
+void pruneCache(StringRef dir) {
+  using namespace std::chrono;
+  auto now = system_clock::now();
+  SmallString<128> marker(dir);
+  llvm::sys::path::append(marker, ".last-prune");
+  llvm::sys::fs::file_status status;
+  if (!llvm::sys::fs::status(marker, status) &&
+      now - status.getLastModificationTime() < hours(24))
+    return;
+  {
+    std::error_code ec;
+    llvm::raw_fd_ostream touch(marker, ec);
+  }
+  std::error_code ec;
+  for (llvm::sys::fs::directory_iterator it(dir, ec), end; !ec && it != end;
+       it.increment(ec)) {
+    StringRef name = llvm::sys::path::filename(it->path());
+    // Answers, and temporaries a writer left behind (`*.answers.XXXXXX`).
+    if (!name.contains(".answers"))
+      continue;
+    llvm::sys::fs::file_status entry;
+    if (llvm::sys::fs::status(it->path(), entry))
+      continue;
+    auto age = now - entry.getLastModificationTime();
+    if (age > hours(24 * 30) ||
+        (!name.ends_with(".answers") && age > hours(24)))
+      (void)llvm::sys::fs::remove(it->path());
+  }
+}
+
 std::optional<SmallVector<Answer>>
 runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
   // The answers to a script are a function of the script and the solver:
@@ -497,8 +548,16 @@ runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
           answers.push_back(c == 'p'   ? Answer::Proven
                             : c == 'u' ? Answer::Unproven
                                        : Answer::Unknown);
-      if (answers.size() == expected)
+      if (answers.size() == expected) {
+        // Used: kept by the pruning (see `pruneCache`).
+        int fd;
+        if (!llvm::sys::fs::openFileForRead(cachePath, fd)) {
+          (void)llvm::sys::fs::setLastAccessAndModificationTime(
+              fd, std::chrono::system_clock::now());
+          llvm::sys::Process::SafelyCloseFileDescriptor(fd);
+        }
         return answers;
+      }
     }
   }
   SmallString<128> scriptPath, outPath;
@@ -10475,8 +10534,8 @@ struct VerifyContractsPass
         if (displayName(fn) == dumpFn)
           fn.print(llvm::errs());
       });
-    SolverConfig solver{z3, rlimit, houdiniRlimit, wallSeconds, dumpDir,
-                        cacheDir};
+    SolverConfig solver{z3,          rlimit,  houdiniRlimit,
+                        wallSeconds, dumpDir, cacheDirectory(cacheDir)};
     solver.rangeRlimit = rangeRlimit;
     if (intRetry)
       solver.nonlinearRlimit = nonlinearRlimit;
@@ -10484,8 +10543,14 @@ struct VerifyContractsPass
     solver.caseSplit = caseSplit;
     solver.invariantRetry = invariantRetry;
     solver.memo = std::make_shared<ScriptMemo>();
-    if (!cacheDir.empty())
-      (void)llvm::sys::fs::create_directories(cacheDir);
+    // A cache that cannot be created (a read-only home, a sandbox) is not
+    // used.
+    if (!solver.cacheDir.empty()) {
+      if (llvm::sys::fs::create_directories(solver.cacheDir))
+        solver.cacheDir.clear();
+      else
+        pruneCache(solver.cacheDir);
+    }
     // The scripts are run from `dump-dir`: one that cannot be written to
     // would leave every query unanswered.
     if (!dumpDir.empty())

@@ -72,8 +72,13 @@ clauses it costs about half again as much), `dump-fn=NAME` prints that
 function's IR as the pass reads it (to debug the pass), `dump-dir=` writes the
 SMT-LIB scripts (the directory
 is created; a script the same as one already run is neither run nor
-written again), and `cache-dir=` caches
-the solver's answers by a hash of each script.
+written again), and `cache-dir=` sets where the solver's answers are
+cached, by a hash of each script and the solver binary: by default
+`mojo/verify-contracts` in the user's cache directory (`getconf
+DARWIN_USER_CACHE_DIR` on macOS, `$XDG_CACHE_HOME` or `~/.cache`
+elsewhere); `cache-dir=none` turns the cache off. A directory that cannot
+be created (a sandbox) means no cache. Answers not used for 30 days are
+removed, at most once a day.
 
 Values are bit-vectors, as in the program, so wrap-around is modelled.
 z3 decides few nonlinear bit-vector facts (`row * k + col < m * k` from
@@ -100,7 +105,7 @@ of the SMT-LIB file `F` to `F.int.smt2` and does nothing else (for
 testing).
 
 Functions are verified in parallel, and their scripts are the same from run
-to run, so with `cache-dir=` a function whose encoding did not change costs
+to run, so with the cache a function whose encoding did not change costs
 no solver time. Changing a callee's contract changes its callers' scripts,
 so they are verified again.
 

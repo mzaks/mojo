@@ -110,7 +110,9 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "Print the IR of the function with this name as the pass reads "
            "it (for debugging the pass)">,
     Option<"cacheDir", "cache-dir", "std::string", /*default=*/"\"\"",
-           "Directory to cache solver answers in, by a hash of each script">,
+           "Directory to cache solver answers in, by a hash of each script "
+           "(default: mojo/verify-contracts in the user's cache directory; "
+           "'none' for no cache)">,
   ];
 }
 
