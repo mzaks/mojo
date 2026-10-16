@@ -1947,6 +1947,50 @@ Struct invariants:
   `_len >= 0` either: `_len += 1` wraps at `Int.MAX`, and nothing bounds a
   list's length. Both were assumptions before; now they are visible ones.
 
+The last 14 `Deque` obligations:
+
+- `test_deque.mojo` now proves 224 of 224 (from 210). What each needed:
+  - Two more clauses in `Deque`'s invariant: the capacity is a power of
+    two (`_head == 62` then means a buffer of at least 64), and
+    `len(self) == (self._tail - self._head) & (self._capacity - 1)`,
+    `__len__`'s own definition, which ties the length the pass knows
+    (`len` of the value) to the fields.
+  - The constructor from `elements` states its length (the list's, or
+    `maxlen` if that is smaller), and `List.__eq__` that equal lists are
+    as long.
+  - `Optional.value()` is a reference to the value the optional holds (of
+    any type, not only integers), so `len(elements.value())` is the
+    list's length.
+  - A move (`var p = q^`, the synthesized `__init__(move: ...)`) keeps the
+    value and its fields. It was opaque: nothing was known of `p`, for a
+    `List` either.
+  - A loop does not write a value it destroys. ASAP destruction puts a
+    value's destructor in the loop when the loop is its last use, on the
+    path of a raise (`assert_equal` in the body): that counted as a write,
+    and every field of the deque was unknown after the loop.
+  - `reversed(q)` of a deque yields `len(q)` times, as the linked list's
+    reversed walk does.
+  - `assert_equal(a, b)` of a struct whose `__eq__` has a postcondition
+    assumes it, with the result `True`.
+- The length clause calls `len(self)`, so `Deque.__len__`, which is
+  `@inline(.always)`, got a call to itself in its own entry clause, and
+  inlining reported a recursive `always_inline` function. A call in a
+  contract clause is never run, so the inliner now leaves such a call
+  alone when it leads back into the caller (and the recursion check
+  ignores calls in clauses).
+- Cost, CPU seconds of the whole `kgen` run on `test_deque.mojo`, median of
+  5 interleaved runs: 4.35 s before, 5.73 s now. Without the power-of-two
+  clause 4.87 s (223 proven), without the length clause 4.63 s (222). So
+  those two clauses cost about 1 s each for 1 and 2 proofs, and the rest
+  about 0.3 s for 11. `test_list.mojo` is unchanged (6.06 s against
+  6.09 s).
+- In `Deque`'s own methods (`include-stdlib=true`) the length clause is
+  not proven where a method returns: in a body, `len(self)` is a function
+  of the value that the pass does not relate to the fields. The length
+  postconditions the methods already had were not proven either, for the
+  same reason. The power-of-two clause fails where the other clauses do,
+  on the paths that size the buffer with `next_power_of_two` and `<< 1`.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
