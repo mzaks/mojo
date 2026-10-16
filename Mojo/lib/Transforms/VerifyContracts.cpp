@@ -3100,6 +3100,10 @@ private:
       return;
     }
     if (auto ifOp = dyn_cast<HLCF::IfOp>(op)) {
+      // A contract's run-time check is the contract again, as code: the
+      // contract ops are what is proven, so the check is not analyzed.
+      if (isContractCheck(ifOp))
+        return;
       walkIf(ifOp, state);
       return;
     }
@@ -3117,6 +3121,32 @@ private:
     }
     evalOp(op, state);
   }
+
+  /// Whether `ifOp` is the run-time check of a contract clause the parser
+  /// emits: `if _contract_checks_enabled(): _check_contract(...)`. Its
+  /// condition is that call's result, through a few conversions.
+  static bool isContractCheck(HLCF::IfOp ifOp) {
+    Value value = ifOp.getCond();
+    for (int depth = 0; value && depth < 6; ++depth) {
+      Operation *def = value.getDefiningOp();
+      if (!def)
+        return false;
+      if (auto call = dyn_cast<LIT::CallOp>(def)) {
+        SymbolRefAttr callee = call.getDirectCallee();
+        if (!callee)
+          return false;
+        StringRef name = callee.getLeafReference().getValue();
+        if (name.starts_with("_contract_checks_enabled"))
+          return true;
+        // `Bool.__mlir_bool__`, from the `Bool` the guard returns.
+        if (!name.starts_with("__mlir_bool__") || call->getNumOperands() != 1)
+          return false;
+      }
+      value = def->getNumOperands() ? def->getOperand(0) : Value();
+    }
+    return false;
+  }
+
 
   /// `hlcf.if`, with `elif` arms: those are pairs of regions, a condition
   /// (ending in `hlcf.if.elifcond.yield`) evaluated where every earlier
