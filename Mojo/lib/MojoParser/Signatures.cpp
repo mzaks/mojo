@@ -1332,7 +1332,8 @@ ParseResult ParsedConstraint::parse(ParserBase &p,
       return failure();
   } else {
     // A contract clause has one spelling for its message, the `else` one.
-    StringRef article = keyword == "ensures" ? "an" : "a";
+    StringRef article =
+        keyword == "ensures" || keyword == "invariant" ? "an" : "a";
     if (auto *paren = dyn_cast<ParenNode>(parsed))
       if (auto *tuple = dyn_cast<TupleNode>(paren->subExpr);
           tuple && tuple->exprs.size() == 2 &&
@@ -1343,7 +1344,8 @@ ParseResult ParsedConstraint::parse(ParserBase &p,
                                " condition else \"message\"'");
     propExpr = parsed;
   }
-  StringRef article = keyword == "ensures" ? "an" : "a";
+  StringRef article =
+      keyword == "ensures" || keyword == "invariant" ? "an" : "a";
   return parseElseMessage(p, stmtIndent,
                           (article + " '" + keyword + "' clause").str(),
                           keyword);

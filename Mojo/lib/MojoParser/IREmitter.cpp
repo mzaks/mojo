@@ -1886,9 +1886,14 @@ AnyValue IREmitter::emitOldCall(const ExprNode *call, const ExprNode *operand,
                                 ExprDest &dest) {
   if (oldCalls->mode == OldCalls::Evaluate)
     return getDeclResolver().emitOldValue(*this, call, operand, dest);
-  emitError(call->getLoc())
-      << "'old' has no meaning in a 'requires' clause, which reads the "
-         "values on entry; use it in an 'ensures' clause";
+  if (oldCalls->keyword == "invariant")
+    emitError(call->getLoc())
+        << "'old' has no meaning in an 'invariant' clause, which is about "
+           "one value; state how a method changes it in an 'ensures' clause";
+  else
+    emitError(call->getLoc())
+        << "'old' has no meaning in a 'requires' clause, which reads the "
+           "values on entry; use it in an 'ensures' clause";
   return {};
 }
 

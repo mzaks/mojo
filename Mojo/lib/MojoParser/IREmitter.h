@@ -147,6 +147,8 @@ public:
     SmallVector<std::pair<StringAttr, Value>, 1> indices;
     /// How many `kgen.old` ops were emitted.
     unsigned count = 0;
+    /// The clause's keyword, for the error in Reject mode.
+    StringRef keyword = "requires";
   };
   OldCalls *oldCalls = nullptr;
 

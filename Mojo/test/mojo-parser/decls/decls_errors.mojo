@@ -386,6 +386,26 @@ def bump_helper(mut a: Int) -> Int:
 def calls_mut(mut a: Int) ensures bump_helper(a) > 0:
   a = 1
 
+# expected-error @+1 {{'old' has no meaning in an 'invariant' clause, which is about one value; state how a method changes it in an 'ensures' clause}}
+struct OldInInvariant invariant self.x >= old(self.x):
+  var x: Int
+  def __init__(out self):
+    self.x = 0
+
+# expected-error @+1 {{'where' clauses must come before 'invariant' clauses}}
+struct WhereAfterInvariant[n: Int] invariant self.x >= 0 where n > 0:
+  var x: Int
+
+# expected-error @+1 {{the message of an 'invariant' clause follows 'else': 'invariant condition else "message"'}}
+struct ParenInvariantMessage invariant (self.x >= 0, "positive"):
+  var x: Int
+
+# expected-error @+1 {{an 'invariant' clause cannot call 'raising_helper', which can raise; a contract may only call functions without effects}}
+struct RaisingInvariant invariant raising_helper(self.x) > 0:
+  var x: Int
+  def __init__(out self) raises:
+    self.x = 1
+
 # expected-note @+1 {{function declared here}}
 def simple_constraints[x: Int, y: Int]()
   # expected-note @+1 {{constraint declared here}}

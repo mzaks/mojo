@@ -189,6 +189,13 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   proven where it returns, with `old(...)` evaluated at its entry, and a
   callee's are assumed after the call (only where it did not raise). An
   unproven one is reported at the return, with a note at the clause.
+- Struct invariants: a struct's `invariant` clauses hold for each argument
+  of the struct's type of its methods. They are assumed where a method
+  starts (unless it initializes the argument, `out`), proven where a method
+  that initializes or changes it (`out`, `mut`) returns, and so assumed
+  after a call to such a method. Callers do not prove them, and a function
+  that is not a method of the struct does not assume them for its
+  arguments (`invariants.mojo`).
 - Quantifiers (`all([... for i in range(lo, hi)])`) are proven for an
   arbitrary index and assumed as real quantifiers.
 - List elements: `xs[i]` reads `elem(xs, i)`; writing it keeps the length

@@ -57,10 +57,15 @@ class ExprDest;
 class BaseDLValue;
 
 /// A contract clause of a function's signature (see `emitContracts`): a
-/// precondition (`requires`) or a postcondition (`ensures`).
+/// precondition (`requires`) or a postcondition (`ensures`), or one of its
+/// struct's `invariant` clauses, for one of its arguments of that struct.
 struct ContractClause {
   const ParsedConstraint *clause;
   enum Kind : uint8_t { Requires, Ensures } kind;
+  /// For an invariant: the struct's name, and the argument that `self` names
+  /// in the clause.
+  mlir::StringAttr invariantOf = {};
+  unsigned selfArg = 0;
 };
 
 /// A postcondition to emit before each return of a function.
@@ -71,6 +76,9 @@ struct PostconditionClause {
   /// Whether the clause is also checked at run time: not if it uses `old`
   /// (its entry values would have to be kept) or a quantifier.
   bool runtimeCheck = false;
+  /// For an invariant, as in `ContractClause`.
+  mlir::StringAttr invariantOf = {};
+  unsigned selfArg = 0;
 };
 
 //===----------------------------------------------------------------------===//
@@ -247,6 +255,10 @@ public:
   /// register, while its body is emitted: the local that holds the result
   /// while the postconditions read it (`result` in an `ensures` clause).
   llvm::DenseMap<mlir::Operation *, mlir::Value> contractResults;
+  /// The `invariant` clauses of structs, recorded with a struct's signature
+  /// for the bodies of its methods (persistently allocated).
+  llvm::DenseMap<mlir::Operation *, ArrayRef<ParsedConstraint>>
+      structInvariants;
 
   /// Emit `old(operand)` in a postcondition as a `kgen.old` at the emitter's
   /// insertion point (see `IREmitter::OldCalls`).

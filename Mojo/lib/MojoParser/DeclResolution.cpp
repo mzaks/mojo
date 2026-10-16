@@ -2744,6 +2744,20 @@ static SmallVector<Value> contractOperands(DeclResolver &resolver,
   return operands;
 }
 
+/// Bind `name` in `scope` to `arg`, a block argument that stands for a
+/// function argument passed with `convention`.
+static void bindArgument(DeclResolver &resolver, ArgConvention convention,
+                         BlockArgument arg, StringAttr name, ASTDecl &scope,
+                         SMLoc loc) {
+  if (convention == ArgConvention::ImmMem)
+    resolver.addFullyResolvedDecl(MBValue(arg), name, loc, &scope);
+  else if (convention == ArgConvention::ImmReg)
+    resolver.addFullyResolvedDecl(SBValue(arg), name, loc, &scope);
+  else
+    resolver.addFullyResolvedDecl(CValue::getMValueForRef(arg), name, loc,
+                                  &scope);
+}
+
 /// Bind the function's argument names in `scope` to the arguments of `block`,
 /// whose first ones stand for the function's arguments, like `resolveBody`
 /// binds them to the entry block's. The `out` argument's result slot is only
@@ -2759,28 +2773,23 @@ static void bindFunctionArguments(DeclResolver &resolver, FnOp funcOp,
       continue;
     if (convention == ArgConvention::ByRefResult && !withResultSlot)
       continue;
-    BlockArgument arg = block.getArgument(argIdx);
-    if (convention == ArgConvention::ImmMem)
-      resolver.addFullyResolvedDecl(MBValue(arg), argName, loc, &scope);
-    else if (convention == ArgConvention::ImmReg)
-      resolver.addFullyResolvedDecl(SBValue(arg), argName, loc, &scope);
-    else
-      resolver.addFullyResolvedDecl(CValue::getMValueForRef(arg), argName, loc,
-                                    &scope);
+    bindArgument(resolver, convention, block.getArgument(argIdx), argName,
+                 scope, loc);
   }
 }
 
 /// Emit the condition of a contract clause into the region of the contract op
 /// `op`, whose operands are `operands` (see `contractOperands`). A scope binds
 /// the function's argument names (and a named result) to the region's block
-/// arguments; `olds` handles the clause's `old(e)` calls. Returns the region's
-/// block.
+/// arguments; `olds` handles the clause's `old(e)` calls. For a struct's
+/// invariant about another argument than `self`, `selfArg` is that argument,
+/// which `self` names in the clause. Returns the region's block.
 static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
                                     ASTDecl &decl,
                                     const ParsedConstraint &clause,
                                     Operation *op, ValueRange operands,
-                                    bool withResult,
-                                    IREmitter::OldCalls *olds) {
+                                    bool withResult, IREmitter::OldCalls *olds,
+                                    std::optional<unsigned> selfArg = {}) {
   SharedState &shared = resolver.shared;
   Location loc = shared.translateLocation(clause.loc);
   SmallVector<Location> argLocs;
@@ -2818,7 +2827,18 @@ static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
             clause.loc, &scope);
   }
 
-  IREmitter clauseEmitter(scope, regionBuilder);
+  ASTDecl *clauseScope = &scope;
+  if (selfArg) {
+    clauseScope = &resolver.addFullyResolvedDecl(nullptr, StringAttr(),
+                                                 clause.loc, &scope);
+    bindArgument(resolver,
+                 funcOp.getFuncTypeGenerator().getArgConventions()[*selfArg],
+                 block->getArgument(*selfArg),
+                 StringAttr::get(resolver.getContext(), "self"), *clauseScope,
+                 clause.loc);
+  }
+
+  IREmitter clauseEmitter(*clauseScope, regionBuilder);
   clauseEmitter.oldCalls = olds;
   clauseEmitter.inContract = true;
   RValue cond =
@@ -2912,9 +2932,8 @@ static LogicalResult checkContractCalls(SharedState &shared, Operation *op,
               "'")
                  .str();
     shared.emitError(clause.loc)
-        << (keyword == "ensures" ? "an '" : "a '") << keyword
-        << "' clause cannot call " << name
-        << ", which " << effect
+        << (keyword == "requires" ? "a '" : "an '") << keyword
+        << "' clause cannot call " << name << ", which " << effect
         << "; a contract may only call functions without effects";
     result = failure();
     return WalkResult::interrupt();
@@ -2961,11 +2980,14 @@ static std::string clauseText(const ParsedConstraint &clause) {
 ///
 /// so the condition is evaluated only when assertions are enabled. A clause's
 /// own message replaces the generated one. `result`, if given, is what the
-/// name `result` means in the clause (see `emitContractCondition`).
+/// name `result` means in the clause (see `emitContractCondition`), and
+/// `self` what `self` means (for a struct's invariant about another
+/// argument). The message names `subject` (the function, if empty).
 static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
-                             IREmitter &emitter,
-                             const ParsedConstraint &clause, StringRef what,
-                             std::optional<CValue> result) {
+                             IREmitter &emitter, const ParsedConstraint &clause,
+                             StringRef what, std::optional<CValue> result,
+                             std::optional<CValue> self = {},
+                             StringRef subject = {}) {
   SharedState &shared = resolver.shared;
   const ExprNode *expr = clause.propExpr;
   if (!emitter.builder || !expr || !shared.hasBuiltinModule())
@@ -3010,12 +3032,18 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
     resolver.addFullyResolvedDecl(
         *result, StringAttr::get(resolver.getContext(), "result"), clause.loc,
         &checkScope);
+  if (self)
+    resolver.addFullyResolvedDecl(
+        *self, StringAttr::get(resolver.getContext(), "self"), clause.loc,
+        &checkScope);
 
   std::string message =
-      clause.message ? clause.message.str()
-                     : (what + " of '" + funcOp.getDeclName().getValue() +
-                        "' does not hold: " + clauseText(clause))
-                           .str();
+      clause.message
+          ? clause.message.str()
+          : (what + " of '" +
+             (subject.empty() ? funcOp.getDeclName().getValue() : subject) +
+             "' does not hold: " + clauseText(clause))
+                .str();
   auto ifOp = HLCF::IfOp::create(
       *emitter.builder, loc, TypeRange{}, enabledI1,
       [&]() -> LogicalResult {
@@ -3047,14 +3075,111 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
     emitter.builder->setInsertionPointAfter(ifOp);
 }
 
+/// `selfArg` of an invariant clause for a `self` that is the function's
+/// named result in a register (a constructor of a register-passable struct).
+static constexpr unsigned kSelfIsResult = ~0u;
+
+/// The type of the value a function argument passes.
+static Type argValueType(Value arg) {
+  if (auto ref = dyn_cast<RefType>(arg.getType()))
+    return ref.getElementType();
+  return arg.getType();
+}
+
+/// The invariant of the struct whose method `funcOp` is, as clauses about
+/// each of its arguments of that struct (`self`, and others like `copy` or
+/// `other`): assumed on entry, unless the function initializes the argument
+/// (`out`), and ensured on return where it initializes or changes it (`out`,
+/// `mut`). Callers do not establish it (see `kgen.requires`).
+static void appendInvariantClauses(DeclResolver &resolver, FnOp funcOp,
+                                   ASTDecl &decl,
+                                   SmallVectorImpl<ContractClause> &contracts) {
+  ASTDecl *parent = decl.getParentDecl();
+  auto structOp = parent
+                      ? dyn_cast_or_null<StructDeclOp>(parent->getIfOperation())
+                      : StructDeclOp();
+  if (!structOp)
+    return;
+  auto it = resolver.structInvariants.find(structOp);
+  if (it == resolver.structInvariants.end())
+    return;
+  // An `@always_inline("builtin")` function folds to its result: it cannot
+  // carry contract ops.
+  if (inlineLevelOrAutomatic(funcOp.getInlineLevel()) ==
+      InlineLevel::AlwaysBuiltin)
+    return;
+
+  // The struct's type, as `self` has it. A method without `self` has no
+  // invariant.
+  FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
+  ArrayRef<ArgConvention> conventions = funcSignature.getArgConventions();
+  Block *body = funcOp.getBody();
+  Type selfType;
+  for (unsigned i = 0, e = conventions.size(); i != e; ++i)
+    if (StringAttr name = funcSignature.getArgName(i);
+        name && name.getValue() == "self")
+      selfType = argValueType(body->getArgument(i));
+  bool selfIsResult = false;
+  if (!selfType && funcOp.getNamedResultAttr() &&
+      funcOp.getNamedResultAttr().getValue() == "self" &&
+      !funcSignature.hasMemoryOnlyResult()) {
+    selfType = funcOp.getUserResultType();
+    selfIsResult = true;
+  }
+  if (!selfType)
+    return;
+
+  StringAttr structName = structOp.getDeclName();
+  SmallVector<ContractClause, 2> ensures;
+  auto add = [&](unsigned selfArg, bool entry, bool exit) {
+    for (const ParsedConstraint &clause : it->second) {
+      if (entry)
+        contracts.push_back(
+            {&clause, ContractClause::Requires, structName, selfArg});
+      if (exit)
+        ensures.push_back(
+            {&clause, ContractClause::Ensures, structName, selfArg});
+    }
+  };
+  for (auto [i, convention] : llvm::enumerate(conventions)) {
+    if (convention == ArgConvention::ByRefError ||
+        argValueType(body->getArgument(i)) != selfType)
+      continue;
+    bool initialized = convention == ArgConvention::ByRefResult;
+    add(i, /*entry=*/!initialized,
+        /*exit=*/initialized || convention == ArgConvention::Mut ||
+            convention == ArgConvention::MutRef);
+  }
+  if (selfIsResult)
+    add(kSelfIsResult, /*entry=*/false, /*exit=*/true);
+  llvm::append_range(contracts, ensures);
+}
+
+/// The argument that `self` names in an invariant clause about argument
+/// `selfArg`, if it is not the one called `self` (see
+/// `emitContractCondition`).
+static std::optional<unsigned> reboundSelf(FnOp funcOp, unsigned selfArg) {
+  if (selfArg == kSelfIsResult)
+    return std::nullopt;
+  StringAttr name = funcOp.getFuncTypeGenerator().getArgName(selfArg);
+  if (name && name.getValue() == "self")
+    return std::nullopt;
+  return selfArg;
+}
+
 LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
                                           IREmitter &emitter,
                                           bool runtimeChecks) {
-  auto it = contractClauses.find(funcOp);
-  if (it == contractClauses.end() || !emitter.builder)
+  if (!emitter.builder)
     return success();
-  ArrayRef<ContractClause> contracts = it->second;
-  contractClauses.erase(it);
+  SmallVector<ContractClause, 4> contracts;
+  if (auto it = contractClauses.find(funcOp); it != contractClauses.end()) {
+    llvm::append_range(contracts, it->second);
+    contractClauses.erase(it);
+  }
+  appendInvariantClauses(*this, funcOp, decl, contracts);
+  if (contracts.empty())
+    return success();
 
   OpBuilder &builder = *emitter.builder;
   Location funcLoc = shared.translateLocation(decl.getLoc());
@@ -3084,19 +3209,30 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
 
     // A precondition reads the values on entry, where `old` has no meaning
     // and the function's result has no value.
+    StringRef keyword = contract.invariantOf ? "invariant" : "requires";
+    std::optional<unsigned> self = contract.invariantOf
+                                       ? reboundSelf(funcOp, contract.selfArg)
+                                       : std::nullopt;
     if (contract.kind == ContractClause::Requires) {
       IREmitter::OldCalls reject{IREmitter::OldCalls::Reject, {}, {}, 0};
+      reject.keyword = keyword;
       SmallVector<Value> operands =
           contractOperands(*this, funcOp, decl, /*withResult=*/false);
       auto requiresOp = KGEN::RequiresOp::create(
           builder, loc, operands, callLoc.getLine(), callLoc.getCol(),
-          callLoc.getFileName(), clause.message, /*invariant=*/StringAttr());
+          callLoc.getFileName(), clause.message, contract.invariantOf);
       Block *condition =
           emitContractCondition(*this, funcOp, decl, clause, requiresOp,
-                                operands, /*withResult=*/false, &reject);
+                                operands, /*withResult=*/false, &reject, self);
       if (!condition ||
-          failed(checkContractCalls(shared, requiresOp, clause, "requires")))
+          failed(checkContractCalls(shared, requiresOp, clause, keyword)))
         return failure();
+      // An invariant holds on entry because every function that changes the
+      // value ensures it: it is not checked again there at run time (where
+      // a clause like `len(self) >= 0` would check itself inside
+      // `__len__`).
+      if (contract.invariantOf)
+        continue;
       Value result = registerResult(*this, funcOp, decl);
       bool usesResult =
           result && llvm::any_of(result.getUsers(), [&](Operation *user) {
@@ -3121,24 +3257,32 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
     // A postcondition is emitted before every return. Emit it here once
     // too, and drop it, to see whether it uses `old`: its `kgen.old` ops need
     // the function's entry marker.
+    // An invariant has no `old`: it is about one state.
     if (!entry)
       entry = KGEN::ContractEntryOp::create(builder, funcLoc);
-    IREmitter::OldCalls olds{
-        IREmitter::OldCalls::Evaluate, entry.getToken(), {}, 0};
+    IREmitter::OldCalls olds{contract.invariantOf
+                                 ? IREmitter::OldCalls::Reject
+                                 : IREmitter::OldCalls::Evaluate,
+                             entry.getToken(),
+                             {},
+                             0};
+    olds.keyword = keyword;
     SmallVector<Value> operands =
         contractOperands(*this, funcOp, decl, /*withResult=*/true);
-    auto trial = KGEN::EnsuresOp::create(builder, loc, operands,
-                                         callLoc.getLine(), callLoc.getCol(),
-                                         callLoc.getFileName(), clause.message,
-                                         /*invariant=*/StringAttr());
+    auto trial = KGEN::EnsuresOp::create(
+        builder, loc, operands, callLoc.getLine(), callLoc.getCol(),
+        callLoc.getFileName(), clause.message, contract.invariantOf);
     if (!emitContractCondition(*this, funcOp, decl, clause, trial, operands,
-                               /*withResult=*/true, &olds) ||
-        failed(checkContractCalls(shared, trial, clause, "ensures")))
+                               /*withResult=*/true, &olds, self) ||
+        failed(
+            checkContractCalls(shared, trial, clause,
+                               contract.invariantOf ? "invariant" : "ensures")))
       return failure();
     bool runtimeCheck = olds.count == 0 && !hasQuantifier(trial);
     trial.erase();
     needsEntry |= olds.count != 0;
-    posts.push_back({&clause, entry.getToken(), runtimeCheck});
+    posts.push_back({&clause, entry.getToken(), runtimeCheck,
+                     contract.invariantOf, contract.selfArg});
   }
   if (entry && !needsEntry)
     entry.erase();
@@ -3172,10 +3316,27 @@ LogicalResult DeclResolver::emitPostconditions(FnOp funcOp,
         if (convention == ArgConvention::ByRefResult)
           result = CValue::getMValueForRef(arg);
     }
-    for (const PostconditionClause &post : it->second)
-      if (post.runtimeCheck)
+    for (const PostconditionClause &post : it->second) {
+      if (!post.runtimeCheck)
+        continue;
+      if (!post.invariantOf) {
         emitRuntimeCheck(*this, funcOp, emitter, *post.clause,
                          "postcondition", result);
+        continue;
+      }
+      // An invariant about another argument than `self`: `self` is that
+      // argument.
+      std::optional<CValue> self;
+      if (std::optional<unsigned> arg = reboundSelf(funcOp, post.selfArg)) {
+        StringAttr name = funcOp.getFuncTypeGenerator().getArgName(*arg);
+        ArrayRef<ASTDecl *> argDecls = decl->lookupInCurrentScope(name);
+        if (argDecls.size() != 1 || !argDecls[0]->getIfIRValue())
+          continue;
+        self = argDecls[0]->getIfIRValue();
+      }
+      emitRuntimeCheck(*this, funcOp, emitter, *post.clause, "invariant",
+                       result, self, post.invariantOf.getValue());
+    }
   }
 
   auto callLoc =
@@ -3187,9 +3348,11 @@ LogicalResult DeclResolver::emitPostconditions(FnOp funcOp,
     auto ensuresOp = KGEN::EnsuresOp::create(
         builder, shared.translateLocation(post.clause->loc), operands,
         callLoc.getLine(), callLoc.getCol(), callLoc.getFileName(),
-        post.clause->message, /*invariant=*/StringAttr());
+        post.clause->message, post.invariantOf);
+    std::optional<unsigned> self =
+        post.invariantOf ? reboundSelf(funcOp, post.selfArg) : std::nullopt;
     if (!emitContractCondition(*this, funcOp, *decl, *post.clause, ensuresOp,
-                               operands, /*withResult=*/true, &olds))
+                               operands, /*withResult=*/true, &olds, self))
       return failure();
   }
   return success();
@@ -4504,9 +4667,29 @@ static LogicalResult parseExplicitDestroyMessage(SharedState &shared,
   return success();
 }
 
+/// Parse a struct's `invariant` clauses, after its `where` clauses.
+static ParseResult
+parseInvariantClauses(ParserBase &p, SmallVectorImpl<ParsedConstraint> &clauses,
+                      std::optional<size_t> stmtIndent) {
+  // Watch out for a dedented clause on a new line.
+  while (p.isTokenInCurrentStatement(stmtIndent) &&
+         p.consumeIfSoftIdentifier("invariant")) {
+    ParsedConstraint clause;
+    if (clause.parse(p, stmtIndent, "invariant"))
+      return failure();
+    clauses.push_back(clause);
+  }
+  if (!clauses.empty() && p.isTokenInCurrentStatement(stmtIndent) &&
+      p.getToken().isIdentifier() && p.getTokenSpelling() == "where")
+    return p.emitError(p.getToken().getLoc(),
+                       "'where' clauses must come before 'invariant' clauses");
+  return success();
+}
+
 /// structdef ::=
 ///   [decorators] "struct" identifier [param_signature]
-///                ["(" conformance_list ")"] ("where" expression)* ":" suite
+///                ["(" conformance_list ")"] ("where" expression)*
+///                ("invariant" expression)* ":" suite
 ///
 LogicalResult DeclResolver::resolveSignature(StructDeclOp structOp,
                                              Lexer &lexer, ASTDecl &decl) {
@@ -4526,6 +4709,7 @@ LogicalResult DeclResolver::resolveSignature(StructDeclOp structOp,
   SMLoc identifierLoc;
   SmallVector<ParsedConformanceEntry> parsedConformances;
   SmallVector<ParsedTraitConstraint> parsedConstraints;
+  SmallVector<ParsedConstraint, 2> invariants;
 
   if (p.parseToken(Token::kw_struct,
                    "internal error: checked by stmt parser") ||
@@ -4537,9 +4721,15 @@ LogicalResult DeclResolver::resolveSignature(StructDeclOp structOp,
           /*allowConformanceConstraints=*/true) ||
       parsedParams.parseTrailingConstraintsIfPresent(
           p, sigDecl.getIndentation()) ||
+      parseInvariantClauses(p, invariants, sigDecl.getIndentation()) ||
       p.parseToken(Token::colon, "expected ':' in struct definition") ||
       decl.isErroneous())
     return failure();
+
+  // Keep the invariant for the bodies of the methods, which emit it.
+  if (!invariants.empty())
+    structInvariants[structOp] =
+        shared.getPersistentCopy(ArrayRef<ParsedConstraint>(invariants));
 
   // Type-check parameters before resolving the conformance list so parameter
   // declarations are in scope for conformance-list constraint emission.

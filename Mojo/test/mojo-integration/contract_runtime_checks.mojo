@@ -13,7 +13,9 @@
 
 # `requires` and `ensures` clauses are checked at run time when assertions
 # are enabled (see Mojo/proposals/function-contracts.md), and not evaluated
-# at all otherwise. A clause that uses `old` is not checked at run time.
+# at all otherwise. A clause that uses `old` is not checked at run time. A
+# struct's `invariant` clauses are checked where a method that initializes or
+# changes a value of it returns.
 
 # Without assertions every case runs to its end.
 # RUN: %mojo-no-debug-no-assert -D CASE=1 %s | FileCheck %s --check-prefix=OFF
@@ -24,6 +26,8 @@
 # RUN: not %mojo -D CASE=3 %s 2>&1 | FileCheck %s --check-prefix=MESSAGE
 # RUN: not %mojo -D CASE=4 %s 2>&1 | FileCheck %s --check-prefix=MEMORY
 # RUN: %mojo -D CASE=5 %s 2>&1 | FileCheck %s --check-prefix=PASS
+# RUN: not %mojo -D CASE=6 %s 2>&1 | FileCheck %s --check-prefix=INVARIANT
+# RUN: not %mojo -D CASE=7 %s 2>&1 | FileCheck %s --check-prefix=OTHER
 
 from std.sys.defines import get_defined_int
 
@@ -53,6 +57,27 @@ def grow(mut xs: List[Int]) ensures len(xs) == old(len(xs)) + 2:
     xs.append(1)  # one short, but `old` clauses are not checked at run time
 
 
+struct Gauge(Movable)
+    invariant self.level >= 0:
+    var level: Int
+
+    def __init__(out self, level: Int) requires level >= 0:
+        self.level = level
+
+    @inline(.never)
+    def set(mut self, level: Int):
+        self.level = level  # no check that `level` is not negative
+
+    @inline(.never)
+    def drain(mut self, mut other: Self):
+        self.level += other.level
+        other.level -= 1  # one too many
+
+    @inline(.never)
+    def read(self) -> Int:
+        return self.level
+
+
 def main():
     comptime test_case = get_defined_int["CASE", 0]()
     var xs: List[Int] = [1, 2, 3]
@@ -71,6 +96,20 @@ def main():
     elif test_case == 5:
         grow(xs)
         print(len(xs))
+        var g = Gauge(1)
+        g.set(2)
+        print(g.read())
+    elif test_case == 6:
+        var g = Gauge(1)
+        # INVARIANT: invariant of 'Gauge' does not hold: self.level >= 0
+        g.set(-1)
+        print(g.read())
+    elif test_case == 7:
+        var g = Gauge(1)
+        var h = Gauge(0)
+        # OTHER: invariant of 'Gauge' does not hold: self.level >= 0
+        g.drain(h)
+        print(h.read())
     # OFF: done
     # PASS: done
     print("done")
