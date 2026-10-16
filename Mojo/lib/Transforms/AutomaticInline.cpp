@@ -49,6 +49,18 @@ static bool isAlwaysInlineFunction(FuncOp func) {
          inlineLevelOrAutomatic(func.getInlineLevel()) == InlineLevel::Always;
 }
 
+/// Whether `call` is in a contract clause (`kgen.requires`, `kgen.ensures`,
+/// `kgen.old`): a specification, never run and erased before code
+/// generation. A call there back into the function (a struct's
+/// `invariant len(self) >= 0` in its `__len__`) is not a recursion.
+static bool inContract(Operation *call) {
+  for (Operation *parent = call->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (isa<RequiresOp, EnsuresOp, OldOp>(parent))
+      return true;
+  return false;
+}
+
 namespace {
 //===----------------------------------------------------------------------===//
 // AlwaysInlineGraphNode
@@ -69,7 +81,7 @@ struct AlwaysInlineGraph
 
   static bool shouldAddToGraph(KGENCallOpInterface call,
                                AlwaysInlineGraphNode *node) {
-    return isAlwaysInlineFunction(node->func);
+    return isAlwaysInlineFunction(node->func) && !inContract(call);
   }
 
   LogicalResult diagnoseCycle(ModuleOp module, const SymbolTable &symtab);
@@ -139,6 +151,10 @@ struct CallGraphNode
   /// parallel inline work dependencies. More inlining heuristics
   /// are defined in the shouldInlineCallee() function.
   bool canInlineCallee(CallGraphNode *callee);
+
+  /// Whether `call` is in a contract clause and leads back into this
+  /// function: it is left as a call.
+  bool recursesThroughContract(Operation *call, CallGraphNode *callee);
 
   /// Lazily compute and return the number of operations in the function.
   uint64_t getNumOps() {
@@ -331,6 +347,11 @@ bool CallGraphNode::canInlineCallee(CallGraphNode *callee) {
   return !sccNodes.contains(callee) && (callee != this) && callee->reachable;
 }
 
+bool CallGraphNode::recursesThroughContract(Operation *call,
+                                            CallGraphNode *callee) {
+  return inContract(call) && (callee == this || sccNodes.contains(callee));
+}
+
 bool CallGraphNode::shouldInlineCallee(CallGraphNode *callee,
                                        uint64_t threshold) {
   // Should always inline `always_inline` ones.
@@ -418,10 +439,11 @@ void CallGraph::inlineNode(CallGraphNode *caller, uint64_t threshold) {
   SmallVector<AnyAsyncValueRef> calleeAsynchValues;
   DenseSet<CallGraphNode *> seenNodes;
   // Collect callee dependencies to wait.
-  for (auto [_, callee] : caller->callsites) {
+  for (auto [call, callee] : caller->callsites) {
     // Don't attempt to inline functions in the SCCs of their callers or those
     // in unreachable SCCs.
-    if (!caller->canInlineCallee(callee))
+    if (!caller->canInlineCallee(callee) ||
+        caller->recursesThroughContract(call, callee))
       continue;
     if (seenNodes.insert(callee).second)
       calleeAsynchValues.emplace_back(callee->doneInlining.copy());
@@ -440,7 +462,8 @@ void CallGraph::inlineNode(CallGraphNode *caller, uint64_t threshold) {
     for (auto [call, callee] : caller->callsites) {
       // Make sure we don't call shouldInlineCallee on a callee that we are not
       // waiting on.
-      if (!caller->canInlineCallee(callee))
+      if (!caller->canInlineCallee(callee) ||
+          caller->recursesThroughContract(call, callee))
         continue;
 
       // Now that the callee has finished processing along with its inner
