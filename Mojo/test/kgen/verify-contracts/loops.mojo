@@ -14,7 +14,9 @@
 # README.md.
 
 
+from std.collections import Deque
 from std.math import align_down
+from std.testing import assert_true
 
 
 def change(mut xs: List[Int]):
@@ -231,6 +233,14 @@ def ok_scaled_counter(p: Pointer[Int, MutUntrackedOrigin], n: Int) -> Int
         t += p[unsafe_offset=off + 3]  # `off` is 4 times the iterations so far
         off += 4
     return t
+
+
+def ok_fields_after_raising_loop(n: Int) raises -> Int:
+    var q = Deque[Int]()
+    q.append(n)
+    for i in range(3):
+        assert_true(i >= 0)  # may raise, and destroy `q` on the way out
+    return q[0]  # the loop does not change `q`
 
 
 # --- must stay UNPROVEN ---

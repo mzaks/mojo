@@ -153,6 +153,10 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
 - A call changes only what it can write: memory reachable through its `mut`
   references is unknown after it (`bad_after_mut_call`), and memory passed by
   immutable reference is kept (`ok_after_imm_call`). Its results are unknown.
+  A move (`var p = q^`) keeps the value and its fields (`ok_deque_moved`).
+- A loop writes what it stores to and passes by `mut` reference, except a
+  value it destroys: its destructor runs on a path that leaves the loop
+  (a raise), or after the value's last use (`ok_fields_after_raising_loop`).
 - Iterating a `List`, `Span`, `Array` or `Deque` (`for x in xs`, and
   `for i, x in enumerate(xs)`), or consuming a `List` or `Array`
   (`for x in xs^`, `for x in [1, 2, 3]`), yields exactly `len(xs)` times:

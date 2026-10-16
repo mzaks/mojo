@@ -3628,15 +3628,33 @@ private:
               !writtenThrough(call->getResult(0)))
             return;
           confined = confinedWrites(call);
-          for (Value operand : call.getOperands())
+          // A destructor in the code (of a value the code is the last to
+          // use, on a path that may leave it, such as a raise) does not
+          // change the value for a later iteration: after it, the value is
+          // not read again. Neither its argument nor its origin, which
+          // names only that value, is written.
+          std::optional<CalleeName> callee = calleeName(call.getCallee());
+          std::optional<Loc> destroyed;
+          if (callee && StringRef(callee->path).contains("::__deinit__(") &&
+              call.getNumOperands() >= 1)
+            destroyed = placeOf(call.getOperands()[0]);
+          for (auto [index, operand] : llvm::enumerate(call.getOperands()))
             if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
-                ref && !ref.isMutableKnown(false))
+                ref && !ref.isMutableKnown(false) && !(destroyed && index == 0))
               addRef(operand);
           // Keep the printed list alive while its elements are used.
           std::string origins = printed(call.getImplicitOriginsAttr());
-          for (StringRef origin : topLevelElements(origins))
-            if (mutableOrigin(origin))
-              addOrigin(origin);
+          for (StringRef origin : topLevelElements(origins)) {
+            if (!mutableOrigin(origin))
+              continue;
+            if (destroyed)
+              if (std::optional<SmallVector<Value>> named =
+                      rootsNamedBy(origin);
+                  named && named->size() == 1 &&
+                  named->front() == destroyed->root)
+                continue;
+            addOrigin(origin);
+          }
           confined = false;
         } else if (op->getNumRegions() && !seen.count(op) &&
                    !isa<HLCF::IfOp, HLCF::LoopOp, LIT::TryOp, RequiresOp,
@@ -6111,6 +6129,8 @@ private:
     assumeListLiteral(call, name, before, state);
     if (callee)
       assumeCopy(call, callee, before, state);
+    if (name)
+      assumeMove(call, *name, before, state);
     // `String(literal)`: as long as the literal. Its own contract cannot say
     // so: naming `String.byte_length()` there makes the declaration depend
     // on itself (through a `String` default argument in `SIMD.cast`).
@@ -6266,6 +6286,30 @@ private:
       params = frame.parent;
       return;
     }
+  }
+
+  /// A move (`var p = q^`, the synthesized `__init__(move: q, p)`): the new
+  /// value is the old one, with its fields as they were before the call,
+  /// so what was known of it (a list's length and elements, a struct's
+  /// fields and the invariant they keep) holds for the new one.
+  void assumeMove(LIT::CallOp call, const CalleeName &name, State &before,
+                  State &state) {
+    if (!StringRef(name.path).contains("::__init__(move:") ||
+        call.getNumOperands() != 2)
+      return;
+    std::optional<Loc> src = placeOf(call.getOperands()[0]);
+    std::optional<Loc> dst = placeOf(call.getOperands()[1]);
+    if (!src || !dst || src->root == dst->root)
+      return;
+    // The whole value, so that its length is the same term.
+    load(*src, before, placeType(*src));
+    forget(*dst, state);
+    for (auto &[loc, value] : before.env)
+      if (loc.root == src->root &&
+          (loc.path == src->path ||
+           StringRef(loc.path).starts_with(src->path + "/")))
+        state.env[Loc{dst->root,
+                      dst->path + loc.path.substr(src->path.size())}] = value;
   }
 
   /// A list or array literal (`[a, b, c]`): its elements are the values it is given,

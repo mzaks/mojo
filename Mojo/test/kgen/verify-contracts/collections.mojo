@@ -145,6 +145,14 @@ def ok_linked_list_enumerate(l: LinkedList[Int]) -> Int:
     return t
 
 
+
+def ok_deque_moved() -> Int:
+    var q = Deque[Int]()
+    q.append(1)
+    q.append(2)
+    var p = q^  # a move keeps the value: `p` has 2 elements
+    return p[1]
+
 # --- must stay UNPROVEN ---
 def bad_bitset(mut b: BitSet[64], i: Int):
     if 0 <= i and i <= 64:
