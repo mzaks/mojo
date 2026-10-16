@@ -16,6 +16,7 @@
 #include "ClosureEmitter.h"
 #include "DLValues.h"
 #include "ExprNodes.h"
+#include "OverloadSet.h"
 #include "IREmitter.h"
 #include "Mojo/MojoParser/ASTDecl.h"
 #include "Mojo/MojoParser/Constraints.h"
@@ -2921,8 +2922,134 @@ static LogicalResult checkContractCalls(SharedState &shared, Operation *op,
   return result;
 }
 
+/// Whether a contract op's region has a quantifier (`all([... for ...])`):
+/// such a clause is not checked at run time, where it would build a list.
+static bool hasQuantifier(Operation *op) {
+  return op
+      ->walk([](KGEN::ForallOp) { return WalkResult::interrupt(); })
+      .wasInterrupted();
+}
+
+/// The source text of a clause's condition on one line, for the message of
+/// its run-time check.
+static std::string clauseText(const ParsedConstraint &clause) {
+  if (!clause.loc.isValid() || !clause.condEnd.isValid() ||
+      clause.condEnd.getPointer() <= clause.loc.getPointer())
+    return {};
+  StringRef text(clause.loc.getPointer(),
+                 clause.condEnd.getPointer() - clause.loc.getPointer());
+  std::string out;
+  bool space = false;
+  for (char c : text) {
+    if (isspace(static_cast<unsigned char>(c))) {
+      space = true;
+      continue;
+    }
+    if (space && !out.empty())
+      out += ' ';
+    space = false;
+    out += c;
+  }
+  return out;
+}
+
+/// Emits the run-time check of a contract clause at the emitter's insertion
+/// point:
+///
+///   if _contract_checks_enabled():
+///       _check_contract(condition, "<what> of 'f' does not hold: condition")
+///
+/// so the condition is evaluated only when assertions are enabled. A clause's
+/// own message replaces the generated one. `result`, if given, is what the
+/// name `result` means in the clause (see `emitContractCondition`).
+static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
+                             IREmitter &emitter,
+                             const ParsedConstraint &clause, StringRef what,
+                             std::optional<CValue> result) {
+  SharedState &shared = resolver.shared;
+  const ExprNode *expr = clause.propExpr;
+  if (!emitter.builder || !expr || !shared.hasBuiltinModule())
+    return;
+  // The standard library is not checked: the checks themselves use it (the
+  // assertion mode is a string, compared through pointers whose accessors
+  // have contracts), so a check inside it would need itself.
+  for (Operation *parent = funcOp->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (auto package = dyn_cast<LIT::PackageOp>(parent);
+        package && package.getSymName() == "std")
+      return;
+  ASTDecl &scope = emitter.declScope;
+  ArrayRef<ASTDecl *> enabledFns = shared.getBuiltinFunction(
+      scope, {"std", "builtin", "_verification"}, "_contract_checks_enabled",
+      clause.loc);
+  ArrayRef<ASTDecl *> assertFns = shared.getBuiltinFunction(
+      scope, {"std", "builtin", "_verification"}, "_check_contract",
+      clause.loc);
+  if (enabledFns.empty() || assertFns.empty())
+    return;
+  Location loc = shared.translateLocation(clause.loc);
+
+  OverloadSet enabledCall("_contract_checks_enabled", enabledFns,
+                          ParamBindings(scope, expr), CallSyntax::kDirectCall);
+  CValue enabled = enabledCall.emitCall(
+      CallOperands(CallSyntax::kDirectCall, expr, EC_BoolCondition), emitter);
+  if (!enabled)
+    return;
+  RValue enabledBool =
+      emitter.emitScalarBool({enabled, expr}, EC_BoolCondition);
+  Value enabledI1 =
+      emitter.emitSRValue({AnyValue(enabledBool), expr}, EC_BoolCondition);
+  if (!enabledI1)
+    return;
+
+  // In a postcondition, `result` names the result, unless an argument has
+  // that name.
+  ASTDecl &checkScope =
+      resolver.addFullyResolvedDecl(nullptr, StringAttr(), clause.loc, &scope);
+  if (result && !hasArgumentNamed(funcOp, "result"))
+    resolver.addFullyResolvedDecl(
+        *result, StringAttr::get(resolver.getContext(), "result"), clause.loc,
+        &checkScope);
+
+  std::string message =
+      clause.message ? clause.message.str()
+                     : (what + " of '" + funcOp.getDeclName().getValue() +
+                        "' does not hold: " + clauseText(clause))
+                           .str();
+  auto ifOp = HLCF::IfOp::create(
+      *emitter.builder, loc, TypeRange{}, enabledI1,
+      [&]() -> LogicalResult {
+        IREmitter check(checkScope, *emitter.builder);
+        AnyValue cond = check.emitExpr(expr, EC_TopLevelStmt);
+        if (cond) {
+          ExprDest messageDest(EC_TopLevelStmt);
+          CValue messageValue = StringLiteralNode::emitCtorCall(
+              message, expr, messageDest, check);
+          if (messageValue) {
+            CallOperands operands(CallSyntax::kDirectCall, expr,
+                                  EC_TopLevelStmt);
+            operands.add({cond, expr});
+            operands.add({messageValue, expr});
+            OverloadSet call("_check_contract", assertFns,
+                             ParamBindings(checkScope, expr),
+                             CallSyntax::kDirectCall);
+            call.emitCall(std::move(operands), check);
+          }
+        }
+        HLCF::YieldOp::create(*check.builder, loc);
+        return success();
+      },
+      [&]() -> LogicalResult {
+        HLCF::YieldOp::create(*emitter.builder, loc);
+        return success();
+      });
+  if (ifOp)
+    emitter.builder->setInsertionPointAfter(ifOp);
+}
+
 LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
-                                          IREmitter &emitter) {
+                                          IREmitter &emitter,
+                                          bool runtimeChecks) {
   auto it = contractClauses.find(funcOp);
   if (it == contractClauses.end() || !emitter.builder)
     return success();
@@ -2985,6 +3112,9 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
                "it in an 'ensures' clause";
         return failure();
       }
+      if (runtimeChecks && !hasQuantifier(requiresOp))
+        emitRuntimeCheck(*this, funcOp, emitter, clause, "precondition",
+                         std::nullopt);
       continue;
     }
 
@@ -3004,9 +3134,10 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
                                /*withResult=*/true, &olds) ||
         failed(checkContractCalls(shared, trial, clause, "ensures")))
       return failure();
+    bool runtimeCheck = olds.count == 0 && !hasQuantifier(trial);
     trial.erase();
     needsEntry |= olds.count != 0;
-    posts.push_back({&clause, entry.getToken()});
+    posts.push_back({&clause, entry.getToken(), runtimeCheck});
   }
   if (entry && !needsEntry)
     entry.erase();
@@ -3016,7 +3147,8 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
 }
 
 LogicalResult DeclResolver::emitPostconditions(FnOp funcOp,
-                                               IREmitter &emitter) {
+                                               IREmitter &emitter,
+                                               bool runtimeChecks) {
   auto it = postconditions.find(funcOp);
   if (it == postconditions.end() || !emitter.builder)
     return success();
@@ -3024,6 +3156,27 @@ LogicalResult DeclResolver::emitPostconditions(FnOp funcOp,
   if (!decl)
     return success();
   OpBuilder &builder = *emitter.builder;
+
+  // The run-time checks come first, so the contract ops stay right before
+  // the return. A clause that uses `old` or a quantifier is not checked (see
+  // `PostconditionClause::runtimeCheck`).
+  if (runtimeChecks) {
+    std::optional<CValue> result;
+    if (Value var = registerResult(*this, funcOp, *decl)) {
+      result = CValue(MLValue(var));
+    } else if (!ASTType(funcOp.getUserResultType()).isNoneType()) {
+      for (auto [arg, convention] :
+           llvm::zip(funcOp.getBody()->getArguments(),
+                     funcOp.getFuncTypeGenerator().getArgConventions()))
+        if (convention == ArgConvention::ByRefResult)
+          result = CValue::getMValueForRef(arg);
+    }
+    for (const PostconditionClause &post : it->second)
+      if (post.runtimeCheck)
+        emitRuntimeCheck(*this, funcOp, emitter, *post.clause,
+                         "postcondition", result);
+  }
+
   auto callLoc =
       emitCallLocation(builder, shared.translateLocation(decl->getLoc()));
   for (const PostconditionClause &post : it->second) {
@@ -3214,13 +3367,14 @@ ParseResult DeclResolver::resolveBody(FnOp funcOp, Lexer &lexer,
     postconditions.erase(funcOp);
     contractResults.erase(funcOp);
   });
-  if (failed(emitContracts(funcOp, decl, emitter)))
+  if (failed(emitContracts(funcOp, decl, emitter,
+                           /*runtimeChecks=*/!contractOnly)))
     return failure();
 
   // A required trait method has no return: its postconditions follow the
   // preconditions directly, as the contract every implementation provides.
   if (contractOnly) {
-    if (failed(emitPostconditions(funcOp, emitter)))
+    if (failed(emitPostconditions(funcOp, emitter, /*runtimeChecks=*/false)))
       return failure();
     endFn.erase();
     auto builder = OpBuilder::atBlockEnd(&body);

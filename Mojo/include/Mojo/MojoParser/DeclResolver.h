@@ -68,6 +68,9 @@ struct PostconditionClause {
   const ParsedConstraint *clause;
   /// The function's `kgen.contract.entry` token, if the clause uses `old`.
   mlir::Value entry;
+  /// Whether the clause is also checked at run time: not if it uses `old`
+  /// (its entry values would have to be kept) or a quantifier.
+  bool runtimeCheck = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -236,7 +239,10 @@ public:
   }
   /// Emit the postconditions of the function being emitted before one of its
   /// returns, at the emitter's insertion point.
-  LogicalResult emitPostconditions(FnOp op, IREmitter &emitter);
+  /// With `runtimeChecks`, each clause that can be is also checked at run time
+  /// when assertions are enabled (see `_contract_checks_enabled`).
+  LogicalResult emitPostconditions(FnOp op, IREmitter &emitter,
+                                   bool runtimeChecks = true);
   /// For a function with postconditions that returns an unnamed result in a
   /// register, while its body is emitted: the local that holds the result
   /// while the postconditions read it (`result` in an `ensures` clause).
@@ -418,7 +424,8 @@ private:
   /// Emit a function's contract at the start of its body: preconditions as
   /// `kgen.requires` ops, the values on entry of postconditions as `kgen.old`
   /// ops, and record the postconditions for its returns.
-  LogicalResult emitContracts(FnOp op, ASTDecl &decl, IREmitter &emitter);
+  LogicalResult emitContracts(FnOp op, ASTDecl &decl, IREmitter &emitter,
+                              bool runtimeChecks);
   /// The contract clauses of functions, recorded with a function's signature
   /// for its body (persistently allocated).
   llvm::DenseMap<mlir::Operation *, ArrayRef<ContractClause>> contractClauses;

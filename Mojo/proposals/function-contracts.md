@@ -361,13 +361,36 @@ These are warnings: verification is opt-in (see
 ## Runtime checking
 
 The verification ops are erased and cost nothing. Besides them, the parser
-emits each clause as an ordinary `debug_assert` with the clause's message: at
-the start of the body for preconditions, and before every return for
-postconditions, with `old(e)` computed into a local on entry. These follow
-the existing assert modes, so they are off by default and on under
-`-D ASSERT=all`, which is how the stdlib tests run. That makes contracts
-useful before any proof: tests exercise them. The verifier does not treat
-these asserts as obligations; the contract ops are what it checks.
+emits a run-time check of each clause: at the start of the body for a
+precondition, and before every return for a postcondition.
+
+```mojo
+if _contract_checks_enabled():
+    _check_contract(condition, "precondition of 'get' does not hold: 0 <= i and i < len(xs)")
+```
+
+The guard follows the assertion modes of a `debug_assert` without an
+`assert_mode`: checks are off by default and on under `-D ASSERT=all`. The
+condition is evaluated only when they are on, so a disabled check costs
+nothing. A failure reports the clause's own message
+if it has one, else which contract of which function failed, with the
+clause's text. That makes contracts useful before any proof: tests exercise
+them. The verifier does not treat these checks as obligations; the contract
+ops are what it checks.
+
+Three kinds of clauses are not checked at run time:
+
+- **Clauses that use `old`.** Their entry values would have to be computed
+  at the start of the function and kept until each return. The parser has no
+  way yet to do that only when checks are on: a value computed inside the
+  guard at entry cannot be read by the guard at a return.
+- **Clauses with a quantifier** (`all([... for i in range(n)])`). Checked as
+  code, they would build a list and loop over it at every call.
+- **Clauses in the standard library.** The checks are built from the
+  standard library: the assertion mode is a string, and comparing strings
+  goes through pointer accessors that have contracts of their own. A check
+  inside those would need itself, at compile time. User code, `max` and the
+  kernels are checked.
 
 A proven obligation needs no runtime check, which is the eventual payoff for
 bounds checks: `check_bounds` could be dropped where the verifier proved it.
@@ -465,7 +488,9 @@ Differences from the design above, found while implementing it:
   return, and the analysis still reads the callee's body as well. A callee
   that breaks its postcondition then makes the rest of its caller unreachable;
   the broken postcondition is reported in the callee.
-- The parser does not emit runtime `debug_assert`s for the clauses yet.
+- Run-time checks cover clauses without `old` or a quantifier, outside the
+  standard library
+  (see [Runtime checking](#runtime-checking)).
 - The doc generator does not show contracts in signatures yet.
 
 Findings from using the contracts:

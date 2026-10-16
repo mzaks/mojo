@@ -89,6 +89,9 @@ struct ParsedConstraint {
   /// as it is for a `not Trait` conformance entry: the clause exists only to
   /// carry its `message`.
   ExprNode *propExpr = nullptr;
+  /// Where the condition's source text ends (the start of the next token),
+  /// for messages that quote it.
+  SMLoc condEnd;
   /// Optional user-provided failure message, from either the
   /// `where (condition, "message")` or the `where condition else "message"`
   /// form. Null if no message was written.

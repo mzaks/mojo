@@ -1322,6 +1322,7 @@ ParseResult ParsedConstraint::parse(ParserBase &p,
   ExprNode *parsed;
   if (p.parseExpression(parsed, stmtIndent))
     return failure();
+  condEnd = p.getToken().getLoc();
 
   // A message is written either `where (condition, "message")` -- which the
   // expression parser produces as a parenthesized two-element tuple -- or

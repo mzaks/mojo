@@ -12,10 +12,12 @@
 # ===----------------------------------------------------------------------=== #
 
 # `requires` and `ensures` clauses are contracts for static verification
-# (see Mojo/proposals/function-contracts.md). They have no runtime effect: the
-# program compiles and runs as without them, even when a call violates one.
+# (see Mojo/proposals/function-contracts.md). Without assertions they have no
+# runtime effect: the program compiles and runs as without them, even when a
+# call violates one. contract_runtime_checks.mojo covers `-D ASSERT=all`,
+# where the clauses are checked.
 
-# RUN: %mojo %s | FileCheck %s
+# RUN: %mojo-no-debug-no-assert %s | FileCheck %s
 
 
 @inline(.never)
