@@ -41,7 +41,7 @@ from std.memory import (
     unsafe_uninit_move_n,
 )
 from std.builtin.builtin_slice import ContiguousSlice, StridedSlice
-from std.builtin._verification import _assume, _ensures, _same_elements
+from std.builtin._verification import _ensures, _same_elements
 from .optional import Optional
 
 # ===-----------------------------------------------------------------------===#
@@ -168,7 +168,8 @@ struct List[T: AnyType, /](
     Movable,
     Sized,
     Writable where conforms_to(T, Writable),
-):
+)
+    invariant self._len >= 0:
     """A dynamically-allocated and resizable list.
 
     This is Mojo's primary dynamic array implementation, meaning the list can
@@ -817,8 +818,6 @@ struct List[T: AnyType, /](
         Returns:
             The number of elements in the list.
         """
-        # Type invariant, maintained by every mutating method.
-        _assume(self._len >= 0)
         return self._len
 
     def __bool__(self) -> Bool:

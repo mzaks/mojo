@@ -49,7 +49,10 @@ struct Deque[ElementType: Movable](
     Movable,
     Sized,
     Writable where conforms_to(ElementType, Writable),
-):
+)
+    invariant self._capacity > 0 and self._data._extent() >= self._capacity
+    invariant 0 <= self._head and self._head < self._capacity
+    invariant 0 <= self._tail and self._tail < self._capacity:
     """Implements a double-ended queue.
 
     It supports pushing and popping from both ends in O(1) time resizing the
@@ -1087,7 +1090,8 @@ struct Deque[ElementType: Movable](
         )
 
     @inline(.always)
-    def _physical_index(self, logical_index: Int) -> Int:
+    def _physical_index(self, logical_index: Int) -> Int
+        ensures 0 <= result and result < self._capacity:
         """Calculates the physical index in the circular buffer.
 
         Args:
