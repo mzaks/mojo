@@ -4635,11 +4635,19 @@ private:
 
   /// The function's own postcondition, where it returns.
   void proveEnsures(EnsuresOp ensures, State &state) {
-    // Reported at the return: the op after the function's last clause.
+    // Reported at the return the clauses are checked for: the `return`
+    // statement (the ops between them, such as the load of an unnamed
+    // result, are at the function's location), or the function where it
+    // ends without one.
     Operation *next = ensures->getNextNode();
     while (next && isa<EnsuresOp>(next))
       next = next->getNextNode();
-    Location at = next ? next->getLoc() : ensures.getLoc();
+    Operation *ret = next;
+    while (ret && !isa<HLCF::ReturnOp>(ret))
+      ret = ret->getNextNode();
+    Location at = ret    ? ret->getLoc()
+                  : next ? next->getLoc()
+                         : ensures.getLoc();
     Obligation ob{state.pc, "false", at, ensures.getLoc(), displayName(fn)};
     ob.postcondition = true;
     if (std::optional<StringRef> invariant = ensures.getInvariant())

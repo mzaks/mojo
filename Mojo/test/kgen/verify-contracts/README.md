@@ -195,7 +195,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
 - Postconditions: a function's own clauses on `out` and `mut` arguments are
   proven where it returns, with `old(...)` evaluated at its entry, and a
   callee's are assumed after the call (only where it did not raise). An
-  unproven one is reported at the return, with a note at the clause.
+  unproven one is reported at the `return` statement (at the `def` where
+  the function ends without one), with a note at the clause.
 - Struct invariants: a struct's `invariant` clauses hold for each argument
   of the struct's type of its methods. They are assumed where a method
   starts (unless it initializes the argument, `out`), proven where a method
