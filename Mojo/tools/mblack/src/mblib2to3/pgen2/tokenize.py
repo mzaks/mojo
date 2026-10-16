@@ -598,7 +598,9 @@ def untokenize(iterable: Iterable[TokenInfo]) -> str:
 
 
 def generate_tokens(
-    readline: Callable[[], str], grammar: Grammar | None = None
+    readline: Callable[[], str],
+    grammar: Grammar | None = None,
+    continuation_lines: set[int] | frozenset[int] = frozenset(),
 ) -> Iterator[GoodTokenInfo]:
     """
     The generate_tokens() generator requires one argument, readline, which
@@ -614,6 +616,10 @@ def generate_tokens(
     ints specifying the row and column where the token ends in the source;
     and the line on which the token was found. The line passed is the
     logical line; continuation lines are included.
+
+    The lines numbered in *continuation_lines* continue the statement
+    before them, as lines inside brackets do (a Mojo header's clauses, and
+    comment lines between them).
     """
     lnum = parenlev = continued = 0
     numchars: Final = "0123456789"
@@ -726,7 +732,9 @@ def generate_tokens(
                     contline = contline + line
                     continue
 
-        elif parenlev == 0 and not continued:  # new statement
+        elif (
+            parenlev == 0 and not continued and lnum not in continuation_lines
+        ):  # new statement
             if not line:
                 break
             column = 0
@@ -846,7 +854,7 @@ def generate_tokens(
                     yield (NUMBER, token, spos, epos, line)
                 elif initial in "\r\n":
                     newline = NEWLINE
-                    if parenlev > 0:
+                    if parenlev > 0 or lnum + 1 in continuation_lines:
                         newline = NL
                     elif async_def:
                         async_def_nl = True

@@ -144,8 +144,11 @@ class LineGenerator(Visitor[Line]):
             any_open_brackets = (
                 self.current_line.bracket_tracker.any_open_brackets()
             )
+            # A comment before a clause of a declaration's header stays in
+            # the header, as one within brackets does.
+            in_header = _starts_header_clause(node)
             for comment in generate_comments(node, preview=self.mode.preview):
-                if any_open_brackets:
+                if any_open_brackets or in_header:
                     # any comment within brackets is subject to splitting
                     self.current_line.append(comment)
                 elif comment.type == token.COMMENT:
@@ -727,7 +730,13 @@ def transform_line(
     string_paren_wrap = StringParenWrapper(ll, sn)
 
     transformers: list[Transformer]
-    if (
+    has_clauses = (line.is_def or line.is_class) and any(
+        _starts_contract_clause(leaf) for leaf in line.leaves
+    )
+    if has_clauses and _header_has_comments(line):
+        # The comments stay with their clauses, each on a line of its own.
+        transformers = [contract_clause_split]
+    elif (
         not line.contains_uncollapsable_type_comments()
         and not line.should_split_rhs
         and not line.magic_trailing_comma
@@ -744,9 +753,7 @@ def transform_line(
             transformers = [string_merge, string_paren_strip]
         else:
             transformers = []
-    elif (line.is_def or line.is_class) and any(
-        _starts_contract_clause(leaf) for leaf in line.leaves
-    ):
+    elif has_clauses:
         # A header with a contract (or a struct's with an invariant) that does
         # not fit gives each clause its own line; what is left of the header
         # is split as usual.
@@ -838,6 +845,32 @@ def transform_line(
         yield line
 
 
+def _starts_header_clause(leaf: Leaf) -> bool:
+    """Is `leaf` the keyword of a contract clause, or of a `where` clause of
+    a function's or a struct's header?"""
+    if _starts_contract_clause(leaf):
+        return True
+    clause = leaf.parent
+    return (
+        clause is not None
+        and clause.type == syms.where_clause
+        and clause.children[0] is leaf
+        and clause.parent is not None
+        and clause.parent.type in (syms.funcdef, syms.classdef)
+    )
+
+
+def _header_has_comments(line: Line) -> bool:
+    """Does a header line with clauses have a comment that is not at its
+    end: a comment line, or a trailing comment, between its clauses?"""
+    if not line.leaves:
+        return False
+    last = id(line.leaves[-1])
+    return line.contains_standalone_comments() or any(
+        key != last for key in line.comments
+    )
+
+
 def _starts_contract_clause(leaf: Leaf) -> bool:
     """Is `leaf` the keyword of a contract clause (`requires`, `ensures`, or
     a struct's `invariant`)?"""
@@ -870,16 +903,8 @@ def contract_clause_split(
         raise CannotSplit("No contract clauses found")
 
     def starts_clause(leaf: Leaf) -> bool:
-        if _starts_contract_clause(leaf):
-            return True
-        clause = leaf.parent
-        return (
-            clause is not None
-            and clause.type == syms.where_clause
-            and clause.children[0] is leaf
-            and clause.parent is not None
-            and clause.parent.type in (syms.funcdef, syms.classdef)
-        )
+        # A comment line between clauses is a line of its own.
+        return leaf.type == STANDALONE_COMMENT or _starts_header_clause(leaf)
 
     starts = [
         index for index, leaf in enumerate(line.leaves) if starts_clause(leaf)

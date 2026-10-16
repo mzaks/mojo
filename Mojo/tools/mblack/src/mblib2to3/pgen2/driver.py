@@ -446,7 +446,32 @@ def _scan_code_brackets(line: str, quote: str | None) -> tuple[int, str | None]:
 
 
 def _normalize_mojo_source(text: str) -> str:
+    """Apply Mojo-specific line normalizations before tokenization."""
+    return _normalize_mojo_source_with_continuations(text)[0]
+
+
+def _is_clause_line(line: str) -> bool:
+    """Does *line* start a `where`, `requires`, `ensures` or `invariant`
+    clause of a declaration?"""
+    stripped = line.lstrip()
+    return any(
+        _starts_with_keyword(stripped, keyword)
+        for keyword in ("where", "requires", "ensures", "invariant")
+    )
+
+
+def _normalize_mojo_source_with_continuations(
+    text: str,
+) -> tuple[str, set[int]]:
     """Apply Mojo-specific line normalizations before tokenization.
+
+    Also returns the (1-based) numbers of the lines that continue the
+    statement before them without being joined to it: the clauses of a
+    declaration's header, and the comment and blank lines between them,
+    where a comment would otherwise be lost (a clause after a comment line,
+    or after a line with a trailing comment) or a blank line would end the
+    statement. The tokenizer reads those lines as it
+    reads lines inside brackets.
 
     Iterates over the lines once, skipping triple-quoted string regions,
     ``# fmt: off`` regions, and lines inside open brackets, then gives
@@ -464,6 +489,12 @@ def _normalize_mojo_source(text: str) -> str:
     in_fmt_off = False
     bracket_depth = 0
     head_indent = 0
+    # Indices into `result` of the continuation lines, and of the comment
+    # and blank lines since the last line of code (which continue a header
+    # if a clause follows them).
+    continuation: set[int] = set()
+    pending_comments: list[int] = []
+    last_code = -1
 
     for line in lines:
         stripped = line.lstrip()
@@ -477,6 +508,43 @@ def _normalize_mojo_source(text: str) -> str:
         at_statement_level = (
             bracket_depth == 0 and ml_quote is None and not in_fmt_off
         )
+        # A clause of a header after a comment (a comment line, or a
+        # trailing comment of the line before) or a blank line continues the
+        # header on its own line, so that the comment keeps its place.
+        if (
+            at_statement_level
+            and (stripped.startswith("#") or not stripped)
+            and result
+        ):
+            pending_comments.append(len(result))
+            result.append(line)
+            delta, ml_quote = _scan_code_brackets(line, ml_quote)
+            bracket_depth += delta
+            continue
+        if (
+            at_statement_level
+            and last_code >= 0
+            and _is_clause_line(line)
+            and len(line) - len(stripped) > head_indent
+        ):
+            code, comment = _split_trailing_comment(result[last_code])
+            code = code.rstrip()
+            if (
+                (pending_comments or comment)
+                and code
+                and not code.endswith(":")
+                and not code.endswith("\\")
+            ):
+                continuation.update(pending_comments)
+                continuation.add(len(result))
+                pending_comments = []
+                last_code = len(result)
+                result.append(line)
+                delta, ml_quote = _scan_code_brackets(line, ml_quote)
+                bracket_depth += delta
+                continue
+        pending_comments = []
+
         # Try to merge this line into the previous one. Needs a previous
         # line to merge into.
         can_normalize = at_statement_level and result
@@ -489,13 +557,15 @@ def _normalize_mojo_source(text: str) -> str:
             # bracket of a multi-line operand.
             if at_statement_level:
                 head_indent = len(line) - len(stripped)
+        if stripped:
+            last_code = len(result) - 1
 
         # Update the code-bracket depth for the next line. Brackets inside
         # strings and comments are ignored, so prose never disables rejoining.
         delta, ml_quote = _scan_code_brackets(line, ml_quote)
         bracket_depth += delta
 
-    return "\n".join(result)
+    return "\n".join(result), {index + 1 for index in continuation}
 
 
 @dataclass
@@ -666,10 +736,15 @@ class Driver:
 
     def parse_string(self, text: str, debug: bool = False) -> NL:
         """Parse a string and return the syntax tree."""
+        continuation_lines: set[int] = set()
         if self.grammar.mojo_keywords:
-            text = _normalize_mojo_source(text)
+            text, continuation_lines = _normalize_mojo_source_with_continuations(
+                text
+            )
         tokens = tokenize.generate_tokens(
-            io.StringIO(text).readline, grammar=self.grammar
+            io.StringIO(text).readline,
+            grammar=self.grammar,
+            continuation_lines=continuation_lines,
         )
         return self.parse_tokens(tokens, debug)
 

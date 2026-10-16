@@ -183,3 +183,89 @@ def test_struct_invariant_after_exploded_conformances():
 def test_invariant_is_a_name_elsewhere():
     source = "def f(invariant: Int) -> Int:\n    return invariant\n"
     assert_mojo_format(source, source)
+
+
+def test_comment_line_between_clauses():
+    source = (
+        "def f(x: Int) -> Int\n"
+        "    requires x > 0\n"
+        "    # positive only\n"
+        "    ensures result > 0:\n"
+        "    return x\n"
+    )
+    assert_mojo_format(source, source)
+
+
+def test_comment_line_before_first_clause():
+    source = (
+        "def f(x: Int) -> Int\n"
+        "    # why it needs this\n"
+        "    requires x > 0:\n"
+        "    return x\n"
+    )
+    assert_mojo_format(source, source)
+
+
+def test_trailing_comment_on_a_clause_keeps_its_line():
+    # The header would fit on one line, but the comment belongs to its
+    # clause.
+    source = (
+        "def g(x: Int) -> Int\n"
+        "    requires x > 0  # trailing comment\n"
+        "    ensures result > 0:\n"
+        "    return x\n"
+    )
+    assert_mojo_format(source, source)
+
+
+def test_comment_between_where_and_contract_clauses():
+    source = (
+        "def c[n: Int](x: Int) -> Int\n"
+        "    where n > 0\n"
+        "    # the contract\n"
+        "    requires x > n:\n"
+        "    return x\n"
+    )
+    assert_mojo_format(source, source)
+
+
+def test_comment_line_between_struct_invariants():
+    source = (
+        "struct T[n: Int](\n"
+        "    Copyable,\n"
+        "    Movable,\n"
+        ")\n"
+        "    where n > 0\n"
+        "    # bounded by n\n"
+        "    invariant self.x < n:\n"
+        "    var x: Int\n"
+    )
+    assert_mojo_format(source, source)
+
+
+def test_blank_line_between_clauses_is_dropped():
+    source = (
+        "def e(x: Int) -> Int\n"
+        "    requires x > 0\n"
+        "\n"
+        "    # a blank line before\n"
+        "    ensures result > 0:\n"
+        "    return x\n"
+    )
+    expected = (
+        "def e(x: Int) -> Int\n"
+        "    requires x > 0\n"
+        "    # a blank line before\n"
+        "    ensures result > 0:\n"
+        "    return x\n"
+    )
+    assert_mojo_format(source, expected)
+
+
+def test_comment_after_header_is_not_a_clause_comment():
+    source = (
+        "def f(x: Int) -> Int requires x > 0:\n"
+        "    # the body\n"
+        "    return x\n"
+    )
+    assert_mojo_format(source, source)
