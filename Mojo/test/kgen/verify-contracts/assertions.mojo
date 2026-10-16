@@ -47,6 +47,12 @@ def ok_scalar(xs: List[Int], n: UInt8) raises -> Int:
     return xs[2]
 
 
+def ok_after_assert_equal_lists(xs: List[Int], ys: List[Int]) raises -> Int:
+    assert_equal(len(xs), 3)
+    assert_equal(xs, ys)  # `List.__eq__` states equal lists are as long
+    return ys[2]
+
+
 # --- must stay UNPROVEN ---
 def bad_before_assert(xs: List[Int]) raises -> Int:
     var x = xs[2]  # the assertion comes after

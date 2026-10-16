@@ -6251,12 +6251,60 @@ private:
       std::string eq = "(= " + a + " " + b + ")";
       fact = kind == "equal" ? eq : "(not " + eq + ")";
     }
+    if (fact.empty() && kind == "equal")
+      fact = equalityContract(call, state);
     if (fact.empty())
       return;
     state.pc = define({true, 1, false},
                       "(and " + state.pc + " (=> (not " +
                           values[call->getResult(0)] + ") " + fact + "))",
                       "r");
+  }
+
+  /// `assert_equal(a, b)` of a struct whose `__eq__` states what equality
+  /// implies (`List`'s: equal lengths): that postcondition, with `a` and
+  /// `b` for `self` and `other` and `True` for the result. Empty if there
+  /// is none.
+  std::string equalityContract(LIT::CallOp call, State &state) {
+    ValueRange ops = call.getOperands();
+    if (ops.size() < 2 || call->getNumResults() < 1)
+      return "";
+    auto ref = dyn_cast<LIT::RefType>(ops[0].getType());
+    auto st = ref ? dyn_cast<LIT::StructType>(ref.getElementType())
+                  : LIT::StructType();
+    auto other = dyn_cast<LIT::RefType>(ops[1].getType());
+    if (!st || !other || other.getElementType() != ref.getElementType())
+      return "";
+    auto decl = dyn_cast_or_null<LIT::StructDeclOp>(
+        symbols.lookupSymbolIn(module, st.getSymbol()));
+    if (!decl)
+      return "";
+    for (auto eq : decl.getBody()->getOps<LIT::FnOp>()) {
+      if (!eq.getSymName() || !eq.getSymName()->starts_with("__eq__(") ||
+          eq.getFunctionBody().empty() ||
+          eq.getFunctionBody().front().getNumArguments() != 2)
+        continue;
+      SmallVector<EnsuresOp> clauses = postconditionClauses(eq);
+      if (clauses.empty())
+        return "";
+      // The result is `True`: the call's raised flag stands for it while
+      // the clauses are instantiated.
+      Value flag = call->getResult(0);
+      std::string raised = values[flag];
+      values[flag] = "true";
+      callResult = flag;
+      std::string holds = "true";
+      for (EnsuresOp ensures : clauses)
+        if (MaybeTerm cond =
+                instantiate(ensures.getBody(), ensures.getArgs(), state,
+                            ops.take_front(2), eq, nullptr, /*assumed=*/true))
+          holds = "(and " + holds + " " + *cond + ")";
+      callResult = {};
+      values[flag] = raised;
+      state.env.erase(Loc{flag, ""});
+      return holds;
+    }
+    return "";
   }
 
   /// `x.copy()` through `Copyable`'s default (`Self(copy=self)`, a call
@@ -6576,8 +6624,11 @@ private:
         "std::collections::dict::Dict::__reversed__[",
         // A linked list's nodes, from the head or (reversed) the tail.
         "std::collections::linked_list::LinkedList::__iter__[",
-        "std::collections::linked_list::LinkedList::__iter__(::LinkedList[$0]$)",
-        "std::collections::linked_list::LinkedList::__reversed__["};
+        "std::collections::linked_list::LinkedList::__iter__(::LinkedList[$0]$"
+        ")",
+        "std::collections::linked_list::LinkedList::__reversed__[",
+        // A deque's elements from the back.
+        "std::collections::deque::Deque::__reversed__["};
     static const char *collectionTypes[] = {
         "@std::@collections::@list::@List<",
         "@std::@collections::@span::@Span<",
@@ -6637,6 +6688,14 @@ private:
                 iterSources[out->root] = *src;
           return produce({{"/index", bvConst(0, 64)}, {"/length", *n}});
         }
+    // `reversed(q)` of a deque: its elements from the back, as many as
+    // it has.
+    if (path.starts_with("std::builtin::reversed::reversed[") &&
+        call.getNumOperands() >= 1 &&
+        StringRef(printed(call.getOperands()[0].getType()))
+            .contains("@std::@collections::@deque::@Deque<"))
+      if (MaybeTerm n = lengthOf(call.getOperands()[0]))
+        return produce({{"/index", bvConst(0, 64)}, {"/length", *n}});
     // `reversed(d)`, `reversed(d.values())`, `reversed(d.items())`: a new
     // count over the same dictionary, from no entries seen.
     if (path.starts_with("std::builtin::reversed::reversed[") &&
@@ -6695,6 +6754,9 @@ private:
     // yields `len(l)` elements as long as its nodes are as many as its
     // size, which its methods keep (an assumption about the stdlib).
     bool linked = path.starts_with("std::collections::linked_list::");
+    // A deque's counts down from its length; counted up here, it yields as
+    // many elements, from the back.
+    bool deque = path.starts_with("std::collections::deque::");
     bool backward = false;
     if (isIterator && !owned && !dict) {
       ParamFrame frame = paramFrame(call, callee);
@@ -6702,7 +6764,7 @@ private:
       if (forward == frame.values.end())
         return false;
       backward = !StringRef(printed(forward->second)).contains("true");
-      if (backward && !linked)
+      if (backward && !linked && !deque)
         return false;
     } else if (isEnumerate && !llvm::any_of(iterators, [&](const char *prefix) {
                  StringRef type = StringRef(prefix).drop_back(2);
@@ -9704,9 +9766,11 @@ private:
     }
   }
 
-  /// `Optional` (of an integer or Boolean) as the stdlib defines it: whether
-  /// it holds a value (`/has`) and the value (`/val`); its constructors from
-  /// a value, from `None` and by copy, `or_else` and `__bool__`. And
+  /// `Optional` as the stdlib defines it: whether it holds a value (`/has`)
+  /// and the value (`/val`); its constructors from a value, from `None` and
+  /// by copy, `or_else` and `__bool__` (of an integer or Boolean), and
+  /// `value()`, a reference to `/val` (of any type: `len(o.value())` of an
+  /// `Optional[List[T]]` is the list's length). And
   /// `ContiguousSlice`'s constructor from two optional bounds, into its
   /// `start` and `end` fields. The results are out-result slots, the
   /// callee's last operand.
@@ -9778,6 +9842,17 @@ private:
       values[call->getResult(0)] = has(*self);
       return true;
     }
+    if ((method.starts_with("value[") || method.starts_with("value(")) &&
+        ops.size() == 1 && call->getNumResults() == 1 &&
+        isa<LIT::RefType>(call->getResult(0).getType())) {
+      std::optional<Loc> self = place(ops[0]);
+      if (!self)
+        return false;
+      Value result = call->getResult(0);
+      values[result] = declare({false, 64, false}, "g");
+      derivedPlaces[result] = Loc{self->root, self->path + "/val"};
+      return true;
+    }
     if (ops.size() < 2)
       return false;
     std::optional<Loc> out = place(ops.back());
@@ -9794,8 +9869,13 @@ private:
       std::optional<Loc> value = place(ops[0]);
       if (!value)
         return false;
+      // A value that is not a scalar (a list) is stored as its own place's
+      // value, so that what is known of it (its length) carries over.
+      Sort sort = !name.params.empty() && !dtypeSort(name.params[0])
+                      ? sortOf(placeType(*value))
+                      : valueSort;
       storeFields(*out, state,
-                  {{"/has", "true"}, {"/val", load(*value, state, valueSort)}});
+                  {{"/has", "true"}, {"/val", load(*value, state, sort)}});
     } else if (method.starts_with("or_else(") && ops.size() == 3) {
       std::optional<Loc> self = place(ops[0]), fallback = place(ops[1]);
       if (!self || !fallback)

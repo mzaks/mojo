@@ -145,6 +145,14 @@ def ok_linked_list_enumerate(l: LinkedList[Int]) -> Int:
     return t
 
 
+def ok_deque_reversed(q: Deque[Int]) -> Int:
+    var t = 0
+    var i = 0
+    for e in reversed(q):
+        t += e + q[len(q) - 1 - i]  # once per element, from the back
+        i += 1
+    return t
+
 
 def ok_deque_moved() -> Int:
     var q = Deque[Int]()
@@ -152,6 +160,19 @@ def ok_deque_moved() -> Int:
     q.append(2)
     var p = q^  # a move keeps the value: `p` has 2 elements
     return p[1]
+
+
+def ok_optional_list(var o: Optional[List[Int]]) -> Int:
+    if o and len(o.value()) > 2:
+        return o.value()[2]
+    return 0
+
+
+def ok_deque_from_list() -> Int:
+    var l: List = [1, 2, 3]
+    var q = Deque(elements=l^, maxlen=7)  # as long as the list
+    return q[2]
+
 
 # --- must stay UNPROVEN ---
 def bad_bitset(mut b: BitSet[64], i: Int):

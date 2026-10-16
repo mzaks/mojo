@@ -142,7 +142,9 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `assert_not_equal(a, b)` from `std.testing`, what they checked holds
   where they did not raise: for `Bool` conditions, and for `Int`, `Bool`
   and integer scalar operands (a type's own `__eq__` is not equality of
-  its value, so other types give no fact).
+  its value). For a struct whose `__eq__` has a postcondition,
+  `assert_equal(a, b)` gives that postcondition with the result `True`:
+  equal lists are as long (`ok_after_assert_equal_lists`).
 - Integer conversions (`Int(n)` of a `UInt8`, `UInt8(i)`) extend by the
   source's signedness or truncate.
 - Integer and Boolean operators are bit-vector and Boolean operations, and
@@ -163,8 +165,9 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   the iterator holds a cursor and the length it started with, and
   `enumerate`'s count is the cursor (plus `start`). It yields element
   `cursor` of the collection: a reference to its place when borrowing, its
-  value when consuming. The elements `enumerate` yields are unknown, and
-  reversed iteration over collections is not modelled.
+  value when consuming. The elements `enumerate` yields are unknown.
+  Iterating a `Deque` backwards (`reversed(q)`) yields `len(q)` times
+  (`ok_deque_reversed`); other reversed collections are not modelled.
 - Iterating a `LinkedList` (`for x in l`, `l.__reversed__()`,
   `enumerate(l)`, and consuming it with `for x in l^`) yields exactly
   `len(l)` times, element `cursor` (from the end when reversed), as
@@ -226,7 +229,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `span[i]` requires `i` in range, and `xs[a:b]` (on a list or a span)
   requires `0 <= a <= b <= len(xs)` and has length `b - a`, with absent
   bounds meaning 0 and `len(xs)`. The pass models `Optional` (its
-  constructors, `or_else`, `__bool__`) to read the bounds. `List(span)`
+  constructors, `or_else`, `__bool__`) to read the bounds, and `value()`
+  as a reference to the value it holds (`ok_optional_list`). `List(span)`
   copies a span and is as long as it.
 - Strided slices (`xs[a:b:c]`, `xs[::-1]`) copy into a new list whose
   length is that of `range(*slice.indices(len(xs)))`: bounds are
