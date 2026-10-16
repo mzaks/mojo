@@ -18,7 +18,43 @@ LLVM, and the comptime interpreter skips them.
 """
 
 from std.collections.string.string_span import _get_kgen_string
+from std.builtin.debug_assert import _assert_enabled, _debug_assert_msg
+from std.reflection import call_location
 from std.traits import IsTriviallyMovable
+
+
+@inline(.nodebug)
+def _contract_checks_enabled() -> Bool:
+    """Returns whether `requires` and `ensures` clauses are checked at run
+    time.
+
+    The parser emits each clause as a `debug_assert` under this condition, so
+    a clause is evaluated only when it is checked: under the same assertion
+    mode as a `debug_assert` without an `assert_mode` (`-D ASSERT=all`).
+
+    Returns:
+        Whether contract clauses are checked.
+    """
+    return _assert_enabled["none", False]()
+
+
+@inline(.nodebug)
+def _check_contract(cond: Bool, message: StringLiteral):
+    """Fails like a `debug_assert` with `message` if `cond` is false.
+
+    The parser calls it for the run-time check of a `requires` or `ensures`
+    clause, under `_contract_checks_enabled`. It reaches the failure report
+    without converting `message` to a string type: the string types have
+    contracts of their own, whose checks would otherwise instantiate this
+    function again.
+
+    Args:
+        cond: The clause's condition.
+        message: What to report when it does not hold.
+    """
+    if cond:
+        return
+    _debug_assert_msg(message.ptr(), message.byte_length() + 1, call_location())
 
 
 @inline(.nodebug)
