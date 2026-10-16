@@ -11,11 +11,12 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-"""Tests for the contract clauses of a function.
+"""Tests for the contract clauses of a function and the invariant of a struct.
 
 These are contracts for static verification (see
 Mojo/proposals/function-contracts.md): `requires` and `ensures` clauses after
-a function's trailing `where` clauses, with a message after `else`.
+a function's trailing `where` clauses, and `invariant` clauses after a
+struct's, with a message after `else`.
 """
 
 from tests.util import assert_mojo_format
@@ -140,4 +141,45 @@ def test_contract_keywords_are_names_elsewhere():
         "    var ensures = requires + 1\n"
         "    return ensures\n"
     )
+    assert_mojo_format(source, source)
+
+
+def test_struct_invariant_on_one_line():
+    source = "struct Counter invariant self.count >= 0:\n    var count: Int\n"
+    assert_mojo_format(source, source)
+
+
+def test_struct_invariant_clauses_get_their_own_lines():
+    source = (
+        "struct Counter[limit: Int](Copyable, Movable) where limit >= 0"
+        " invariant 0 <= self.count invariant self.count <= limit:\n"
+        "    var count: Int\n"
+    )
+    expected = (
+        "struct Counter[limit: Int](Copyable, Movable)\n"
+        "    where limit >= 0\n"
+        "    invariant 0 <= self.count\n"
+        "    invariant self.count <= limit:\n"
+        "    var count: Int\n"
+    )
+    assert_mojo_format(source, expected)
+
+
+def test_struct_invariant_after_exploded_conformances():
+    source = (
+        "struct Ring[T: Movable](\n"
+        "    Copyable,\n"
+        "    Movable,\n"
+        "    Sized,\n"
+        ")\n"
+        "    invariant 0 <= self._len and self._len <= self._capacity\n"
+        '    invariant self._capacity > 0 else "a ring is never empty":\n'
+        "    var _len: Int\n"
+        "    var _capacity: Int\n"
+    )
+    assert_mojo_format(source, source)
+
+
+def test_invariant_is_a_name_elsewhere():
+    source = "def f(invariant: Int) -> Int:\n    return invariant\n"
     assert_mojo_format(source, source)

@@ -691,15 +691,17 @@ class LineGenerator(Visitor[Line]):
     def visit_where_clause(self, node: Node) -> Iterator[Line]:
         normalize_invisible_parens(
             node,
-            parens_after={"where", "requires", "ensures"},
+            parens_after={"where", "requires", "ensures", "invariant"},
             preview=self.mode.preview,
         )
         for child in node.children:
             yield from self.visit_default(child)
 
-    # A function's contract clauses share the form of a `where` clause.
+    # A function's contract clauses, and a struct's invariant, share the form
+    # of a `where` clause.
     visit_requires_clause = visit_where_clause
     visit_ensures_clause = visit_where_clause
+    visit_invariant_clause = visit_where_clause
 
 
 def transform_line(
@@ -742,11 +744,12 @@ def transform_line(
             transformers = [string_merge, string_paren_strip]
         else:
             transformers = []
-    elif line.is_def and any(
+    elif (line.is_def or line.is_class) and any(
         _starts_contract_clause(leaf) for leaf in line.leaves
     ):
-        # A header with a contract that does not fit gives each clause its
-        # own line; what is left of the header is split as usual.
+        # A header with a contract (or a struct's with an invariant) that does
+        # not fit gives each clause its own line; what is left of the header
+        # is split as usual.
         transformers = [contract_clause_split]
     elif line.is_def:
         transformers = [left_hand_split]
@@ -836,11 +839,13 @@ def transform_line(
 
 
 def _starts_contract_clause(leaf: Leaf) -> bool:
-    """Is `leaf` the `requires` or `ensures` keyword of a contract clause?"""
+    """Is `leaf` the keyword of a contract clause (`requires`, `ensures`, or
+    a struct's `invariant`)?"""
     clause = leaf.parent
     return (
         clause is not None
-        and clause.type in (syms.requires_clause, syms.ensures_clause)
+        and clause.type
+        in (syms.requires_clause, syms.ensures_clause, syms.invariant_clause)
         and clause.children[0] is leaf
     )
 
@@ -848,7 +853,8 @@ def _starts_contract_clause(leaf: Leaf) -> bool:
 def contract_clause_split(
     line: Line, features: Collection[Feature] = ()
 ) -> Iterator[Line]:
-    """Split a function header before each of its contract clauses.
+    """Split a function header before each of its contract clauses (a struct
+    header before each of its `invariant` clauses).
 
     Every `requires` and `ensures` clause gets a line of its own, indented
     once under the `def`, so a reader finds a function's preconditions and
@@ -872,7 +878,7 @@ def contract_clause_split(
             and clause.type == syms.where_clause
             and clause.children[0] is leaf
             and clause.parent is not None
-            and clause.parent.type == syms.funcdef
+            and clause.parent.type in (syms.funcdef, syms.classdef)
         )
 
     starts = [
@@ -883,9 +889,11 @@ def contract_clause_split(
     for part, (begin, end) in enumerate(zip(bounds, bounds[1:])):
         result = Line(mode=line.mode, depth=line.depth + (1 if part else 0))
         for leaf in line.leaves[begin:end]:
-            if not result.leaves:
+            # The head is appended as new, so that it notices a magic
+            # trailing comma (`struct S(A, B,)`) and stays exploded.
+            if not result.leaves or part == 0:
                 leaf.prefix = ""
-            result.append(leaf, preformatted=True)
+            result.append(leaf, preformatted=part != 0)
             for comment_after in line.comments_after(leaf):
                 result.append(comment_after, preformatted=True)
         if result:
@@ -988,6 +996,7 @@ def _closes_where_condition_with_message(closing_bracket: Leaf) -> bool:
         syms.where_clause,
         syms.requires_clause,
         syms.ensures_clause,
+        syms.invariant_clause,
     ):
         return False
     return any(

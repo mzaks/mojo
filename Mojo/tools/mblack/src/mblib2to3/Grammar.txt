@@ -21,6 +21,8 @@ where_clause: WHERE top_test ['else' test]
 # postconditions, after its trailing `where` clauses. Soft keywords.
 requires_clause: "requires" top_test ['else' test]
 ensures_clause: "ensures" top_test ['else' test]
+# A struct's invariant, after its trailing `where` clauses. Soft keyword.
+invariant_clause: "invariant" top_test ['else' test]
 # Mojo terms: metaparams [..] = parameter list; parameters (..) = argument list;
 # captures {..} = capture list (production names kept from black's Python grammar).
 funcdef: ('def' | MLIR_REGION) NAME [metaparams] parameters [named_effect*] [global_effects] [captures] ['->' result_type] (where_clause)* (requires_clause)* (ensures_clause)* ':' suite
@@ -248,7 +250,7 @@ type_factor: ('+'|'-'|'~') type_factor | type_power
 type_power: [AWAIT] type_atom trailer* ['**' factor]
 type_atom: functype | generatortype | atom
 
-classdef: STRUCT NAME [metaparams] ['(' [arglist] ')'] (where_clause)* ':' suite | ('class' | TRAIT | EXTENSION) NAME [metaparams] ['(' [arglist] ')'] ':' suite
+classdef: STRUCT NAME [metaparams] ['(' [arglist] ')'] (where_clause)* (invariant_clause)* ':' suite | ('class' | TRAIT | EXTENSION) NAME [metaparams] ['(' [arglist] ')'] ':' suite
 
 typeconvexpr: atom trailer* | functype | generatortype
 typeconv: (['*'|VAR|IMM|MUT|OUT|DEINIT] ['*'|'**'] typeconvexpr [':' ['*'|'**'] test]) | '/' | '*' | '//'

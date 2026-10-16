@@ -229,8 +229,8 @@ def _join_clause_continuation(
 ) -> str | None:
     """Join a trailing clause of a declaration from a continuation line.
 
-    In Mojo, the `where`, `requires` and `ensures` clauses of a declaration
-    may each start a further-indented line::
+    In Mojo, the `where`, `requires`, `ensures` and `invariant` clauses of a
+    declaration may each start a further-indented line::
 
         def pop(mut self) -> Self.T
             requires len(self) > 0
@@ -241,7 +241,7 @@ def _join_clause_continuation(
     stripped = line.lstrip()
     if not any(
         _starts_with_keyword(stripped, keyword)
-        for keyword in ("where", "requires", "ensures")
+        for keyword in ("where", "requires", "ensures", "invariant")
     ):
         return None
     cur_indent = len(line) - len(stripped)
