@@ -194,7 +194,7 @@ def make_zeros(n: Int) -> List[Int]
 
 A fact that holds before and after a call, like the one on `reserve`, is
 written in both places. That is a struct invariant in disguise, and
-[struct invariants](#future-work) are the better home for it.
+[struct invariants](#struct-invariants) are the better home for it.
 
 A clause is not tied to an argument. Facts about several arguments, or about
 none of them, have an obvious place:
@@ -213,6 +213,57 @@ raise establishes nothing, and preconditions still apply.
 
 A function whose result is a reference (`-> ref T`) cannot name it in an
 `ensures` clause yet.
+
+### Struct invariants
+
+A struct states what holds for every value of it in `invariant` clauses,
+after the `where` clauses of its header:
+
+```mojo
+struct Deque[ElementType: Movable](Copyable, Movable, Sized)
+    invariant self._capacity > 0 and self._data._extent() >= self._capacity
+    invariant 0 <= self._head and self._head < self._capacity
+    invariant 0 <= self._tail and self._tail < self._capacity:
+    ...
+```
+
+`self` is the value the clause is about. The clauses are conditions on one
+value: `old` is an error in them, and the message follows `else` as in the
+other clauses.
+
+The invariant holds for every argument of the struct's type of the
+struct's methods: `self`, and others like `copy: Self` or `mut other: Self`.
+
+| Argument                          | Assumed on entry | Proven at every return |
+|-----------------------------------|------------------|------------------------|
+| `out`                             | no               | yes                    |
+| `mut`                             | yes              | yes                    |
+| read-only, `var`, `deinit`, `ref` | yes              | no                     |
+
+A `ref` argument counts as read-only even when its origin is mutable, so a
+method that changes fields through `ref self` is not held to the invariant.
+
+A caller does not prove the invariant: the precondition is *free*. Every
+value of the struct was made by a constructor and last changed by a `mut`
+method, which proved it where they returned; a caller assumes it after such
+a call, like any postcondition. This rests on two things the language does
+not enforce:
+
+- Only the struct's methods write its fields. A field written from outside
+  (`q._head = -1`) can break it, and nothing reports that.
+- A method does not call another method while the invariant is broken. The
+  callee would assume what does not hold.
+
+A function that is not a method of the struct does not assume the invariant
+of its arguments: an argument `q: Deque[Int]` of a free function knows
+nothing about `q._head`. The facts arrive through the values a function
+builds or changes itself.
+
+Methods marked `@always_inline("builtin")` get no invariant clauses: they
+must fold to their result, and a contract op is not foldable. Synthesized
+methods (from `@fieldwise_init`, or the default copy and move constructors)
+get none either: their callers do not know the invariant of what they
+return.
 
 ### What is not a contract
 
@@ -378,6 +429,11 @@ clause's text. That makes contracts useful before any proof: tests exercise
 them. The verifier does not treat these checks as obligations; the contract
 ops are what it checks.
 
+A struct's invariant is checked where a method that initializes or changes
+the value returns, not on entry: an entry check of
+`invariant len(self) >= 0` would call `__len__`, whose entry would check it
+again.
+
 Three kinds of clauses are not checked at run time:
 
 - **Clauses that use `old`.** Their entry values would have to be computed
@@ -433,6 +489,13 @@ Implemented, on the `mojo-bounds-verifier` branch:
   is an error that points to the new clauses. A clause that calls a function taking a
   `mut` argument, or one that can raise, is an error (see
   [Contract expressions](#contract-expressions)).
+- Struct invariants (see [Struct invariants](#struct-invariants)): the
+  parser adds them to each method, as a `kgen.requires` and a
+  `kgen.ensures` with an `invariant` attribute naming the struct. The
+  verifier does not check such a `kgen.requires` at calls. `List` states
+  `self._len >= 0` instead of an `_assume` in `__len__`, and `Deque` that
+  its buffer holds `_capacity` elements and that `_head` and `_tail` are
+  indices into it.
 - `result` in an `ensures` clause. A named `out` result and a result in
   memory are what the clause reads. An unnamed result in a register goes
   through a local of the function at each return, which the clause reads, so
@@ -599,11 +662,10 @@ time, and cannot refer to runtime arguments.
 - **Refinement types.** A type that carries a fact, like a `Nat` that is an
   `Int` with `self >= 0`: an argument `n: Nat` would behave like `n: Int`
   with `requires n >= 0`. This needs its own syntax decision.
-- **Struct invariants,** such as
-  `0 <= self._len and self._len <= self._capacity` for `List`, assumed on
-  entry to every method and checked where constructors and `mut` methods
-  return. They would replace the `_assume` in `List.__len__`, and the clauses
-  that today are written once as `requires` and once as `ensures`.
+- **Invariants of arguments outside the struct.** A free function could
+  assume the invariant of its arguments of the struct's type too, by the
+  same argument that makes it free in methods. Values read from fields and
+  collections would still not carry it.
 - **Loop invariants,** stated in the source rather than inferred.
 - **Frame clauses.** A `ref` argument with a mutable origin may change, so
   its clauses must state what it keeps (`len(xs) == old(len(xs))`). Dafny's

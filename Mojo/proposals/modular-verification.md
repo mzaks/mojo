@@ -1908,6 +1908,45 @@ Tensors and GPU kernels:
   to `n`), and kernels in MAX's own packages, which are now
   skipped as imported code unless `include-stdlib=true`.
 
+Struct invariants:
+
+- A struct's `invariant` clauses (see
+  [struct invariants](function-contracts.md#struct-invariants)) reach the
+  pass as a `kgen.requires` and a `kgen.ensures` per method and argument of
+  the struct's type, marked with the struct's name. The pass assumes such a
+  precondition in the method like any other, and does not check it at
+  calls, at kernel launches, or against a trait method the method
+  implements. Such a postcondition is reported as the invariant of the
+  struct where the method returns.
+- `Deque` states that its buffer holds `_capacity` elements
+  (`self._data._extent() >= self._capacity`, and `_capacity > 0`) and
+  that `_head` and `_tail` are indices into it. That gives back the
+  accesses `test_deque.mojo` makes through the private pointer
+  (`q._data[unsafe_offset=2]` after `assert_equal(q._capacity, 4)`):
+  210 of 224 proven, from 100. The 14 left need more than the invariant
+  (the capacity being a power of two, the length's relation to `_head`
+  and `_tail`, or elements of nested lists).
+- `List` states `self._len >= 0`, which replaces the `_assume` in
+  `__len__`. Nothing else changed (17 example files and 8 stdlib test
+  files give the same numbers, plus the new `invariants.mojo`).
+- Cost, CPU seconds of the whole `kgen` run, median of 5 interleaved runs
+  (load about 4): `test_deque.mojo` 4.40 s against 3.77 s without the
+  invariants, `test_list.mojo` 6.11 s against 5.82 s. Every call to a
+  `mut` method now assumes the invariant, and `List`'s methods are called
+  everywhere: 5% for no new proof there, the price of checking what the
+  `_assume` took on trust.
+- With `include-stdlib=true` (verifying the methods themselves), the
+  invariant shows what it rests on. `Deque._physical_index` now proves
+  `0 <= result and result < self._capacity` from the invariant on entry,
+  and with it `append`, `appendleft`, `insert`, `remove`, `pop` and
+  `popleft` keep the invariant. The constructors, `_realloc`, `clear`,
+  `rotate` and the operators do not: they size the buffer with
+  `next_power_of_two` and `<< 1`, which state no bounds (and can
+  overflow), and allocate through `alloc(Layout(...)).unsafe_leak()`,
+  which states no extent. `List.append` and `extend` cannot prove
+  `_len >= 0` either: `_len += 1` wraps at `Int.MAX`, and nothing bounds a
+  list's length. Both were assumptions before; now they are visible ones.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through
