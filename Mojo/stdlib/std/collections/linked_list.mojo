@@ -20,6 +20,7 @@ traversal.
 """
 
 from std.builtin.rebind import downcast, rebind_var
+from std.builtin._verification import _index_in_bounds, _position_in_bounds
 from std.collections import check_bounds
 from std.reflection import call_location
 import std.format._utils as fmt
@@ -473,7 +474,7 @@ struct LinkedList[ElementType: Movable](
     def pop[
         I: Indexer & Deinitable, //
     ](mut self, var i: I) raises -> Self.ElementType
-        requires 0 <= index(i) and index(i) < len(self)
+        requires _index_in_bounds(index(i), len(self))
         ensures len(self) == old(len(self)) - 1:
         """Remove the ith element of the list, counting from the tail if
         given a negative index.
@@ -610,7 +611,7 @@ struct LinkedList[ElementType: Movable](
 
     @inline(.always)
     def insert[I: Indexer](mut self, idx: I, var elem: Self.ElementType)
-        requires 0 <= index(idx) and index(idx) <= len(self)
+        requires _position_in_bounds(index(idx), len(self))
         ensures len(self) == old(len(self)) + 1:
         """Insert an element `elem` into the list at index `idx`.
 
@@ -824,7 +825,7 @@ struct LinkedList[ElementType: Movable](
     ](ref self, idx: I) -> ref[
         origin_of(self)._get_owned_interior["element"]
     ] Self.ElementType
-        requires 0 <= index(idx) and index(idx) < len(self):
+        requires _index_in_bounds(index(idx), len(self)):
         """Get the element at the specified index.
 
         Parameters:

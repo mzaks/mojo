@@ -30,6 +30,7 @@ print(len(bs))          # Prints 0.
 # ---------------------------------------------------------------------------
 
 
+from std.builtin._verification import _index_in_bounds
 from std.math import ceildiv, align_down
 from std.sys import simd_width_of, bit_width_of
 
@@ -289,7 +290,7 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
     # --------------------------------------------------------------------- #
 
     @inline(.always)
-    def set(mut self, idx: Int) requires 0 <= idx and idx < Self.size:
+    def set(mut self, idx: Int) requires _index_in_bounds(idx, Self.size):
         """Sets the bit at the specified index `idx` to 1.
 
         If `idx` is greater than or equal to the current logical size,
@@ -304,7 +305,7 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
         self._words.unsafe_get(w) |= Int64(_bit_mask(idx))
 
     @inline(.always)
-    def clear(mut self, idx: Int) requires 0 <= idx and idx < Self.size:
+    def clear(mut self, idx: Int) requires _index_in_bounds(idx, Self.size):
         """Clears the bit at the specified index `idx` (sets it to 0).
 
         Aborts if `idx` is negative or greater than or equal to the
@@ -318,7 +319,7 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
         self._words.unsafe_get(w) &= Int64(~_bit_mask(idx))
 
     @inline(.always)
-    def toggle(mut self, idx: Int) requires 0 <= idx and idx < Self.size:
+    def toggle(mut self, idx: Int) requires _index_in_bounds(idx, Self.size):
         """Toggles (inverts) the bit at the specified index `idx`.
 
         If the bit becomes 1 and `idx` is greater than or equal to the
@@ -333,7 +334,7 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
         self._words.unsafe_get(w) ^= Int64(_bit_mask(idx))
 
     @inline(.always)
-    def test(self, idx: Int) -> Bool requires 0 <= idx and idx < Self.size:
+    def test(self, idx: Int) -> Bool requires _index_in_bounds(idx, Self.size):
         """Tests if the bit at the specified index `idx` is set (is 1).
 
         Aborts if `idx` is negative or greater than or equal to the

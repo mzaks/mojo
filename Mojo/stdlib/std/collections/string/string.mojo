@@ -13,6 +13,7 @@
 """Implements the core `String` type and related utilities."""
 
 from std.builtin.globals import global_constant
+from std.builtin._verification import _index_in_bounds
 from std.collections import KeyElement, Span, check_slice_bounds
 from std.collections.string import CodepointsIter
 from std.collections.string._parsing_numbers.parsing_floats import _atof
@@ -805,7 +806,7 @@ struct String(
     def __getitem__(
         self, *, byte: Int
     ) -> StringSlice[origin_of(self)._get_owned_interior["bytes"]]
-        requires 0 <= byte and byte < self.byte_length():
+        requires _index_in_bounds(byte, self.byte_length()):
         """Gets a single byte at the specified byte index.
 
         This performs byte-level indexing, not character (codepoint) indexing.
@@ -831,7 +832,7 @@ struct String(
     ](self, *, byte: I) -> StringSlice[
         origin_of(self)._get_owned_interior["bytes"]
     ]
-        requires 0 <= index(byte) and index(byte) < self.byte_length():
+        requires _index_in_bounds(index(byte), self.byte_length()):
         """Gets a single byte at the specified byte index.
 
         This performs byte-level indexing, not character (codepoint) indexing.

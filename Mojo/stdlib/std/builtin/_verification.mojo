@@ -167,3 +167,41 @@ def _same_elements[
             _type=__mlir_type.`!kgen.scalar<bool>`
         ](dst._mlir_value, src._mlir_value, count._mlir_value)
     )
+
+
+@inline(.nodebug)
+def _index_in_bounds(idx: Int, length: Int) -> Bool
+    ensures result == (0 <= idx and idx < length):
+    """Whether `idx` is an index of a sequence of `length` elements: the
+    precondition of reading, writing or removing the element at `idx`.
+
+    Use it in a `requires` clause, as
+    `requires _index_in_bounds(idx, len(self))`.
+
+    Args:
+        idx: The index.
+        length: The number of elements.
+
+    Returns:
+        Whether `0 <= idx < length`.
+    """
+    return 0 <= idx and idx < length
+
+
+@inline(.nodebug)
+def _position_in_bounds(idx: Int, length: Int) -> Bool
+    ensures result == (0 <= idx and idx <= length):
+    """Whether `idx` is a position in a sequence of `length` elements, before
+    one of them or at its end: the precondition of inserting at `idx`.
+
+    Use it in a `requires` clause, as
+    `requires _position_in_bounds(idx, len(self))`.
+
+    Args:
+        idx: The position.
+        length: The number of elements.
+
+    Returns:
+        Whether `0 <= idx <= length`.
+    """
+    return 0 <= idx and idx <= length

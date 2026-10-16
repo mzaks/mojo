@@ -115,8 +115,8 @@ An unproven precondition is a warning at the call, with a note at the clause:
 straight_line.mojo:78:14: warning: cannot prove the precondition of 'List.__getitem__'
     return xs[i]  # nothing is known about `i`
              ^
-list.mojo:1623:18: note: precondition declared here
-        requires 0 <= idx and idx < len(self):
+list.mojo:1610:18: note: precondition declared here
+        requires _index_in_bounds(idx, len(self)):
                  ^
 ```
 
@@ -142,7 +142,10 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
 - A function's own preconditions are assumed at its entry.
 - At every call to a function with preconditions, they are obligations,
   instantiated with the call's arguments. `xs[i]` is such a call: `List`'s
-  `__getitem__(idx: Int)` states `0 <= idx and idx < len(self)`.
+  `__getitem__(idx: Int)` states `_index_in_bounds(idx, len(self))`, a
+  helper whose postcondition says it is `0 <= idx and idx < len(self)`.
+  The stdlib's collections, strings and `BitSet` state their indices with
+  it, and positions to insert at with `_position_in_bounds` (`<=`).
 - After `assert_true(c)`, `assert_false(c)`, `assert_equal(a, b)` and
   `assert_not_equal(a, b)` from `std.testing`, what they checked holds
   where they did not raise: for `Bool` conditions, and for `Int`, `Bool`

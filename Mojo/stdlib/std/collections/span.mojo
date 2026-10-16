@@ -31,7 +31,7 @@ from std.memory import (
 )
 from std.collections import check_bounds, check_slice_bounds
 from std.builtin.rebind import downcast
-from std.builtin._verification import _assume
+from std.builtin._verification import _assume, _index_in_bounds
 from std.sys import align_of
 from std.sys.info import simd_width_of
 from std.traits import (
@@ -361,7 +361,7 @@ struct Span[
     def __getitem__(
         self, idx: Int, /
     ) -> ref[Self.origin, Self.address_space] Self.T
-        requires 0 <= idx and idx < len(self):
+        requires _index_in_bounds(idx, len(self)):
         """Gets the span element at the given index.
 
         Args:

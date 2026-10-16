@@ -13,6 +13,7 @@
 """Implements the `StringSpan` type and related utilities for efficient string operations."""
 
 from std.builtin.builtin_slice import ContiguousSlice
+from std.builtin._verification import _index_in_bounds
 from std.builtin.format_int import _write_int
 from std.reflection import call_location
 from std.collections import check_bounds, check_slice_bounds, Span
@@ -755,7 +756,7 @@ struct StringSpan[origin: ImmOrigin](
 
     @inline(.always)
     def __getitem__[I: Indexer, //](self, *, byte: I) -> Self
-        requires 0 <= index(byte) and index(byte) < self.byte_length():
+        requires _index_in_bounds(index(byte), self.byte_length()):
         """Gets a single byte at the specified byte index.
 
         This performs byte-level indexing, not character (codepoint) indexing.

@@ -22,6 +22,7 @@ from std.collections import Deque
 """
 
 
+from std.builtin._verification import _index_in_bounds, _position_in_bounds
 from std.bit import next_power_of_two
 from std.builtin.rebind import downcast
 import std.format._utils as fmt
@@ -544,7 +545,7 @@ struct Deque[ElementType: Movable](
     def __getitem__(
         ref self, idx: Int
     ) -> ref[self._unchecked_get(idx)] Self.ElementType
-        requires 0 <= idx and idx < len(self):
+        requires _index_in_bounds(idx, len(self)):
         """Gets the deque element at the given index.
 
         Args:
@@ -837,7 +838,7 @@ struct Deque[ElementType: Movable](
     @inline(.always)
     def insert(mut self, idx: Int, var value: Self.ElementType) raises
         where conforms_to(Self.ElementType, Deinitable)
-        requires 0 <= idx and idx <= len(self)
+        requires _position_in_bounds(idx, len(self))
         ensures len(self) == old(len(self)) + 1 and self._maxlen == old(
             self._maxlen
         ):

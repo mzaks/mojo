@@ -41,7 +41,12 @@ from std.memory import (
     unsafe_uninit_move_n,
 )
 from std.builtin.builtin_slice import ContiguousSlice, StridedSlice
-from std.builtin._verification import _ensures, _same_elements
+from std.builtin._verification import (
+    _ensures,
+    _index_in_bounds,
+    _position_in_bounds,
+    _same_elements,
+)
 from .optional import Optional
 
 # ===-----------------------------------------------------------------------===#
@@ -983,7 +988,7 @@ struct List[T: AnyType, /](
     @inline(.always)
     def insert(mut self, i: Int, var value: Self.T, /)
         where conforms_to(Self.T, Movable)
-        requires 0 <= i and i <= len(self)
+        requires _position_in_bounds(i, len(self))
         ensures len(self) == old(len(self)) + 1:
         """Inserts a value to the list at the given index.
         `a.insert(len(a), value)` is equivalent to `a.append(value)`.
@@ -1183,7 +1188,7 @@ struct List[T: AnyType, /](
     @inline(.always)
     def pop(mut self, i: Int) -> Self.T
         where conforms_to(Self.T, Movable)
-        requires 0 <= i and i < len(self)
+        requires _index_in_bounds(i, len(self))
         ensures (
             len(self) == old(len(self)) - 1
             and _same_elements(self._data, old(self._data), i)
@@ -1602,7 +1607,7 @@ struct List[T: AnyType, /](
     def __getitem__(
         ref self, idx: Int, /
     ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T
-        requires 0 <= idx and idx < len(self):
+        requires _index_in_bounds(idx, len(self)):
         """Gets the list element at the given index.
 
         Unlike when subscripting using slices negative indices are
@@ -1643,7 +1648,7 @@ struct List[T: AnyType, /](
     def unsafe_get(
         ref self, idx: Int
     ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T
-        requires 0 <= idx and idx < len(self):
+        requires _index_in_bounds(idx, len(self)):
         """Get a reference to an element of self without checking index bounds.
 
         Args:
@@ -1668,7 +1673,7 @@ struct List[T: AnyType, /](
     @inline(.always)
     def unsafe_set(mut self, idx: Int, var value: Self.T)
         where conforms_to(Self.T, Deinitable & Movable)
-        requires 0 <= idx and idx < len(self)
+        requires _index_in_bounds(idx, len(self))
         ensures len(self) == old(len(self)):
         """Write a value to a given location without checking index bounds.
 

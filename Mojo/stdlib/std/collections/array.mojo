@@ -34,6 +34,7 @@ var filled = Array[Int, 5](fill=42)
 
 
 from std.math import max, min, align_down
+from std.builtin._verification import _index_in_bounds
 import std.memory
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.builtin.rebind import downcast
@@ -673,7 +674,7 @@ struct Array[T: AnyType, length: Int](
     @stable(since="1.0")
     @inline(.always)
     def __getitem__(ref self, idx: Int, /) -> ref[self] Self.T
-        requires 0 <= idx and idx < len(self):
+        requires _index_in_bounds(idx, len(self)):
         """Gets a reference to the element at the given index.
 
         Args:
