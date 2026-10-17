@@ -184,6 +184,15 @@ def ok_linked_list_rows() -> Int:
     return l.get_nth(0).get_nth(1) + l.get_nth(1).get_nth(0)
 
 
+def ok_linked_list_counter(l: LinkedList[Int]) -> Int:
+    var t = 0
+    var i = 0
+    for el in l:
+        t += el + l.get_nth(i)  # one node per step
+        i += 1
+    return t
+
+
 # --- must stay UNPROVEN ---
 def bad_bitset(mut b: BitSet[64], i: Int):
     if 0 <= i and i <= 64:
@@ -262,3 +271,12 @@ def bad_linked_list_row_past_end() -> Int:
     row.append(1)
     l.append(row^)
     return l.get_nth(0).get_nth(1)  # the row has one element
+
+
+def bad_linked_list_counter_ahead(l: LinkedList[Int]) -> Int:
+    var t = 0
+    var i = 1
+    for el in l:
+        t += el + l.get_nth(i)  # past the last node in the last step
+        i += 1
+    return t

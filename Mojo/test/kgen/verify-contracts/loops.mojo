@@ -243,6 +243,24 @@ def ok_fields_after_raising_loop(n: Int) raises -> Int:
     return q[0]  # the loop does not change `q`
 
 
+def ok_reversed_with_counter(xs: List[Int]) -> Int:
+    var t = 0
+    var i = 0
+    for x in reversed(xs):
+        t += x + xs[len(xs) - 1 - i]  # the counter follows the iteration
+        i += 1
+    return t
+
+
+def ok_counter_down(xs: List[Int]) -> Int:
+    var t = 0
+    var i = len(xs) - 1
+    for x in xs:
+        t += x + xs[i]  # the counter and the cursor add up to a constant
+        i -= 1
+    return t
+
+
 # --- must stay UNPROVEN ---
 def bad_one_past(xs: List[Int]) -> Int:
     var s = 0
@@ -412,4 +430,13 @@ def bad_scaled_counter(p: Pointer[Int, MutUntrackedOrigin], n: Int) -> Int
     for _ in range(n):
         t += p[unsafe_offset=off + 4]  # one past the last
         off += 4
+    return t
+
+
+def bad_counter_down_past(xs: List[Int]) -> Int:
+    var t = 0
+    var i = len(xs)
+    for x in xs:
+        t += x + xs[i]  # one past the end in the first iteration
+        i -= 1
     return t

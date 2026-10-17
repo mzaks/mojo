@@ -4528,6 +4528,18 @@ private:
         if (!(other == loc))
           for (const char *op : {"bvsle", "bvslt"})
             candidates.push_back({loc, op, other, ""});
+      // A counter the body steps beside a loop's cursor (`i += 1` in `for
+      // el in xs`, or in `for j in range(n)`): equal to the cursor, or
+      // with it what the two were on entry (`i -= 1`).
+      if (loc.path.empty() && changes(loc))
+        for (const Loc &other : places)
+          if (other.root != loc.root && changes(other) &&
+              (StringRef(other.path).ends_with("/index") ||
+               StringRef(other.path).ends_with("/seen") ||
+               StringRef(other.path).ends_with("/curr"))) {
+            candidates.push_back({loc, "=", other, ""});
+            candidates.push_back({loc, "=", other, "", false, "bvadd"});
+          }
     }
     auto render = [&](const Candidate &c, State &at) {
       if (!c.scale.empty()) {
@@ -6830,7 +6842,13 @@ private:
         ")",
         "std::collections::linked_list::LinkedList::__reversed__[",
         // A deque's elements from the back.
-        "std::collections::deque::Deque::__reversed__["};
+        "std::collections::deque::Deque::__reversed__[",
+        // A list's, span's or array's elements from the back: the iterator's
+        // own `index` counts down from the length, so the model counts what
+        // it has yielded in a field of its own (`/seen`), not in `/index`.
+        "std::collections::list::List::__reversed__[",
+        "std::collections::span::Span::__reversed__[",
+        "std::collections::array::Array::__reversed__["};
     static const char *collectionTypes[] = {
         "@std::@collections::@list::@List<",
         "@std::@collections::@span::@Span<",
@@ -6849,14 +6867,29 @@ private:
         "std::collections::dict::_DictEntryIter::",
         "std::collections::linked_list::_LinkedListIter::",
         "std::collections::linked_list::_LinkedListIterOwned::"};
-    // The length of the collection at `v`, a reference.
+    // The length of the collection at `v`, a reference, or `v` itself (a
+    // span's `__reversed__` takes `self` by value).
     auto lengthOf = [&](Value v) -> MaybeTerm {
+      if (!isa<LIT::RefType>(v.getType())) {
+        std::string value = term(v, state);
+        if (sortOfTerm(value).isBool || sortOfTerm(value).width != 64)
+          return std::nullopt;
+        return define(sort, lenOf(value));
+      }
       std::optional<Loc> loc = placeOf(v);
       if (!loc)
         return std::nullopt;
       if (MaybeTerm n = loc->path.empty() ? arrayLength(*loc) : std::nullopt)
         return n;
       return define(sort, lenOf(load(*loc, state, placeType(*loc))));
+    };
+    // Whether the iteration counts what it has yielded in `/seen` (see
+    // `collections`): backward over a list, span or array.
+    auto countsSeen = [](StringRef p) {
+      return p.contains("::__reversed__[") &&
+             (p.starts_with("std::collections::list::") ||
+              p.starts_with("std::collections::span::") ||
+              p.starts_with("std::collections::array::"));
     };
     // The result of a call: its register result or its `out` slot.
     auto produce = [&](std::map<std::string, std::string> fields) {
@@ -6878,7 +6911,8 @@ private:
     };
     for (const char *prefix : collections)
       if (path.starts_with(prefix) && call.getNumOperands() >= 1 &&
-          isa<LIT::RefType>(call.getOperands()[0].getType()) &&
+          (isa<LIT::RefType>(call.getOperands()[0].getType()) ||
+           path.contains("::__reversed__[")) &&
           (call->getNumResults() == 1 || call.getNumOperands() == 2))
         if (MaybeTerm n = lengthOf(call.getOperands()[0])) {
           // The iterator's elements are the collection's (see `__next__`);
@@ -6888,16 +6922,23 @@ private:
             if (std::optional<Loc> src = placeOf(call.getOperands()[0]))
               if (std::optional<Loc> out = placeOf(call.getOperands()[1]))
                 iterSources[out->root] = *src;
-          return produce({{"/index", bvConst(0, 64)}, {"/length", *n}});
+          return produce(
+              {{countsSeen(path) ? "/seen" : "/index", bvConst(0, 64)},
+               {"/length", *n}});
         }
-    // `reversed(q)` of a deque: its elements from the back, as many as
-    // it has.
+    // `reversed(q)` of a deque, list, span or array: its elements from the
+    // back, as many as it has.
     if (path.starts_with("std::builtin::reversed::reversed[") &&
-        call.getNumOperands() >= 1 &&
-        StringRef(printed(call.getOperands()[0].getType()))
-            .contains("@std::@collections::@deque::@Deque<"))
-      if (MaybeTerm n = lengthOf(call.getOperands()[0]))
-        return produce({{"/index", bvConst(0, 64)}, {"/length", *n}});
+        call.getNumOperands() >= 1) {
+      StringRef type = printed(call.getOperands()[0].getType());
+      bool isDeque = type.contains("@std::@collections::@deque::@Deque<");
+      if (isDeque || type.contains("@std::@collections::@list::@List<") ||
+          type.contains("@std::@collections::@span::@Span<") ||
+          type.contains("@std::@collections::@array::@Array<"))
+        if (MaybeTerm n = lengthOf(call.getOperands()[0]))
+          return produce({{isDeque ? "/index" : "/seen", bvConst(0, 64)},
+                          {"/length", *n}});
+    }
     // `reversed(d)`, `reversed(d.values())`, `reversed(d.items())`: a new
     // count over the same dictionary, from no entries seen.
     if (path.starts_with("std::builtin::reversed::reversed[") &&
@@ -6945,9 +6986,6 @@ private:
     if (!self)
       return false;
     std::string inner = isEnumerate ? "/_inner" : "";
-    Loc index{self->root, self->path + inner + "/index"},
-        length{self->root, self->path + inner + "/length"},
-        count{self->root, self->path + "/_count"};
     // An owned iterator (`_ListIterOwned`) only goes forward; a dictionary's
     // counts the entries it has seen in either direction.
     bool owned = path.contains("IterOwned::");
@@ -6959,6 +6997,8 @@ private:
     // A deque's counts down from its length; counted up here, it yields as
     // many elements, from the back.
     bool deque = path.starts_with("std::collections::deque::");
+    // So does a list's, span's or array's, in `/seen` (its `index` is the
+    // real field, counting down).
     bool backward = false;
     if (isIterator && !owned && !dict) {
       ParamFrame frame = paramFrame(call, callee);
@@ -6966,8 +7006,6 @@ private:
       if (forward == frame.values.end())
         return false;
       backward = !StringRef(printed(forward->second)).contains("true");
-      if (backward && !linked && !deque)
-        return false;
     } else if (isEnumerate && !llvm::any_of(iterators, [&](const char *prefix) {
                  StringRef type = StringRef(prefix).drop_back(2);
                  return !name.params.empty() &&
@@ -6976,9 +7014,13 @@ private:
                })) {
       return false;
     }
+    std::string cursor = backward && !linked && !deque ? "/seen" : "/index";
+    Loc index{self->root, self->path + inner + cursor},
+        length{self->root, self->path + inner + "/length"},
+        count{self->root, self->path + "/_count"};
     if (method.starts_with("__iter__")) {
       std::map<std::string, std::string> fields = {
-          {inner + "/index", load(index, state, sort)},
+          {inner + cursor, load(index, state, sort)},
           {inner + "/length", load(length, state, sort)}};
       if (isEnumerate)
         fields["/_count"] = load(count, state, sort);
