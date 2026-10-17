@@ -174,6 +174,16 @@ def ok_deque_from_list() -> Int:
     return q[2]
 
 
+def ok_linked_list_rows() -> Int:
+    var l = LinkedList[LinkedList[Int]]()
+    for i in range(2):
+        var row = LinkedList[Int]()
+        row.append(i)
+        row.append(i + 1)
+        l.append(row^)  # the appended row is known, and earlier rows kept
+    return l.get_nth(0).get_nth(1) + l.get_nth(1).get_nth(0)
+
+
 # --- must stay UNPROVEN ---
 def bad_bitset(mut b: BitSet[64], i: Int):
     if 0 <= i and i <= 64:

@@ -223,7 +223,11 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `List.append` and `LinkedList.append` state the element they add, so
   an appended row is known where it is read back (`xs[0][1]` after
   `xs.append(row^)`: the row's length is `row`'s).
-- Loop invariants also bound the lengths of lists a loop appends to.
+- Loop invariants also bound the lengths of lists a loop appends to. A
+  loop over `range(n)` with a constant `n` of at most 8 that changes a
+  variable from outside it (`for i in range(2): ... xs.append(row^)`) is
+  walked once per iteration instead, like a `comptime for` over a
+  constant, so that each appended element is known.
 - Generic code is verified once, for every value of its parameters.
   `comptime for` is a loop over an arbitrary iteration, `comptime if` joins
   its arms, and parameter expressions are evaluated where they are

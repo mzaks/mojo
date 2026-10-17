@@ -2246,6 +2246,19 @@ private:
     if (auto it = definitions.find(term.str());
         it != definitions.end() && depth < 32)
       return constantInt(it->second, depth + 1);
+    // A choice whose condition is decided (a range's end, clamped at 0:
+    // `(ite (bvslt 2 0) 0 2)`), and sums and differences of constants.
+    SmallVector<StringRef> parts = application(term);
+    if (parts.size() == 4 && parts[0] == "ite" && depth < 32)
+      if (std::optional<bool> cond = decided(parts[1]))
+        return constantInt(parts[*cond ? 2 : 3], depth + 1);
+    if (parts.size() == 3 && (parts[0] == "bvadd" || parts[0] == "bvsub") &&
+        depth < 32)
+      if (std::optional<int64_t> a = constantInt(parts[1], depth + 1),
+          b = constantInt(parts[2], depth + 1);
+          a && b)
+        return (int64_t)(parts[0] == "bvadd" ? (uint64_t)*a + (uint64_t)*b
+                                             : (uint64_t)*a - (uint64_t)*b);
     return std::nullopt;
   }
 
@@ -3737,7 +3750,84 @@ private:
       notAnalyzed(loop, state);
       return;
     }
+    if (unrollRangeLoop(loop, state))
+      return;
     walkLoopBody(loop, loop.getBody().front(), /*comptime=*/false, state);
+  }
+
+  /// A loop over `range(n)` whose `n` and start are known constants (`for i
+  /// in range(2)`): its body walked once per iteration, as
+  /// `unrollComptimeFor` walks a `comptime for`. The invariant search keeps
+  /// only what holds of an arbitrary iteration, which loses what is known
+  /// of each element a loop appends (a row built and appended per
+  /// iteration: its length). Only a loop that changes a variable from
+  /// outside it other than its range, and under the same caps: at most 8
+  /// iterations, and 16 bodies through nested loops.
+  bool unrollRangeLoop(HLCF::LoopOp loop, State &state) {
+    Block &body = loop.getBody().front();
+    // The range the loop advances: `self` of the body's `__next__`.
+    Value root;
+    body.walk([&](LIT::CallOp call) {
+      if (root || call.getNumOperands() != 3)
+        return;
+      std::optional<CalleeName> name = calleeName(call.getCallee());
+      if (!name ||
+          !StringRef(name->path).starts_with("std::builtin::range::") ||
+          !StringRef(name->path).contains("::__next__"))
+        return;
+      std::optional<Loc> self = placeOf(call.getOperands()[0]);
+      if (self && self->path.empty())
+        root = self->root;
+    });
+    if (!root || !root.getDefiningOp<LIT::VarDeclOp>() ||
+        loop->isAncestor(root.getDefiningOp()) || !onlyAdvanced(loop, root))
+      return false;
+    auto curr = state.env.find(Loc{root, "/curr"});
+    auto end = state.env.find(Loc{root, "/end"});
+    if (curr == state.env.end() || end == state.env.end())
+      return false;
+    std::optional<int64_t> c = constantInt(curr->second),
+                           e = constantInt(end->second);
+    if (!c || !e || *e < *c || *e - *c > 8)
+      return false;
+    uint64_t n = *e - *c;
+    if (unrolledBodies * std::max<uint64_t>(n, 1) > 16)
+      return false;
+    std::optional<llvm::DenseSet<Value>> written = writtenRoots(loop);
+    if (!written || llvm::none_of(*written, [&](Value other) {
+          Operation *def = other.getDefiningOp();
+          return other != root && def && !loop->isAncestor(def) &&
+                 def->getParentOfType<LIT::FnOp>() == fn;
+        }))
+      return false;
+    uint64_t outer = unrolledBodies;
+    unrolledBodies *= std::max<uint64_t>(n, 1);
+    SmallVector<State> exits;
+    State current = state;
+    current.yields.clear();
+    for (uint64_t k = 0; k < n && current.alive; ++k) {
+      LoopFrame frame{labelOf(loop), false, {}, {}, {}, {}, {}};
+      loops.push_back(&frame);
+      State iteration = current;
+      walkBlock(body, iteration);
+      loops.pop_back();
+      if (iteration.alive)
+        frame.continues.push_back(iteration);
+      // The `__next__` of an iteration within the count does not raise:
+      // the `break` it leads to is not a path.
+      for (State &exit : frame.breaks)
+        if (decided(exit.pc) != false)
+          exits.push_back(std::move(exit));
+      current = merge(frame.continues);
+    }
+    unrolledBodies = outer;
+    // After the last iteration `__next__` raises, which ends the loop.
+    if (current.alive)
+      exits.push_back(current);
+    State exit = merge(exits);
+    exit.yields = state.yields;
+    state = std::move(exit);
+    return true;
   }
 
   /// `hlcf.comptime.for`: its body (region 0) runs once per value of the

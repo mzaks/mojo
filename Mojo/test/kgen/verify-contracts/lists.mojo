@@ -132,6 +132,16 @@ def ok_appended_row() -> Int:
     return xs[0][1]
 
 
+def ok_rows_built_in_loop() -> Int:
+    var xs = List[List[Int]]()
+    for i in range(2):
+        var row = List[Int]()
+        for j in range(3):
+            row.append(i + j)
+        xs.append(row^)  # earlier rows are kept as appended
+    return xs[0][2] + xs[1][0]
+
+
 # --- must stay UNPROVEN ---
 def bad_literal_past_end() -> Int:
     var xs: List[Int] = [1, 2, 3]
