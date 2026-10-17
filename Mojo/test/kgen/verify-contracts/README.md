@@ -174,8 +174,10 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `enumerate`'s count is the cursor (plus `start`). It yields element
   `cursor` of the collection: a reference to its place when borrowing, its
   value when consuming. The elements `enumerate` yields are unknown.
-  Iterating a `Deque` backwards (`reversed(q)`) yields `len(q)` times
-  (`ok_deque_reversed`); other reversed collections are not modelled.
+  Iterating a `Deque`, `List`, `Span` or `Array` backwards (`reversed(xs)`,
+  `xs.__reversed__()`) yields `len(xs)` times (`ok_deque_reversed`,
+  `ok_reversed_with_counter`); the pass counts what such an iterator has
+  yielded in a field of its own, since the iterator's `index` counts down.
 - Iterating a `LinkedList` (`for x in l`, `l.__reversed__()`,
   `enumerate(l)`, and consuming it with `for x in l^`) yields exactly
   `len(l)` times, element `cursor` (from the end when reversed), as
@@ -197,7 +199,11 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   against 0, against the values before the loop and lengths, and between the
   loop's variables, and for a list the loop changes, that its length plus or
   minus a loop variable keeps its value on entry (`len(xs) + i` when each
-  step pops once). Only variables the loop's conditions depend on are
+  step pops once), and for a counter the body steps beside an iteration's
+  cursor (`i += 1` in `for x in xs`, or in `for j in range(n)`), that it
+  equals the cursor or adds up with it to what the two were on entry
+  (`ok_iterate_with_counter`, `ok_counter_down`,
+  `ok_linked_list_counter`). Only variables the loop's conditions depend on are
   considered. The invariants hold only where the loop is reached.
 
 - Postconditions: a function's own clauses on `out` and `mut` arguments are
@@ -249,7 +255,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   bounds meaning 0 and `len(xs)`. The pass models `Optional` (its
   constructors, `or_else`, `__bool__`) to read the bounds, and `value()`
   as a reference to the value it holds (`ok_optional_list`). `List(span)`
-  copies a span and is as long as it.
+  copies a span and is as long as it. `Span(unsafe_ptr=p, length=n)` has
+  `n` elements (a builtin constructor, modelled by the pass). A write
+  through a span of a list (`s[0] = 9`) writes an element of the list,
+  whose length is kept (`ok_write_through_span`): a store through a
+  reference the pass does not track, whose origin names a variable of
+  another type than the reference's, is a write to a part of it.
 - Strided slices (`xs[a:b:c]`, `xs[::-1]`) copy into a new list whose
   length is that of `range(*slice.indices(len(xs)))`: bounds are
   normalized as `indices` does (negative ones count from the end, out of
@@ -289,8 +300,9 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   in range, `s[byte=a:b]` requires `0 <= a <= b <= s.byte_length()` and has
   `b - a` bytes, `as_bytes()` is as long as the string, `s += t` adds
   `t.byte_length()`, and `String()`, `String(literal)` and the
-  `StringSlice` constructors state their lengths. That `s[byte=i]` must
-  also fall on a codepoint boundary is not stated.
+  `StringSlice` constructors state their lengths; `count_codepoints()` is
+  not negative, and `split(sep)` gives at least one part. That `s[byte=i]`
+  must also fall on a codepoint boundary is not stated.
 - Nested collections (`xs[i][j]`, `xs[i].append(v)`, `l.get_nth(i).get_nth(j)`):
   a reference to an element is a place whose value is the element; writing it
   (directly, through a field, or by a call that takes it `mut`) writes the

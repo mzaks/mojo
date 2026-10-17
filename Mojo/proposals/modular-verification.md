@@ -2037,6 +2037,55 @@ Elements of nested collections:
   3.30 s against 3.28 s. Cheaper where loops are unrolled: walking a
   two-iteration body twice costs less than the invariant search for it.
 
+Counters beside iterations, writes through spans, and three string
+clauses:
+
+- A counter the body steps beside an iteration's cursor (`i += 1` in
+  `for el in l` with `l.get_nth(i)`, or `i -= 1` beside a reversed walk)
+  had no candidate invariant: the templates related two integer variables
+  by `<=` and `<` only. Two more, for a variable the body changes against a
+  cursor it changes (`/index`, `/seen`, `/curr`): equal to it, or adding up
+  with it to what the two were on entry.
+- Backward iteration over a `List`, `Span` or `Array` (`reversed(xs)`,
+  `xs.__reversed__()`) was not modelled. It is now, as a deque's: the pass
+  counts what the iterator has yielded in a field of its own (`/seen`),
+  not in `/index`, since the iterator's real `index` counts down from the
+  length and anything that reads it (`__len__`) must not see a count-up.
+  `Span.__reversed__` takes `self` by value, so the length is read from
+  the value, not a place.
+- A write through a span of a list (`s[0] = 9` after `s = Span(l)`) made
+  `l` unknown: the reference `Span.__getitem__` returns has the list's
+  origin, and a store through an untracked reference forgot everything
+  the origin names. A reference to another type than the variable's is a
+  reference to a part of it (an element), so the write now keeps the
+  variable's length, as an interior origin does. The one case this
+  misreads, a method handing out a reference to a field of its own type
+  (`ref self._len`), would appear as a tracked field place, not here.
+- `Span(unsafe_ptr=p, length=n)` is `@always_inline("builtin")`, which
+  admits no clause; the pass models it as `n` elements.
+- `count_codepoints()` of a `String` or `StringSlice` is not negative, and
+  `StringSlice.split(sep)` (with or without `maxsplit`, and `_split` under
+  them) gives at least one part: every split yields at least one.
+- Numbers: `test_linked_list.mojo` 182 of 182 (from 181), `test_span.mojo`
+  106 of 111 (from 102), `test_string_span.mojo` 57 of 57 (from 55); the
+  other stdlib test files are unchanged. New examples: `ok_reversed_with_counter`,
+  `ok_counter_down`, `bad_counter_down_past` (loops.mojo),
+  `ok_linked_list_counter`, `bad_linked_list_counter_ahead`
+  (collections.mojo), `ok_write_through_span`, `ok_span_from_pointer`,
+  `bad_span_from_pointer_past` (spans.mojo), `ok_split_parts`,
+  `ok_codepoint_count`, `bad_split_second` (strings.mojo).
+- Cost, CPU seconds of the whole `kgen` run, median of 5 interleaved runs,
+  cache off: `test_list.mojo` 5.21 s against 5.23 s before,
+  `test_deque.mojo` 5.43 s against 5.61 s, `test_linked_list.mojo` 2.39 s
+  against 2.43 s, `test_span.mojo` 3.11 s against 3.05 s,
+  `test_string_span.mojo` 2.48 s against 2.47 s: the two counter templates
+  cost nothing measurable.
+- Left open in the stdlib tests: `test_dict.mojo` (10: the length of
+  `d.keys()` and of lists built by iterating a dictionary, which needs the
+  dictionary's own length after `pop` and `__setitem__`), `test_span.mojo`
+  (a span chosen by `if` between two `mut` lists of unknown length, which
+  no clause of the test states; a reassigned slice; a comptime size).
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through

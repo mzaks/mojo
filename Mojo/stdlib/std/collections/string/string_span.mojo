@@ -1552,7 +1552,7 @@ struct StringSpan[origin: ImmOrigin](
 
         return len(self._slice)
 
-    def count_codepoints(self) -> Int:
+    def count_codepoints(self) -> Int ensures result >= 0:
         """Calculates the length in Unicode codepoints encoded in the
         UTF-8 representation of this string.
 
@@ -1985,7 +1985,8 @@ struct StringSpan[origin: ImmOrigin](
             return self.byte_length() != 0
 
     @inline(.always)
-    def split(self, sep: StringSpan) -> List[Self.Immutable]:
+    def split(self, sep: StringSpan) -> List[Self.Immutable]
+        ensures len(result) >= 1:
         """Split the string by a separator.
 
         Args:
@@ -2010,7 +2011,8 @@ struct StringSpan[origin: ImmOrigin](
         return _split[has_maxsplit=False](self.as_imm(), sep, -1)
 
     @inline(.always)
-    def split(self, sep: StringSpan, maxsplit: Int) -> List[Self.Immutable]:
+    def split(self, sep: StringSpan, maxsplit: Int) -> List[Self.Immutable]
+        ensures len(result) >= 1:
         """Split the string by a separator.
 
         Args:
@@ -2869,7 +2871,8 @@ def _split[
     sep: StringSpan,
     maxsplit: Int,
     out output: List[type_of(src_str).Immutable],
-):
+)
+    ensures len(output) >= 1:
     comptime S = type_of(src_str).Immutable
     var ptr = src_str.unsafe_ptr()
     var sep_len = sep.byte_length()

@@ -63,6 +63,16 @@ def ok_span_loop(s: StringSlice) -> Int:
     return t
 
 
+def ok_split_parts(s: StringSlice) -> Int:
+    var parts = s.split(",")  # at least one part
+    return parts[0].byte_length() + parts[len(parts) - 1].byte_length()
+
+
+def ok_codepoint_count(s: StringSlice) -> Int:
+    var counts = List[Int](length=s.count_codepoints(), fill=0)
+    return len(counts)
+
+
 # --- must stay UNPROVEN ---
 def bad_byte_past() -> Int:
     var s: String = "héllo"
@@ -83,3 +93,8 @@ def bad_slice_past() -> Int:
 def bad_empty() -> Int:
     var s = String()
     return s[byte=0].byte_length()
+
+
+def bad_split_second(s: StringSlice) -> Int:
+    var parts = s.split(",")
+    return parts[1].byte_length()  # one part when there is no comma

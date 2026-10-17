@@ -1583,7 +1583,7 @@ struct String(
             return self._len_or_data
 
     @inline(.always)
-    def count_codepoints(self) -> Int:
+    def count_codepoints(self) -> Int ensures result >= 0:
         """Calculates the length in Unicode codepoints encoded in the
         UTF-8 representation of this string.
 
