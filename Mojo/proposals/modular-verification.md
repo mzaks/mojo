@@ -1991,6 +1991,52 @@ The last 14 `Deque` obligations:
   same reason. The power-of-two clause fails where the other clauses do,
   on the paths that size the buffer with `next_power_of_two` and `<< 1`.
 
+Elements of nested collections:
+
+- Half of the stdlib tests' open obligations were reads into an element
+  that is itself a collection (`list[0][1]`, `l.get_nth(0).get_nth(1)`)
+  after the outer one was built by `append`. The element model knew the
+  outer list's length and that `append` keeps the other elements, but
+  nothing of the element it adds, so the inner length was unknown.
+- `List.append` and `LinkedList.append` now state the element they add,
+  `_element_is(self, old(len(self)), value)`, and `LinkedList.append`
+  (whose elements are not at a pointer it holds, so `_same_elements` does
+  not apply) that the others are kept, `_elements_kept(self,
+  old(len(self)))`. Both helpers return `True`; the pass reads them as
+  `elem(xs, n) = v` and as the quantified equality `_same_elements`
+  gives. `value` is a `var` argument of a type that need not be copyable,
+  so it has no `old(...)`: the pass reads it as it was at entry, which is
+  the value stored. `List.reserve` states its length and elements, and
+  `LinkedList.maybe_pop` its length (one less, or zero) and elements.
+- Rows built and appended in a loop (`for i in range(2): ... xs.append(row^)`)
+  need what each iteration appended, which the invariant search (facts
+  about an arbitrary iteration) cannot give. A loop over `range(n)` whose
+  bounds are known constants, with at most 8 iterations and 16 bodies
+  through nested loops, that changes a variable from outside it other than
+  its range is now walked once per iteration, as a `comptime for` over a
+  constant is. For that, the pass reads constants through a decided `ite`
+  (a range's end is clamped at 0: `(ite (bvslt 2 0) 0 2)`) and through sums
+  and differences of constants.
+- `LinkedList.get_nth(0)` with a literal index gave the element model an
+  unknown index: for an index passed by reference, the branch for an
+  integer value ran first and took the reference's handle. The reference
+  branch now runs first (an `Int` by reference, or a literal's value from
+  its type).
+- Numbers: `test_list.mojo` 259 of 259 (from 226 of 237: unrolled
+  iterations count their obligations one by one), `test_linked_list.mojo`
+  181 of 182 (from 157 of 173), `test_array.mojo` 63 of 63 (from 51 of
+  51), `test_bitset.mojo` 278 of 278 (from 271 of 271); the example files
+  gain `ok_appended_row`, `ok_rows_built_in_loop` and
+  `ok_linked_list_rows`, and keep every `bad_*` unproven. Left in these
+  files: a counter stepped beside `for el in l` (`l.get_nth(i)`), the
+  loop-counter item of the list.
+- Cost, CPU seconds of the whole `kgen` run, median of 5 interleaved runs,
+  cache off, load about 20: `test_list.mojo` 5.64 s against 6.52 s before,
+  `test_linked_list.mojo` 2.67 s against 3.21 s, `test_deque.mojo` 6.05 s
+  against 6.21 s, `test_bitset.mojo` 1.76 s against 1.84 s, `test_span.mojo`
+  3.30 s against 3.28 s. Cheaper where loops are unrolled: walking a
+  two-iteration body twice costs less than the invariant search for it.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through

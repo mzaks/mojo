@@ -1229,7 +1229,11 @@ struct List[T: AnyType, /](
         return ret_val^
 
     @stable(since="1.0")
-    def reserve(mut self, capacity: Int) where conforms_to(Self.T, Movable):
+    def reserve(mut self, capacity: Int)
+        where conforms_to(Self.T, Movable)
+        ensures len(self) == old(len(self)) and _same_elements(
+            self._data, old(self._data), len(self)
+        ):
         """Reserves the requested capacity.
 
         Args:

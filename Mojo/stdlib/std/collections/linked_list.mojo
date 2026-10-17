@@ -528,7 +528,10 @@ struct LinkedList[ElementType: Movable](
 
         raise Error("Invalid index for pop: ", idx)
 
-    def maybe_pop(mut self) -> Optional[Self.ElementType]:
+    def maybe_pop(mut self) -> Optional[Self.ElementType]
+        ensures len(self) == (
+            old(len(self)) - 1 if old(len(self)) > 0 else 0
+        ) and _elements_kept(self, len(self)):
         """Removes the tail of the list and returns it, if it exists.
 
         Returns:
