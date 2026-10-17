@@ -2832,20 +2832,29 @@ private:
     return named;
   }
 
-  /// Memory a mutable origin (printed) may reach becomes unknown.
-  void havocOrigin(StringRef origin, State &state, bool confined = false) {
+  /// Memory a mutable origin (printed) may reach becomes unknown. With
+  /// `pointee`, the type the reference written through refers to: a part
+  /// of a variable of another type (an element of a list, through a span
+  /// of it: the reference `Span.__getitem__` returns has the list's
+  /// origin), not the variable itself.
+  void havocOrigin(StringRef origin, State &state, bool confined = false,
+                   Type pointee = {}) {
     if (std::optional<SmallVector<Value>> named = rootsNamedBy(origin)) {
       for (Value root : *named) {
         Loc loc{root, ""};
         // An interior origin (`xs["element"]` in source,
         // `#lit.interior.origin<xs, "element">` here) reaches what the root
         // owns (a collection's elements), not the root's own fields: its
-        // length is kept.
+        // length is kept. So does a write to a part of the root through a
+        // reference of another type (not a field a method hands out, which
+        // `placeOf` tracks as the field).
         std::string name = quotedOriginName(root);
         size_t at = origin.find(name);
-        if (at != StringRef::npos &&
-            origin.take_front(at).ends_with(
-                "#lit.interior.origin<#kgen.param.decl.ref<")) {
+        if ((at != StringRef::npos &&
+             origin.take_front(at).ends_with(
+                 "#lit.interior.origin<#kgen.param.decl.ref<")) ||
+            (pointee && pointee != placeType(loc) &&
+             !isScalar(placeType(loc)) && !isa<LIT::RefType>(placeType(loc)))) {
           std::string old = load(loc, state, placeType(loc));
           std::string fresh = declare({false, 64, false}, "h");
           facts.push_back("(= " + lenOf(fresh) + " " + lenOf(old) + ")");
@@ -4986,8 +4995,11 @@ private:
         store(*loc, state, term(value, state), value);
       else if (auto ref = dyn_cast<LIT::RefType>(dest.getType()))
         // A store through a reference into shared or global memory
-        // (`smem_ptr[i] = v`) writes that memory only.
-        havocOrigin(printed(ref.getOrigin()), state, otherSpace(ref));
+        // (`smem_ptr[i] = v`) writes that memory only; one into a part of
+        // a variable (an element of a list, through a span of it) keeps
+        // the variable's length.
+        havocOrigin(printed(ref.getOrigin()), state, otherSpace(ref),
+                    ref.getElementType());
       else
         havocAll(state);
       return;
@@ -9644,6 +9656,20 @@ private:
       return true;
     if (evalOptional(call, name, state))
       return true;
+    // `Span(unsafe_ptr=p, length=n)`: a span of `n` elements. The
+    // constructor is `@always_inline("builtin")`, which admits no clause.
+    if (path.starts_with(
+            "std::collections::span::Span::__init__(unsafe_ptr:") &&
+        call.getNumOperands() == 2 && call->getNumResults() == 1 &&
+        !isa<LIT::RefType>(call.getOperands()[1].getType())) {
+      std::string n = term(call.getOperands()[1], state);
+      if (!sortOfTerm(n).isBool && sortOfTerm(n).width == 64) {
+        std::string span = declare({false, 64, false}, "g");
+        facts.push_back("(= " + lenOf(span) + " " + n + ")");
+        values[result] = span;
+        return true;
+      }
+    }
     // A string's length in bytes: `len` of its value (`String` has no
     // `__len__` of its own); a literal's, from its type.
     if ((path.starts_with(

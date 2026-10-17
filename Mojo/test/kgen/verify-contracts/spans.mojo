@@ -88,6 +88,18 @@ def ok_backwards(vs: List[Int]) -> Int:
     return 0
 
 
+def ok_write_through_span() -> Int:
+    var l: List = [1, 2, 3]
+    var s = Span(l)
+    s[0] = 9  # writes an element of `l`, whose length is kept
+    return l[0] + l[len(l) - 1]
+
+
+def ok_span_from_pointer(p: Pointer[Int, MutUntrackedOrigin]) -> Int:
+    var s = Span(unsafe_ptr=p, length=2)
+    return s[1]
+
+
 # --- must stay UNPROVEN ---
 def bad_slice_tail_past(vs: List[Int]) -> Int:
     if len(vs) > 0:
@@ -126,3 +138,8 @@ def bad_every_other_past() -> Int:
 def bad_zero_step() -> Int:
     var vs: List[Int] = [1, 2, 3]
     return vs[::0][0]  # a zero step selects nothing
+
+
+def bad_span_from_pointer_past(p: Pointer[Int, MutUntrackedOrigin]) -> Int:
+    var s = Span(unsafe_ptr=p, length=2)
+    return s[2]
