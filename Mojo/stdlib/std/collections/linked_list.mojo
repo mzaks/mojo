@@ -20,7 +20,12 @@ traversal.
 """
 
 from std.builtin.rebind import downcast, rebind_var
-from std.builtin._verification import _index_in_bounds, _position_in_bounds
+from std.builtin._verification import (
+    _element_is,
+    _elements_kept,
+    _index_in_bounds,
+    _position_in_bounds,
+)
 from std.collections import check_bounds
 from std.reflection import call_location
 import std.format._utils as fmt
@@ -378,7 +383,11 @@ struct LinkedList[ElementType: Movable](
         self._delete_list_elements(deinit_func)
 
     def append(mut self, var value: Self.ElementType)
-        ensures len(self) == old(len(self)) + 1:
+        ensures (
+            len(self) == old(len(self)) + 1
+            and _elements_kept(self, old(len(self)))
+            and _element_is(self, old(len(self)), value)
+        ):
         """Add an element to the end of the list.
 
         Args:

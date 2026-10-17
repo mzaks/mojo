@@ -519,6 +519,12 @@ Implemented, on the `mojo-bounds-verifier` branch:
   `_same_elements(dst, src, count)` (a `kgen.contract.same_elements`): the
   `count` elements at `dst` on exit are those at `src` on entry. It compares
   bits, so it states nothing for element types whose move is not trivial.
+  `append` (of `List` and `LinkedList`) also states the element it adds,
+  `_element_is(self, old(len(self)), value)`, and `LinkedList.append`, whose
+  elements are not at a pointer it holds, that the others are kept,
+  `_elements_kept(self, old(len(self)))`. Both are statements for the
+  verifier only (they return `True`): `value` is read as it was at entry,
+  since a `var` argument of a type that cannot be copied has no `old(...)`.
 - The experimental `modular=contracts` mode of `bounds-check-report` checks a
   call to a callee with contracts against them alone, without opening its
   body.

@@ -6567,7 +6567,50 @@ private:
         !StringRef(dstField->second.second).contains("_data") ||
         dstField->second.second != srcField->second.second)
       return assuming ? "true" : "false";
-    const std::string &a = dstField->second.first, &b = srcField->second.first;
+    return sameElementsOf(dstField->second.first, srcField->second.first,
+                          count);
+  }
+
+  /// `_elements_kept(xs, n)`: the first `n` elements of the collection `xs`
+  /// as the call left it are those it had at entry (`oldState`). Unknown
+  /// outside a postcondition.
+  std::string elementsKept(Value collection, State &state,
+                           const std::string &count) {
+    if (!oldState || !isa<LIT::RefType>(collection.getType()) ||
+        !placeOf(collection))
+      return assuming ? "true" : "false";
+    return sameElementsOf(valueThrough(collection, state),
+                          valueThrough(collection, *oldState), count);
+  }
+
+  /// `_element_is(xs, i, v)`: element `i` of the collection `xs` is `v`.
+  /// A `v` given by reference (a `var` argument, which the body consumed)
+  /// is read as it was at entry (`oldState`): it is the value stored.
+  /// Stated only: nothing proves it (the body writes elements through
+  /// pointers the model does not read as elements).
+  std::string elementIs(Value collection, State &state,
+                        const std::string &index, Value v) {
+    if (!assuming)
+      return "false";
+    std::string handle = isa<LIT::RefType>(collection.getType())
+                             ? valueThrough(collection, state)
+                             : term(collection, state);
+    std::string value = isa<LIT::RefType>(v.getType())
+                            ? valueThrough(v, oldState ? *oldState : state)
+                            : term(v, state);
+    Sort sort = sortOfTerm(handle);
+    if (sort.isBool || sort.width != 64 || sortOfTerm(index).isBool ||
+        sortOfTerm(index).width != 64)
+      return "true";
+    return define({true, 1, false},
+                  "(= " + elem(handle, index, sortOfTerm(value)) + " " + value +
+                      ")");
+  }
+
+  /// The first `count` elements of the collections `a` and `b` are equal,
+  /// for every element sort read so far.
+  std::string sameElementsOf(const std::string &a, const std::string &b,
+                             const std::string &count) {
     elem(a, bvConst(0, 64), {false, 64, true}); // At least `Int` elements.
     std::string k = declare({false, 64, true}, "k");
     std::string equal = "true";
@@ -6633,26 +6676,28 @@ private:
     static llvm::Regex literalRe("int_literal (-?[0-9]+)|"
                                  "#pop<int_literal (-?[0-9]+)>");
     SmallVector<StringRef> m;
+    auto literal = [&](Type type) {
+      // The literal's value is in the index's type (`IntLiteral[0]`).
+      int64_t v;
+      if (literalRe.match(printed(type), &m) &&
+          !(m[1].empty() ? m[2] : m[1]).getAsInteger(10, v))
+        index = bvConst(v, 64);
+    };
     if (call.getNumOperands() == 2 &&
-        sortOf(call.getOperands()[1].getType()).width == 64 &&
-        !sortOf(call.getOperands()[1].getType()).isBool &&
-        !path.contains("IntLiteral")) {
-      index = term(call.getOperands()[1], state);
-    } else if (call.getNumOperands() == 2 &&
-               isa<LIT::RefType>(call.getOperands()[1].getType())) {
-      // `get_nth[I: Indexer]`: an `Int` index, by reference.
+        isa<LIT::RefType>(call.getOperands()[1].getType())) {
+      // `get_nth[I: Indexer]`: an `Int` index, or a literal, by reference.
       auto ref = cast<LIT::RefType>(call.getOperands()[1].getType());
       if (isInt(ref.getElementType()))
         index = valueThrough(call.getOperands()[1], state);
+      else
+        literal(ref.getElementType());
+    } else if (call.getNumOperands() == 2 &&
+               sortOf(call.getOperands()[1].getType()).width == 64 &&
+               !sortOf(call.getOperands()[1].getType()).isBool &&
+               !path.contains("IntLiteral")) {
+      index = term(call.getOperands()[1], state);
     } else if (call.getNumOperands() == 2) {
-      // The literal's value is in the index's type (`IntLiteral[0]`).
-      std::string type = printed(call.getOperands()[1].getType());
-      if (literalRe.match(type, &m)) {
-        int64_t v;
-        StringRef digits = m[1].empty() ? m[2] : m[1];
-        if (!digits.getAsInteger(10, v))
-          index = bvConst(v, 64);
-      }
+      literal(call.getOperands()[1].getType());
     }
     if (index.empty())
       return false;
@@ -9558,6 +9603,19 @@ private:
       values[result] = sameElements(term(call.getOperands()[0], state),
                                     term(call.getOperands()[1], state),
                                     term(call.getOperands()[2], state));
+      return true;
+    }
+    if (path.starts_with("std::builtin::_verification::_elements_kept[") &&
+        call.getNumOperands() == 2) {
+      values[result] = elementsKept(call.getOperands()[0], state,
+                                    term(call.getOperands()[1], state));
+      return true;
+    }
+    if (path.starts_with("std::builtin::_verification::_element_is[") &&
+        call.getNumOperands() == 3) {
+      values[result] =
+          elementIs(call.getOperands()[0], state,
+                    term(call.getOperands()[1], state), call.getOperands()[2]);
       return true;
     }
     // An integer conversion (`Int(u8)`, `UInt8(i)`): extended by the

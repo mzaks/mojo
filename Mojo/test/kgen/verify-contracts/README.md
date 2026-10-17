@@ -217,7 +217,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
 - List elements: `xs[i]` reads `elem(xs, i)`; writing it keeps the length
   and the other elements. `_same_elements(a._data, b._data, n)` says the
   first `n` elements of two lists are equal, which is how `List.append`,
-  `pop` and `_realloc` state what they keep.
+  `pop` and `_realloc` state what they keep; `_elements_kept(xs, n)` says
+  the same of a collection without a pointer to its elements
+  (`LinkedList.append`). `_element_is(xs, i, v)` says element `i` is `v`:
+  `List.append` and `LinkedList.append` state the element they add, so
+  an appended row is known where it is read back (`xs[0][1]` after
+  `xs.append(row^)`: the row's length is `row`'s).
 - Loop invariants also bound the lengths of lists a loop appends to.
 - Generic code is verified once, for every value of its parameters.
   `comptime for` is a loop over an arbitrary iteration, `comptime if` joins

@@ -42,6 +42,7 @@ from std.memory import (
 )
 from std.builtin.builtin_slice import ContiguousSlice, StridedSlice
 from std.builtin._verification import (
+    _element_is,
     _ensures,
     _index_in_bounds,
     _position_in_bounds,
@@ -956,8 +957,10 @@ struct List[T: AnyType, /](
     @stable(since="1.1")
     def append(mut self, var value: Self.T, /)
         where conforms_to(Self.T, Movable)
-        ensures len(self) == old(len(self)) + 1 and _same_elements(
-            self._data, old(self._data), old(len(self))
+        ensures (
+            len(self) == old(len(self)) + 1
+            and _same_elements(self._data, old(self._data), old(len(self)))
+            and _element_is(self, old(len(self)), value)
         ):
         """Appends a value to this list.
 

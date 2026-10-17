@@ -123,6 +123,15 @@ def ok_nested_param(xs: List[List[Int]], i: Int, j: Int) -> Int:
     return 0
 
 
+def ok_appended_row() -> Int:
+    var xs = List[List[Int]]()
+    var row = List[Int]()
+    row.append(1)
+    row.append(2)
+    xs.append(row^)  # the appended row is known: its length is 2
+    return xs[0][1]
+
+
 # --- must stay UNPROVEN ---
 def bad_literal_past_end() -> Int:
     var xs: List[Int] = [1, 2, 3]
@@ -172,3 +181,11 @@ def bad_copy_then_grow(xs: List[Int]) -> Int:
 def bad_unsafe_get_past() -> Int:
     var xs: List[Int] = [1, 2, 3]
     return xs.unsafe_get(3)  # unchecked at run time, not statically
+
+
+def bad_appended_row_past_end() -> Int:
+    var xs = List[List[Int]]()
+    var row = List[Int]()
+    row.append(1)
+    xs.append(row^)
+    return xs[0][1]  # the row has one element

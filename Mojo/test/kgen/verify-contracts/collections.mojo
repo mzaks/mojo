@@ -237,7 +237,6 @@ def bad_dict_keys_unchecked(d: Dict[Int, Int]) -> Int:
     return keys[0]  # `d` may be empty
 
 
-
 def bad_linked_list_iterate_next(l: LinkedList[Int]) -> Int:
     var t = 0
     var i = 0
@@ -245,3 +244,11 @@ def bad_linked_list_iterate_next(l: LinkedList[Int]) -> Int:
         t += el + l.get_nth(i + 1)  # past the last node
         i += 1
     return t
+
+
+def bad_linked_list_row_past_end() -> Int:
+    var l = LinkedList[LinkedList[Int]]()
+    var row = LinkedList[Int]()
+    row.append(1)
+    l.append(row^)
+    return l.get_nth(0).get_nth(1)  # the row has one element

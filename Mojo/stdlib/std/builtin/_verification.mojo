@@ -170,6 +170,65 @@ def _same_elements[
 
 
 @inline(.nodebug)
+def _element_is[
+    C: AnyType, T: AnyType
+](collection: C, index: Int, value: T) -> Bool:
+    """States, in a postcondition, that `collection` holds `value` at
+    `index` on exit.
+
+    Use it in an `ensures` clause of a method that stores an element, as
+    `ensures _element_is(self, old(len(self)), value)` for an append. The
+    verifier then knows what `collection[index]` is after the call: for an
+    element that is itself a collection, its length. A `value` given by
+    reference (a `var` argument the method consumed) is read as it was at
+    entry: no `old(...)` is needed, and none is possible for a type that
+    cannot be copied. Unlike comparing elements with `==`, it works for any
+    element type. It has no runtime effect, and the verifier does not prove
+    it of the method's body: it is stated, as `_same_elements` is.
+
+    Parameters:
+        C: The collection type.
+        T: The element type.
+
+    Args:
+        collection: The collection on exit.
+        index: The index of the element.
+        value: The element stored there.
+
+    Returns:
+        The statement, for the verifier.
+    """
+    return True
+
+
+@inline(.nodebug)
+def _elements_kept[C: AnyType](collection: C, count: Int) -> Bool:
+    """States, in a postcondition, that the first `count` elements of
+    `collection` on exit are its first `count` elements on entry.
+
+    Use it in an `ensures` clause, as `_elements_kept(self, old(len(self)))`
+    for an append. The verifier reads `collection` in both the entry and
+    the exit state, so no `old(...)` of the collection is needed (and none
+    is possible for a collection that cannot be copied). It is
+    `_same_elements` for a collection whose elements are not at a pointer
+    it holds. It has no runtime effect, and the verifier does not prove it
+    of the method's body: it is stated.
+
+    Parameters:
+        C: The collection type.
+
+    Args:
+        collection: The collection on exit (and, for the verifier, on
+            entry).
+        count: The number of elements kept, from index 0.
+
+    Returns:
+        The statement, for the verifier.
+    """
+    return True
+
+
+@inline(.nodebug)
 def _index_in_bounds(idx: Int, length: Int) -> Bool
     ensures result == (0 <= idx and idx < length):
     """Whether `idx` is an index of a sequence of `length` elements: the
