@@ -46,6 +46,7 @@ from std.utils.index import Index, IndexList
 from std.collections import OptionalReg
 
 from .....utils import (
+    _gemm_shapes_relate,
     GemmShape,
     elementwise_compute_lambda_type,
     elementwise_epilogue_type,
@@ -96,7 +97,8 @@ def small_MN_gemms[
     a: TileTensor,
     b: TileTensor,
     ctx: DeviceContext,
-) raises:
+) raises
+    requires _gemm_shapes_relate[True](c, a, b):
     """Launches a small-MN GEMM via the configured split-K GEMV or MMA-CPasync kernel.
 
     Selects between `gemm_mma_cpasync` (for `GEMM_MMA_CPASYNC` kernel kind) and
@@ -212,7 +214,8 @@ def dispatch_gemv[
     a: TileTensor[a_type, ...],
     b: TileTensor[b_type, ...],
     ctx: DeviceContext,
-) raises:
+) raises
+    requires _gemm_shapes_relate[transpose_b](c, a, b):
     """Dispatch M=1 (or N=1) matmul to GEMV or SM100 GEMM based on (N, K).
 
     For most M=1 shapes GEMV is preferred, but for certain large (N, K)
@@ -296,7 +299,8 @@ def matmul_dispatch_sm100[
     a: TileTensor[a_type, ...],
     b: TileTensor[b_type, ...],
     ctx: DeviceContext,
-) raises:
+) raises
+    requires _gemm_shapes_relate[transpose_b](c, a, b):
     """Dispatches a 2D matmul to the appropriate SM100 (B200+) kernel.
 
     Routes the problem to GEMV for M=1 or N=1 shapes, to the IEEE-fp32 split-K

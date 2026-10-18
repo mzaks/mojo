@@ -361,6 +361,73 @@ struct MicroKernelShape(TrivialRegisterPassable):
     var simd_cols: Int
 
 
+@inline(.always)
+def _gemm_shapes_relate[
+    transpose_b: Bool
+](c: TileTensor[...], a: TileTensor[...], b: TileTensor[...]) -> Bool
+    ensures result == (
+        Int(a.dim[0]()) == Int(c.dim[0]())
+        and Int(c.dim[0]()) < 2147483648
+        and Int(c.dim[1]()) < 2147483648
+        and Int(a.dim[1]()) < 2147483648
+        and (
+            transpose_b
+            or (
+                Int(b.dim[0]()) == Int(a.dim[1]())
+                and Int(b.dim[1]()) == Int(c.dim[1]())
+                and Int(c.dim[1]()) >= 1
+            )
+        )
+        and (
+            not transpose_b
+            or (
+                Int(b.dim[0]()) == Int(c.dim[1]())
+                and Int(b.dim[1]()) == Int(a.dim[1]())
+                and Int(c.dim[0]()) >= 1
+            )
+        )
+    ):
+    """Whether `c = a @ b` (or `a @ b^T`) relates the three shapes as a GEMM:
+    `a` is M x K, `b` is K x N (N x K transposed), `c` is M x N, each
+    dimension fits an `Int32` kernel argument, and the output has a column
+    (a row, transposed), so that the GEMV launches have a grid. What the
+    GPU matmul launchers require of their arguments, for verify-contracts.
+
+    Parameters:
+        transpose_b: Whether `b` is stored as N x K.
+
+    Args:
+        c: The rank-2 output.
+        a: The rank-2 left operand.
+        b: The rank-2 right operand.
+
+    Returns:
+        True if the shapes relate as described.
+    """
+    return (
+        Int(a.dim[0]()) == Int(c.dim[0]())
+        and Int(c.dim[0]()) < 2147483648
+        and Int(c.dim[1]()) < 2147483648
+        and Int(a.dim[1]()) < 2147483648
+        and (
+            transpose_b
+            or (
+                Int(b.dim[0]()) == Int(a.dim[1]())
+                and Int(b.dim[1]()) == Int(c.dim[1]())
+                and Int(c.dim[1]()) >= 1
+            )
+        )
+        and (
+            not transpose_b
+            or (
+                Int(b.dim[0]()) == Int(c.dim[1]())
+                and Int(b.dim[1]()) == Int(a.dim[1]())
+                and Int(c.dim[0]()) >= 1
+            )
+        )
+    )
+
+
 @fieldwise_init
 struct GemmShape(TrivialRegisterPassable):
     """Helper class to unpack gemm dimension and layout."""

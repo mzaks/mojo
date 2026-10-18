@@ -65,6 +65,7 @@ from ...gemv import (
 )
 from ...utils import (
     GemmShape,
+    _gemm_shapes_relate,
     elementwise_compute_lambda_type,
     elementwise_epilogue_type,
 )
@@ -482,7 +483,8 @@ def _matmul_gpu[
     a: TileTensor[mut=False, ...],
     b: TileTensor[mut=False, ...],
     ctx: DeviceContext,
-) raises:
+) raises
+    requires _gemm_shapes_relate[transpose_b](c, a, b):
     """GPU matmul dispatch entry point. Routes to the appropriate kernel
     based on hardware capabilities and tensor properties.
 
