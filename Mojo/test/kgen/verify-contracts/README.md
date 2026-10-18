@@ -28,6 +28,13 @@ verified only when something in the file uses it) and
 kernel of `linalg`: it needs every kernel package on the import path and
 `packages=linalg`, and is compiled too (`-elaborate` without
 `--verify-contracts`), which checks its `comptime assert`s.
+`matmul_dispatch.mojo` calls the GPU matmul dispatcher itself with static
+N and K, so that with `packages=linalg` every launcher and kernel it
+reaches for that shape is verified for the launched instantiation (run
+on their own, the kernel files are verified only generically, with no
+launch facts): one call reaches about 30 files of `linalg` and 666
+obligations. It is a corpus driver, not an example of what is proven:
+expect about 40 CPU minutes cold.
 
 ```bash
 ./bazelw build --config=build-mojo //max/kernels/src/layout:layout
@@ -700,3 +707,4 @@ machine that sleeps stops the solver too.
 | `structs.mojo`       | all `bad_*`        | all `ok_*`       |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |
 | `gemm_mma_cpasync.mojo` | (none)          | all `ok_*`       |
+| `matmul_dispatch.mojo` | (none)           | (a corpus driver, nothing expected) |
