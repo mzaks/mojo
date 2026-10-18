@@ -4821,18 +4821,23 @@ private:
               else if ((*answers)[k] != Answer::Proven)
                 refuted[i] = true;
             }
-        bool any = false;
+        unsigned undecided = 0;
         for (size_t i = 0; i < set.size(); ++i) {
           open[i] = open[i] && !refuted[i];
-          any = any || open[i];
+          undecided += open[i];
         }
-        if (any && solver.invariantRetry) {
+        // Without it: a round's few undecided candidates (at most 3) are
+        // asked once more with twice the limit. A query at the edge of the
+        // limit otherwise flips with any change in the script (the number
+        // of constants declared), taking proofs with it, and the cost is
+        // bounded; a kernel's rounds, with many undecided, pay nothing.
+        if (undecided && (solver.invariantRetry || undecided <= 3)) {
           SmallVector<size_t> again;
           for (size_t i = 0; i < set.size(); ++i)
             if (kept[i] && open[i])
               again.append(1 + ends.size(), i);
-          std::string retry =
-              rebuild(set, kept, before, head, ends, render, &open, 4);
+          std::string retry = rebuild(set, kept, before, head, ends, render,
+                                      &open, solver.invariantRetry ? 4 : 2);
           std::string name =
               dumpPrefix + ".houdini" + std::to_string(houdiniRuns++);
           std::optional<SmallVector<Answer>> more = runZ3(solver, retry, name);
