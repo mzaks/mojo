@@ -6942,11 +6942,13 @@ private:
     // back, as many as it has.
     if (path.starts_with("std::builtin::reversed::reversed[") &&
         call.getNumOperands() >= 1) {
-      StringRef type = printed(call.getOperands()[0].getType());
-      bool isDeque = type.contains("@std::@collections::@deque::@Deque<");
-      if (isDeque || type.contains("@std::@collections::@list::@List<") ||
-          type.contains("@std::@collections::@span::@Span<") ||
-          type.contains("@std::@collections::@array::@Array<"))
+      std::string type = printed(call.getOperands()[0].getType());
+      bool isDeque =
+          StringRef(type).contains("@std::@collections::@deque::@Deque<");
+      if (isDeque ||
+          StringRef(type).contains("@std::@collections::@list::@List<") ||
+          StringRef(type).contains("@std::@collections::@span::@Span<") ||
+          StringRef(type).contains("@std::@collections::@array::@Array<"))
         if (MaybeTerm n = lengthOf(call.getOperands()[0]))
           return produce({{isDeque ? "/index" : "/seen", bvConst(0, 64)},
                           {"/length", *n}});
