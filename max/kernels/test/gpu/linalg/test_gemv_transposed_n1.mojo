@@ -12,12 +12,13 @@
 # ===----------------------------------------------------------------------=== #
 # GEMV with N == 1 and transpose_b=True, M > 1.
 #
-# `gemv_gpu` picks `GEMV_KERNEL` for N == 1 (float32 always) without checking
-# `transpose_b`; `gemv_gpu_dispatch` then takes its transposed launch, which
-# runs the kernel over N rows (`c[j] = dot(B[j], A[0])`). With N == 1 that is
-# one row, so for M > 1 rows 1.. of C would never be written. With N == 1, B
-# is the same K contiguous elements whether it is K x 1 or 1 x K, so the
-# expected result is `c[i] = dot(A[i], B)` for every i < M in both layouts.
+# `gemv_gpu` picks `GEMV_KERNEL` for N == 1 (float32 always) whatever
+# `transpose_b` is. `gemv_gpu_dispatch` used to take its transposed launch
+# then, which runs the kernel over N rows (`c[j] = dot(B[j], A[0])`): with
+# N == 1 that is one row, so for M > 1 rows 1.. of C were never written.
+# With N == 1, B is the same K contiguous elements whether it is K x 1 or
+# 1 x K, so the dispatcher now launches over A's rows in both layouts and
+# the expected result is `c[i] = dot(A[i], B)` for every i < M.
 #
 # Cases: the non-transposed launch and the transposed one with M == 1 are
 # controls; the transposed one with M == 4 is the case in question, called

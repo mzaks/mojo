@@ -1267,13 +1267,8 @@ def gemv_gpu_dispatch[
         )
         and (
             kernel_func is not GEMVAlgorithm.GEMV_KERNEL
-            or transpose_b
             or Int(c.dim[1]()) == 1
-        )
-        and (
-            kernel_func is not GEMVAlgorithm.GEMV_KERNEL
-            or not transpose_b
-            or Int(c.dim[0]()) == 1
+            or (transpose_b and Int(c.dim[0]()) == 1)
         )
         and (
             kernel_func is not GEMVAlgorithm.GEMV_KERNEL_VECTOR
@@ -1604,51 +1599,63 @@ def gemv_gpu_dispatch[
             else:
                 _one_row_per_warp()
 
-    elif kernel_func is GEMVAlgorithm.GEMV_KERNEL and transpose_b == False:
-        logger.info("Executing: GEMV_KERNEL (no transpose)")
+    elif kernel_func is GEMVAlgorithm.GEMV_KERNEL:
+        # One warp per row of the matrix operand, the other operand the
+        # vector. With N == 1 the matrix is A and B is the K-element vector
+        # (the same K contiguous elements whether it is K x 1 or, transposed,
+        # 1 x K), so the launch is the same with or without transpose_b.
+        # Only with transpose_b and M == 1 is the matrix B and A the vector.
+        @__parameter
+        def _rows_of_a() raises:
+            logger.info("Executing: GEMV_KERNEL (rows of A)")
 
-        comptime kernel = gemv_kernel[
-            c_type,
-            a_type,
-            b_type,
-            elementwise_lambda_fn=elementwise_lambda_fn,
-            pdl_level=pdl_level,
-        ]
+            comptime kernel = gemv_kernel[
+                c_type,
+                a_type,
+                b_type,
+                elementwise_lambda_fn=elementwise_lambda_fn,
+                pdl_level=pdl_level,
+            ]
 
-        ctx.enqueue_function[kernel](
-            c.to_device_buffer(ctx),
-            a.to_device_buffer(ctx),
-            b.to_device_buffer(ctx),
-            Int32(m),
-            Int32(n),
-            Int32(k),
-            grid_dim=ceildiv(m, WARPS_PER_BLOCK),
-            block_dim=WARP_SIZE * WARPS_PER_BLOCK,
-            attributes=pdl_launch_attributes(pdl_level),
-        )
+            ctx.enqueue_function[kernel](
+                c.to_device_buffer(ctx),
+                a.to_device_buffer(ctx),
+                b.to_device_buffer(ctx),
+                Int32(m),
+                Int32(n),
+                Int32(k),
+                grid_dim=ceildiv(m, WARPS_PER_BLOCK),
+                block_dim=WARP_SIZE * WARPS_PER_BLOCK,
+                attributes=pdl_launch_attributes(pdl_level),
+            )
 
-    elif kernel_func is GEMVAlgorithm.GEMV_KERNEL and transpose_b == True:
-        logger.info("Executing: GEMV_KERNEL (with transpose)")
+        comptime if not transpose_b:
+            _rows_of_a()
+        else:
+            if n == 1:
+                _rows_of_a()
+            else:
+                logger.info("Executing: GEMV_KERNEL (rows of transposed B)")
 
-        comptime kernel = gemv_kernel[
-            c_type,
-            b_type,
-            a_type,
-            transpose_b=transpose_b,
-            elementwise_lambda_fn=elementwise_lambda_fn,
-            pdl_level=pdl_level,
-        ]
-        ctx.enqueue_function[kernel](
-            c.to_device_buffer(ctx),
-            b.to_device_buffer(ctx),
-            a.to_device_buffer(ctx),
-            Int32(n),
-            Int32(m),
-            Int32(k),
-            grid_dim=ceildiv(n, WARPS_PER_BLOCK),
-            block_dim=WARP_SIZE * WARPS_PER_BLOCK,
-            attributes=pdl_launch_attributes(pdl_level),
-        )
+                comptime kernel = gemv_kernel[
+                    c_type,
+                    b_type,
+                    a_type,
+                    transpose_b=transpose_b,
+                    elementwise_lambda_fn=elementwise_lambda_fn,
+                    pdl_level=pdl_level,
+                ]
+                ctx.enqueue_function[kernel](
+                    c.to_device_buffer(ctx),
+                    b.to_device_buffer(ctx),
+                    a.to_device_buffer(ctx),
+                    Int32(n),
+                    Int32(m),
+                    Int32(k),
+                    grid_dim=ceildiv(n, WARPS_PER_BLOCK),
+                    block_dim=WARP_SIZE * WARPS_PER_BLOCK,
+                    attributes=pdl_launch_attributes(pdl_level),
+                )
     elif kernel_func is GEMVAlgorithm.GEVM_KERNEL:
         logger.info("Executing: GEVM_KERNEL")
         comptime kernel = gevm_kernel[
@@ -1837,13 +1844,16 @@ def gemv_gpu[
             DType.float16,
             DType.float8_e4m3fn,
         ):
-            if k % simd_width == 0:
-                if ceildiv(n, 2) <= ctx.get_attribute(
-                    DeviceAttribute.MAX_GRID_DIM_Y
-                ):
-                    kernel_func = GEMVAlgorithm.GEMV_SPLIT_K
-                else:
-                    kernel_func = GEMVAlgorithm.GEMV_KERNEL_VECTOR
+            if k % simd_width == 0 and ceildiv(n, 2) <= ctx.get_attribute(
+                DeviceAttribute.MAX_GRID_DIM_Y
+            ):
+                kernel_func = GEMVAlgorithm.GEMV_SPLIT_K
+            elif m > 1:
+                # The router gate's rows: of these kernels only split-K
+                # takes more than one.
+                kernel_func = GEMVAlgorithm.MATMUL_NAIVE
+            elif k % simd_width == 0:
+                kernel_func = GEMVAlgorithm.GEMV_KERNEL_VECTOR
             else:
                 kernel_func = GEMVAlgorithm.GEMV_KERNEL
         else:
