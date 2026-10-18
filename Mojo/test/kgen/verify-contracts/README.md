@@ -164,6 +164,11 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   references is unknown after it (`bad_after_mut_call`), and memory passed by
   immutable reference is kept (`ok_after_imm_call`). Its results are unknown.
   A move (`var p = q^`) keeps the value and its fields (`ok_deque_moved`).
+  A callee whose body stores only to some fields of a `mut` argument, or
+  passes it on to callees that do, changes only those fields; one that
+  writes only through pointers it took from the argument (a lookup in a
+  dictionary's table) leaves it a new value as long as before
+  (`ok_dict_lookup_keeps_length`).
 - A loop writes what it stores to and passes by `mut` reference, except a
   value it destroys: its destructor runs on a path that leaves the loop
   (a raise), or after the value's last use (`ok_fields_after_raising_loop`).
@@ -230,10 +235,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   an appended row is known where it is read back (`xs[0][1]` after
   `xs.append(row^)`: the row's length is `row`'s).
 - Loop invariants also bound the lengths of lists a loop appends to. A
-  loop over `range(n)` with a constant `n` of at most 8 that changes a
-  variable from outside it (`for i in range(2): ... xs.append(row^)`) is
-  walked once per iteration instead, like a `comptime for` over a
-  constant, so that each appended element is known.
+  loop over a `range` with constant bounds and step and at most 16
+  iterations that changes a variable from outside it (`for i in range(2):
+  ... xs.append(row^)`) is walked once per iteration instead, like a
+  `comptime for` over a constant, so that each appended element, and each
+  key inserted, is known. A loop that only advances its iterator keeps the
+  length the iterator started with.
 - Generic code is verified once, for every value of its parameters.
   `comptime for` is a loop over an arbitrary iteration, `comptime if` joins
   its arms, and parameter expressions are evaluated where they are
@@ -289,12 +296,18 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `extend`, `clear` and `reverse` state lengths. Indices are generic
   (`I: Indexer`): `index(i)` is `i` for an `Int` and the literal's value
   for an `IntLiteral`.
-- `Dict` and `Set` state only lengths (nothing about them is indexed):
-  empty constructors are empty, literals at most as long as their
-  elements (repeats collapse), copies as long as the original, `d[k] = v`,
-  `setdefault` and `add` at least 1 and at most one longer, `pop` and
-  `remove` one shorter (where they did not raise), `pop(k, default)` and
-  `discard` at most one shorter, and `clear` empty.
+- `Dict` states its lengths and which keys it holds (`_has_key(d, k)`,
+  stated, not proven, as `_same_elements` is): empty constructors are
+  empty (and hold no key: a key held means a length above 0), literals at
+  most as long as their elements (repeats collapse), copies as long as the
+  original, `d[k] = v` and `setdefault` one longer unless the key was
+  held, and then hold it, `pop` one shorter (where it did not raise) and
+  `pop(k, default)` one shorter if the key was held, and then do not hold
+  it; each keeps the other keys (`_other_keys_kept`), and `k in d` is
+  whether the key is held (`ok_dict_keys_counted`,
+  `ok_dict_contains_after_set`). `Set` states only lengths: `add` at least
+  1 and at most one longer, `remove` one shorter, `discard` at most one
+  shorter, and `clear` empty. Keys and values are not indexed.
 - Strings: `s.byte_length()` of a `String` or `StringSlice` is `len` of its
   value, and of a literal the literal's length. `s[byte=i]` requires `i`
   in range, `s[byte=a:b]` requires `0 <= a <= b <= s.byte_length()` and has

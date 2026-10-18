@@ -229,6 +229,58 @@ def _elements_kept[C: AnyType](collection: C, count: Int) -> Bool:
 
 
 @inline(.nodebug)
+def _has_key[C: AnyType, K: AnyType](collection: C, key: K) -> Bool:
+    """States whether `collection` holds an entry for `key`, for the
+    verifier.
+
+    Use it in the clauses of a keyed collection: `__contains__` ensures
+    `result == _has_key(self, key)`, `__setitem__` ensures
+    `_has_key(self, key)` and a length one more than at entry unless
+    `old(_has_key(self, key))`. A `key` given by reference (a `var` argument
+    the method consumed) is read as it was at entry. It has no runtime
+    effect (it returns `True`), and the verifier does not prove it of the
+    method's body: it is stated.
+
+    Parameters:
+        C: The collection type.
+        K: The key type.
+
+    Args:
+        collection: The collection.
+        key: The key.
+
+    Returns:
+        The statement, for the verifier.
+    """
+    return True
+
+
+@inline(.nodebug)
+def _other_keys_kept[C: AnyType, K: AnyType](collection: C, key: K) -> Bool:
+    """States, in a postcondition, that `collection` holds on exit the same
+    keys as on entry, except possibly `key`.
+
+    Use it in the `ensures` clause of a method that adds or removes one
+    entry, with `_has_key`. The verifier reads `collection` in both the
+    entry and the exit state. It has no runtime effect, and the verifier
+    does not prove it of the method's body: it is stated.
+
+    Parameters:
+        C: The collection type.
+        K: The key type.
+
+    Args:
+        collection: The collection on exit (and, for the verifier, on
+            entry).
+        key: The key that may have been added or removed.
+
+    Returns:
+        The statement, for the verifier.
+    """
+    return True
+
+
+@inline(.nodebug)
 def _index_in_bounds(idx: Int, length: Int) -> Bool
     ensures result == (0 <= idx and idx < length):
     """Whether `idx` is an index of a sequence of `length` elements: the

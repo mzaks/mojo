@@ -2086,6 +2086,79 @@ clauses:
   (a span chosen by `if` between two `mut` lists of unknown length, which
   no clause of the test states; a reassigned slice; a comptime size).
 
+Keys of a dictionary, and what a callee writes:
+
+- `test_dict.mojo` read lists built from a dictionary's keys after
+  inserting and popping known keys (`keys[7]` after 14 inserts, 7 pops and
+  one more insert). That needs the dictionary's length exactly, so which
+  keys it holds: `__setitem__` could only say "at most one longer".
+- `_has_key(d, k)` and `_other_keys_kept(d, k)` in `_verification`, stated
+  like `_same_elements`: the pass reads them as an uninterpreted `haskey`
+  of the dictionary's value and the key (one function per key width), and
+  as the quantified frame over the other keys. `Dict.__setitem__` and
+  `setdefault` ensure the length is one more unless `old(_has_key(self,
+  key))`, that the key is held, and the other keys kept; both `pop`s that
+  the key is not held, the others kept, and the length (one less, or one
+  less if the key was held); `__contains__` that its result is
+  `_has_key`. An axiom ties a held key to a length above 0, so a new
+  dictionary holds none. `old(_has_key(self, key))` works for a `var key`:
+  the pass reads a key given by reference as it was at entry.
+- The inserts and pops are loops (`for i in range(max_load)`, `for i in
+  range(0, max_load, 2)`), so the unroller now takes up to 16 iterations
+  and strided ranges with constant bounds, and `constantInt` folds
+  products, divisions and remainders (`capacity * 7 // 8`) besides sums.
+- Two model fixes found on the way. An iterator's length at the loop head
+  was an unknown the invariant search had to bound again, which with five
+  loops before it did not; a loop that only advances its iterator now
+  keeps it, as it keeps a range's end. And `writtenFields`, which lets a
+  call forget only the fields its callee stores to, took an argument
+  passed on to any callee as written whole: `Dict.__getitem__` (which
+  calls `_find_ref`) made the dictionary unknown. It now follows the
+  argument into the callee, and counts a write through a pointer taken
+  from the argument (`self._table._slots`) as a write to what it owns:
+  such a callee leaves the argument a new value as long as before, and
+  one that also stores to a field leaves it unknown. Forgetting a field
+  of an element's place (`xs[0].pop()`, which stores to `_len`) now writes
+  the element back into its collection, as a store does; without that,
+  `bad_nested_after_pop` was proven. Only a callee that may write through
+  the pointer counts (a `Pointer` method that initializes, writes, moves,
+  takes or destroys its pointee, or a function outside the builtins); a
+  read through it (`p[]`, `load`) does not, else every lookup made its
+  collection a new value. A destructor's argument is dead after the call,
+  so what it writes is not modelled.
+- Two costs found on the way. `constantInt` and `decided` walked a term's
+  definitions as a tree, which the unrolled loops' arithmetic
+  (`(bvadd t t)` at every level) made exponential: `test_dict.mojo` spent
+  25 CPU seconds in the pass itself. Both are memoized (a definition never
+  changes), and the literal test is no longer a regular expression. And
+  the Houdini budget per candidate query, 1M resources, sat on the edge
+  for `_test_copyinit_trivial_types` in `test_list.mojo`: a change in the
+  number of constants declared flipped one query to unknown and lost two
+  invariants and three proofs. Doubling the budget (`houdini-rlimit`)
+  costs the kernel examples 44%: their rounds have many undecided
+  candidates, each paying the whole budget. Instead a round with at most
+  three undecided candidates asks them once more with twice the budget
+  (`invariant-retry`, still off, asks all of them with four times). That
+  keeps the three proofs, and the kernel examples cost the same (CPU
+  seconds of `kernels.mojo`, `tensors.mojo` and `gemv_split_k.mojo`
+  together, median of 3 interleaved runs: 124.9 s against 124.4 s before;
+  measured back to back under different load the same files read 92 s
+  and 119 s, which is how the 44% was first mistaken for 30%).
+- Numbers: `test_dict.mojo` 57 of 58 (from 24 of 34; unrolled iterations
+  count their obligations one by one), `test_list.mojo` 280 of 280 (from
+  259 of 259), `test_bitset.mojo` 305 of 305 (from 278 of 278); the rest left
+  there is `disposed[0]` after a closure appended through
+  `deinit_with`. New examples `ok_dict_keys_counted`,
+  `ok_dict_contains_after_set`, `ok_dict_lookup_keeps_length` and
+  `bad_dict_keys_counted_past`.
+- Cost, CPU seconds of the whole `kgen` run, median of 5 interleaved runs,
+  cache off: `test_dict.mojo` 17.7 s against 9.3 s before, for 33 more
+  proofs (the unrolled loops of 14 inserts and 7 pops, each assuming three
+  clauses and a quantified frame); `test_list.mojo` 5.15 s against
+  5.16 s, `test_deque.mojo` 5.60 s against 5.33 s, `test_span.mojo` 2.72 s
+  against 3.10 s, `test_linked_list.mojo` 2.13 s against 2.39 s,
+  `test_bitset.mojo` 1.56 s against 1.60 s.
+
 ## Risks and open questions
 
 - **Stdlib coverage.** Before inlining, every call the proof goes through

@@ -41,6 +41,7 @@ See the `Dict` docs for more details.
 """
 
 from std.builtin.rebind import downcast
+from std.builtin._verification import _has_key, _other_keys_kept
 from std.hashlib import Hasher, default_comp_time_hasher, default_hasher
 import std.format._utils as fmt
 
@@ -917,9 +918,9 @@ struct Dict[
             Self.V, Deinitable
         )
         ensures (
-            len(self) >= 1
-            and len(self) - old(len(self)) >= 0
-            and len(self) - old(len(self)) <= 1
+            len(self) == old(len(self)) + (0 if old(_has_key(self, key)) else 1)
+            and _has_key(self, key)
+            and _other_keys_kept(self, key)
         ):
         """Set a value in the dictionary by key.
 
@@ -970,7 +971,8 @@ struct Dict[
         return None
 
     @inline(.always)
-    def __contains__(self, key: Self.K) -> Bool:
+    def __contains__(self, key: Self.K) -> Bool
+        ensures result == _has_key(self, key):
         """Check if a given key is in the dictionary or not.
 
         Args:
@@ -1405,7 +1407,9 @@ struct Dict[
             Self.V, Deinitable
         )
         ensures (
-            old(len(self)) - len(self) >= 0 and old(len(self)) - len(self) <= 1
+            len(self) == old(len(self)) - (1 if old(_has_key(self, key)) else 0)
+            and not _has_key(self, key)
+            and _other_keys_kept(self, key)
         ):
         """Remove a value from the dictionary by key.
 
@@ -1453,7 +1457,11 @@ struct Dict[
 
     def pop(mut self, ref key: Self.K) raises DictKeyError[Self.K] -> Self.V
         where conforms_to(Self.K, Deinitable)
-        ensures len(self) == old(len(self)) - 1:
+        ensures (
+            len(self) == old(len(self)) - 1
+            and not _has_key(self, key)
+            and _other_keys_kept(self, key)
+        ):
         """Remove a value from the dictionary by key.
 
         Constraints:
@@ -1789,9 +1797,9 @@ struct Dict[
             Self.V, Deinitable
         )
         ensures (
-            len(self) >= 1
-            and len(self) - old(len(self)) >= 0
-            and len(self) - old(len(self)) <= 1
+            len(self) == old(len(self)) + (0 if old(_has_key(self, key)) else 1)
+            and _has_key(self, key)
+            and _other_keys_kept(self, key)
         ):
         """Get a value from the dictionary by key, or set it to a default if it
         doesn't exist.

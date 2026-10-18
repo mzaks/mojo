@@ -193,6 +193,30 @@ def ok_linked_list_counter(l: LinkedList[Int]) -> Int:
     return t
 
 
+def ok_dict_keys_counted() raises -> Int:
+    var d = Dict[Int, Int]()
+    for i in range(3):
+        d[i] = i  # three new keys: the dictionary knows which it holds
+    d[1] = 7  # an old key: as many entries
+    _ = d.pop(0)  # one less
+    var keys = List(d.keys())
+    return keys[1]
+
+
+def ok_dict_contains_after_set(mut d: Dict[Int, Int]) raises -> Int:
+    d[5] = 1
+    if 5 in d:  # states what `__contains__` answers
+        return d[5]
+    return 0
+
+
+def ok_dict_lookup_keeps_length(mut d: Dict[Int, Int]) raises -> Int:
+    d[1] = 1
+    var v = d[1]  # a lookup writes nothing of the dictionary
+    var keys = List(d.keys())
+    return keys[0] + v
+
+
 # --- must stay UNPROVEN ---
 def bad_bitset(mut b: BitSet[64], i: Int):
     if 0 <= i and i <= 64:
@@ -280,3 +304,12 @@ def bad_linked_list_counter_ahead(l: LinkedList[Int]) -> Int:
         t += el + l.get_nth(i)  # past the last node in the last step
         i += 1
     return t
+
+
+def bad_dict_keys_counted_past() raises -> Int:
+    var d = Dict[Int, Int]()
+    for i in range(3):
+        d[i] = i
+    _ = d.pop(0)
+    var keys = List(d.keys())
+    return keys[2]  # two entries are left

@@ -6912,6 +6912,77 @@ private:
                       ")");
   }
 
+  /// `haskey` for keys of `width` bits: whether a collection (a `Dict`,
+  /// by its value) holds a key. Declared once, with the axiom that a
+  /// collection holding a key is not empty (so a new, empty one holds
+  /// none).
+  std::string hasKeyFn(unsigned width) {
+    std::string fn = "haskey" + std::to_string(width);
+    if (hasKeyFunctions.insert(fn).second) {
+      std::string k = "(_ BitVec " + std::to_string(width) + ")";
+      prelude += "(declare-fun " + fn + " ((_ BitVec 64) " + k + ") Bool)\n";
+      lenOf(bvConst(0, 64)); // Declares `len`.
+      facts.push_back("(forall ((h (_ BitVec 64)) (k " + k + ")) (! (=> (" +
+                      fn + " h k) (bvsgt (len h) " + bvConst(0, 64) +
+                      ")) :pattern ((" + fn + " h k))))");
+    }
+    return fn;
+  }
+  std::set<std::string> hasKeyFunctions;
+
+  /// The collection's value and the key's term for `_has_key(d, k)` and
+  /// `_other_keys_kept(d, k)`: a key given by reference (a `var` argument
+  /// of `__setitem__`, which the body consumed) as it was at entry.
+  std::optional<std::pair<std::string, std::string>>
+  collectionAndKey(Value collection, Value key, State &state) {
+    std::string handle = isa<LIT::RefType>(collection.getType())
+                             ? valueThrough(collection, state)
+                             : term(collection, state);
+    std::string k = isa<LIT::RefType>(key.getType())
+                        ? valueThrough(key, oldState ? *oldState : state)
+                        : term(key, state);
+    Sort hs = sortOfTerm(handle), ks = sortOfTerm(k);
+    if (hs.isBool || hs.width != 64 || ks.isBool)
+      return std::nullopt;
+    return std::make_pair(handle, k);
+  }
+
+  /// `_has_key(d, k)`: `haskey` of the collection's value and the key.
+  std::string hasKey(Value collection, Value key, State &state) {
+    std::optional<std::pair<std::string, std::string>> at =
+        collectionAndKey(collection, key, state);
+    if (!at)
+      return declare({true, 1, false});
+    return define({true, 1, false},
+                  "(" + hasKeyFn(sortOfTerm(at->second).width) + " " +
+                      at->first + " " + at->second + ")");
+  }
+
+  /// `_other_keys_kept(d, k)`: every key but `k` is held by the collection
+  /// as the call left it iff it was at entry (`oldState`).
+  std::string otherKeysKept(Value collection, Value key, State &state) {
+    if (!oldState || !isa<LIT::RefType>(collection.getType()) ||
+        !placeOf(collection))
+      return assuming ? "true" : "false";
+    std::optional<std::pair<std::string, std::string>> at =
+        collectionAndKey(collection, key, state);
+    if (!at)
+      return assuming ? "true" : "false";
+    std::string old = valueThrough(collection, *oldState);
+    Sort ks = sortOfTerm(at->second);
+    std::string fn = hasKeyFn(ks.width);
+    std::string j = declare(ks, "k");
+    std::string equal = "(= (" + fn + " " + at->first + " " + j + ") (" + fn +
+                        " " + old + " " + j + "))";
+    std::string other = "(not (= " + j + " " + at->second + "))";
+    if (!assuming)
+      return define({true, 1, false}, "(=> " + other + " " + equal + ")");
+    return define({true, 1, false}, "(forall ((" + j + " " + ks.str() +
+                                        ")) (! (=> " + other + " " + equal +
+                                        ") :pattern ((" + fn + " " + at->first +
+                                        " " + j + "))))");
+  }
+
   /// The first `count` elements of the collections `a` and `b` are equal,
   /// for every element sort read so far.
   std::string sameElementsOf(const std::string &a, const std::string &b,
@@ -9960,6 +10031,18 @@ private:
         call.getNumOperands() == 2) {
       values[result] = elementsKept(call.getOperands()[0], state,
                                     term(call.getOperands()[1], state));
+      return true;
+    }
+    if (path.starts_with("std::builtin::_verification::_has_key[") &&
+        call.getNumOperands() == 2) {
+      values[result] =
+          hasKey(call.getOperands()[0], call.getOperands()[1], state);
+      return true;
+    }
+    if (path.starts_with("std::builtin::_verification::_other_keys_kept[") &&
+        call.getNumOperands() == 2) {
+      values[result] =
+          otherKeysKept(call.getOperands()[0], call.getOperands()[1], state);
       return true;
     }
     if (path.starts_with("std::builtin::_verification::_element_is[") &&
