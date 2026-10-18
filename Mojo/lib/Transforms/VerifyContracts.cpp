@@ -2111,11 +2111,77 @@ private:
       }
       capped.push_back(std::move(text));
     }
+    // What a case can change: the unknowns it fixes and the quotients it
+    // makes exact, the terms defined from them, and whatever a fact relates
+    // to those. A query mentioning none of it is not asked again: a case
+    // cannot decide it, only cost its limit once more (a kernel loop's
+    // invariant search asked 200 undecided candidates again for a warp
+    // size none of them depends on, 200M of work for nothing).
+    auto mentions = [](StringRef expr, StringRef name) {
+      for (size_t at = expr.find(name); at != StringRef::npos;
+           at = expr.find(name, at + name.size())) {
+        bool before = at == 0 || (!llvm::isAlnum(expr[at - 1]) &&
+                                  expr[at - 1] != '_');
+        size_t end = at + name.size();
+        bool after = end == expr.size() ||
+                     (!llvm::isAlnum(expr[end]) && expr[end] != '_');
+        if (before && after)
+          return true;
+      }
+      return false;
+    };
+    SmallVector<std::string> seeds;
+    for (auto &[unknown, values] : domains)
+      seeds.push_back(unknown);
+    // The names an expression uses, the fixed unknowns included (`namesIn`
+    // reads only a letter followed by digits).
+    auto namesOf = [&](StringRef expr) {
+      SmallVector<std::string> names = namesIn(expr);
+      for (const std::string &unknown : seeds)
+        if (mentions(expr, unknown))
+          names.push_back(unknown);
+      return names;
+    };
+    llvm::StringSet<> affected;
+    if (!exact) {
+      for (const std::string &quotient : caseQuotients)
+        seeds.push_back(quotient);
+      llvm::StringMap<SmallVector<std::string>> users;
+      for (auto &[name, expr] : definitions)
+        for (const std::string &used : namesOf(expr))
+          users[used].push_back(name);
+      SmallVector<SmallVector<std::string>> factNames;
+      for (const std::string &fact : facts)
+        factNames.push_back(namesOf(fact));
+      llvm::StringMap<SmallVector<size_t>> factsOf;
+      for (auto [k, names] : llvm::enumerate(factNames))
+        for (const std::string &name : names)
+          factsOf[name].push_back(k);
+      SmallVector<std::string> work(seeds.begin(), seeds.end());
+      while (!work.empty()) {
+        std::string name = work.pop_back_val();
+        if (!affected.insert(name).second)
+          continue;
+        if (auto it = users.find(name); it != users.end())
+          work.append(it->second.begin(), it->second.end());
+        if (auto it = factsOf.find(name); it != factsOf.end())
+          for (size_t k : it->second)
+            work.append(factNames[k].begin(), factNames[k].end());
+      }
+    }
+    auto caseCanChange = [&](size_t i) {
+      if (exact)
+        return true;
+      for (const std::string &name : namesOf(queries[i]))
+        if (affected.count(name))
+          return true;
+      return false;
+    };
     // Still to decide: open and not refuted by a case so far (a query a case
     // refutes is not asked again, so a real failure costs one or two cases).
     SmallVector<bool> pending;
     for (size_t i = 0; i < answers.size(); ++i)
-      pending.push_back(open(i));
+      pending.push_back(open(i) && caseCanChange(i));
     // The script of case `c` for the queries `asked`.
     auto caseScript = [&](size_t c, ArrayRef<size_t> asked) {
       std::string t = head;
