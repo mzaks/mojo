@@ -2236,13 +2236,35 @@ private:
   }
 
   /// The value of a 64-bit term that is a constant by its definition.
+  /// The value of a 64-bit literal `(_ bvN 64)`.
+  static std::optional<int64_t> literalInt(StringRef term) {
+    uint64_t v;
+    if (term.consume_front("(_ bv") && term.consume_back(" 64)") &&
+        !term.empty() && !term.getAsInteger(10, v))
+      return (int64_t)v;
+    return std::nullopt;
+  }
+
+  /// Memoized: a term's definition never changes, and the definitions
+  /// form a DAG that walking as a tree (`(bvadd t t)` at every level, as
+  /// an unrolled loop's arithmetic is) makes exponential.
+  std::map<std::string, std::optional<int64_t>> constantInts;
+  std::map<std::string, std::optional<bool>> decidedTerms;
+
   std::optional<int64_t> constantInt(StringRef term, unsigned depth = 0) {
     term = term.trim();
-    static llvm::Regex constRe("^\\(_ bv([0-9]+) 64\\)$");
-    SmallVector<StringRef> m;
-    uint64_t v;
-    if (constRe.match(term, &m) && !m[1].getAsInteger(10, v))
-      return (int64_t)v;
+    if (std::optional<int64_t> v = literalInt(term))
+      return v;
+    auto memo = constantInts.find(term.str());
+    if (memo != constantInts.end())
+      return memo->second;
+    std::optional<int64_t> value = constantIntOf(term, depth);
+    if (depth < 32)
+      constantInts[term.str()] = value;
+    return value;
+  }
+
+  std::optional<int64_t> constantIntOf(StringRef term, unsigned depth) {
     if (auto it = definitions.find(term.str());
         it != definitions.end() && depth < 32)
       return constantInt(it->second, depth + 1);
@@ -2252,13 +2274,32 @@ private:
     if (parts.size() == 4 && parts[0] == "ite" && depth < 32)
       if (std::optional<bool> cond = decided(parts[1]))
         return constantInt(parts[*cond ? 2 : 3], depth + 1);
-    if (parts.size() == 3 && (parts[0] == "bvadd" || parts[0] == "bvsub") &&
-        depth < 32)
+    if (parts.size() == 3 && depth < 32 &&
+        (parts[0] == "bvadd" || parts[0] == "bvsub" || parts[0] == "bvmul" ||
+         parts[0] == "bvsdiv" || parts[0] == "bvsrem" || parts[0] == "bvudiv" ||
+         parts[0] == "bvurem"))
       if (std::optional<int64_t> a = constantInt(parts[1], depth + 1),
           b = constantInt(parts[2], depth + 1);
-          a && b)
-        return (int64_t)(parts[0] == "bvadd" ? (uint64_t)*a + (uint64_t)*b
-                                             : (uint64_t)*a - (uint64_t)*b);
+          a && b) {
+        StringRef op = parts[0];
+        uint64_t x = *a, y = *b;
+        if (op == "bvadd")
+          return (int64_t)(x + y);
+        if (op == "bvsub")
+          return (int64_t)(x - y);
+        if (op == "bvmul")
+          return (int64_t)(x * y);
+        if (y == 0)
+          return std::nullopt;
+        if (op == "bvudiv")
+          return (int64_t)(x / y);
+        if (op == "bvurem")
+          return (int64_t)(x % y);
+        if (*a == INT64_MIN && *b == -1)
+          return std::nullopt;
+        // SMT-LIB's signed division truncates, as C's does.
+        return op == "bvsdiv" ? *a / *b : *a % *b;
+      }
     return std::nullopt;
   }
 
@@ -2273,6 +2314,15 @@ private:
       return false;
     if (depth > 32)
       return std::nullopt;
+    auto memo = decidedTerms.find(term.str());
+    if (memo != decidedTerms.end())
+      return memo->second;
+    std::optional<bool> value = decidedOf(term, depth);
+    decidedTerms[term.str()] = value;
+    return value;
+  }
+
+  std::optional<bool> decidedOf(StringRef term, unsigned depth) {
     if (auto it = definitions.find(term.str()); it != definitions.end())
       return decided(it->second, depth + 1);
     SmallVector<StringRef> parts = application(term);
@@ -3856,14 +3906,14 @@ private:
     walkLoopBody(loop, loop.getBody().front(), /*comptime=*/false, state);
   }
 
-  /// A loop over `range(n)` whose `n` and start are known constants (`for i
-  /// in range(2)`): its body walked once per iteration, as
-  /// `unrollComptimeFor` walks a `comptime for`. The invariant search keeps
-  /// only what holds of an arbitrary iteration, which loses what is known
-  /// of each element a loop appends (a row built and appended per
-  /// iteration: its length). Only a loop that changes a variable from
-  /// outside it other than its range, and under the same caps: at most 8
-  /// iterations, and 16 bodies through nested loops.
+  /// A loop over `range(n)`, `range(a, b)` or `range(a, b, step)` whose
+  /// bounds are known constants (`for i in range(2)`): its body walked once
+  /// per iteration, as `unrollComptimeFor` walks a `comptime for`. The
+  /// invariant search keeps only what holds of an arbitrary iteration,
+  /// which loses what is known of each element a loop appends (a row built
+  /// and appended per iteration: its length) and of each key it inserts.
+  /// Only a loop that changes a variable from outside it other than its
+  /// range; at most 16 iterations, and 16 bodies through nested loops.
   bool unrollRangeLoop(HLCF::LoopOp loop, State &state) {
     Block &body = loop.getBody().front();
     // The range the loop advances: `self` of the body's `__next__`.
@@ -3883,16 +3933,33 @@ private:
     if (!root || !root.getDefiningOp<LIT::VarDeclOp>() ||
         loop->isAncestor(root.getDefiningOp()) || !onlyAdvanced(loop, root))
       return false;
-    auto curr = state.env.find(Loc{root, "/curr"});
-    auto end = state.env.find(Loc{root, "/end"});
-    if (curr == state.env.end() || end == state.env.end())
+    // The iterations: of `range(end)` and `range(start, end)`, `end -
+    // curr`; of `range(start, end, step)` the steps from `start` before
+    // `end` in the step's direction.
+    auto constantField = [&](const char *field) -> std::optional<int64_t> {
+      auto it = state.env.find(Loc{root, field});
+      return it == state.env.end() ? std::nullopt : constantInt(it->second);
+    };
+    std::optional<int64_t> c = constantField("/curr"),
+                           e = constantField("/end");
+    uint64_t n;
+    if (c && e) {
+      if (*e < *c || *e - *c > 16)
+        return false;
+      n = *e - *c;
+    } else if (std::optional<int64_t> s = constantField("/start"),
+               st = constantField("/step"), i = constantField("/idx");
+               s && e && st && i && *i == 0 && *st != 0) {
+      int64_t span = *st > 0 ? *e - *s : *s - *e, step = *st > 0 ? *st : -*st;
+      if (span < 0)
+        span = 0;
+      if (span > 16 * step)
+        return false;
+      n = (span + step - 1) / step;
+    } else {
       return false;
-    std::optional<int64_t> c = constantInt(curr->second),
-                           e = constantInt(end->second);
-    if (!c || !e || *e < *c || *e - *c > 8)
-      return false;
-    uint64_t n = *e - *c;
-    if (unrolledBodies * std::max<uint64_t>(n, 1) > 16)
+    }
+    if (n > 16 || unrolledBodies * std::max<uint64_t>(n, 1) > 16)
       return false;
     std::optional<llvm::DenseSet<Value>> written = writtenRoots(loop);
     if (!written || llvm::none_of(*written, [&](Value other) {
