@@ -2762,6 +2762,13 @@ private:
       state.env[Loc{loc.root, prefix}] = fresh;
     }
     state.refs.erase(loc);
+    // Forgetting a field of an element's place writes the element, as
+    // `store` does: the collection gets the element's new value.
+    if (!loc.path.empty())
+      if (auto it = elements.find(loc.root); it != elements.end()) {
+        auto [list, index] = it->second;
+        storeElement(list, index, state.env[Loc{loc.root, ""}], state);
+      }
   }
 
   void havoc(const Loc &loc, State &state, Type type) {
@@ -3472,10 +3479,11 @@ private:
 
   /// The fields of its `index`th argument, a mutable reference, that
   /// `callee` may write: the paths it stores to and the paths it passes on
-  /// as mutable references. Null where it may write the whole argument, or
-  /// memory in the default address space through a reference that is
-  /// neither that argument's nor a local variable's (which may then be the
-  /// argument under another name).
+  /// as mutable references, and `/*` for memory reached through a pointer
+  /// held by value (what the argument owns). Null where it may write the
+  /// whole argument, or memory in the default address space through a
+  /// reference that is neither that argument's nor a local variable's
+  /// (which may then be the argument under another name).
   const std::set<std::string> *writtenFields(LIT::FnOp callee, size_t index,
                                              size_t operands) {
     if (!callee || callee.getFunctionBody().empty())
@@ -3489,7 +3497,8 @@ private:
       return it->second ? &*it->second : nullptr;
     Value formal = entry.getArgument(index);
     // 0: the argument's place (its path in `path`), 1: a local variable's
-    // or another argument's, 2: anything else.
+    // or another argument's, 3: memory a pointer held by value leads to
+    // (`p[]`, the elements a collection owns), 2: anything else.
     std::function<int(Value, std::string &)> rooted =
         [&](Value ref, std::string &path) -> int {
       if (ref == formal)
@@ -3513,9 +3522,11 @@ private:
       }
       // A reference a call returns (`self.offsets[v]`, an element of an
       // array field) is into what its reference arguments lead to: into
-      // the argument's field if one of them is, a local's if all are.
+      // the argument's field if one of them is, a local's if all are;
+      // with none (`p[]` of a pointer held by value), into memory a
+      // pointer leads to.
       if (auto inner = dyn_cast<LIT::CallOp>(def)) {
-        int kind = 2;
+        int kind = 3;
         bool any = false;
         for (Value operand : inner.getOperands()) {
           if (!isa<LIT::RefType>(operand.getType()))
@@ -3527,28 +3538,105 @@ private:
           if (k == 0 && (!any || kind != 0)) {
             kind = 0;
             path = sub;
-          } else if (!any) {
+          } else if (!any || kind == 3) {
             kind = k;
           }
           any = true;
         }
-        return any ? kind : 2;
+        return kind;
       }
       return 2;
     };
     std::set<std::string> fields;
     bool whole = false;
-    auto written = [&](Value ref) {
+    // `inner`, with `index` the operand, when `ref` is passed on to a call:
+    // what that callee writes of it, if that is known.
+    auto written = [&](Value ref, LIT::CallOp inner = {}, size_t index = 0) {
       auto type = dyn_cast<LIT::RefType>(ref.getType());
       std::string path;
       int kind = rooted(ref, path);
       if (kind == 0) {
+        // Passed on whole to a callee that writes only some of its fields
+        // (`self._find_ref(key)` in `Dict.__getitem__`, which writes none):
+        // those fields. A callee being analyzed (a recursion) or unknown
+        // writes it whole.
+        if (inner && path.empty() && depthOfWrites < 8) {
+          ++depthOfWrites;
+          const std::set<std::string> *sub =
+              writtenFields(lookup(inner), index, inner.getNumOperands());
+          --depthOfWrites;
+          if (sub) {
+            fields.insert(sub->begin(), sub->end());
+            return;
+          }
+        }
         if (path.empty())
           whole = true;
         fields.insert(path);
+      } else if (kind == 3) {
+        // Memory a pointer leads to: what the argument owns (a list's
+        // elements, a table's slots), not its own fields. The caller makes
+        // the argument a new value with the same length.
+        fields.insert("/*");
       } else if (kind == 2 && !(type && otherSpace(type))) {
         whole = true;
       }
+    };
+    // Whether a value is a pointer (or holds one) taken from the argument:
+    // loaded from one of its fields, or computed by a call from such a
+    // value (`self._data.unsafe_offset(i)`). A call given one may write
+    // through it what the argument owns.
+    std::function<bool(Value, int)> fromArg = [&](Value v, int depth) {
+      if (depth > 6)
+        return true;
+      Operation *def = v.getDefiningOp();
+      if (!def)
+        return false;
+      if (isa<LIT::RefLoadOp>(def) ||
+          def->getName().getStringRef() == "lit.load.consume") {
+        std::string path;
+        return rooted(def->getOperand(0), path) == 0;
+      }
+      if (auto extract = dyn_cast<LIT::StructExtractOp>(def))
+        return fromArg(extract.getContainer(), depth + 1);
+      if (auto inner = dyn_cast<LIT::CallOp>(def)) {
+        for (Value operand : inner.getOperands()) {
+          if (isa<LIT::RefType>(operand.getType())) {
+            std::string path;
+            if (rooted(operand, path) == 0)
+              return true;
+          } else if (fromArg(operand, depth + 1)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+    auto isPointer = [](Type type) {
+      return StringRef(printed(type))
+          .starts_with("!lit.struct<@std::@memory::@pointer::@Pointer<");
+    };
+    // Whether a call may write through a pointer it is given by value: a
+    // `Pointer` method that initializes, writes, moves, takes or destroys
+    // its pointee, or any function outside the builtins and `Pointer`
+    // (its body is not read here). Reading methods (`p[]`, `load`,
+    // `unsafe_offset`, conversions) do not.
+    auto mayWriteThrough = [&](LIT::CallOp inner) {
+      std::optional<CalleeName> name = calleeName(inner.getCallee());
+      if (!name)
+        return true;
+      StringRef path(name->path);
+      if (path.starts_with("std::builtin::") ||
+          path.starts_with("std::collections::span::Span::__init__("))
+        return false;
+      if (!path.consume_front("std::memory::pointer::Pointer::"))
+        return true;
+      for (const char *writer :
+           {"init_pointee", "write", "store", "take", "move", "destroy",
+            "deinit", "__setitem__", "swap", "memcpy", "memset", "copy"})
+        if (path.contains(writer))
+          return true;
+      return false;
     };
     callee.walk([&](Operation *op) {
       // A clause writes nothing (`self.offsets[v]` read through `mut self`).
@@ -3558,16 +3646,20 @@ private:
       if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
         written(store->getOperand(1));
       } else if (auto inner = dyn_cast<LIT::CallOp>(op)) {
-        for (Value operand : inner.getOperands())
+        for (auto [index, operand] : llvm::enumerate(inner.getOperands()))
           if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
               ref && !ref.isMutableKnown(false))
-            written(operand);
+            written(operand, inner, index);
+          else if (!ref && isPointer(operand.getType()) &&
+                   mayWriteThrough(inner) && fromArg(operand, 0))
+            fields.insert("/*");
       }
     });
     if (!whole)
       it->second = std::move(fields);
     return it->second ? &*it->second : nullptr;
   }
+  unsigned depthOfWrites = 0;
   std::map<std::pair<Operation *, size_t>,
            std::optional<std::set<std::string>>>
       calleeWrites;
@@ -4218,8 +4310,8 @@ private:
   }
 
   /// Whether all that `loop` (and the local closures it calls) does to the
-  /// variable `root`, a range's iterator, is to call `__next__` on it: no
-  /// store to it, and no other call that may write it.
+  /// variable `root`, a range or a collection's iterator, is to call
+  /// `__next__` on it: no store to it, and no other call that may write it.
   bool onlyAdvanced(Operation *loop, Value root) {
     bool only = true;
     SmallVector<Operation *> work{loop};
@@ -4253,14 +4345,18 @@ private:
             std::optional<Loc> self = call.getNumOperands()
                                           ? placeOf(call.getOperands()[0])
                                           : std::nullopt;
-            only = name && self && self->root == root &&
-                   StringRef(name->path).starts_with("std::builtin::range::") &&
-                   StringRef(name->path).contains("::__next__") &&
-                   llvm::all_of(call.getOperands().drop_front(),
-                                [&](Value operand) {
-                                  std::optional<Loc> loc = placeOf(operand);
-                                  return loc && loc->root != root;
-                                });
+            only =
+                name && self && self->root == root &&
+                (StringRef(name->path).starts_with("std::builtin::range::") ||
+                 StringRef(name->path).starts_with("std::collections::") ||
+                 StringRef(name->path)
+                     .starts_with("std::iter::__init__::_Enumerate::")) &&
+                StringRef(name->path).contains("::__next__") &&
+                llvm::all_of(call.getOperands().drop_front(),
+                             [&](Value operand) {
+                               std::optional<Loc> loc = placeOf(operand);
+                               return loc && loc->root != root;
+                             });
           }
         }
       });
@@ -4303,10 +4399,12 @@ private:
                    ? head.env.erase(it)
                    : std::next(it);
         head.refs.erase(loc);
-        // A range the loop only advances keeps its end and its step: they
-        // are not candidates for the invariant search, which the two more
-        // unknowns per strided loop made several times larger.
-        for (const char *field : {"/end", "/step"})
+        // A range the loop only advances keeps its end and its step, and
+        // an iterator the length it started with: they are not candidates
+        // for the invariant search, which the two more unknowns per strided
+        // loop made several times larger (and which, with many loops
+        // before, did not always find the length again).
+        for (const char *field : {"/end", "/step", "/length", "/_inner/length"})
           if (auto it = before.env.find(Loc{root, field});
               it != before.env.end() && onlyAdvanced(loop, root))
             head.env[Loc{root, field}] = it->second;
@@ -4321,7 +4419,8 @@ private:
         if (!unborrowed.count(loc.root))
           continue;
         if (!storedRoots.count(loc.root) ||
-            ((loc.path == "/end" || loc.path == "/step") &&
+            ((loc.path == "/end" || loc.path == "/step" ||
+              loc.path == "/length" || loc.path == "/_inner/length") &&
              onlyAdvanced(loop, loc.root)))
           kept.insert({loc, value});
       }
@@ -6274,6 +6373,10 @@ private:
       if (!ref || ref.isMutableKnown(false))
         continue;
       if (std::optional<Loc> loc = placeOf(operand)) {
+        // A destructor's argument is dead after the call: what it writes
+        // (the elements, through pointers) is read by nothing.
+        if (name && StringRef(name->path).contains("::__deinit__("))
+          continue;
         // A callee that writes only some fields of the argument (a method
         // that advances `self.stage`) leaves the others as they are.
         // Not a call through a trait: its body is the implementation's,
@@ -6282,6 +6385,22 @@ private:
                 isa<GetWitnessAttr>(call.getCallee())
                     ? nullptr
                     : writtenFields(callee, index, call.getNumOperands())) {
+          if (fields->count("/*")) {
+            // What the argument owns is written (a table's slots through
+            // its pointer) and no field of its own: a new value, as long
+            // as before (`len` is a field's, `_len`, which is kept). With
+            // a field written too (`List.pop`: `_len` and the elements),
+            // the whole argument is unknown.
+            if (fields->size() == 1) {
+              std::string old = load(*loc, state, placeType(*loc));
+              std::string fresh = declare({false, 64, false}, "h");
+              facts.push_back("(= " + lenOf(fresh) + " " + lenOf(old) + ")");
+              store(*loc, state, fresh);
+              continue;
+            }
+            havoc(*loc, state, ref.getElementType());
+            continue;
+          }
           for (const std::string &field : *fields)
             forget(Loc{loc->root, loc->path + field}, state);
           continue;
