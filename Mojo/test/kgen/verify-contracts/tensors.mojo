@@ -253,6 +253,34 @@ def ok_device_buffer(
     return buffer_of(buf, rows * Int(t.dim[1]()))
 
 
+def flat_rows(t: TileTensor[mut=False, ...]) -> Int
+    requires t.LayoutType.flat_rank == t.rank:
+    return Int(t.dim[0]())
+
+
+def ok_flat_rank_alias(t: TileTensor[mut=False, ...]) -> Int:
+    # The tensor's `flat_rank` (the flattened shape types counted) is its
+    # layout's `flat_rank` witness, as its `rank` is the layout's `rank`.
+    comptime assert t.rank == 2
+    comptime assert t.flat_rank == 2
+    return flat_rows(t)
+
+
+def ok_built_dims(p: Pointer[Float32, MutAnyOrigin], m: Int) -> Int
+    requires m >= 0 and p._extent() >= m * 4:
+    # A tensor built over a layout `row_major(Coord(...))`: its dimensions
+    # are the coordinate's elements, a runtime `m` and a static 4.
+    var t = TileTensor(p, row_major(Coord(m, Idx[4])))
+    return rows_of(t, m) + Int(t.dim[1]())
+
+
+def ok_built_device_dims(ctx: DeviceContext, m: Int) raises -> Int
+    requires m >= 0:
+    var buf = ctx.enqueue_create_buffer[DType.float32](m * 4)
+    var t = TileTensor(buf, row_major(Coord(m, Idx[4])))  # over a buffer
+    return rows_of(t, m)
+
+
 def ok_comptime_for_write[N: Int]() -> Float32:
     var t = stack_allocation[dtype=DType.float32](row_major[4, N]())
     comptime for j in range(N):
@@ -571,6 +599,17 @@ def bad_tensor_of_pointer(p: Pointer[Float32, MutAnyOrigin]) -> Float32
     requires p._extent() >= 12:
     var t = TileTensor(p, row_major[3, 4]())
     return t.ptr[unsafe_offset=12]
+
+
+def bad_flat_rank_alias(t: TileTensor[mut=False, ...]) -> Int:
+    comptime assert t.rank == 2  # nothing about the flat rank: nested?
+    return flat_rows(t)
+
+
+def bad_built_dims(p: Pointer[Float32, MutAnyOrigin], m: Int) -> Int
+    requires m >= 0 and p._extent() >= m * 4:
+    var t = TileTensor(p, row_major(Coord(m, Idx[4])))
+    return rows_of(t, m + 1)  # one more row than built with
 
 
 def bad_swizzled[tile_k: Int](lin: Int) -> Int

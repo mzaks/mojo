@@ -553,6 +553,13 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
 - `t.reshape(row_major(Coord(...)))`: the view's dimensions are the
   layout's shape, and it must cover no more elements than `t` validly holds
   (assumed: `t` has no zero stride). Other layouts leave them unknown.
+- `TileTensor(storage, row_major(Coord(...)))`, over a pointer or a device
+  buffer: the tensor's dimensions are the layout's shape (`m` and 4 for
+  `Coord(m, Idx[4])`), which a kernel test builds its arguments with.
+  `t.as_imm()` is the same tensor.
+- `t.flat_rank` (the layout's shape types flattened and counted) is the
+  layout's `flat_rank` witness, as `t.rank` is its `rank`: a `comptime
+  assert t.flat_rank == 2` reaches a clause on `t.LayoutType.flat_rank`.
 - `x if comptime (c) else y` is the value of the taken arm.
 - A local closure (`@__parameter def` in a function) that is only ever
   called is verified where it is called, with its caller's state; one

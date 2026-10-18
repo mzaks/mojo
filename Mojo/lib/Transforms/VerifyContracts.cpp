@@ -5699,6 +5699,32 @@ private:
          witness.getWitnessName() == "flat_rank"))
       return layoutWitness(witness.getWitnessName(),
                            layoutKey(witness.getTypeValue()));
+    // `TileTensor.flat_rank`: `_Flattened[*Self.LayoutType._shape_types]
+    // .length`, a `param_list.size` of lists built from the layout's
+    // `_shape_types` witness alone, which is what the layout's `flat_rank`
+    // witness counts: the same term, so `comptime assert t.flat_rank == 2`
+    // reaches a clause on `t.LayoutType.flat_rank`.
+    if (auto size = dyn_cast<ParamListSizeAttr>(attr);
+        size && !sort.isBool && sort.width == 64) {
+      std::optional<std::string> layout;
+      bool other = false;
+      attr.walk([&](GetWitnessAttr witness) {
+        StringRef name = witness.getWitnessName();
+        // The element types `_Flattened` recurses through.
+        if (name == "_ParamListType")
+          return;
+        if (name != "_shape_types" && name != "__shape_types") {
+          other = true;
+          return;
+        }
+        std::string key = layoutKey(witness.getTypeValue());
+        if (layout && *layout != key)
+          other = true;
+        layout = key;
+      });
+      if (layout && !other)
+        return layoutWitness("flat_rank", *layout);
+    }
     // `static_shape[k]` of a layout type: its `k`th flat extent, or -1 where
     // that is known only at run time.
     if (auto bind = dyn_cast<BindParamsAttr>(attr);
@@ -7975,34 +8001,61 @@ private:
           "r");
       return true;
     }
-    // `TileTensor(ptr, layout)` over a pointer (the default engine's
-    // storage, passed by reference to the constructor): its `ptr` is that
-    // pointer.
+    // `TileTensor(storage, layout)`: over a pointer (the default engine's
+    // storage, passed by reference to the constructor), its `ptr` is that
+    // pointer; over any storage, with a layout `row_major(Coord(...))`
+    // built, its dimensions are the layout's shape (a kernel test's
+    // `TileTensor(buffer, row_major(Coord(m, Idx[K])))`).
     if (path.starts_with("layout::tile_tensor::TileTensor::__init__(") &&
         call.getNumOperands() == 2) {
       Value storage = call.getOperands()[0];
       Type type = storage.getType();
       if (auto ref = dyn_cast<LIT::RefType>(type))
         type = ref.getElementType();
-      if (StringRef(printed(type))
-              .starts_with("!lit.struct<@std::@memory::@pointer::@Pointer<")) {
-        std::string pointer = isa<LIT::RefType>(storage.getType())
-                                  ? valueThrough(storage, state)
-                                  : term(storage, state);
+      bool overPointer =
+          StringRef(printed(type))
+              .starts_with("!lit.struct<@std::@memory::@pointer::@Pointer<");
+      auto shape = layoutShapes.find(tensorTerm(call.getOperands()[1], state));
+      if (overPointer || shape != layoutShapes.end()) {
+        std::string pointer;
+        if (overPointer)
+          pointer = isa<LIT::RefType>(storage.getType())
+                        ? valueThrough(storage, state)
+                        : term(storage, state);
         setResultsUnknown(call);
         std::string tensor = values[result];
-        if (!sortOfTerm(tensor).isBool && sortOfTerm(tensor).width == 64 &&
-            !sortOfTerm(pointer).isBool && sortOfTerm(pointer).width == 64)
+        if (sortOfTerm(tensor).isBool || sortOfTerm(tensor).width != 64)
+          return true;
+        if (overPointer && !sortOfTerm(pointer).isBool &&
+            sortOfTerm(pointer).width == 64)
           tensorPointers[tensor] = pointer;
+        if (shape != layoutShapes.end()) {
+          if (!tensorDimDeclared) {
+            prelude += "(declare-fun tdim ((_ BitVec 64) (_ BitVec 64)) "
+                       "(_ BitVec 64))\n";
+            tensorDimDeclared = true;
+          }
+          for (auto [k, d] : llvm::enumerate(shape->second))
+            facts.push_back("(= (tdim " + tensor + " " + bvConst(k, 64) +
+                            ") " + d + ")");
+        }
         return true;
       }
     }
-    // The implicit conversion of a mutable tensor to an immutable one: the
-    // same tensor (layout and storage), so the same dimensions.
+    // The implicit conversion of a mutable tensor to an immutable one, and
+    // `t.as_imm()`: the same tensor (layout and storage), so the same
+    // dimensions.
     if (path.starts_with("layout::tile_tensor::TileTensor::__init__[") &&
         path.contains("](::TileTensor[") && call.getNumOperands() == 1 &&
         !isa<LIT::RefType>(call.getOperands()[0].getType())) {
       values[result] = term(call.getOperands()[0], state);
+      return true;
+    }
+    if (path.starts_with("layout::tile_tensor::TileTensor::as_imm(") &&
+        call.getNumOperands() == 1) {
+      Value t = call.getOperands()[0];
+      values[result] = isa<LIT::RefType>(t.getType()) ? valueThrough(t, state)
+                                                      : term(t, state);
       return true;
     }
     // `t.num_elements()`: the product of its dimensions (its rank from its
