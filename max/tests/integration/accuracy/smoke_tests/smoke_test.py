@@ -815,6 +815,8 @@ def smoke_test(
                 num_questions=num_questions,
                 disable_timeouts=disable_timeouts,
                 metrics_url=metrics_url,
+                # Mach refreshes /metrics every 2s; wait so reads aren't stale.
+                metrics_delay_s=2 if framework == "mach-ci" else 0,
                 lm_eval_metadata=lm_eval_metadata,
             )
 
