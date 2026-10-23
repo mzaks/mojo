@@ -63,6 +63,14 @@ This version is still a work in progress.
   `DeviceContext` argument fails there instead of while compiling the
   generated code.
 
+- Source tracebacks (`InferenceSession.debug.source_tracebacks`) now stop at
+  your code's call into the graph API, so errors point at the lines that
+  created each op rather than at MAX's implementation of it. Set
+  `source_tracebacks_hide_internal = False` to keep every frame. Errors
+  that `Model.execute` raises are now `max.engine.ModelExecutionError`, a
+  `RuntimeError` subclass that is also a `ValueError`, so existing
+  `except ValueError` handlers keep working.
+
 - `max.nn.Transformer`, `DistributedTransformer`, `logits_postprocess()` and
   `distributed_logits_postprocess()` return a
   `max.nn.graph_groups.DecoderOutputs` of named groups instead of a tuple.

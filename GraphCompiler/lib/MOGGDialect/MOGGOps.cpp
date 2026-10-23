@@ -1326,8 +1326,9 @@ static std::string collectCompactSourceNotes(Location rootLoc) {
       os << '\n';
   }
 
+  // Ops with the same traceback share a note: this counts tracebacks, not ops.
   if (notes.size() > 1)
-    os << "[fused from " << notes.size() << " ops]";
+    os << "[fused from " << notes.size() << " source locations]";
 
   return result;
 }
