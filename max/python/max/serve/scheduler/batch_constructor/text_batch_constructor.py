@@ -1492,8 +1492,9 @@ class TextBatchConstructor:
 
         # A deferred lookup is charged the tokens its request would take from
         # the batch, so one pass starts no more lookups than it could have
-        # run. It is kept apart from the batch budget, which only work that
-        # runs this step draws on.
+        # run. That is its post-cache weight, since before the lookup answers
+        # the request's window is still the whole prompt. It is kept apart
+        # from the batch budget, which only work that runs this step draws on.
         lookup_budget = batch.token_budget.remaining
         while (
             len(batch) < max_batch_size
@@ -1628,7 +1629,7 @@ class TextBatchConstructor:
                         awaiting_lookup=awaiting_lookup,
                     )
                     if awaiting_lookup:
-                        lookup_budget -= ctx.tokens.active_length
+                        lookup_budget -= self._ce_weight(ctx)
                         if req_id not in self._lookup_holds:
                             self._lookup_holds[req_id] = _LookupHold(
                                 replica_idx=replica_idx,

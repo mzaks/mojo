@@ -4992,6 +4992,72 @@ def _only_starts_a_lookup(
     )
 
 
+@pytest.mark.parametrize("bound", [4, 1])
+def test_dp_ce_balance__charges_a_lookup_its_post_cache_weight(
+    monkeypatch: pytest.MonkeyPatch, bound: int
+) -> None:
+    """A pass charges each lookup its prompt's post-cache weight.
+
+    Both prompts are three times the step's budget, but the connector holds
+    all but 44 tokens of each, so one pass could run both. Charged their
+    whole prompts, the first lookup would spend the pass, and the second
+    would wait at the head of the queue and end the pass there, keeping the
+    prefill under way behind them out of the batch. The bound on unanswered
+    lookups still stops the second when it allows only one.
+    """
+    monkeypatch.setenv(MAX_PENDING_LOOKUPS_ENV_VAR, str(bound))
+    batch_constructor = create_dp_balance_constructor()
+    first = _long_ce_context(300)
+    second = _long_ce_context(300)
+    under_way = create_lora_context(seq_len=10)
+    lookup_ids = {first.request_id, second.request_id}
+    _stub_per_request_hits(
+        batch_constructor,
+        {
+            request_id: [PrefixCacheHits(external_blocks=16), PrefixCacheHits()]
+            for request_id in lookup_ids
+        },
+    )
+    kv_cache = _mock_kv_cache_of(batch_constructor)
+    kv_cache.num_req_blocks = Mock(return_value=0)
+    kv_cache.starts_lookup = Mock(
+        side_effect=lambda ctx: ctx.request_id in lookup_ids
+    )
+    kv_cache.awaits_lookup = Mock(
+        side_effect=lambda ctx: ctx.request_id in lookup_ids
+    )
+    kv_cache.alloc = Mock(
+        side_effect=lambda ctx, defer_lookup=False: (
+            _IncompleteOnload()
+            if ctx.request_id in lookup_ids
+            else CompletedTransfer()
+        )
+    )
+    # The second prompt is held behind the first's lookup, so it asks here.
+    kv_cache.start_lookup = Mock(side_effect=lambda ctx: _IncompleteOnload())
+    for ctx in (first, second, under_way):
+        batch_constructor.enqueue_new_request(ctx, replica_idx=0)
+    under_way.tokens.skip_processing(2)
+
+    inputs = batch_constructor.construct_batch()
+
+    if bound == 1:
+        assert list(batch_constructor._onloading_reqs) == [first.request_id]
+        assert not inputs.batches[0]
+        assert list(batch_constructor.replicas[0].ce_reqs) == [
+            second.request_id,
+            under_way.request_id,
+        ]
+    else:
+        assert list(batch_constructor._onloading_reqs) == [
+            first.request_id,
+            second.request_id,
+        ]
+        assert [ctx.request_id for ctx in inputs.batches[0]] == [
+            under_way.request_id
+        ]
+
+
 @pytest.mark.parametrize("later_under_way", [False, True])
 def test_dp_ce_balance__a_rebound_prompt_keeps_its_turn_under_a_lookup_hold(
     later_under_way: bool,
