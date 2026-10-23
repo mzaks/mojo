@@ -97,8 +97,9 @@ static std::string capitalize(llvm::StringRef s) {
 /// build_graph cannot mutate their inputs, so a relaxed match is allowed).
 /// Adaptor equality ignores the `stable` flag on purpose, so a build_graph
 /// `StableTensor` / `StableVariadicTensors` argument aligns with the plain
-/// execute argument at the same position; `declVerifyStableTensorArguments`
-/// owns the rules for where stable arguments may appear.
+/// shape-function argument at the same position;
+/// `declVerifyStableTensorArguments` owns the rules for where stable
+/// arguments may appear.
 LogicalResult verifyInputArgumentsAlign(KernelDeclOp decl,
                                         const KernelDeclFunctionAdaptor &lhs,
                                         KernelFunctionKind lhsKind,
@@ -208,20 +209,98 @@ LogicalResult declVerifyShapeFunctionInputsMatchExecuteFunction(
   return success();
 }
 
-/// build_graph must align with execute modulo their launch arguments
-/// (DeviceContext vs DeviceGraphBuilder). Same tensor signature is required,
-/// except that a build_graph argument may be the slot-backed (`StableTensor` /
-/// `StableVariadicTensors`) form of the execute argument at the same position:
-/// the adaptor equality used by `verifyInputArgumentsAlign` ignores `stable`.
+/// `build_graph` takes the same arguments as `execute`: a recording stub hands
+/// both entry points the same values. The signatures are compared position by
+/// position, with two exceptions:
+///
+/// - The `DeviceContext` of `execute` is a `DeviceGraphBuilder` on
+///   `build_graph`.
+///
+/// - And a `build_graph` tensor may be the slot-backed
+///   (`StableTensor` / `StableVariadicTensors`) form of the `execute` tensor
+///   at the same position, as long as that tensor is not fused: a slot
+///   publishes the address of a tensor in memory, and a fused input is a
+///   compute lambda with no address.
 LogicalResult
 declVerifyExecuteMatchesBuildGraph(KernelDeclOp decl,
                                    const KernelDeclAdaptor &adaptor) {
   if (!adaptor.executeFunction.has_value() ||
       !adaptor.buildGraphFunction.has_value())
     return success();
-  return verifyInputArgumentsAlign(
-      decl, *adaptor.executeFunction, KernelFunctionKind::Execute,
-      *adaptor.buildGraphFunction, KernelFunctionKind::BuildGraph);
+  StringRef executeName =
+      stringifyKernelFunctionKind(KernelFunctionKind::Execute);
+  StringRef buildGraphName =
+      stringifyKernelFunctionKind(KernelFunctionKind::BuildGraph);
+  std::string contract =
+      (buildGraphName + " takes the same arguments as " + executeName +
+       ", with the DeviceContext replaced by a DeviceGraphBuilder")
+          .str();
+  auto positionOf = [](const KernelDeclOperandAdaptor &arg) -> uint64_t {
+    return arg.sourceDescriptor ? arg.sourceDescriptor->position : 0;
+  };
+  auto describe = [](const KernelDeclOperandAdaptor &arg) -> std::string {
+    std::string out;
+    llvm::raw_string_ostream os(out);
+    if (std::optional<IOSpec> ioSpec = arg.getIoSpec())
+      os << (arg.isStableTensorType() ? "stable " : "")
+         << (arg.isVariadicTensorType() ? "variadic " : "")
+         << toString(*ioSpec);
+    else
+      os << arg.underlyingType;
+    return out;
+  };
+  // Tensor equality ignores the `stable` bit; everything else must agree.
+  auto sameArgument = [](const KernelDeclOperandAdaptor &executeArg,
+                         const KernelDeclOperandAdaptor &buildGraphArg) {
+    if (!executeArg.isTensorType())
+      return executeArg == buildGraphArg;
+    return executeArg.isVariadicTensorType() ==
+               buildGraphArg.isVariadicTensorType() &&
+           executeArg.getIoSpec() == buildGraphArg.getIoSpec() &&
+           executeArg.getTraitContract() == buildGraphArg.getTraitContract();
+  };
+
+  // `execute` is the reference, so errors point at the `build_graph` side.
+  auto compare =
+      [&](StringRef kind, ArrayRef<KernelDeclOperandAdaptor> executeArgs,
+          ArrayRef<KernelDeclOperandAdaptor> buildGraphArgs) -> LogicalResult {
+    if (executeArgs.size() != buildGraphArgs.size())
+      return mlir::emitError(
+                 decl.getMojoFunctionLocation(KernelFunctionKind::BuildGraph))
+             << executeName << " declares " << executeArgs.size() << " " << kind
+             << "s but " << buildGraphName << " declares "
+             << buildGraphArgs.size() << "; " << contract;
+    for (auto [executeArg, buildGraphArg] :
+         llvm::zip(executeArgs, buildGraphArgs)) {
+      if (executeArg.isContextType() && buildGraphArg.isBuilderType())
+        continue;
+      if (buildGraphArg.isStableTensorType() && executeArg.isFusedTensorType())
+        return emitMojoArgumentError(decl, KernelFunctionKind::BuildGraph,
+                                     buildGraphArg)
+               << "the " << kind << " at position " << positionOf(buildGraphArg)
+               << " of " << buildGraphName
+               << " reads a stable address slot, but the " << kind
+               << " at position " << positionOf(executeArg) << " of "
+               << executeName
+               << " is fused; a slot publishes the address of a tensor in "
+                  "memory, and a fused input is a functor with none";
+      if (!sameArgument(executeArg, buildGraphArg))
+        return emitMojoArgumentError(decl, KernelFunctionKind::BuildGraph,
+                                     buildGraphArg)
+               << "the " << kind << " at position " << positionOf(executeArg)
+               << " is " << describe(executeArg) << " on " << executeName
+               << " but " << describe(buildGraphArg) << " on " << buildGraphName
+               << "; " << contract;
+    }
+    return success();
+  };
+
+  if (compare("input", adaptor.executeFunction->inputArguments,
+              adaptor.buildGraphFunction->inputArguments)
+          .failed())
+    return failure();
+  return compare("output", adaptor.executeFunction->outputArguments,
+                 adaptor.buildGraphFunction->outputArguments);
 }
 
 /// Slot-backed tensor arguments (`StableTensor` / `StableVariadicTensors`)
@@ -284,8 +363,6 @@ declVerifyStableTensorArguments(KernelDeclOp decl,
   return success();
 }
 
-/// A build_graph method records nodes against a DeviceGraphBuilder, so the
-/// signature must explicitly accept one.
 LogicalResult declVerifyBuildGraphHasBuilder(KernelDeclOp decl,
                                              const KernelDeclAdaptor &adaptor) {
   if (!adaptor.buildGraphFunction.has_value())
@@ -1118,16 +1195,6 @@ struct VerifyKernelsPass : public impl::VerifyKernelsBase<VerifyKernelsPass> {
               .failed())
         continue;
 
-      if (setFlagIfFailed(failed, declVerifyExecuteMatchesBuildGraph, decl,
-                          adaptor)
-              .failed())
-        continue;
-
-      if (setFlagIfFailed(failed, declVerifyStableTensorArguments, decl,
-                          adaptor)
-              .failed())
-        continue;
-
       if (setFlagIfFailed(failed, declVerifyExecuteFunctionDoesNotReturnATensor,
                           decl, adaptor)
               .failed())
@@ -1140,6 +1207,16 @@ struct VerifyKernelsPass : public impl::VerifyKernelsBase<VerifyKernelsPass> {
 
       if (setFlagIfFailed(failed, declVerifyContextsAppearLastInSignature, decl,
                           adaptor, shapeFnAdaptor)
+              .failed())
+        continue;
+
+      if (setFlagIfFailed(failed, declVerifyExecuteMatchesBuildGraph, decl,
+                          adaptor)
+              .failed())
+        continue;
+
+      if (setFlagIfFailed(failed, declVerifyStableTensorArguments, decl,
+                          adaptor)
               .failed())
         continue;
 

@@ -387,6 +387,16 @@ struct KernelDeclOperandAdaptor {
 
   bool isTraitTensorType() const { return getTraitContract().has_value(); }
 
+  /// nullopt for a non-tensor argument.
+  std::optional<IOSpec> getIoSpec() const {
+    if (const auto *t = std::get_if<KernelDeclTensorAdaptor>(&underlyingType))
+      return t->ioSpec;
+    if (const auto *t =
+            std::get_if<KernelDeclVariadicTensorAdaptor>(&underlyingType))
+      return t->ioSpec;
+    return std::nullopt;
+  }
+
   /// A trait-lane `TensorTuple` (`xs: TensorTuple[*Ts]`), whose elements are
   /// gathered into one argument.
   bool isTraitTensorTupleType() const {
