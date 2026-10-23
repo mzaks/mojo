@@ -12,11 +12,12 @@
 # ===----------------------------------------------------------------------=== #
 """Architecture registration for GLM-5.3-Flash (``glm5_next``).
 
-Text and images; video is not wired yet. The decoder is assembled in
+Text, images and video. The decoder is assembled in
 :meth:`~.model.Glm5NextModel.graph_specs`, which calls
 ``attach_layers(build_layers())``, so this resolves to GLM-5.3-Flash's own
 graph rather than to DeepSeek-V3.2's. The vision tower compiles beside it and
-its rows are scattered onto the image placeholders after the embedding.
+its rows are scattered onto the image and video-frame placeholders after the
+embedding.
 
 A load failure is a real failure, not bring-up noise.
 
@@ -58,16 +59,12 @@ glm5_next_arch = SupportedArchitecture(
     default_encoding=Glm5NextConfig.DEFAULT_ENCODING,
     supported_encodings=Glm5NextConfig.SUPPORTED_ENCODINGS,
     pipeline_model=Glm5NextModel,
-    input_modalities={InputModality.TEXT, InputModality.IMAGE},
+    input_modalities={
+        InputModality.TEXT,
+        InputModality.IMAGE,
+        InputModality.VIDEO,
+    },
     batching=Glm5NextBatchProcessor,
-    # TODO(GLM53-VISION): video. When wiring it, clamp the sampled frame count
-    # before it reaches the processor. `sample_frames` returns an *empty*
-    # array for a sub-second clip below the target fps -- at `duration=0.9,
-    # target_fps=1`, `extract_t` is 0, the walk appends frame 0, and
-    # `len(frame_indices) > extract_t` then routes to `linspace(num=0)`. That
-    # is upstream behaviour, reproduced faithfully and pinned by
-    # `test_sub_second_clip_below_target_fps_samples_nothing`; neither the
-    # processor nor the reference will reject it, so the caller must.
     tokenizer=Glm5NextTokenizer,
     context_type=Glm5NextTextAndVisionContext,
     weight_adapters={

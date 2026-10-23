@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""GLM-5.3-Flash frame sampling and clip patchifying.
+"""GLM-5.3-Flash frame sampling, clip decoding and clip patchifying.
 
 The expected index lists were produced by the reference's
 ``Glm5NextVideoProcessor.sample_frames`` (``modular_glm5_next.py`` at
@@ -19,6 +19,10 @@ The expected index lists were produced by the reference's
 
 from __future__ import annotations
 
+import io
+import tracemalloc
+
+import av
 import numpy as np
 import pytest
 from max.pipelines.architectures.glm5_next.video_processor import (
@@ -91,6 +95,24 @@ def test_sample_frames_caps_at_max_frames() -> None:
     assert indices[-2:].tolist() == [239881, 239999]
 
 
+def test_sample_frames_cost_follows_the_sample() -> None:
+    """A clip's header can declare any frame count; sampling must not walk it.
+
+    The reference builds a timestamp per declared frame, about 35 MB for a
+    million; the 2048 frames kept here take a small fraction of that.
+    """
+    tracemalloc.start()
+    try:
+        indices = _processor().sample_frames(10**6, 30.0, 10**6 / 30.0, 2.0)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(indices) == 2048
+    assert indices[-1] == 10**6 - 1
+    assert peak < 1 << 20
+
+
 def test_missing_fps_is_refused() -> None:
     with pytest.raises(ValueError, match="native fps"):
         _processor().sample_frames(100, 0.0, 10.0, 2.0)
@@ -109,6 +131,28 @@ def test_clip_grid_matches_patchified_output() -> None:
     assert patches.shape[1] == 3 * 2 * 14 * 14
 
 
+def test_temporal_patch_fits_one_encode_pass() -> None:
+    """A 4K frame pair is shrunk to what one encode pass holds.
+
+    Only the clip-wide budget bounds a short clip's canvas, and four 4K frames
+    fit it at 10,764 tokens a pair. A clip already within one pass keeps the
+    reference's canvas.
+    """
+    uncapped = _processor()
+    capped = Glm5NextVideoProcessor.from_processor_config(
+        _PROCESSOR_CONFIG, max_entry_tokens=8192
+    )
+
+    def tokens(canvas: tuple[int, int]) -> int:
+        return canvas[0] * canvas[1] // 28**2
+
+    assert tokens(uncapped.canvas_size(2160, 3840, 4)) == 10764
+    assert tokens(capped.canvas_size(2160, 3840, 4)) <= 8192
+    assert capped.canvas_size(720, 1280, 4) == uncapped.canvas_size(
+        720, 1280, 4
+    )
+
+
 def test_video_budget_is_the_video_one() -> None:
     """Read from the `video_processor` section, not the image one."""
     processor = _processor()
@@ -116,3 +160,49 @@ def test_video_budget_is_the_video_one() -> None:
     assert processor.max_image_tokens == 240000
     assert processor.fps == 2
     assert processor.max_frames == 2048
+
+
+def _mp4(num_frames: int, fps: int, width: int = 32, height: int = 32) -> bytes:
+    """An H.264 clip whose frame ``i`` is a flat ``8 * i`` grey."""
+    buffer = io.BytesIO()
+    container = av.open(buffer, mode="w", format="mp4")
+    stream = container.add_stream("libx264", rate=fps)
+    assert isinstance(stream, av.VideoStream)
+    stream.width = width
+    stream.height = height
+    stream.pix_fmt = "yuv420p"
+    for index in range(num_frames):
+        pixels = np.full((height, width, 3), 8 * index, dtype=np.uint8)
+        frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+        for packet in stream.encode(frame):
+            container.mux(packet)
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+    return buffer.getvalue()
+
+
+def _grey_levels(frames: list[Image.Image]) -> list[int]:
+    return [round(float(np.asarray(frame).mean()) / 8) for frame in frames]
+
+
+def test_decode_fetches_the_frames_sample_frames_picks() -> None:
+    """Seven frames at 1 fps: an odd sample, so the last frame is repeated."""
+    frames, indices, fps = _processor().decode(_mp4(7, 1))
+
+    assert indices == [0, 1, 2, 3, 4, 5, 6, 6]
+    assert fps == 1.0
+    assert _grey_levels(frames) == indices
+
+
+def test_decode_keeps_the_first_frame_of_a_sub_second_clip() -> None:
+    """0.4 s at 2 fps: the reference samples nothing, and MAX one pair.
+
+    The reference's processor then divides by the empty grid, so there is no
+    behaviour of its to match; a clip this short is one temporal patch of its
+    first frame rather than a failed request.
+    """
+    frames, indices, _ = _processor().decode(_mp4(4, 10))
+
+    assert indices == [0, 0]
+    assert _grey_levels(frames) == [0, 0]

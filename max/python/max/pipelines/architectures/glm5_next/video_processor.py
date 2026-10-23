@@ -42,17 +42,67 @@ not modelled here.
 
 from __future__ import annotations
 
+import logging
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from max.pipelines.context import VideoSource, decode_video_frames
 from PIL import Image
 from typing_extensions import Self
 
-from .image_processor import Glm5NextPatchifier
+from .image_processor import Glm5NextPatchifier, smart_resize
 
 __all__ = ["Glm5NextVideoProcessor"]
+
+logger = logging.getLogger("max.pipelines")
+
+# The reference processor's frame rate for a clip that declares none.
+_DEFAULT_FPS = 24.0
+
+
+def _second_boundary_walk(
+    total_num_frames: int,
+    native_fps: float,
+    target_fps: float,
+    max_seconds: int,
+    limit: int,
+) -> list[int]:
+    """The reference's second-boundary walk, at most ``limit`` steps long.
+
+    The reference scans every frame's timestamp, ``i * (1 / native_fps)``, for
+    the first at or past a running sum of ``1 / target_fps``. This jumps to
+    that frame instead, so the cost follows the frames kept rather than the
+    clip's declared frame count, with the reference's float arithmetic.
+    """
+    duration_per_frame = 1 / native_fps
+    inv_fps = 1 / target_fps
+    indices: list[int] = []
+    current_second = 0.0
+    lowest = 0
+    while lowest < total_num_frames and len(indices) < limit:
+        index = max(lowest, math.ceil(current_second / duration_per_frame))
+        # The division can round across a frame boundary either way.
+        while (
+            index > lowest
+            and (index - 1) * duration_per_frame >= current_second
+        ):
+            index -= 1
+        while (
+            index < total_num_frames
+            and index * duration_per_frame < current_second
+        ):
+            index += 1
+        if index >= total_num_frames:
+            break
+        current_second += inv_fps
+        indices.append(index)
+        if current_second >= max_seconds:
+            break
+        lowest = index + 1
+    return indices
 
 
 class Glm5NextVideoProcessor(Glm5NextPatchifier):
@@ -66,11 +116,13 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
         max_image_tokens: int = 240000,
         fps: float = 2.0,
         max_frames: int = 2048,
+        max_entry_tokens: int | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(max_image_tokens=max_image_tokens, **kwargs)
         self.fps = fps
         self.max_frames = max_frames
+        self.max_entry_tokens = max_entry_tokens
 
     @classmethod
     def from_processor_config(
@@ -90,6 +142,7 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
         native_fps: float,
         duration: float | None = None,
         target_fps: float | None = None,
+        max_frames: int | None = None,
     ) -> npt.NDArray[np.int64]:
         """Picks which frame indices of a clip the tower sees.
 
@@ -99,6 +152,9 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
             duration: The clip's duration in seconds, if the container reports
                 one. Derived from the frame count and rate when it does not.
             target_fps: Sampling rate. Defaults to the configured ``fps``.
+            max_frames: Frame cap. Defaults to the configured ``max_frames``;
+                a smaller one, such as a decoded-memory budget's, samples as
+                a checkpoint configured with it would.
 
         Returns:
             An even-length, ascending array of frame indices, possibly with the
@@ -108,7 +164,7 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
             ValueError: If ``native_fps`` is missing, which the reference also
                 refuses to guess at.
         """
-        if not native_fps:
+        if not native_fps > 0:
             raise ValueError(
                 "Frame sampling needs the clip's native fps; GLM-5.3-Flash "
                 "budgets frames in seconds, not in frame counts."
@@ -120,10 +176,10 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
         max_seconds = int(duration)
         if target_fps is None:
             target_fps = self.fps
+        if max_frames is None:
+            max_frames = self.max_frames
 
-        extract_t = min(int(duration * target_fps), self.max_frames)
-        duration_per_frame = 1 / native_fps
-        timestamps = [i * duration_per_frame for i in range(total_num_frames)]
+        extract_t = min(int(duration * target_fps), max_frames)
 
         frame_indices: list[int]
         if total_num_frames < extract_t:
@@ -131,15 +187,15 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
                 0, total_num_frames - 1, extract_t, dtype=int
             ).tolist()
         else:
-            frame_indices = []
-            current_second = 0.0
-            inv_fps = 1 / target_fps
-            for frame_index in range(total_num_frames):
-                if timestamps[frame_index] >= current_second:
-                    current_second += inv_fps
-                    frame_indices.append(frame_index)
-                    if current_second >= max_seconds:
-                        break
+            # A walk longer than `extract_t` is replaced below whatever it
+            # holds, so one past it is all the walk needs to find.
+            frame_indices = _second_boundary_walk(
+                total_num_frames,
+                native_fps,
+                target_fps,
+                max_seconds,
+                limit=extract_t + 1,
+            )
 
         if len(frame_indices) < extract_t:
             if not frame_indices:
@@ -167,6 +223,86 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
             unique.append(unique[-1])
 
         return np.array(unique, dtype=np.int64)
+
+    def decode(
+        self, source: VideoSource, max_decoded_bytes: int | None = None
+    ) -> tuple[list[Image.Image], list[int], float]:
+        """Decodes the frames :meth:`sample_frames` picks from a clip.
+
+        The duration is the frame count over the frame rate, as transformers'
+        PyAV loader computes it. A decoded-memory budget lowers the frame cap
+        rather than rejecting the clip.
+
+        A clip too short to yield a frame at the target rate -- under half a
+        second at 2 fps -- gets its first frame as one temporal pair. There is
+        no reference behaviour to match: the reference samples no frames and
+        its processor then divides by the empty grid.
+
+        Args:
+            source: The encoded clip.
+            max_decoded_bytes: Ceiling on the decoded frames' footprint.
+
+        Returns:
+            The sampled frames, their source indices, and the frame rate the
+            indices count in, which the timestamps in the prompt are built
+            from.
+        """
+
+        def sample(total: int, fps: float, max_frames: int | None) -> list[int]:
+            wanted = min(int(total / fps * self.fps), self.max_frames)
+            if max_frames is not None and max_frames < wanted:
+                logger.warning(
+                    "Sampling %d of the %d frames GLM-5.3-Flash takes from a "
+                    "video; the rest do not fit the request's media budget "
+                    "(MAX_SERVE_MAX_MEDIA_BYTES).",
+                    max_frames,
+                    wanted,
+                )
+            # The sampler pads an odd count with a repeated frame, so an odd
+            # cap would keep one frame more than the budget allows.
+            if max_frames is not None and max_frames > 1:
+                max_frames -= max_frames % 2
+            indices = self.sample_frames(
+                total, fps, duration=total / fps, max_frames=max_frames
+            )
+            return indices.tolist() or [0, 0]
+
+        sampled = decode_video_frames(
+            source,
+            sample_indices=sample,
+            max_frames=self.max_frames,
+            max_decoded_bytes=max_decoded_bytes,
+            default_fps=_DEFAULT_FPS,
+        )
+        return sampled.images, sampled.indices, sampled.info.fps or _DEFAULT_FPS
+
+    def canvas_size(
+        self, height: int, width: int, num_frames: int | None = None
+    ) -> tuple[int, int]:
+        """Returns the clip's canvas, shrunk until one temporal patch fits.
+
+        The model encodes each temporal patch in one pass and never splits
+        one, so a patch over ``max_entry_tokens`` gets the largest canvas that
+        holds that many tokens. Any other clip keeps the reference's canvas.
+        """
+        canvas_height, canvas_width = super().canvas_size(
+            height, width, num_frames
+        )
+        if (
+            self.max_entry_tokens is None
+            or canvas_height * canvas_width // self.spatial_factor**2
+            <= self.max_entry_tokens
+        ):
+            return canvas_height, canvas_width
+        return smart_resize(
+            self.temporal_patch_size,
+            height,
+            width,
+            temporal_factor=self.temporal_patch_size,
+            factor=self.spatial_factor,
+            min_image_tokens=self.min_image_tokens,
+            max_image_tokens=self.max_entry_tokens,
+        )
 
     def grid_thw(self, frames: Sequence[Image.Image]) -> tuple[int, int, int]:
         """Returns a clip's ``(t, h, w)`` grid without touching the pixels."""

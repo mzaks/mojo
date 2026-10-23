@@ -10,14 +10,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""GLM-5.3-Flash tokenizer: the GLM-5.x text tokenizer plus image inputs.
+"""GLM-5.3-Flash tokenizer: the GLM-5.x text tokenizer plus images and video.
 
 The chat template wraps each image as
 ``<|begin_of_image|><|image|><|end_of_image|>``, and the reference processor
 (``Glm5NextProcessor.replace_image_token``) widens the one ``<|image|>`` to
-``t * h * w / merge**2`` copies, one per merged vision token. The tower's rows
-are scattered onto exactly those positions; the decoder is NoPE, so there are
-no position ids to adjust.
+``t * h * w / merge**2`` copies, one per merged vision token. A video renders as
+``<|begin_of_video|><|video|><|end_of_video|>``, and ``replace_video_token``
+turns the ``<|video|>`` into one
+``<|begin_of_image|><|image|>...<|end_of_image|>{t:.1f} seconds`` run per
+temporal patch: the same placeholder as an image, told apart only by the video
+span around it. Each run is an entry of its own with ``grid_t = 1``, which is
+how the reference tower sees a clip as well, so a clip is encoded and cached
+frame pair by frame pair. The tower's rows are scattered onto exactly those
+positions; the decoder is NoPE, so there are no position ids to adjust.
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
@@ -52,6 +58,7 @@ from transformers.utils import cached_file
 
 from .context import Glm5NextTextAndVisionContext
 from .image_processor import Glm5NextImageProcessor
+from .video_processor import Glm5NextVideoProcessor
 
 logger = logging.getLogger("max.pipelines")
 
@@ -80,19 +87,39 @@ def _load_processor_config(
         return json.load(f)
 
 
+class _Video(NamedTuple):
+    """One decoded and patchified clip."""
+
+    patches: npt.NDArray[np.float32]
+    """``(grid_t * h * w, patch_dim)`` rows, temporal patch major."""
+
+    grid: tuple[int, int, int]
+    indices: list[int]
+    """Source frame of each sampled frame, two per temporal patch."""
+
+    fps: float
+    content_hash: int | None
+
+
+class _Entry(NamedTuple):
+    """One tower input inside a placeholder's replacement."""
+
+    offset: int
+    """Index of the entry's first placeholder within the replacement."""
+
+    num_tokens: int
+    """How many placeholder tokens the entry covers."""
+    pixel_values: npt.NDArray[np.float32]
+    image_hash: int | None
+    grid: tuple[int, int, int]
+
+
 class Glm5NextTokenizer(GlmTokenizer):
-    """Builds :class:`.Glm5NextTextAndVisionContext` for text and images.
+    """Builds :class:`.Glm5NextTextAndVisionContext` for text, images and video.
 
     Text handling -- the chat template, reasoning effort and tool-result
     ordering -- is :class:`GlmTokenizer`'s, unchanged.
     """
-
-    # TODO(GLM53-VISION): video. The placeholder is the same `<|image|>`, one
-    # `<|begin_of_image|>...<|end_of_image|>{t:.1f} seconds` run per temporal
-    # patch inside a `<|begin_of_video|>` span, so each run maps onto one
-    # `grid_t = 1` image entry. Missing are decoding the clip, `sample_frames`
-    # (clamp its sub-second empty result, see `arch.py`) and the timestamps.
-    max_videos_per_request = 0
 
     def __init__(
         self,
@@ -107,10 +134,20 @@ class Glm5NextTokenizer(GlmTokenizer):
         )
         hf_config = pipeline_config.model.huggingface_config
         self.image_token_id = int(hf_config.image_token_id)
+        self._image_start_token_id = int(hf_config.image_start_token_id)
+        self._image_end_token_id = int(hf_config.image_end_token_id)
+        self._video_token_id = int(hf_config.video_token_id)
         self._video_start_token_id = int(hf_config.video_start_token_id)
         self._video_end_token_id = int(hf_config.video_end_token_id)
+        processor_config = _load_processor_config(model_path, revision)
         self.image_processor = Glm5NextImageProcessor.from_processor_config(
-            _load_processor_config(model_path, revision)
+            processor_config
+        )
+        self.video_processor = Glm5NextVideoProcessor.from_processor_config(
+            processor_config,
+            # The model encodes a temporal patch in one pass, and the memory
+            # planner reserves for passes of this many rows.
+            max_entry_tokens=pipeline_config.runtime.max_batch_input_tokens,
         )
         # Every image expands to at least `min_image_tokens` placeholders, so
         # more images than this cannot fit; the router rejects them before
@@ -127,19 +164,19 @@ class Glm5NextTokenizer(GlmTokenizer):
 
     @property
     def expects_content_wrapping(self) -> bool:
-        """Keeps image parts as placeholders for the chat template."""
+        """Keeps image and video parts as placeholders for the chat template."""
         return True
 
     def _flatten_message(
         self, message: TextGenerationRequestMessage
     ) -> dict[str, Any]:
-        """Leaves a message with an image as a list of parts.
+        """Leaves a message with an image or a video as a list of parts.
 
-        GLM's template renders each image part in place. Text-only messages
+        GLM's template renders each media part in place. Text-only messages
         are flattened as before, which joins multiple text parts with
         newlines.
         """
-        if message.number_of_images == 0:
+        if message.number_of_images == 0 and message.number_of_videos == 0:
             return super()._flatten_message(message)
         return message.model_dump(exclude_none=True)
 
@@ -149,51 +186,167 @@ class Glm5NextTokenizer(GlmTokenizer):
         """Positions of image placeholders outside any video span.
 
         A video frame uses the same token; the reference tells them apart by
-        whether a ``<|begin_of_video|>`` is open, as done here.
+        whether a ``<|begin_of_video|>`` is open, as done here. Frames are
+        expanded from ``<|video|>``, so a rendered prompt has no ``<|image|>``
+        in a video span until then.
         """
         is_placeholder = token_ids == self.image_token_id
         in_video = np.cumsum(token_ids == self._video_start_token_id) > (
             np.cumsum(token_ids == self._video_end_token_id)
         )
         if np.any(is_placeholder & in_video):
-            raise ValueError("GLM-5.3-Flash does not accept video input yet.")
+            raise ValueError(
+                "The prompt has an image placeholder inside a video span, "
+                "which no image or video fills."
+            )
         return np.flatnonzero(is_placeholder)
+
+    def video_replacement(
+        self, grid: tuple[int, int, int], timestamps: Sequence[float]
+    ) -> tuple[npt.NDArray[np.int64], list[int]]:
+        """Returns the ids one ``<|video|>`` becomes, and each frame's offset.
+
+        ``Glm5NextProcessor.replace_video_token`` on token ids rather than
+        text. The timestamp text always sits between two special tokens, which
+        the tokenizer splits on first, so encoding it alone yields the ids it
+        gets inside the whole prompt.
+
+        Args:
+            grid: The clip's ``(t, h, w)`` patch grid.
+            timestamps: Seconds at the first frame of each temporal patch.
+
+        Returns:
+            The replacement ids, and the offset of each temporal patch's first
+            placeholder within them.
+        """
+        grid_t, grid_h, grid_w = grid
+        per_frame = grid_h * grid_w // self.video_processor.merge_size**2
+        texts = [f"{timestamp:.1f} seconds" for timestamp in timestamps]
+        text_ids = {
+            text: np.asarray(
+                self.delegate.encode(text, add_special_tokens=False),
+                dtype=np.int64,
+            )
+            for text in dict.fromkeys(texts)
+        }
+        placeholders = np.full(per_frame, self.image_token_id, dtype=np.int64)
+        begin = np.array([self._image_start_token_id], dtype=np.int64)
+        end = np.array([self._image_end_token_id], dtype=np.int64)
+        pieces: list[npt.NDArray[np.int64]] = []
+        offsets: list[int] = []
+        offset = 0
+        for _, text in zip(range(grid_t), texts, strict=True):
+            offsets.append(offset + 1)
+            pieces += [begin, placeholders, end, text_ids[text]]
+            offset += per_frame + 2 + len(text_ids[text])
+        return np.concatenate(pieces), offsets
+
+    def _video_entries(
+        self, video: _Video
+    ) -> tuple[npt.NDArray[np.int64], list[_Entry]]:
+        """Splits a clip into one ``grid_t = 1`` entry per temporal patch.
+
+        The reference tower attends within a temporal patch only, so an entry
+        encodes to exactly its rows of the whole clip. Its cache key is the
+        clip's bytes plus the two source frames and the canvas, which together
+        fix its pixels: the canvas depends on the clip's frame count, so the
+        same frames sampled from a longer clip key apart.
+        """
+        grid_t, grid_h, grid_w = video.grid
+        rows = grid_h * grid_w
+        # `[::2]`, not `[::temporal_patch_size]`: the reference's own slice.
+        timestamps = [index / video.fps for index in video.indices[::2]]
+        replacement, offsets = self.video_replacement(
+            video.grid, timestamps[:grid_t]
+        )
+        count = rows // self.video_processor.merge_size**2
+        entries = [
+            _Entry(
+                offset=offset,
+                num_tokens=count,
+                pixel_values=video.patches[t * rows : (t + 1) * rows],
+                image_hash=hash_image(
+                    np.array(
+                        [
+                            video.content_hash,
+                            *video.indices[2 * t : 2 * t + 2],
+                            *video.grid,
+                        ],
+                        dtype=np.int64,
+                    )
+                )
+                if video.content_hash is not None
+                else None,
+                grid=(1, grid_h, grid_w),
+            )
+            for t, offset in enumerate(offsets)
+        ]
+        return replacement, entries
+
+    def _preprocess_videos(
+        self,
+        videos: Sequence[bytes],
+        content_hashes: Sequence[int | None],
+        max_decoded_bytes: int | None,
+    ) -> list[_Video]:
+        """Decodes, samples and patchifies each clip."""
+        processed: list[_Video] = []
+        for raw, content_hash in zip(videos, content_hashes, strict=True):
+            frames, indices, fps = self.video_processor.decode(
+                raw, max_decoded_bytes
+            )
+            patches, grid = self.video_processor.preprocess(frames)
+            processed.append(_Video(patches, grid, indices, fps, content_hash))
+        return processed
 
     def expand_image_placeholders(
         self,
         token_ids: npt.NDArray[np.integer[Any]],
         images: Sequence[bytes | Image.Image],
         image_hashes: Sequence[int | None],
+        videos: Sequence[_Video] = (),
     ) -> tuple[
         npt.NDArray[np.integer[Any]], list[ImageMetadata], npt.NDArray[np.int64]
     ]:
         """Preprocesses the images and widens each placeholder to its rows.
 
-        A request without images passes through unchanged, so a prompt that
-        quotes ``<|image|>`` keeps it as text, as the base GLM tokenizer did.
+        A ``<|video|>`` widens to its clip's frame runs, and every temporal
+        patch becomes an entry of its own, in prompt order with the images. A
+        request without media passes through unchanged, so a prompt that
+        quotes ``<|image|>`` or ``<|video|>`` keeps it as text, as the base GLM
+        tokenizer did.
 
         Args:
-            token_ids: The encoded prompt, one placeholder per image.
+            token_ids: The encoded prompt, one placeholder per image or video.
             images: The request's images, in prompt order.
             image_hashes: One content hash per image, or ``None`` per image
                 when no cache needs one.
+            videos: The request's preprocessed clips, in prompt order.
 
         Returns:
-            The expanded token ids, one :class:`ImageMetadata` per image whose
-            span covers exactly its placeholders, and the ``(t, h, w)`` grids.
+            The expanded token ids, one :class:`ImageMetadata` per image or
+            temporal patch whose span covers exactly its placeholders, and
+            their ``(t, h, w)`` grids.
 
         Raises:
-            ValueError: If the placeholder and image counts differ.
+            ValueError: If a placeholder count differs from its media count.
             PromptTooLongError: If the expanded prompt exceeds ``max_length``.
         """
-        if not images:
+        if not images and not videos:
             return token_ids, [], np.empty((0, 3), dtype=np.int64)
-        positions = self._image_placeholders(token_ids)
-        if len(positions) != len(images):
+        image_positions = self._image_placeholders(token_ids)
+        if len(image_positions) != len(images):
             raise ValueError(
-                f"The prompt has {len(positions)} image placeholders but the "
-                f"request carries {len(images)} images."
+                f"The prompt has {len(image_positions)} image placeholders but "
+                f"the request carries {len(images)} images."
             )
+        video_positions = np.flatnonzero(token_ids == self._video_token_id)
+        if len(video_positions) != len(videos):
+            raise ValueError(
+                f"The prompt has {len(video_positions)} video placeholders but "
+                f"the request carries {len(videos)} videos."
+            )
+
         opened = [open_image(image) for image in images]
         counts = [
             self.image_processor.num_image_tokens(
@@ -201,46 +354,80 @@ class Glm5NextTokenizer(GlmTokenizer):
             )
             for image in opened
         ]
+        edits: list[tuple[int, npt.NDArray[np.int64], list[_Entry]]] = [
+            (int(position), *self._video_entries(video))
+            for position, video in zip(video_positions, videos, strict=True)
+        ]
         # Checked before patchifying: images below the token floor are
         # upscaled, so many tiny ones would take gigabytes first.
-        length = len(token_ids) + sum(counts) - len(counts)
+        length = (
+            len(token_ids)
+            + sum(counts)
+            - len(counts)
+            + sum(len(replacement) - 1 for _, replacement, _ in edits)
+        )
         if self.max_length and length > self.max_length:
             raise PromptTooLongError(length, self.max_length)
-        processed = [self.image_processor.preprocess(image) for image in opened]
-        expanded = np.insert(
-            token_ids,
-            np.repeat(positions, [count - 1 for count in counts]),
-            self.image_token_id,
-        )
-        starts = (
-            positions + np.cumsum([0, *counts[:-1]]) - np.arange(len(counts))
-        )
-        metadata = [
-            ImageMetadata(
-                start_idx=int(start),
-                end_idx=int(start) + count,
-                pixel_values=patches,
-                image_hash=image_hash,
+        for position, image, count, image_hash in zip(
+            image_positions, opened, counts, image_hashes, strict=True
+        ):
+            patches, grid = self.image_processor.preprocess(image)
+            edits.append(
+                (
+                    int(position),
+                    np.full(count, self.image_token_id, dtype=np.int64),
+                    [_Entry(0, count, patches, image_hash, grid)],
+                )
             )
-            for start, count, (patches, _), image_hash in zip(
-                starts, counts, processed, image_hashes, strict=True
-            )
-        ]
-        grids = np.array([grid for _, grid in processed], dtype=np.int64)
-        return expanded, metadata, grids
+        edits.sort(key=lambda edit: edit[0])
+
+        pieces: list[npt.NDArray[np.integer[Any]]] = []
+        metadata: list[ImageMetadata] = []
+        grids: list[tuple[int, int, int]] = []
+        previous = 0
+        shift = 0
+        for position, replacement, entries in edits:
+            pieces += [token_ids[previous:position], replacement]
+            for entry in entries:
+                start = position + shift + entry.offset
+                metadata.append(
+                    ImageMetadata(
+                        start_idx=start,
+                        end_idx=start + entry.num_tokens,
+                        pixel_values=entry.pixel_values,
+                        image_hash=entry.image_hash,
+                    )
+                )
+                grids.append(entry.grid)
+            shift += len(replacement) - 1
+            previous = position + 1
+        pieces.append(token_ids[previous:])
+        return (
+            np.concatenate(pieces),
+            metadata,
+            np.array(grids, dtype=np.int64),
+        )
 
     async def new_context(
         self, request: TextGenerationRequest
     ) -> Glm5NextTextAndVisionContext:
-        """Creates a context, expanding image placeholders if there are any."""
-        if request.videos:
-            raise ValueError("GLM-5.3-Flash does not accept video input yet.")
+        """Creates a context, expanding image and video placeholders."""
         _prompt, token_ids = await self._generate_prompt_and_token_ids(
             prompt=request.prompt,
             messages=request.messages,
             tools=request.tools,
             **(request.chat_template_options or {}),
         )
+        # Before any clip is decoded, which can take seconds.
+        if request.videos:
+            placeholders = int(
+                np.count_nonzero(np.asarray(token_ids) == self._video_token_id)
+            )
+            if placeholders != len(request.videos):
+                raise ValueError(
+                    f"The prompt has {placeholders} video placeholders but "
+                    f"the request carries {len(request.videos)} videos."
+                )
 
         # Keyed on the encoded bytes and the token budget, which together fix
         # the padded canvas the tower sees.
@@ -250,11 +437,29 @@ class Glm5NextTokenizer(GlmTokenizer):
             else None
             for raw in request.images
         ]
+        # Keyed on the encoded bytes alone: each temporal patch's key adds
+        # the frames and the canvas it was sampled at.
+        videos = (
+            await run_with_default_executor(
+                self._preprocess_videos,
+                request.videos,
+                [
+                    hash_image(raw, self.video_processor.max_image_tokens)
+                    if self._hash_images
+                    else None
+                    for raw in request.videos
+                ],
+                request.max_decoded_bytes,
+            )
+            if request.videos
+            else []
+        )
         token_ids, images, grid_thws = await run_with_default_executor(
             self.expand_image_placeholders,
             token_ids,
             request.images_for_processing(),
             image_hashes,
+            videos,
         )
         if self.max_length and len(token_ids) > self.max_length:
             raise PromptTooLongError(len(token_ids), self.max_length)

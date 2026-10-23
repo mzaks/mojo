@@ -388,6 +388,48 @@ class TestWalkIndexPlanning:
         assert first == second
 
 
+class TestCustomSampler:
+    """A model's own frame-selection rule, run inside the bounded decoder."""
+
+    def test_decodes_the_indices_it_returns(self) -> None:
+        """Including a repeat, which a paired temporal patch can need."""
+        sampled = decode_video_frames(
+            _make_video_bytes(num_frames=24),
+            sample_indices=lambda total, fps, cap: [0, 11, 23, 23],
+        )
+
+        assert sampled.indices == [0, 11, 23, 23]
+        means = [float(frame.mean()) for frame in sampled.frames]
+        assert means[0] < means[1] < means[2] == means[3]
+
+    def test_receives_the_tighter_of_both_caps(self) -> None:
+        seen: list[tuple[int, float, int | None]] = []
+
+        def sample(total: int, fps: float, cap: int | None) -> list[int]:
+            seen.append((total, fps, cap))
+            return [0]
+
+        video = _make_video_bytes(num_frames=24)
+        decode_video_frames(video, sample_indices=sample)
+        decode_video_frames(video, sample_indices=sample, max_frames=7)
+        decode_video_frames(
+            video,
+            sample_indices=sample,
+            max_frames=7,
+            max_decoded_bytes=FRAME_BYTES * 3,
+        )
+
+        assert seen == [(24, 24.0, None), (24, 24.0, 7), (24, 24.0, 3)]
+
+    def test_rejects_a_second_sampling_policy(self) -> None:
+        with pytest.raises(ValueError, match="sample_indices replaces"):
+            decode_video_frames(
+                _make_video_bytes(num_frames=8),
+                num_frames=2,
+                sample_indices=lambda total, fps, cap: [0],
+            )
+
+
 class TestDecodedByteBudget:
     """Decoded footprint is bounded by the same knob as everything else."""
 

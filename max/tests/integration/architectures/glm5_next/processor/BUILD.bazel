@@ -16,8 +16,14 @@ modular_py_test(
     name = "test_video_processor",
     size = "small",
     srcs = ["test_video_processor.py"],
+    target_compatible_with = select({
+        # libx264 encode via PyAV is unreliable on the macOS CI image.
+        "@platforms//os:macos": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     deps = [
         "//max/python/max/pipelines/architectures/glm5_next",
+        requirement("av"),
         requirement("numpy"),
         requirement("pillow"),
     ],
