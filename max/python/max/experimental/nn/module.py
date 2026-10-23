@@ -645,7 +645,10 @@ class Module(Generic[_P, _R]):
                 def forward(self, x: Tensor) -> Tensor:
                     return x @ self.weight.T + self.bias
 
-            linear = Linear(Tensor.zeros([10, 5]), Tensor.zeros([10]))
+            linear = Linear(
+                Tensor.zeros([10, 5], dtype=DType.float32),
+                Tensor.zeros([10], dtype=DType.float32),
+            )
             _, mesh = defaults()
             run = linear.compile(
                 TensorType(DType.float32, [3, 5], mesh.devices[0])
