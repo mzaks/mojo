@@ -733,6 +733,9 @@ def run_until_completion(
         ):
             for onloading in list(batch_constructor._onloading_reqs.values()):
                 onloading.event.synchronize()
+            if isinstance(kv_cache, JengaKVCacheManager):
+                for pending in kv_cache._pending_transfers[0]:
+                    pending.event.synchronize()
             kv_cache.poll_transfers()
             batch_info = create_batch_and_execute(scheduler)
             poll_iters += 1
