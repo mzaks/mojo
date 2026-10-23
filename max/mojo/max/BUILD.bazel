@@ -1,4 +1,4 @@
-load("//bazel:api.bzl", "mojo_library", "pkg_files")
+load("//bazel:api.bzl", "mojo_library", "overlay_layer", "overlay_srcs", "pkg_files")
 
 package(default_visibility = ["//max:consumers"])
 
@@ -10,9 +10,26 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+overlay_layer(
+    name = "max_base_layer",
+    srcs = [":max_srcs"],
+    strip_prefix = "max/mojo/",
+)
+
+# The HAL client API is staged in unconditionally (for now), so
+# `max.gpu.host._hal` resolves without --config=hal-device-context.
+overlay_srcs(
+    name = "max_srcs_with_hal",
+    layers = [
+        ":max_base_layer",
+        "//max/driver/src/max_license/_hal:_hal_staged_layer",
+        "//max/driver/src/max_license:hal_compat_staged_layer",
+    ],
+)
+
 mojo_library(
     name = "max",
-    srcs = [":max_srcs"],
+    srcs = [":max_srcs_with_hal"],
     docs_base_path = "mojo",
     deps = [
         "//MLRT:Driver/DeviceContext",

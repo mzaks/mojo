@@ -1,8 +1,9 @@
 package(default_visibility = ["//max:consumers"])
 
-# The HAL DeviceContext compiles only as part of the MAX overlay: staged over
-# `max/gpu/host/_legacy/device_context.mojo` under --config=hal-device-context (see
-# //max/driver/src/max_license:max_srcs_hal).
+# The HAL DeviceContext compiles only as part of the MAX overlay: staged as
+# `max.gpu.host._device_context_hal` in the default `max`, and over the
+# `max/gpu/host/_legacy` modules it replaces under --config=hal-device-context
+# (see :hal_compat_staged_layer and :hal_compat in //max/driver/src/max_license).
 # It defines `DevicePointer` and `DefaultDeviceTypeEncoder` against its own
 # `DeviceBuffer`, which cannot conform to `builtin.device_passable`'s
 # signatures outside the overlay, so there is no standalone `mojo_library`.

@@ -14,11 +14,23 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
-# Staged into the MAX overlay under --config=hal-device-context (see
-# //max/driver/src/max_license:max_srcs_hal).
+# The HAL client API, staged onto MAX's gpu.host package with `machine` nested
+# inside it. //max/mojo/max:max stacks it unconditionally, so
+# `max.gpu.host._hal` resolves in every configuration.
 overlay_layer(
     name = "_hal_staged_layer",
-    file_map = {src: "max/gpu/host/_hal/" + src for src in _HAL_SRCS},
+    file_map = {
+        src: "max/gpu/host/_hal/" + src
+        for src in _HAL_SRCS
+        if src != "_machine.mojo"
+    } | {
+        # The staged-tree variant of `_machine.mojo` imports the nested
+        # `machine` package rather than a sibling one.
+        "//max/driver/src/max_license/_device_context_hal:_machine.mojo": "max/gpu/host/_hal/_machine.mojo",
+        "//max/driver/src/max_license/machine:__init__.mojo": "max/gpu/host/_hal/machine/__init__.mojo",
+        "//max/driver/src/max_license/machine:device.mojo": "max/gpu/host/_hal/machine/device.mojo",
+        "//max/driver/src/max_license/machine:machine.mojo": "max/gpu/host/_hal/machine/machine.mojo",
+    },
     visibility = ["//visibility:public"],
 )
 

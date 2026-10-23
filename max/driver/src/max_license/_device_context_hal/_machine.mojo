@@ -14,8 +14,8 @@
 
 The `max.gpu.host` overlay stages the `machine` package inside `_hal`, so the
 re-exported names resolve relative to it. Staged over `_hal/_machine.mojo` by
-`max_srcs_hal` (see `max/driver/src/max_license/BUILD.bazel`); never compiled at
-this location.
+`_hal_staged_layer` (see `max/driver/src/max_license/_hal/BUILD.bazel`); never
+compiled at this location.
 """
 
 from .machine import MachineDefinition, DeviceRef, DeviceSpec
