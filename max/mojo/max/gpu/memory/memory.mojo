@@ -573,6 +573,32 @@ def _mark_eviction[
             ]()
 
 
+@always_inline
+def _tma_cache_hint[eviction_policy: CacheEviction]() -> Int64:
+    """Returns the L2 cache-policy word a TMA copy's `.L2::cache_hint`
+    operand takes for `eviction_policy`.
+
+    The operand is the opaque value `createpolicy.fractional` returns, not the
+    enum's discriminant. These are its values for a fraction of 1.0, as
+    immediates so they cost no instruction.
+
+    Parameters:
+        eviction_policy: The cache eviction policy to encode.
+
+    Returns:
+        The 64-bit cache-policy word.
+    """
+    comptime match eviction_policy:
+        case == CacheEviction.EVICT_FIRST:
+            return 0x12F0000000000000
+        case == CacheEviction.EVICT_LAST:
+            return 0x14F0000000000000
+        case == CacheEviction.EVICT_UNCHANGED:
+            return 0x10F0000000000000
+        case _:
+            return 0x16F0000000000000
+
+
 @inline(.nodebug)
 def async_copy[
     dtype: DType,
@@ -1377,7 +1403,7 @@ def cp_async_bulk_tensor_shared_cluster_global[
                 Int32(coords[0]),
                 Int32(coords[1]),
                 Int32(coords[2]),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
             )
         elif rank == 2:
             inlined_assembly[
@@ -1390,7 +1416,7 @@ def cp_async_bulk_tensor_shared_cluster_global[
                 Int32(Int(mem_bar)) & 0xFEFFFFFF,
                 Int32(coords[0]),
                 Int32(coords[1]),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
             )
         elif rank == 1:
             inlined_assembly[
@@ -1402,7 +1428,7 @@ def cp_async_bulk_tensor_shared_cluster_global[
                 tma_descriptor,
                 Int32(Int(mem_bar)) & 0xFEFFFFFF,
                 Int32(coords[0]),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
             )
         elif rank == 4:
             inlined_assembly[
@@ -1417,7 +1443,7 @@ def cp_async_bulk_tensor_shared_cluster_global[
                 Int32(coords[1]),
                 Int32(coords[2]),
                 Int32(coords[3]),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
             )
         else:  # rank == 5
             inlined_assembly[
@@ -1433,7 +1459,7 @@ def cp_async_bulk_tensor_shared_cluster_global[
                 Int32(coords[2]),
                 Int32(coords[3]),
                 Int32(coords[4]),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
             )
     else:
         comptime if rank == 3:
@@ -1586,7 +1612,7 @@ def cp_async_bulk_tensor_shared_cluster_global_elect[
                 Int32(coords[0]),
                 Int32(coords[1]),
                 Int32(coords[2]),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
                 elect,
             )
         elif rank == 2:
@@ -1600,7 +1626,7 @@ def cp_async_bulk_tensor_shared_cluster_global_elect[
                 Int32(Int(mem_bar)) & 0xFEFFFFFF,
                 Int32(coords[0]),
                 Int32(coords[1]),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
                 elect,
             )
         elif rank == 1:
@@ -1613,7 +1639,7 @@ def cp_async_bulk_tensor_shared_cluster_global_elect[
                 tma_descriptor,
                 Int32(Int(mem_bar)) & 0xFEFFFFFF,
                 Int32(coords[0]),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
                 elect,
             )
         elif rank == 4:
@@ -1631,7 +1657,7 @@ def cp_async_bulk_tensor_shared_cluster_global_elect[
                 Int32(coords[1]),
                 Int32(coords[2]),
                 Int32(coords[3]),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
                 elect,
             )
         else:  # rank == 5
@@ -1650,7 +1676,7 @@ def cp_async_bulk_tensor_shared_cluster_global_elect[
                 Int32(coords[2]),
                 Int32(coords[3]),
                 Int32(coords[4]),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
                 elect,
             )
     else:
@@ -1805,7 +1831,7 @@ def cp_async_bulk_tensor_2d_gather4[
             row1,
             row2,
             row3,
-            Int64(eviction_policy._value),
+            _tma_cache_hint[eviction_policy](),
         )
     else:
         inlined_assembly[
@@ -2440,7 +2466,7 @@ def cp_async_bulk_tensor_global_shared_cta[
             Int32(coords[2]),
             Int32(coords[3]),
             Int32(coords[4]),
-            eviction_policy._value,
+            _tma_cache_hint[eviction_policy](),
             cache_hint,
         )
     elif rank == 4:
@@ -2451,7 +2477,7 @@ def cp_async_bulk_tensor_global_shared_cta[
             Int32(coords[1]),
             Int32(coords[2]),
             Int32(coords[3]),
-            eviction_policy._value,
+            _tma_cache_hint[eviction_policy](),
             cache_hint,
         )
 
@@ -2462,7 +2488,7 @@ def cp_async_bulk_tensor_global_shared_cta[
             Int32(coords[0]),
             Int32(coords[1]),
             Int32(coords[2]),
-            eviction_policy._value,
+            _tma_cache_hint[eviction_policy](),
             cache_hint,
         )
     elif rank == 2:
@@ -2471,7 +2497,7 @@ def cp_async_bulk_tensor_global_shared_cta[
             tma_descriptor,
             Int32(coords[0]),
             Int32(coords[1]),
-            eviction_policy._value,
+            _tma_cache_hint[eviction_policy](),
             cache_hint,
         )
     else:
@@ -2479,7 +2505,7 @@ def cp_async_bulk_tensor_global_shared_cta[
             src_mem,
             tma_descriptor,
             Int32(coords[0]),
-            eviction_policy._value,
+            _tma_cache_hint[eviction_policy](),
             cache_hint,
         )
 
@@ -2558,7 +2584,7 @@ def cp_async_bulk_tensor_global_shared_cta_elect[
                 tma_descriptor,
                 Int32(coords[0]),
                 Int32(Int(src_mem)),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
                 elect,
             )
         elif rank == 2:
@@ -2571,7 +2597,7 @@ def cp_async_bulk_tensor_global_shared_cta_elect[
                 Int32(coords[0]),
                 Int32(coords[1]),
                 Int32(Int(src_mem)),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
                 elect,
             )
         elif rank == 3:
@@ -2585,7 +2611,7 @@ def cp_async_bulk_tensor_global_shared_cta_elect[
                 Int32(coords[1]),
                 Int32(coords[2]),
                 Int32(Int(src_mem)),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
                 elect,
             )
         elif rank == 4:
@@ -2600,7 +2626,7 @@ def cp_async_bulk_tensor_global_shared_cta_elect[
                 Int32(coords[2]),
                 Int32(coords[3]),
                 Int32(Int(src_mem)),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
                 elect,
             )
         else:  # rank == 5
@@ -2618,7 +2644,7 @@ def cp_async_bulk_tensor_global_shared_cta_elect[
                 Int32(coords[3]),
                 Int32(coords[4]),
                 Int32(Int(src_mem)),
-                Int64(eviction_policy._value),
+                _tma_cache_hint[eviction_policy](),
                 elect,
             )
     else:
@@ -2753,7 +2779,7 @@ def cp_async_bulk_tensor_reduce_global_shared_cta[
             Int32(coords[0]),
             Int32(coords[1]),
             Int32(coords[2]),
-            UInt64(eviction_policy._value),
+            UInt64(_tma_cache_hint[eviction_policy]()),
             red_op,
             cache_hint,
         )
@@ -2766,7 +2792,7 @@ def cp_async_bulk_tensor_reduce_global_shared_cta[
             tma_descriptor,
             Int32(coords[0]),
             Int32(coords[1]),
-            UInt64(eviction_policy._value),
+            UInt64(_tma_cache_hint[eviction_policy]()),
             red_op,
             cache_hint,
         )
@@ -2778,7 +2804,7 @@ def cp_async_bulk_tensor_reduce_global_shared_cta[
             src_mem,
             tma_descriptor,
             Int32(coords[0]),
-            UInt64(eviction_policy._value),
+            UInt64(_tma_cache_hint[eviction_policy]()),
             red_op,
             cache_hint,
         )
