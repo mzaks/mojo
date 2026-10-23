@@ -405,7 +405,9 @@ def click_option_requires(
     default=None,
     help=(
         "[--cascade] Number of local GPU worker subprocesses. When unset, "
-        "auto-sized from ``--devices`` (one per distinct GPU set)."
+        "auto-sized from ``--devices`` (one per distinct GPU set). With "
+        "``--cascade-local-cpu-workers 0`` and no remote CPU workers, every "
+        "worker runs in the server process and this must be unset or 0."
     ),
 )
 @click_option_requires("cascade")(
