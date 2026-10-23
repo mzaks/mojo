@@ -152,6 +152,11 @@ This version is still a work in progress.
   URIs and base64 data, including OpenAI `image_url` parts. URLs are fetched
   with a 30 second timeout and a 100 MiB limit per image.
 
+- Errors from `AutoModel.generate()` and `AutoModel.generate_iter()` now name
+  `AutoModel`, not `generate()`. An image part that holds its own image, or
+  an `image_url` part, now raises `ValueError` pointing to `AutoProcessor`,
+  even when `images` gives the row the right count.
+
 - Removed the `blocking_sync`, `disable_timing` and `interprocess` parameters
   from the Mojo `DeviceContext.create_event()`, along with `EventFlags`. Events
   never record timing; use `DeviceContext.execution_time()` to time kernels.

@@ -76,6 +76,7 @@ from max.pipelines.lib.tokenizer import open_image
 from max.pipelines.lora import LoRAConfig
 from max.pipelines.modeling.types import (
     BatchType,
+    ImageContentPart,
     InputModality,
     PipelineTask,
     RequestID,
@@ -1045,6 +1046,13 @@ def _image_arch(
     )
 
 
+# The image count error with no AutoProcessor hint after it.
+_NO_HINT = (
+    r"^Row {row} has 1 image part but 0 images\. Pass one image per image "
+    r"part, in order\.$"
+)
+
+
 def _chat(text: str, num_images: int = 0) -> list[dict[str, object]]:
     """One user turn holding ``num_images`` image parts, then ``text``."""
     return [
@@ -1347,7 +1355,47 @@ def test_expanded_prompt_over_the_planned_max_length_raises(
             lambda pipeline: GenerateIterator(
                 pipeline, messages=[_chat("1", num_images=1)], max_new_tokens=5
             ),
-            "Row 0 has 1 image part but 0 images",
+            _NO_HINT.format(row=0),
+        ),
+        # A part with no image of its own gets the plain count error.
+        *(
+            (
+                lambda pipeline, conversation=conversation: GenerateIterator(
+                    pipeline, messages=[conversation], max_new_tokens=5
+                ),
+                _NO_HINT.format(row=0),
+            )
+            for conversation in (
+                [{"role": "user", "content": [{"type": "image", "url": None}]}],
+                [{"role": "user", "content": [ImageContentPart()]}],
+                [
+                    TextGenerationRequestMessage(
+                        role="user", content=[ImageContentPart()]
+                    )
+                ],
+            )
+        ),
+        (
+            lambda pipeline: GenerateIterator(
+                pipeline,
+                messages=[
+                    _chat("1"),
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "cat.png"},
+                                }
+                            ],
+                        }
+                    ],
+                ],
+                max_new_tokens=5,
+            ),
+            r"^Row 1 has an image_url part, which generate\(\) does not read\. "
+            "Pass the conversations through AutoProcessor",
         ),
     ],
 )
@@ -1360,6 +1408,40 @@ def test_malformed_messages_and_images_raise(
     _image_arch(monkeypatch)
     with pytest.raises(ValueError, match=message):
         start(pipeline)
+    assert pipeline.kv_manager.claimed == {}
+
+
+@pytest.mark.parametrize("key", ["image", "path", "url", "base64"])
+@pytest.mark.parametrize(
+    "images", [None, [[], [b"dog"]]], ids=["no_images", "matching_count"]
+)
+def test_image_parts_holding_their_image_point_to_auto_processor(
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    images: list[list[bytes]] | None,
+) -> None:
+    pipeline = _vision_pipeline(monkeypatch)
+    _image_arch(monkeypatch)
+    with pytest.raises(ValueError) as error:
+        GenerateIterator(
+            pipeline,
+            messages=[
+                _chat("1"),
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", key: "cat.png"}],
+                    }
+                ],
+            ],
+            images=images,
+            max_new_tokens=5,
+        )
+    assert str(error.value) == (
+        'Row 1 has an image part with an "image", "path", "url" or "base64" '
+        "entry, which generate() does not read. Pass the conversations "
+        "through AutoProcessor, which moves them into images."
+    )
     assert pipeline.kv_manager.claimed == {}
 
 
@@ -2262,14 +2344,29 @@ def test_removed_row_keeps_logits_and_log_probs_aligned() -> None:
     assert [lp.sampled_token_ids for lp in batch.log_probs] == new_tokens
 
 
-def test_logits_need_a_synchronous_pipeline() -> None:
+@pytest.mark.parametrize(
+    ("caller", "advice"),
+    [
+        ("generate()", "Use AutoModel, which turns the overlap scheduler off."),
+        (
+            "AutoModel",
+            "Load the AutoModel without enable_overlap_scheduler=True.",
+        ),
+    ],
+)
+def test_logits_need_a_synchronous_pipeline(caller: str, advice: str) -> None:
     pipeline = FakeOverlapPipeline()
     with pytest.raises(
         ValueError, match="output_logits needs a synchronous pipeline"
-    ):
+    ) as error:
         GenerateIterator(
-            pipeline, _prompts(1), max_new_tokens=5, output_logits=True
+            pipeline,
+            _prompts(1),
+            max_new_tokens=5,
+            output_logits=True,
+            caller=caller,
         )
+    assert str(error.value).endswith(advice)
     assert pipeline.kv_manager.claimed == {}
 
 

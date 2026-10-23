@@ -103,6 +103,13 @@ _TOKENIZER_TEMPLATE_KEYS = frozenset(
     )
 )
 
+# The image part entries AutoProcessor reads and the message model drops.
+_INLINE_IMAGE_KEYS = ("image", "path", "url", "base64")
+_AUTO_PROCESSOR_HINT = (
+    "Pass the conversations through AutoProcessor, which moves them into "
+    "images."
+)
+
 _logger = logging.getLogger("max.pipelines")
 
 _T = TypeVar("_T")
@@ -366,6 +373,24 @@ def _encode_image(
     return buffer.getvalue(), image
 
 
+def _dict_parts(message: object) -> list[Mapping[object, object]]:
+    """Returns a dict message's dict content parts, or none for others."""
+    if not isinstance(message, Mapping):
+        return []
+    content = message.get("content")
+    if isinstance(content, str) or not isinstance(content, Sequence):
+        return []
+    return [part for part in content if isinstance(part, Mapping)]
+
+
+def _has_inline_image(message: object) -> bool:
+    return any(
+        part.get("type") == "image"
+        and any(part.get(key) is not None for key in _INLINE_IMAGE_KEYS)
+        for part in _dict_parts(message)
+    )
+
+
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
@@ -385,6 +410,17 @@ def _materialize_conversations(
             "messages must be a list of conversations, one per row. Wrap one "
             "conversation as [messages]."
         )
+    messages = [list(row) for row in messages]
+    for row, conversation in enumerate(messages):
+        if any(
+            part.get("type") == "image_url"
+            for message in conversation
+            for part in _dict_parts(message)
+        ):
+            raise ValueError(
+                f"Row {row} has an image_url part, which {caller} does not "
+                f"read. {_AUTO_PROCESSOR_HINT}"
+            )
     rows = [
         [
             message
@@ -473,6 +509,14 @@ def _materialize_conversations(
     for row, (num_parts, row_entries) in enumerate(
         zip(image_parts, row_images, strict=True)
     ):
+        # Checked whatever the image count, since a matching count would
+        # otherwise run the row on a different image.
+        if any(map(_has_inline_image, messages[row])):
+            raise ValueError(
+                f'Row {row} has an image part with an "image", "path", "url" '
+                f'or "base64" entry, which {caller} does not read. '
+                f"{_AUTO_PROCESSOR_HINT}"
+            )
         if len(row_entries) != num_parts:
             raise ValueError(
                 f"Row {row} has {_plural(num_parts, 'image part')} but "
@@ -944,6 +988,7 @@ def _check_output_options(
     synchronous: bool,
     output_logits: bool,
     output_logprobs: int,
+    caller: str,
 ) -> None:
     """Raises if the pipeline cannot return the requested outputs."""
     if not 0 <= output_logprobs <= _MAX_TOP_LOGPROBS:
@@ -960,11 +1005,15 @@ def _check_output_options(
             "tokens to a row."
         )
     if output_logits and not synchronous:
+        advice = (
+            "Load the AutoModel without enable_overlap_scheduler=True."
+            if caller == "AutoModel"
+            else "Use AutoModel, which turns the overlap scheduler off."
+        )
         raise ValueError(
             "output_logits needs a synchronous pipeline, but this pipeline "
             "has overlap active, so each step returns the tokens sampled "
-            "from the previous step's logits. Use AutoModel, which turns the "
-            "overlap scheduler off."
+            f"from the previous step's logits. {advice}"
         )
     # The pipeline checks this only after the rows have claimed KV.
     if output_logprobs and isinstance(pipeline, _OverlapSource):
@@ -1215,10 +1264,12 @@ class GenerateIterator:
             than ``messages``, images or video on an architecture that takes
             text only, a row with more images than the tokenizer's
             ``max_images_per_request``, a row whose image count differs from
-            its image parts, ``images``, ``chat_template_kwargs`` or
-            ``attention_mask`` without the matching prompt argument, or a
-            ``chat_template_kwargs`` key the tokenizer sets itself. Also
-            raised for ``output_logprobs`` outside ``[0, 7]``,
+            its image parts, an ``image_url`` part or an image part with its
+            own image, ``images``,
+            ``chat_template_kwargs`` or ``attention_mask`` without the
+            matching prompt argument, or a ``chat_template_kwargs`` key the
+            tokenizer sets itself. Also raised for ``output_logprobs``
+            outside ``[0, 7]``,
             ``output_logprobs`` on a model that does not compute log
             probabilities, ``output_logits`` on a pipeline that is not
             synchronous, ``output_logits`` or ``output_logprobs`` with
@@ -1361,7 +1412,7 @@ class GenerateIterator:
         _check_graph_capture(pipeline, dp_degree, caller)
         self._start(pipeline, contexts, dp_degree)
         _check_output_options(
-            pipeline, self._synchronous, output_logits, output_logprobs
+            pipeline, self._synchronous, output_logits, output_logprobs, caller
         )
         if output_logits:
             self._logits_recorders = [_LogitsRecorder() for _ in contexts]

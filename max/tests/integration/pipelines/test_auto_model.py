@@ -266,6 +266,18 @@ def test_generate_takes_tokenizer_output(model_path: str) -> None:
     assert text.startswith(TEXT)
 
 
+def test_batch_errors_name_auto_model(model_path: str) -> None:
+    with _load_cpu(model_path) as model:
+        for start in (model.generate, model.generate_iter):
+            with pytest.raises(ValueError) as error:
+                start(PROMPTS, max_new_tokens=1)
+            assert str(error.value).splitlines()[0] == (
+                "AutoModel does not support scheduling across batches. 2 "
+                "prompts exceed the pipeline's max batch size of 1, and "
+                "AutoModel never splits its prompts."
+            )
+
+
 def test_debug_defaults_and_overrides(model_path: str) -> None:
     with _load_cpu(model_path, max_batch_size=2) as model:
         config = model.pipeline_config
@@ -731,6 +743,7 @@ def test_generate_and_generate_iter_pass_every_argument(
         "seed": 7,
         "output_logits": True,
         "output_logprobs": 2,
+        "caller": "AutoModel",
     }
     assert calls == [((pipeline, PROMPTS, MASKS), expected_kwargs)] * 2
 

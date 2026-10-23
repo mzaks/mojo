@@ -391,6 +391,7 @@ class AutoModel:
             seed=seed,
             output_logits=output_logits,
             output_logprobs=output_logprobs,
+            caller="AutoModel",
         )
 
     def generate_iter(
@@ -453,6 +454,7 @@ class AutoModel:
             seed=seed,
             output_logits=output_logits,
             output_logprobs=output_logprobs,
+            caller="AutoModel",
         )
 
     def close(self) -> None:
