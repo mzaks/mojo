@@ -981,16 +981,17 @@ struct PagedRowIndices[
                         # Issue OOB TMAs for the remaining `[_p,
                         # pages_per_iter)` page slots. The TMA descriptor
                         # is built with `OOBFill.NONE`, which writes 0
-                        # for any OOB coordinate; we use a row coord
-                        # (`Int32.MAX >> 1`) that is unconditionally
-                        # past `globalDim[0]` (block-row count is
-                        # bounded by `total_blocks * stride`, well
-                        # below 2^30 for any realistic workload). Each
-                        # OOB TMA still arrives at `mbar` with its
-                        # byte count, so the caller's `expect_bytes`
-                        # MUST cover the full
+                        # for any OOB coordinate. The row coord is
+                        # negative, so the whole box lies before row 0
+                        # whatever the tensor's extent. A large positive
+                        # coord stops being OOB once the block-row count
+                        # passes it: a 725k-page, 6-layer pool has 1.1e9
+                        # rows, so row 2^30 is a live page whose bytes
+                        # reach P@V. Each OOB TMA still arrives at `mbar`
+                        # with its byte count, so the caller's
+                        # `expect_bytes` MUST cover the full
                         # `pages_per_iter * num_depth_chunks` issues.
-                        comptime _OOB_ROW: Int = 1 << 30
+                        comptime _OOB_ROW: Int = -(1 << 30)
                         comptime for _q in range(_p, pages_per_iter):
                             comptime if fold >= 2 and row_major:
                                 # One rank-5 chunk-inner TMA per OOB page slot.
@@ -998,8 +999,9 @@ struct PagedRowIndices[
                                 # chunk-inner block (num_depth_chunks *
                                 # tma_per_issue_rows * gran). Coord is fast-first
                                 # (gran, in-atom-row, chunk-base, atom_row, head);
-                                # atom_row = _OOB_ROW (>> globalDim atom-row extent)
-                                # so OOBFill.NONE zero-fills this page slot.
+                                # atom_row = _OOB_ROW (< 0, so the whole box is
+                                # before atom-row 0) and OOBFill.NONE zero-fills
+                                # this page slot.
                                 comptime smem_off_oob_rm = (
                                     _q
                                     * num_depth_chunks
