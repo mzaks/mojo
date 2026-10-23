@@ -1124,10 +1124,11 @@ def _block_scaled_grouped_matmul(
     b_scales = interleave_grouped_scales(
         weight.weight_scale, sf_vector_size=weight.block_size[1]
     )
-    num_active = int(expert_ids.shape[0])
-    usage_stats_host = F.constant(
-        [8192, num_active], dtype=DType.uint32, device=CPU()
-    )
+    # With no estimate, the dispatcher picks its tile regime from the row
+    # count here, so it must be the routed rows, not a prefill-sized bound.
+    usage_stats_host = F.shape_to_tensor(
+        [x_quantized.shape[0], expert_ids.shape[0]]
+    ).cast(DType.uint32)
     return grouped_matmul_block_scaled(
         x_quantized,
         weight.weight,
