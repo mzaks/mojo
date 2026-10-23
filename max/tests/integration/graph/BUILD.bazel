@@ -37,6 +37,7 @@ _SEPARATE_TARGET_TESTS = [
     "test_buffer_create_init_gpu.py",
     "test_debug_config.py",
     "test_debug_config_integration.py",
+    "test_device_graph_side_stream_reclaim.py",
     "test_device_graph_synthesis.py",
     "test_engine_device_graph.py",
     "test_execution_spans.py",
@@ -581,6 +582,35 @@ modular_py_test(
         "//conditions:default": [],
     }),
     precompile_mefs = True,
+    tags = [
+        "gpu",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        requirement("hypothesis"),
+        requirement("numpy"),
+    ],
+)
+
+# A small VMM budget with fine granules, so filling the free budget after a
+# capture is cheap and the allocator's reuse of released memory is visible.
+modular_py_test(
+    name = "test_device_graph_side_stream_reclaim",
+    srcs = [
+        "conftest.py",
+        "test_device_graph_side_stream_reclaim.py",
+    ],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE": "2147483648",
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM": "1",
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM_PAGE_MB": "2",
+    },
+    # TODO(CENG-1259): Run on AMD too once HIP keeps side-stream views alive
+    # after capture; the fix this test covers is CUDA only.
+    gpu_constraints = ["//:nvidia_gpu"],
     tags = [
         "gpu",
     ],
