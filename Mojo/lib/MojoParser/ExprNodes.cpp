@@ -69,8 +69,7 @@ using namespace M::KGEN;
 using namespace M::KGEN::LIT;
 
 static bool usesClosurePipeline(FnOp fn) {
-  return fn->getParentOfType<FnOp>() && !fn.isOptionalSymbol() &&
-         !fn.getFuncTypeGenerator().isCapturing();
+  return fn->getParentOfType<FnOp>() && !fn.isOptionalSymbol();
 }
 
 LogicalResult ExprNode::emitDestructuringPValue(PValue value,
@@ -4837,7 +4836,7 @@ AnyValue FunctionTypeNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   argList.resultArg = resultArg;
   argList.effects = effects;
   argList.isThin = isThin;
-  argList.isParsingClosure = !isThin && !effects.isCapturing();
+  argList.isParsingClosure = !isThin;
   argList.thrownTypeExpr = const_cast<ExprNode *>(thrownTypeExpr);
 
   TypeCheckedFnSignature tcSignature(paramList, argList, originExpr,

@@ -45,7 +45,7 @@
 # COM: per-signature trait, and no bridging wrapper is emitted.
 # S0: lit.struct.decl @"closure$s0_make_closure{{.*}}::my_closure::__storage"(trait<@"##__mojo_closure__##"<
 # S0-SAME: :param_list<type> [], :param_list<type> [#kgen.quote<!Int{{[0-9]*}}>], :type #kgen.quote<!Int{{[0-9]*}}>
-# S0-SAME: #kgen.fn_metadata<[imm_mem, imm]
+# S0-SAME: #kgen.fn_metadata<[imm_mem, imm], "none"
 # S0-SAME: >, @{{.*}}::@AnyType, @{{.*}}::@Copyable, @{{.*}}::@Deinitable, @{{.*}}::@ImplicitlyCopyable, @{{.*}}::@Movable>) attributes {{{.*}}synthetic}
 # S0-NEXT: move :{{.*}}@{{.*}}::@"{{.*}}::my_closure::__storage"::@"__init__(move:
 # S0-NEXT: copy :{{.*}}@{{.*}}::@"{{.*}}::my_closure::__storage"::@"__init__(copy:

@@ -400,10 +400,8 @@ LogicalResult CallIndirectOp::canonicalize(CallIndirectOp op,
   if (!create)
     return b.notifyMatchFailure(op.getLoc(), "callee op is not create closure");
   // Replace this with a direct call.
-  SmallVector<Value> args = llvm::to_vector(create.getCaptures());
-  llvm::append_range(args, op.getArguments());
   b.replaceOpWithNewOp<CallParamOp>(op, op.getResultTypes(), create.getCallee(),
-                                    args);
+                                    op.getArguments());
   return success();
 }
 
@@ -453,20 +451,12 @@ CallIndirectOp::parametric_interpret(ArrayRef<Attribute> operands,
 
 ErrorTreeOrSuccess CreateClosureOp::interpret(ArrayRef<Attribute> operands,
                                               InterpreterState &state) {
-  // We have no representation for closing over runtime values.
-  if (!operands.empty())
-    return ErrorTree(getLoc(), "TODO: cannot form a closure at compile time");
-
   return state.mapResults(getCallee());
 }
 
 ErrorTreeOrSuccess
 CreateClosureOp::parametric_interpret(ArrayRef<Attribute> operands,
                                       ParametricInterpreterState &state) {
-  // We have no representation for closing over runtime values.
-  if (!operands.empty())
-    return ErrorTree(getLoc(), "TODO: cannot form a closure at compile time");
-
   return state.mapResults(state.getReboundAttribute(getCallee()));
 }
 

@@ -216,7 +216,7 @@ kgen.generator @will_pass<a, b>() -> (index, index) {
   hlcf.return %0, %1 : index, index
 }
 
-!capture = !kgen.struct<(string, index, (!kgen.pointer<pointer<none>>) capturing -> !kgen.none)>
+!capture = !kgen.struct<(string, index, (!kgen.pointer<pointer<none>>) -> !kgen.none)>
 
 // expected-error @below {{function instantiation failed}}
 kgen.generator export @main() {

@@ -460,15 +460,8 @@ SRValue IREmitter::emitPValueToSRValue(ASTExprAnd<PValue> value,
       return {};
     }
 
-    // Materialize signatures as closures.
-    if (signature.isCapturing()) {
-      emitError(
-          expr->getLoc(),
-          "TODO: capturing closures cannot be materialized as runtime values");
-      return {};
-    }
-    return SRValue(CreateClosureOp::create(*builder, location, signature, attr,
-                                           ValueRange()));
+    return SRValue(
+        CreateClosureOp::create(*builder, location, signature, attr));
   }
 
   ASTType valueType = value.ir.getRValueType();
