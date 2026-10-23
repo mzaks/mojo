@@ -292,6 +292,38 @@ def head_bf16_enabled() -> bool:
     return _env_switch(HEAD_BF16_ENV)
 
 
+# The CSA2 compressor's projections on bf16 operands (default on).
+COMPRESSOR_BF16_ENV = "MAX_DSV41_COMPRESSOR_BF16"
+
+
+def compressor_bf16_enabled() -> bool:
+    """Whether the compressor's ``wkv``/``wgate`` keep the checkpoint's bf16.
+
+    On (default): bf16 matmuls with float32 accumulation and output. Off
+    (``MAX_DSV41_COMPRESSOR_BF16=0``): the weights are widened to float32
+    at load and the bf16 input to float32 in the graph. The products of
+    bf16 values are exact in both, so only the accumulation order differs.
+    """
+    return _env_switch(COMPRESSOR_BF16_ENV)
+
+
+# Each CSA2 layer's index list in one kernel launch (default on).
+INDEX_LIST_FUSED_ENV = "MAX_DSV41_INDEX_LIST_FUSED"
+
+
+def index_list_fused_enabled() -> bool:
+    """Whether a GPU layer builds its CSA2 index list in one launch.
+
+    On (default): one ``mo.csa2.index_list`` kernel writes the layer's
+    ``[T, 640]`` window and compressed slots
+    (:func:`~.layers.csa2.index_list`). Off
+    (``MAX_DSV41_INDEX_LIST_FUSED=0``): the graph ops of
+    :func:`~.layers.csa2.index_list_ops`, which build the same list bit for
+    bit.
+    """
+    return _env_switch(INDEX_LIST_FUSED_ENV)
+
+
 @dataclass(kw_only=True)
 class DeepseekV41Config(ArchConfigWithKVCache):
     """Configuration for DeepSeek-V4.1-Flash models.

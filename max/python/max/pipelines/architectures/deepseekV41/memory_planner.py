@@ -50,6 +50,7 @@ from .layers.indexer import (
 from .layers.moe import router_reads_bf16_gate
 from .model_config import (
     DeepseekV41Config,
+    compressor_bf16_enabled,
     data_parallel_ep_config,
     forward_row_bound,
     head_bf16_enabled,
@@ -58,6 +59,7 @@ from .model_config import (
     woa_mxfp8_enabled,
 )
 from .weight_adapters import (
+    COMPRESSOR_WEIGHT_SUFFIXES,
     DSPARK_CHECKPOINT_PREFIX,
     FLOAT32_WEIGHT_SUFFIXES,
     FUSED_QUERY_PROJECTIONS,
@@ -389,6 +391,8 @@ class DeviceWeightLayout:
     expert_scales_preinterleaved: bool
     router_gate_float32: bool = True
     """Whether the router holds a float32 copy of its bf16 gate weight."""
+    compressor_bf16: bool = True
+    """Whether the compressors' ``wkv``/``wgate`` stay bf16."""
 
     @classmethod
     def current(cls, *, router_gate_float32: bool = True) -> DeviceWeightLayout:
@@ -402,6 +406,7 @@ class DeviceWeightLayout:
             # exactly, so the env switch alone decides.
             expert_scales_preinterleaved=nvfp4_sf_preinterleave_enabled(),
             router_gate_float32=router_gate_float32,
+            compressor_bf16=compressor_bf16_enabled(),
         )
 
 
@@ -420,6 +425,8 @@ def _device_bytes_factor(
         return 1.0 if layout.head_bf16 else 2.0
     if dtype == "BF16" and name.endswith(FLOAT32_WEIGHT_SUFFIXES):
         return 2.0
+    if dtype == "BF16" and name.endswith(COMPRESSOR_WEIGHT_SUFFIXES):
+        return 1.0 if layout.compressor_bf16 else 2.0
     if dtype == "BF16" and name.endswith(_ROUTER_GATE_SUFFIX):
         return 2.0 if layout.router_gate_float32 else 1.0
     if dtype == "F8_E4M3" and name.endswith(".weight"):

@@ -203,6 +203,128 @@ def leaf_slots(
     return ops.where(valid, slot, ops.constant(-1, DType.int32, entry.device))
 
 
+def index_list(
+    positions: TensorValue,
+    requests: TensorValue,
+    window: PagedCacheValues,
+    window_layer: int,
+    *,
+    valid_from: TensorValue | None = None,
+    selected: TensorValue | None = None,
+    comp: PagedCacheValues | None = None,
+    comp_layer: int = 0,
+    ratio: int = 1,
+) -> TensorValue:
+    """Returns each query's ``[T, 640]`` index list, built in one launch.
+
+    The list :func:`window_entries` and :func:`leaf_slots` build, bit for
+    bit: the window slots of positions ``p, p - 1, ..., p - 127``, then the
+    compressed slots of groups ``selected // ratio``, ``-1``-padded to 512.
+    A position below 0 or ``valid_from`` and a negative selection name
+    ``-1``. GPU only.
+
+    Args:
+        positions: ``[T]`` absolute query positions.
+        requests: ``[T]`` each query's row in the leaves' lookup tables.
+        window: The window cache leaf.
+        window_layer: The layer's index among the window leaf's layers.
+        valid_from: Optional ``[batch]`` start of each request's valid
+            window, as for :func:`window_entries`.
+        selected: ``[T, k]`` raw positions of the selected groups' closing
+            tokens, ``-1`` for none, ``k`` at most 512; ``None`` on a
+            window-only layer.
+        comp: The compressed cache leaf; required with ``selected``.
+        comp_layer: The layer's index among the compressed leaf's layers.
+        ratio: Positions pooled into one compressed record.
+
+    Raises:
+        ValueError: If ``selected`` is given without ``comp``.
+    """
+    device = positions.device
+    positions = ops.cast(positions, DType.int32)
+    window_blocks = window.kv_blocks
+    parameters: dict[str, bool | int | float | str | DType] = {
+        "window_page": records_per_page(window_blocks),
+        "window_layers": int(window_blocks.shape[2]),
+        "has_floor": valid_from is not None,
+    }
+    values = [
+        positions,
+        ops.cast(requests, DType.int32),
+        # Unread without a floor.
+        positions if valid_from is None else ops.cast(valid_from, DType.int32),
+        ops.cast(window.lookup_table, DType.uint32),
+    ]
+    layers = [ops.constant(window_layer, DType.uint32, DeviceRef.CPU())]
+    name = "mo.csa2.index_list.window_only"
+    if selected is not None:
+        if comp is None:
+            raise ValueError("a compressed selection needs its cache leaf")
+        name = "mo.csa2.index_list"
+        parameters["comp_page"] = records_per_page(comp.kv_blocks)
+        parameters["comp_layers"] = int(comp.kv_blocks.shape[2])
+        parameters["ratio"] = ratio
+        values += [
+            ops.cast(comp.lookup_table, DType.uint32),
+            ops.cast(selected, DType.int32),
+        ]
+        layers.append(ops.constant(comp_layer, DType.uint32, DeviceRef.CPU()))
+    return ops.custom(
+        name,
+        device=device,
+        values=[*values, *layers],
+        out_types=[
+            TensorType(DType.int32, [positions.shape[0], INDEX_WIDTH], device)
+        ],
+        parameters=parameters,
+    )[0].tensor
+
+
+def index_list_ops(
+    positions: TensorValue,
+    requests: TensorValue,
+    window: PagedCacheValues,
+    window_layer: int,
+    *,
+    valid_from: TensorValue | None = None,
+    selected: TensorValue | None = None,
+    comp: PagedCacheValues | None = None,
+    comp_layer: int = 0,
+    ratio: int = 1,
+) -> TensorValue:
+    """Returns the list :func:`index_list` builds, from graph ops.
+
+    :func:`window_entries` and :func:`leaf_slots` for the window, the
+    selection's groups through :func:`leaf_slots` for the compressed part,
+    and concats; runs on any device. Takes :func:`index_list`'s arguments.
+
+    Raises:
+        ValueError: If ``selected`` is given without ``comp``.
+    """
+    device = positions.device
+    t = positions.shape[0]
+    request = ops.unsqueeze(ops.cast(requests, DType.int32), -1)
+    window_slots = leaf_slots(
+        window,
+        request,
+        window_entries(positions, requests, valid_from),
+        window_layer,
+    )
+    none = ops.constant(-1, DType.int32, device)
+    if selected is None:
+        return ops.concat(
+            [window_slots, ops.broadcast_to(none, [t, MAX_COMPRESSED])], axis=1
+        )
+    if comp is None:
+        raise ValueError("a compressed selection needs its cache leaf")
+    group = ops.where(selected >= 0, ops.floor_div(selected, ratio), none)
+    lists = [window_slots, leaf_slots(comp, request, group, comp_layer)]
+    pad = MAX_COMPRESSED - int(selected.shape[-1])
+    if pad:
+        lists.append(ops.broadcast_to(none, [t, pad]))
+    return ops.concat(lists, axis=1)
+
+
 def store_window_kv(
     cache: BufferValue,
     latent: TensorValue,

@@ -377,6 +377,70 @@ modular_py_test(
     ],
 )
 
+modular_py_library(
+    name = "prefill_glue_cases",
+    testonly = True,
+    srcs = ["prefill_glue_cases.py"],
+    data = ["//max/tests/integration/architectures/deepseekV41/testdata"],
+    imports = ["."],
+    deps = [
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/nn",
+        "//max/python/max/pipelines/architectures/deepseekV41",
+        requirement("numpy"),
+        requirement("torch"),
+    ],
+)
+
+# Guards the compressor's bf16 projection against the float32 one it
+# replaces.
+modular_py_test(
+    name = "test_prefill_glue_gpu",
+    srcs = ["test_prefill_glue_gpu.py"],
+    exec_properties = {
+        "test.resources:gpu-memory": "16",
+    },
+    gpu_constraints = ["//:b200_gpu"],
+    tags = ["gpu"],
+    target_compatible_with = REQUIRES_INTERNAL_KERNELS,
+    deps = [
+        ":prefill_glue_cases",
+        "//max/python/max/driver",
+        "//max/python/max/engine",
+        requirement("torch"),
+    ],
+)
+
+# Manual A/B of the compressor's bf16 projection and the CSA2 index list at
+# the model's rows. See the docstring of bench_prefill_glue.py; run it under the
+# nsys wrapper for kernel time per arm.
+modular_py_test(
+    name = "bench_prefill_glue",
+    size = "enormous",
+    srcs = ["bench_prefill_glue.py"],
+    # Its inputs live in torch, which gets 10% of gpu-memory by default.
+    env = {"MODULAR_TORCH_MEMORY_PERCENT": "0.3"},
+    exec_properties = {
+        "test.resources:gpu-memory": "48",
+    },
+    gpu_constraints = ["//:b200_gpu"],
+    main = "bench_prefill_glue.py",
+    tags = [
+        "gpu",
+        "manual",
+    ],
+    target_compatible_with = REQUIRES_INTERNAL_KERNELS,
+    deps = [
+        ":prefill_glue_cases",
+        "//max/python/max/driver",
+        "//max/python/max/engine",
+        "//max/python/max/profiler",
+        requirement("torch"),
+    ],
+)
+
 # Checks the absolute-slot boundary used by trimmed decoder SWA reads.
 modular_py_test(
     name = "test_swa_floor",

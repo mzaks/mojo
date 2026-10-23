@@ -58,7 +58,12 @@ from max.nn.quant_ops import _matmul_float8_mxfp8
 
 from ...deepseekV4.layers.rope import apply_rope_tail
 from ..layer_resolver import LayerInfo
-from ..model_config import DeepseekV41Config, woa_mxfp8_enabled
+from ..model_config import (
+    DeepseekV41Config,
+    compressor_bf16_enabled,
+    index_list_fused_enabled,
+    woa_mxfp8_enabled,
+)
 from .compressor import DeepseekV41Compressor, ring_save_slots, ring_slots
 from .csa2 import (
     HEAD_DIM,
@@ -66,10 +71,11 @@ from .csa2 import (
     PREFILL_ROWS,
     WINDOW_ENTRIES,
     csa2_attention,
+    index_list,
+    index_list_ops,
     leaf_slots,
     store_compressed_kv,
     store_window_kv,
-    window_entries,
 )
 from .indexer import (
     DeepseekV41Indexer,
@@ -598,6 +604,11 @@ class CSA2Attention(Module):
                 hidden_size=hidden_size,
                 device=device,
                 head_dim=head_dim,
+                weight_dtype=(
+                    DType.bfloat16
+                    if compressor_bf16_enabled()
+                    else DType.float32
+                ),
             )
             if is_kv_source
             else None
@@ -917,7 +928,10 @@ class CSA2Attention(Module):
 
         The window slots of positions ``p, p - 1, ..., p - 127`` come first
         (``-1`` below position 0), then the compressed slots of the
-        ``selected`` groups' records, ``-1``-padded to 512.
+        ``selected`` groups' records, ``-1``-padded to 512. On a GPU one
+        kernel builds it (:func:`~.csa2.index_list`) unless
+        :func:`~max.pipelines.architectures.deepseekV41.model_config.index_list_fused_enabled`
+        is off; otherwise graph ops do (:func:`~.csa2.index_list_ops`).
 
         Args:
             state: :meth:`begin`'s state.
@@ -927,32 +941,25 @@ class CSA2Attention(Module):
                 window-only layer.
             swa_valid_from: Per-request SWA validity boundary; see :meth:`end`.
         """
-        device = state.q.device
-        t = state.q.shape[0]
-        request = ops.unsqueeze(ops.cast(rows.bid, DType.int32), -1)
-        window = leaf_slots(
-            state.swa_collection,
-            request,
-            window_entries(rows.positions, rows.bid, swa_valid_from),
-            self.layer_info.layer_id,
+        if selected is not None:
+            assert state.comp_collection is not None
+            assert state.comp_index is not None
+        build = (
+            index_list
+            if state.q.device.is_gpu() and index_list_fused_enabled()
+            else index_list_ops
         )
-        none = ops.constant(-1, DType.int32, device)
-        if selected is None:
-            return ops.concat(
-                [window, ops.broadcast_to(none, [t, MAX_COMPRESSED])], axis=1
-            )
-        assert state.comp_collection is not None
-        assert state.comp_index is not None
-        ratio = self.layer_info.compress_ratio
-        group = ops.where(selected >= 0, ops.floor_div(selected, ratio), none)
-        lists = [
-            window,
-            leaf_slots(state.comp_collection, request, group, state.comp_index),
-        ]
-        pad = MAX_COMPRESSED - int(selected.shape[-1])
-        if pad:
-            lists.append(ops.broadcast_to(none, [t, pad]))
-        return ops.concat(lists, axis=1)
+        return build(
+            rows.positions,
+            rows.bid,
+            state.swa_collection,
+            self.layer_info.layer_id,
+            valid_from=swa_valid_from,
+            selected=selected,
+            comp=state.comp_collection,
+            comp_layer=state.comp_index or 0,
+            ratio=self.layer_info.compress_ratio,
+        )
 
     def _attend(
         self,
