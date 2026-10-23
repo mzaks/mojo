@@ -269,6 +269,14 @@ def fa4_load[
     comptime q_bytes = size_of[qkv_type]() * (
         q_elements - q_pad_rows * config.BK0
     )
+    # `q_elements` is per TMA call, so in 2Q each half would subtract the whole
+    # tile's pad and under-expect, and the zero-fill only covers the second
+    # half's tail. This holds for any non-dividing fused group, whichever
+    # route admits it.
+    comptime assert q_pad_rows == 0 or num_q == 1, (
+        "a non-dividing fused group is only wired for the 1Q route; the 2Q"
+        " Q1 barriers still expect the full `q_bytes`"
+    )
 
     var q_gmem_row: UInt32 = PositionType.get_q_gmem_row[ragged=ragged](
         seq_info, max_seq_len

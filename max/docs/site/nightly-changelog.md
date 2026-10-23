@@ -23,6 +23,17 @@ This version is still a work in progress.
   `logprobs` in `max serve` and `output_logprobs` in `generate()` work for
   them.
 
+- Added support for
+  [`poolside/Laguna-S-2.1-NVFP4`](https://huggingface.co/poolside/Laguna-S-2.1-NVFP4)
+  on the `LagunaForCausalLM` architecture. The checkpoint interleaves 12
+  full-attention layers with 36 sliding-window layers on a 512-token window,
+  gates attention output per head rather than per element, and mixes expert
+  precisions: NVFP4 routed experts in layers 1-39 and bfloat16 ones in layers
+  40-47, with the dense first layer and every shared expert in bfloat16
+  throughout. Attention type, query-head count, RoPE scaling and MLP precision
+  are now all resolved per layer, so `poolside/Laguna-M.1-NVFP4` keeps its
+  uniform layout.
+
 ## Inference server
 
 - `/v1/completions` now returns a 400 error for `echo` with `logprobs` on a

@@ -333,7 +333,17 @@ class LagunaHFConfig(PretrainedConfig):
     model_type = "laguna"
 
     def __init__(self, **kwargs: object) -> None:
+        # Laguna nests its rope config per attention type, which transformers'
+        # flat rope validation rejects, so withhold the rope keys from the base
+        # initializer and restore them afterwards.
+        deferred_rope = {
+            key: kwargs.pop(key)
+            for key in ("rope_parameters", "rope_scaling", "rope_theta")
+            if key in kwargs
+        }
         super().__init__(**kwargs)
+        for key, value in deferred_rope.items():
+            setattr(self, key, value)
         for k, v in kwargs.items():
             if not hasattr(self, k):
                 setattr(self, k, v)
