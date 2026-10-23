@@ -22,6 +22,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from max.driver import accelerator_api
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.nn.comm.ep import EPConfig
@@ -89,6 +90,23 @@ def mxfp8_splitk_enabled() -> bool:
     matmul. Off (``MAX_DSV41_MXFP8_SPLITK=0``): production at every size.
     """
     return _env_switch(MXFP8_SPLITK_ENV)
+
+
+ENGRAM_HOST_GATHER_ENV = "MAX_ENGRAM_HOST_GATHER"
+
+
+def engram_host_gather_enabled() -> bool:
+    """Whether full-table Engram lookups hash and gather on host threads.
+
+    On (default, NVIDIA GPUs): from 1,024 tokens CPU threads read the pinned
+    tables and the operands reach the GPU in chunks, so no SM reads the
+    tables, and data-parallel forwards run the lookup on a side stream that
+    overlaps the layers before the first Engram layer. Smaller steps and
+    steps a device graph captures run the GPU kernels, on that side stream
+    too. Off (``MAX_ENGRAM_HOST_GATHER=0``, and on other GPUs): the GPU
+    kernels at every size, on the main stream.
+    """
+    return accelerator_api() == "cuda" and _env_switch(ENGRAM_HOST_GATHER_ENV)
 
 
 # Interleave routed-expert NVFP4 block scales on the host (default on). "0"

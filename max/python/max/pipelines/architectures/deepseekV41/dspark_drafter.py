@@ -536,16 +536,9 @@ class DeepseekV41WithDSpark(DeepseekV41):
             signal_buffers,
             split.replica_tokens,
             tap_layer_ids=replicas[0].config.dspark_target_layer_ids,
-            engram_operands=[
-                replica._engram_operands(tok, row, lookback)
-                for replica, tok, row, lookback in zip(
-                    replicas,
-                    split.tokens,
-                    split.rows,
-                    split.lookbacks,
-                    strict=True,
-                )
-            ],
+            engram_operands=DeepseekV41._engram_operands_data_parallel(
+                replicas, split
+            ),
             visions=visions,
         )
         assert taps is not None

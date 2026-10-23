@@ -72,7 +72,12 @@ from .layers.attention import (
 from .layers.dspark_moe import DeepseekV41DSparkMoE
 from .layers.engram import Engram
 from .layers.engram_hash import EngramLayout
-from .layers.engram_lookup import EngramLookup, EngramOperand, EngramTokens
+from .layers.engram_lookup import (
+    EngramLookup,
+    EngramOperand,
+    EngramPending,
+    EngramTokens,
+)
 from .layers.moe import (
     IMAGE_SENTINEL_BASE_ID,
     DeepseekV41MoE,
@@ -1052,7 +1057,8 @@ class DeepseekV41Trunk(Module):
         replica_tokens: ReplicaTokens,
         *,
         tap_layer_ids: Sequence[int],
-        engram_operands: Sequence[Mapping[int, EngramOperand]],
+        engram_operands: Sequence[Mapping[int, EngramOperand]]
+        | Sequence[EngramPending],
         visions: Sequence[VisionMerge] | None = None,
     ) -> tuple[list[TensorValue], list[TensorValue] | None]:
         """Runs :meth:`forward_with_taps` with each device on its own requests.
@@ -1060,7 +1066,9 @@ class DeepseekV41Trunk(Module):
         ``tokens``, ``rows``, ``caches``, ``engram_operands`` and ``visions``
         (:meth:`VisionMerge.for_rows`) cover each device's own rows;
         ``batch_tokens`` is the whole batch's ``[1, T]`` token ids on every
-        device (:meth:`DeepseekV41Block.data_parallel`).
+        device (:meth:`DeepseekV41Block.data_parallel`). Pending operands
+        (:meth:`DeepseekV41._engram_operands_data_parallel`) are joined on
+        the stream entering the first Engram layer.
 
         Returns:
             Per device, its own ``[1, t_i, d]`` stream and its
@@ -1089,12 +1097,28 @@ class DeepseekV41Trunk(Module):
             )
         ]
         engram_token_masks = [is_text_token(tok) for tok in tokens]
+        pending = [p for p in engram_operands if isinstance(p, EngramPending)]
+        joined: list[Mapping[int, EngramOperand]] = [
+            p for p in engram_operands if not isinstance(p, EngramPending)
+        ]
         for i, layer_info in enumerate(lead.layer_infos):
             tapped = layer_info.layer_id in tap_ids
             if tapped and layer_info.has_engram:
                 raise ValueError(
                     f"tap layer {layer_info.layer_id} is an Engram layer"
                 )
+            if layer_info.has_engram and pending:
+                # the latest tensor of each device's stream, so the main
+                # stream waits for the lookup only after the layers before
+                joined = [
+                    p.join(
+                        stream.out
+                        if stream.out is not None
+                        else stream.residual
+                    )
+                    for p, stream in zip(pending, streams, strict=True)
+                ]
+                pending = []
             blocks = []
             for trunk in trunks:
                 block = trunk.layers[i]
@@ -1109,10 +1133,7 @@ class DeepseekV41Trunk(Module):
                 signal_buffers,
                 replica_tokens,
                 engram_operands=(
-                    [
-                        operands[layer_info.layer_id]
-                        for operands in engram_operands
-                    ]
+                    [operands[layer_info.layer_id] for operands in joined]
                     if layer_info.has_engram
                     else None
                 ),
@@ -1292,6 +1313,41 @@ class DeepseekV41(Module):
             self._engram_tables(lookup),
             self.device,
         )
+
+    @staticmethod
+    def _engram_operands_data_parallel(
+        replicas: Sequence[DeepseekV41],
+        split: ReplicaBatch,
+    ) -> list[Mapping[int, EngramOperand]] | list[EngramPending]:
+        """Each data-parallel replica's Engram operands, for its own rows.
+
+        With the host lookup (``EngramLookup.host_gather``), the lookups run
+        on a side stream and come back pending, for
+        :meth:`DeepseekV41Trunk.data_parallel_with_taps` to join on the
+        stream entering the first Engram layer; the layers before it
+        overlap them.
+        """
+        inputs = zip(
+            replicas, split.tokens, split.rows, split.lookbacks, strict=True
+        )
+        lookup = replicas[0]._engram_lookup()
+        if (
+            lookup is None
+            or not lookup.host_gather
+            or replicas[0].trunk.layer_infos[0].has_engram
+        ):
+            return [
+                replica._engram_operands(tok, row, lookback)
+                for replica, tok, row, lookback in inputs
+            ]
+        return [
+            lookup.full_on_side_stream(
+                engram_tokens(tok, row, lookback, lookup.lookback_depth),
+                replica._engram_tables(lookup),
+                replica.device,
+            )
+            for replica, tok, row, lookback in inputs
+        ]
 
     @staticmethod
     def _engram_operands_tensor_parallel(
@@ -1652,16 +1708,9 @@ class DeepseekV41(Module):
             signal_buffers,
             split.replica_tokens,
             tap_layer_ids=(),
-            engram_operands=[
-                replica._engram_operands(tok, row, lookback)
-                for replica, tok, row, lookback in zip(
-                    replicas,
-                    split.tokens,
-                    split.rows,
-                    split.lookbacks,
-                    strict=True,
-                )
-            ],
+            engram_operands=DeepseekV41._engram_operands_data_parallel(
+                replicas, split
+            ),
             visions=(
                 [
                     vision.for_rows(
