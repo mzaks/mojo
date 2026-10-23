@@ -25,6 +25,7 @@ ALL_ARCHITECTURES = [
     "//max/python/max/pipelines/architectures/dspark_gemma4",
     "//max/python/max/pipelines/architectures/eagle3_deepseekV3",
     "//max/python/max/pipelines/architectures/eagle_llama3",
+    "//max/python/max/pipelines/architectures/flint",
     "//max/python/max/pipelines/architectures/flux2",
     "//max/python/max/pipelines/architectures/flux2_modulev3",
     "//max/python/max/pipelines/architectures/flux_modulev3",

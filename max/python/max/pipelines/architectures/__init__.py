@@ -155,6 +155,7 @@ def register_all_models() -> None:
             "LlamaForCausalLMEagle3", ".eagle_llama3", "eagle3_llama_arch"
         ),
         _LazyArch("LlamaForCausalLMEagle", ".eagle_llama3", "eagle_llama_arch"),
+        _LazyArch("FlintForCausalLM_ModuleV3", ".flint", "flint_arch"),
         _LazyArch("Flux2Pipeline", ".flux2", "flux2_arch"),
         _LazyArch("Flux2KleinPipeline", ".flux2", "flux2_klein_arch"),
         _LazyArch(

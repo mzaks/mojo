@@ -587,6 +587,7 @@
                 "api/python/pipelines.architectures.dspark_gemma4",
                 "api/python/pipelines.architectures.eagle3_deepseekV3",
                 "api/python/pipelines.architectures.eagle_llama3",
+                "api/python/pipelines.architectures.flint",
                 "api/python/pipelines.architectures.flux2",
                 "api/python/pipelines.architectures.gemma3",
                 "api/python/pipelines.architectures.gemma3multimodal",
