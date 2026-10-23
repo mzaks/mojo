@@ -637,24 +637,30 @@ struct NonMaximumSuppression:
 
     @staticmethod
     def execute[
-        dtype: DType,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=.int64, rank=2, ...],
-        boxes: InputTensor[dtype=dtype, rank=3, ...],
-        scores: InputTensor[dtype=dtype, rank=3, ...],
+        output: Some[Output & Tensor],
+        boxes: Some[Input & Tensor],
+        scores: Some[Input & Tensor],
         max_output_boxes_per_class: Int64,
         iou_threshold: Float32,
         score_threshold: Float32,
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(boxes), TileTensorable)
+        comptime assert conforms_to(type_of(scores), TileTensorable)
+        comptime dtype = type_of(boxes).dtype
+        comptime assert type_of(output).rank == 2
+        comptime assert type_of(boxes).rank == 3
+        comptime assert type_of(scores).rank == 3
         var max_output_boxes_int = Int(max_output_boxes_per_class)
         var iou_threshold_float = iou_threshold
         var score_threshold_float = score_threshold
 
-        non_max_suppression[target=target,](
-            boxes.to_tile_tensor[.int64]().as_imm(),
-            scores.to_tile_tensor[.int64]().as_imm(),
+        non_max_suppression[target=target](
+            boxes.to_tile_tensor[dtype, mut=False](),
+            scores.to_tile_tensor[dtype, mut=False](),
             output.to_tile_tensor[.int64](),
             max_output_boxes_int,
             iou_threshold_float,
@@ -720,23 +726,29 @@ struct ROIAlign:
     def execute[
         aligned: Bool,
         mode: StaticString,
-        dtype: DType,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=4, ...],
-        input: InputTensor[dtype=dtype, rank=4, ...],
-        rois: InputTensor[dtype=dtype, rank=2, ...],
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        rois: Some[Input & Tensor],
         output_height: Int64,
         output_width: Int64,
         spatial_scale: Scalar,
         sampling_ratio: Scalar,
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(rois), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(output).rank == 4
+        comptime assert type_of(input).rank == 4
+        comptime assert type_of(rois).rank == 2
         comptime if is_cpu[target]():
             roi_align_nhwc[aligned, mode](
-                output.to_tile_tensor[.int64](),
-                input.to_tile_tensor[.int64](),
-                rois.to_tile_tensor[.int64](),
+                output.to_tile_tensor(),
+                input.to_tile_tensor[dtype](),
+                rois.to_tile_tensor[dtype](),
                 Int(output_height),
                 Int(output_width),
                 spatial_scale,
@@ -748,9 +760,9 @@ struct ROIAlign:
                 aligned,
                 mode,
             ](
-                output.to_tile_tensor[.int64](),
-                input.to_tile_tensor[.int64](),
-                rois.to_tile_tensor[.int64](),
+                output.to_tile_tensor(),
+                input.to_tile_tensor[dtype](),
+                rois.to_tile_tensor[dtype](),
                 Int(output_height),
                 Int(output_width),
                 spatial_scale,
@@ -817,21 +829,27 @@ struct RepeatInterleave:
     def execute[
         target: StaticString,
     ](
-        output: OutputTensor,
-        input: InputTensor[dtype=output.dtype, rank=output.rank, ...],
-        repeats: InputTensor[rank=1, ...],
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        repeats: Some[Input & Tensor],
         axis: Scalar,
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(repeats), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(input).rank == type_of(output).rank
+        comptime assert type_of(repeats).rank == 1
         comptime assert (
             axis.dtype.is_integral()
         ), "axis value must be integer type"
 
         repeat_interleave[target=target](
-            input.to_tile_tensor[.int64](),
-            repeats.to_tile_tensor[.int64](),
-            Int(normalize_neg_index(axis, input.rank)),
-            output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[dtype](),
+            repeats.to_tile_tensor(),
+            Int(normalize_neg_index(axis, type_of(input).rank)),
+            output.to_tile_tensor(),
             ctx,
         )
 
@@ -1158,7 +1176,6 @@ struct Fold:
 
     @staticmethod
     def execute[
-        dtype: DType,
         stride_h: Int,
         stride_w: Int,
         dilation_h: Int,
@@ -1167,19 +1184,32 @@ struct Fold:
         padding_w: Int,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=4, ...],
-        input: InputTensor[dtype=dtype, rank=3, ...],
-        output_size: InputTensor,
-        kernel_size: InputTensor,
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        output_size: Some[Input & Tensor],
+        kernel_size: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(output_size), TileTensorable)
+        comptime assert conforms_to(type_of(kernel_size), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(output).rank == 4
+        comptime assert type_of(input).rank == 3
         comptime assert (
-            kernel_size.dtype.is_integral() and output_size.dtype.is_integral()
+            type_of(kernel_size).dtype.is_integral()
+            and type_of(output_size).dtype.is_integral()
         ), "kernel_size and output_size must have integral type"
-        var output_size_tuple = Index(output_size._ptr[0], output_size._ptr[1])
-        var kernel_size_tuple = Index(kernel_size._ptr[0], kernel_size._ptr[1])
-        var input_tensor = input.to_tile_tensor[.int64]()
-        var output_tensor = output.to_tile_tensor[.int64]()
+        # `output_size`/`kernel_size` are indexed directly as flat pointers
+        # rather than as tensors; a non-pointer storage policy aborts here at
+        # run time.
+        var output_size_ptr = output_size.to_tile_tensor().ptr
+        var kernel_size_ptr = kernel_size.to_tile_tensor().ptr
+        var output_size_tuple = Index(output_size_ptr[0], output_size_ptr[1])
+        var kernel_size_tuple = Index(kernel_size_ptr[0], kernel_size_ptr[1])
+        var input_tensor = input.to_tile_tensor[dtype]()
+        var output_tensor = output.to_tile_tensor()
 
         fold[
             stride=(stride_h, stride_w),
@@ -1265,20 +1295,22 @@ struct IRFFT:
     @staticmethod
     def execute[
         target: StaticString,
-        dtype: DType,
-        rank: Int,
         n: Int,
         buffer_size_mb: Int,
     ](
-        output: OutputTensor[dtype=dtype, rank=rank, ...],
-        input: InputTensor[dtype=dtype, rank=rank, ...],
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
         comptime assert is_gpu[target](), "only valid on GPUs"
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(input).rank == type_of(output).rank
 
         irfft(
-            input.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[dtype](),
+            output.to_tile_tensor(),
             n,
             buffer_size_mb,
             ctx,
@@ -3638,22 +3670,27 @@ struct EaglePrefillShiftTokens:
     @inline(.always)
     @staticmethod
     def execute[
-        dtype: DType,
-        rank: Int,
-        //,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=rank, ...],
-        tokens: InputTensor[dtype=dtype, rank=rank, ...],
-        offsets: InputTensor[dtype=.uint32, rank=1, ...],
-        shift_next_tokens: InputTensor[dtype=dtype, rank=1, ...],
+        output: Some[Output & Tensor],
+        tokens: Some[Input & Tensor],
+        offsets: Some[Input & Tensor],
+        shift_next_tokens: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(tokens), TileTensorable)
+        comptime assert conforms_to(type_of(offsets), TileTensorable)
+        comptime assert conforms_to(type_of(shift_next_tokens), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(tokens).rank == type_of(output).rank
+        comptime assert type_of(offsets).rank == 1
+        comptime assert type_of(shift_next_tokens).rank == 1
         eagle_prefill_shift_tokens[target=target](
-            output.to_tile_tensor[.int64](),
-            tokens.to_tile_tensor[.int64](),
+            output.to_tile_tensor(),
+            tokens.to_tile_tensor[dtype](),
             offsets.to_tile_tensor[.uint32](),
-            shift_next_tokens.to_tile_tensor[.int64](),
+            shift_next_tokens.to_tile_tensor[dtype](),
             ctx,
         )
 
@@ -3733,13 +3770,11 @@ struct TPoolPatchMerger:
     @inline(.always)
     @staticmethod
     def execute[
-        dtype: DType,
-        //,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=2, ...],
-        input: InputTensor[dtype=dtype, rank=2, ...],
-        grid_thws: InputTensor[dtype=.int64, rank=2, ...],
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        grid_thws: Some[Input & Tensor],
         kH: Int32,
         kW: Int32,
         max_h: Int32,
@@ -3747,27 +3782,23 @@ struct TPoolPatchMerger:
         _total_output_patches: Int32,
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(grid_thws), TileTensorable)
         comptime assert is_gpu[
             target
         ](), "tpool_patch_merger only supported on GPUs"
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(output).rank == 2
+        comptime assert type_of(input).rank == 2
+        comptime assert type_of(grid_thws).rank == 2
 
-        var out_tt = output.to_tile_tensor[.int64]()
-        var in_tt = input.to_tile_tensor[.int64]()
-        var grid_tt = grid_thws.to_tile_tensor[.int64]()
-
+        # Cast the tiles, not their storage handles: the origin casts belong to
+        # `TileTensor` and preserve whatever storage policy the argument carries.
         nn_tpool_patch_merger[dtype](
-            TileTensor(
-                out_tt._storage.unsafe_origin_cast[MutAnyOrigin](),
-                out_tt.layout,
-            ),
-            TileTensor(
-                in_tt._storage.as_imm().unsafe_origin_cast[ImmutAnyOrigin](),
-                in_tt.layout,
-            ),
-            TileTensor(
-                grid_tt._storage.as_imm().unsafe_origin_cast[ImmutAnyOrigin](),
-                grid_tt.layout,
-            ),
+            output.to_tile_tensor().as_unsafe_any_origin(),
+            input.to_tile_tensor[dtype]().as_unsafe_any_origin(),
+            grid_thws.to_tile_tensor[.int64]().as_unsafe_any_origin(),
             Int(kH),
             Int(kW),
             Int(max_h),

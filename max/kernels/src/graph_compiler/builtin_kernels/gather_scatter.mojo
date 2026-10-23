@@ -79,9 +79,12 @@ from nn.split import split
 from nn.tile import tile, tile_shape
 from extensibility import (
     ElementwiseUnaryOp,
+    Input,
     InputTensor,
     InputVariadicTensors,
     ManagedTensorSlice,
+    MutableInput,
+    Output,
     OutputTensor,
     OutputVariadicTensors,
     Tensor,
@@ -686,18 +689,24 @@ struct ScatterND:
     def execute[
         target: StaticString,
     ](
-        output: OutputTensor,
-        input: InputTensor[dtype=output.dtype, rank=output.rank, ...],
-        updates: InputTensor[dtype=output.dtype, ...],
-        indices: InputTensor,
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        updates: Some[Input & Tensor],
+        indices: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(updates), TileTensorable)
+        comptime assert conforms_to(type_of(indices), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(input).rank == type_of(output).rank
         # Existing implementations do not require static shape information
         scatter_nd[target=target](
-            input.to_tile_tensor[.int64](),
-            indices.to_tile_tensor[.int64](),
-            updates.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[dtype](),
+            indices.to_tile_tensor(),
+            updates.to_tile_tensor[dtype](),
+            output.to_tile_tensor(),
             context=ctx,
         )
 
@@ -731,12 +740,18 @@ struct ScatterNDSkipOobIndices:
     def execute[
         target: StaticString,
     ](
-        output: OutputTensor,
-        input: InputTensor[dtype=output.dtype, rank=output.rank, ...],
-        updates: InputTensor[dtype=output.dtype, ...],
-        indices: InputTensor,
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        updates: Some[Input & Tensor],
+        indices: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(updates), TileTensorable)
+        comptime assert conforms_to(type_of(indices), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(input).rank == type_of(output).rank
         # Unlike mo.scatter_nd, which requires every index to lie in
         # [-dim_size, dim_size), this skips the update for an index outside
         # that range. Negative indices inside it still wrap, so -1 writes the
@@ -748,10 +763,10 @@ struct ScatterNDSkipOobIndices:
             atomic_update_fn=None,
             _trace_description="scatter_nd.skip_oob_indices",
         ](
-            input.to_tile_tensor[.int64](),
-            indices.to_tile_tensor[.int64](),
-            updates.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[dtype](),
+            indices.to_tile_tensor(),
+            updates.to_tile_tensor[dtype](),
+            output.to_tile_tensor(),
             context=ctx,
         )
 
@@ -764,21 +779,27 @@ struct ScatterNDAdd:
     def execute[
         target: StaticString,
     ](
-        output: OutputTensor,
-        input: InputTensor[dtype=output.dtype, rank=output.rank, ...],
-        updates: InputTensor[dtype=output.dtype, ...],
-        indices: InputTensor,
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        updates: Some[Input & Tensor],
+        indices: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(updates), TileTensorable)
+        comptime assert conforms_to(type_of(indices), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(input).rank == type_of(output).rank
         scatter_nd_generator[
             target=target,
             atomic_update_fn=_atomic_add,
             _trace_description="scatter_nd.add",
         ](
-            input.to_tile_tensor[.int64](),
-            indices.to_tile_tensor[.int64](),
-            updates.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[dtype](),
+            indices.to_tile_tensor(),
+            updates.to_tile_tensor[dtype](),
+            output.to_tile_tensor(),
             context=ctx,
         )
 
@@ -811,12 +832,19 @@ struct ScatterNDMul:
     def execute[
         target: StaticString,
     ](
-        output: OutputTensor,
-        input: InputTensor[dtype=output.dtype, rank=output.rank, ...],
-        updates: InputTensor[dtype=output.dtype, ...],
-        indices: InputTensor,
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        updates: Some[Input & Tensor],
+        indices: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(updates), TileTensorable)
+        comptime assert conforms_to(type_of(indices), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(input).rank == type_of(output).rank
+
         @inline(.always)
         def reduce_fn[
             dtype: DType, width: SIMDLength
@@ -830,10 +858,10 @@ struct ScatterNDMul:
             atomic_update_fn=_atomic_reduce[reduce_fn],
             _trace_description="scatter_nd.mul",
         ](
-            input.to_tile_tensor[.int64](),
-            indices.to_tile_tensor[.int64](),
-            updates.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[dtype](),
+            indices.to_tile_tensor(),
+            updates.to_tile_tensor[dtype](),
+            output.to_tile_tensor(),
             context=ctx,
         )
 
@@ -866,12 +894,19 @@ struct ScatterNDMin:
     def execute[
         target: StaticString,
     ](
-        output: OutputTensor,
-        input: InputTensor[dtype=output.dtype, rank=output.rank, ...],
-        updates: InputTensor[dtype=output.dtype, ...],
-        indices: InputTensor,
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        updates: Some[Input & Tensor],
+        indices: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(updates), TileTensorable)
+        comptime assert conforms_to(type_of(indices), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(input).rank == type_of(output).rank
+
         @inline(.always)
         def reduce_fn[
             dtype: DType, width: SIMDLength
@@ -885,10 +920,10 @@ struct ScatterNDMin:
             atomic_update_fn=_atomic_reduce[reduce_fn],
             _trace_description="scatter_nd.min",
         ](
-            input.to_tile_tensor[.int64](),
-            indices.to_tile_tensor[.int64](),
-            updates.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[dtype](),
+            indices.to_tile_tensor(),
+            updates.to_tile_tensor[dtype](),
+            output.to_tile_tensor(),
             context=ctx,
         )
 
@@ -921,12 +956,19 @@ struct ScatterNDMax:
     def execute[
         target: StaticString,
     ](
-        output: OutputTensor,
-        input: InputTensor[dtype=output.dtype, rank=output.rank, ...],
-        updates: InputTensor[dtype=output.dtype, ...],
-        indices: InputTensor,
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        updates: Some[Input & Tensor],
+        indices: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(updates), TileTensorable)
+        comptime assert conforms_to(type_of(indices), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(input).rank == type_of(output).rank
+
         @inline(.always)
         def reduce_fn[
             dtype: DType, width: SIMDLength
@@ -940,10 +982,10 @@ struct ScatterNDMax:
             atomic_update_fn=_atomic_reduce[reduce_fn],
             _trace_description="scatter_nd.max",
         ](
-            input.to_tile_tensor[.int64](),
-            indices.to_tile_tensor[.int64](),
-            updates.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[dtype](),
+            indices.to_tile_tensor(),
+            updates.to_tile_tensor[dtype](),
+            output.to_tile_tensor(),
             context=ctx,
         )
 
@@ -979,16 +1021,22 @@ struct ApplyPackedBitmask:
         //,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=2, ...],
-        logits: InputTensor[dtype=dtype, rank=2, ...],
-        packed: InputTensor[dtype=.int32, rank=2, ...],
+        output: Some[Output & Tensor],
+        logits: Some[Input & Tensor],
+        packed: Some[Input & Tensor],
         fill_value: Scalar[dtype],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(logits), TileTensorable)
+        comptime assert conforms_to(type_of(packed), TileTensorable)
+        comptime assert type_of(output).rank == 2
+        comptime assert type_of(logits).rank == 2
+        comptime assert type_of(packed).rank == 2
         apply_packed_bitmask[target](
-            output.to_tile_tensor(),
-            logits.to_tile_tensor(),
-            packed.to_tile_tensor(),
+            output.to_tile_tensor[dtype](),
+            logits.to_tile_tensor[dtype](),
+            packed.to_tile_tensor[.int32](),
             fill_value,
             ctx,
         )
@@ -1002,18 +1050,21 @@ struct ScatterSetConstant:
     @staticmethod
     def execute[
         data_type: DType,
-        index_type: DType,
         //,
         target: StaticString,
     ](
-        data: MutableInputTensor[dtype=data_type, rank=2, ...],
-        indices: InputTensor[dtype=index_type, rank=2, ...],
+        data: Some[MutableInput & Tensor],
+        indices: Some[Input & Tensor],
         fill_value: Scalar[data_type],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(data), TileTensorable)
+        comptime assert conforms_to(type_of(indices), TileTensorable)
+        comptime assert type_of(data).rank == 2
+        comptime assert type_of(indices).rank == 2
         scatter_set_constant[target](
-            data.to_tile_tensor[.int64](),
-            indices.to_tile_tensor[.int64](),
+            data.to_tile_tensor[data_type](),
+            indices.to_tile_tensor(),
             fill_value,
             ctx,
         )
@@ -1975,22 +2026,30 @@ struct MutableStoreSlice:
     @staticmethod
     def execute[
         target: StaticString,
-        dtype: DType,
-        rank: Int,
     ](
-        to_buffer: MutableInputTensor[dtype=dtype, rank=rank, ...],
-        in_slice: InputTensor[dtype=dtype, rank=rank, ...],
-        starts: InputTensor[rank=1, ...],
-        stops: InputTensor[rank=1, ...],
-        steps: InputTensor[rank=1, ...],
+        to_buffer: Some[MutableInput & Tensor],
+        in_slice: Some[Input & Tensor],
+        starts: Some[Input & Tensor],
+        stops: Some[Input & Tensor],
+        steps: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(to_buffer), TileTensorable)
+        comptime assert conforms_to(type_of(in_slice), TileTensorable)
+        comptime assert conforms_to(type_of(starts), TileTensorable)
+        comptime assert conforms_to(type_of(stops), TileTensorable)
+        comptime assert conforms_to(type_of(steps), TileTensorable)
+        comptime dtype = type_of(to_buffer).dtype
+        comptime assert type_of(in_slice).rank == type_of(to_buffer).rank
+        comptime assert type_of(starts).rank == 1
+        comptime assert type_of(stops).rank == 1
+        comptime assert type_of(steps).rank == 1
         copy_to_slice[target=target](
-            to_buffer.to_tile_tensor[.int64](),
-            in_slice.to_tile_tensor[.int64](),
-            starts.to_tile_tensor[.int64](),
-            stops.to_tile_tensor[.int64](),
-            steps.to_tile_tensor[.int64](),
+            to_buffer.to_tile_tensor[dtype](),
+            in_slice.to_tile_tensor[dtype](),
+            starts.to_tile_tensor(),
+            stops.to_tile_tensor(),
+            steps.to_tile_tensor(),
             ctx,
         )
 
@@ -2005,15 +2064,19 @@ struct GatherND:
         target: StaticString,
         _trace_name: StaticString,
     ](
-        output: OutputTensor,
-        data: InputTensor[dtype=output.dtype, ...],
-        indices: InputTensor,
+        output: Some[Output & Tensor],
+        data: Some[Input & Tensor],
+        indices: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(data), TileTensorable)
+        comptime assert conforms_to(type_of(indices), TileTensorable)
+        comptime dtype = type_of(output).dtype
         gather_nd[batch_dims=batchDims, target=target](
-            data.to_tile_tensor[.int64](),
-            indices.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            data.to_tile_tensor[dtype](),
+            indices.to_tile_tensor(),
+            output.to_tile_tensor(),
             ctx,
         )
 
@@ -2115,9 +2178,9 @@ struct GatherSum:
     def execute[
         target: StaticString,
     ](
-        output: OutputTensor,
-        input: InputTensor[dtype=output.dtype, ...],
-        indices: InputTensor[dtype=.int32, ...],
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        indices: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
         """Fused gather (axis 0) + sum reduction (axis 1).
@@ -2125,10 +2188,14 @@ struct GatherSum:
         Dispatches to the CPU `gather_reduce` kernel or the GPU
         `gather_sum` kernel based on `target`.
         """
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(indices), TileTensorable)
+        comptime dtype = type_of(output).dtype
         gather_sum[target=target](
-            output.to_tile_tensor[.int64](),
-            input.to_tile_tensor[.int64](),
-            indices.to_tile_tensor[.int64](),
+            output.to_tile_tensor(),
+            input.to_tile_tensor[dtype](),
+            indices.to_tile_tensor[.int32](),
             ctx,
         )
 
@@ -2139,19 +2206,22 @@ struct Tile:
 
     @staticmethod
     def execute[
-        dtype: DType,
-        rank: Int,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=rank, ...],
-        input: InputTensor[dtype=dtype, rank=rank, ...],
-        repeats: InputTensor,
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        repeats: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(repeats), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(input).rank == type_of(output).rank
         tile[target=target](
-            input.to_tile_tensor[.int64](),
-            repeats.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[dtype](),
+            repeats.to_tile_tensor(),
+            output.to_tile_tensor[dtype](),
             ctx,
         )
 
@@ -2391,23 +2461,23 @@ struct IndexTensor:
 
     @staticmethod
     def execute[
-        dtype: DType,
-        indices_type: DType,
-        data_rank: Int,
-        indices_rank: Int,
-        output_rank: Int,
         batch_dims: Int,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=output_rank, ...],
-        data: InputTensor[dtype=dtype, rank=data_rank, ...],
-        indices: InputTensor[dtype=indices_type, rank=indices_rank, ...],
+        output: Some[Output & Tensor],
+        data: Some[Input & Tensor],
+        indices: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(data), TileTensorable)
+        comptime assert conforms_to(type_of(indices), TileTensorable)
+        comptime dtype = type_of(output).dtype
+        comptime indices_type = type_of(indices).dtype
         index_tensor[dtype, indices_type, batch_dims, target=target](
-            data.to_tile_tensor[.int64](),
-            indices.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            data.to_tile_tensor[dtype](),
+            indices.to_tile_tensor(),
+            output.to_tile_tensor(),
             ctx,
         )
 
