@@ -355,6 +355,16 @@ def main() raises:
         ](ctx, 1024, 5120, 3072)
         test[.bfloat16, N=Int(3072), K=Int(32768)](ctx, 1024, 3072, 32768)
         test[.bfloat16, N=Int(3072), K=Int(3072)](ctx, 1024, 3072, 3072)
+        # On SM100 these (N, K) take the SM100 GEMM at M 1 instead of GEMV.
+        test[.bfloat16, transpose_b=True, N=Int(32768), K=Int(1280)](
+            ctx, 1, 32768, 1280
+        )
+        test[.bfloat16, transpose_b=True, N=Int(4096), K=Int(1280)](
+            ctx, 1, 4096, 1280
+        )
+        test[.bfloat16, transpose_b=True, N=Int(4096), K=Int(1280)](
+            ctx, 3, 4096, 1280
+        )
 
         comptime if ctx.target.is_nvidia_gpu():
             test[
