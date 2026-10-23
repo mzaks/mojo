@@ -117,6 +117,7 @@
         },
         "develop/model-bringup-skills",
         "develop/serve-custom-model-architectures",
+        "develop/max-pipeline-bring-your-own-model",
         {
           "label": "Graphs",
           "type": "category",
@@ -136,6 +137,7 @@
             "develop/read-model-config",
             "develop/weight-adapters",
             "develop/pipelines",
+            "develop/supported-layers",
             "develop/quantize"
           ]
         },
