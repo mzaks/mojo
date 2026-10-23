@@ -774,3 +774,16 @@ def test_create_counter_accepts_a_no_op_meter() -> None:
         counter = metrics._create_counter("test.counter", "A test counter.")
 
     assert isinstance(counter, NoOpCounter)
+
+
+def test_scheduler_step_time_is_a_separate_histogram() -> None:
+    name = "maxserve.scheduler.batch_step_time"
+    assert _is_histogram(metrics.SERVE_METRICS[name])
+    client = mock.Mock()
+    recorder = metrics._AsyncMetrics()
+    recorder.configure(client, {"model": "m"})
+    recorder.scheduler_batch_step_time(3.0, "CE")
+    measurement = client.send_measurement.call_args.args[0]
+    assert measurement.instrument_name == name
+    assert measurement.value == 3.0
+    assert measurement.attributes == {"model": "m", "batch_type": "CE"}

@@ -222,6 +222,7 @@ HISTOGRAM_BUCKETS_BY_METRIC: dict[str, tuple[float, ...]] = {
     "maxserve.itl": HISTOGRAM_LATENCY_BUCKETS_MS,
     "maxserve.time_per_output_token": HISTOGRAM_LATENCY_BUCKETS_MS,
     "maxserve.batch_execution_time": HISTOGRAM_LATENCY_BUCKETS_MS,
+    "maxserve.scheduler.batch_step_time": HISTOGRAM_LATENCY_BUCKETS_MS,
     "maxserve.batch_creation_time": HISTOGRAM_LATENCY_BUCKETS_MS,
     "maxserve.di.api_pre_tokenize": HISTOGRAM_LATENCY_BUCKETS_MS,
     "maxserve.di.api_submit": HISTOGRAM_LATENCY_BUCKETS_MS,

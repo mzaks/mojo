@@ -229,7 +229,15 @@ SERVE_METRICS: dict[str, SupportedInstruments] = {
     "maxserve.batch_execution_time": _meter.create_histogram(
         "maxserve.batch_execution_time",
         unit="ms",
-        description="Distribution of batch execution time.",
+        description="Host executor service time per completed batch.",
+    ),  # type: ignore
+    "maxserve.scheduler.batch_step_time": _meter.create_histogram(
+        "maxserve.scheduler.batch_step_time",
+        unit="ms",
+        description=(
+            "Whole scheduler step including execution, request advancement, "
+            "release and response publication; excludes batch construction."
+        ),
     ),  # type: ignore
     "maxserve.di.decode_admission_queue_wait_time": _meter.create_histogram(
         "maxserve.di.decode_admission_queue_wait_time",
@@ -1429,6 +1437,15 @@ class _AsyncMetrics:
             MaxMeasurement(
                 "maxserve.batch_size",
                 size,
+                {**self.extra_attributes, "batch_type": batch_type},
+            ),
+        )
+
+    def scheduler_batch_step_time(self, value: float, batch_type: str) -> None:
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.scheduler.batch_step_time",
+                value,
                 {**self.extra_attributes, "batch_type": batch_type},
             ),
         )

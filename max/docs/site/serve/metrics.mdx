@@ -129,19 +129,46 @@ The following metrics track batch composition and per-batch throughput.
 
 {/* BEGIN METRICS: Batch scheduler */}
 
-| Metric                                                   | Type      | Description                                                                                          |
-|----------------------------------------------------------|-----------|------------------------------------------------------------------------------------------------------|
-| `maxserve_batch_size`                                    | Histogram | Distribution of batch sizes (number of requests), labeled by `batch_type` (CE prefill or TG decode). |
-| `maxserve_batch_execution_time_milliseconds`             | Histogram | Distribution of batch execution time.                                                                |
-| `maxserve_batch_input_tokens`                            | Histogram | Distribution of input tokens per scheduler batch.                                                    |
-| `maxserve_batch_context_tokens`                          | Histogram | Distribution of accumulated context tokens per scheduler batch.                                      |
-| `maxserve_batch_creation_time_milliseconds`              | Histogram | Distribution of scheduler batch creation time.                                                       |
-| `maxserve_batch_prompt_throughput_tokens_per_second`     | Histogram | Per-batch prompt-side throughput per second.                                                         |
-| `maxserve_batch_generation_throughput_tokens_per_second` | Histogram | Per-batch generation-side throughput per second.                                                     |
-| `maxserve_batch_terminated_reqs`                         | Histogram | Distribution of requests terminated per scheduler batch.                                             |
-| `maxserve_batch_pending_reqs`                            | Histogram | Distribution of requests pending in the queue, sampled once per scheduler batch.                     |
+| Metric                                                   | Type      | Description                                                                                                                   |
+|----------------------------------------------------------|-----------|-------------------------------------------------------------------------------------------------------------------------------|
+| `maxserve_batch_size`                                    | Histogram | Distribution of batch sizes (number of requests), labeled by `batch_type` (CE prefill or TG decode).                          |
+| `maxserve_batch_execution_time_milliseconds`             | Histogram | Host executor service time per completed batch.                                                                               |
+| `maxserve_scheduler_batch_step_time_milliseconds`        | Histogram | Whole scheduler step including execution, request advancement, release and response publication; excludes batch construction. |
+| `maxserve_batch_input_tokens`                            | Histogram | Distribution of input tokens per scheduler batch.                                                                             |
+| `maxserve_batch_context_tokens`                          | Histogram | Distribution of accumulated context tokens per scheduler batch.                                                               |
+| `maxserve_batch_creation_time_milliseconds`              | Histogram | Distribution of scheduler batch creation time.                                                                                |
+| `maxserve_batch_prompt_throughput_tokens_per_second`     | Histogram | Per-batch prompt-side throughput per second.                                                                                  |
+| `maxserve_batch_generation_throughput_tokens_per_second` | Histogram | Per-batch generation-side throughput per second.                                                                              |
+| `maxserve_batch_terminated_reqs`                         | Histogram | Distribution of requests terminated per scheduler batch.                                                                      |
+| `maxserve_batch_pending_reqs`                            | Histogram | Distribution of requests pending in the queue, sampled once per scheduler batch.                                              |
 
 {/* END METRICS: Batch scheduler */}
+
+Batch execution time is a host executor service interval, not GPU kernel time.
+Without overlap it measures the call to `pipeline.execute()`, excluding batch
+construction, scheduler advancement, release, and response publication. With
+overlap it is the observed completion time minus the later of the batch's
+enqueue time and the previous successful batch's observed completion time.
+
+Both modes include executor preparation, sampling, and synchronization. Overlap
+can also include time between the forward finishing and the host observing its
+completion, including other batches' scheduling and advancement. Successful
+completions record once, including final drains; failed launches and completions
+do not contribute a successful execution-time sample.
+
+The prompt throughput numerator is all active input tokens, including decode
+rows in mixed batches. Generation throughput counts returned output tokens
+before scheduler filtering, including prefill outputs and accepted plus bonus
+speculative outputs. Both rates use this execution interval, and overlap labels
+and counts describe the completed batch. A completion with zero duration records
+time but omits rates.
+
+This timing change retains MAX's existing metric names and `CE` / `TG` labels.
+Mach retains its own names and `prefill` / `decode` / `mixed` labels; no shared
+name or batch-label migration is part of this change.
+
+`maxserve.scheduler.batch_step_time` preserves the former full scheduler-step
+interval as a separate diagnostic; it is not a throughput denominator.
 
 ### KV cache
 

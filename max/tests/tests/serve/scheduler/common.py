@@ -676,7 +676,7 @@ def create_batch_and_execute(scheduler: TokenGenerationScheduler) -> BatchInfo:
     if batch_size == 0:
         return BatchInfo.empty()
 
-    num_terminated_reqs = scheduler._schedule(inputs)
+    num_terminated_reqs = scheduler._schedule(inputs).terminated_reqs
     assert isinstance(scheduler.pipeline, FakeTokenGeneratorPipeline)
 
     return BatchInfo(

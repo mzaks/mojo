@@ -55,6 +55,20 @@ This version is still a work in progress.
 
 ### Server metrics
 
+- `maxserve_batch_execution_time_milliseconds` now measures the executor
+  call when overlap is off. The former full scheduler-step duration is
+  available as `maxserve_scheduler_batch_step_time_milliseconds`. Batch
+  throughput uses the executor interval and counts returned output tokens,
+  including prefill outputs and accepted speculative tokens. See the
+  [batch timing contract](/serve/metrics#batch-scheduler) for overlap timing.
+  Intermediate prefill chunks returning no tokens now contribute zero to
+  the CE generation-throughput histogram, shifting its distribution on
+  chunked-prefill workloads. The benchmark harness's
+  `prefill_batch_execution_time_ms` and `decode_batch_execution_time_ms`
+  columns use `maxserve_batch_execution_time_milliseconds`, so MAX's
+  synchronous values now exclude scheduler work; comparisons with older
+  builds are not like for like.
+
 - Added `maxserve_request_client_disconnect_cancellations_total`, which
   counts streamed responses cut short by a client disconnect and completion
   requests abandoned while waiting for a result, split by `phase`. A
