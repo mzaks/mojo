@@ -138,6 +138,9 @@ from max.graph import (
     ops,
 )
 from max.graph import TensorType as TensorType  # re-exported
+from max.graph._api_boundary import (
+    register_api_boundaries as _register_api_boundaries,
+)
 from max.graph.ops.constant import NestedArray, Number
 from max.graph.value import HasTensorValue
 from rich.pretty import pretty_repr
@@ -2727,3 +2730,7 @@ from max.experimental import functional as F  # isort: skip
 # partially-initialized package (circular import guard).
 _buffer_store_slice = lambda *a, **kw: F.buffer_store_slice(*a, **kw)
 _transfer_to = lambda *a, **kw: F.transfer_to(*a, **kw)
+
+
+# A tensor's operators and methods create ops (see `max.graph._api_boundary`).
+_register_api_boundaries(vars(Tensor), "max")

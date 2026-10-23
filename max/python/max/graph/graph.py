@@ -52,6 +52,7 @@ from mojo.paths import (
     is_mojo_source_package_path,
 )
 
+from ._api_boundary import api_boundary
 from .type import (
     BufferType,
     DeviceRef,
@@ -1393,6 +1394,7 @@ class Graph:
             entries
         )
 
+    @api_boundary
     def output(self, *outputs: GraphOutputs) -> None:
         """Sets the output values of the graph and finalizes construction.
 
@@ -1616,6 +1618,7 @@ class Graph:
         self._data_dependent_dims = index + 1
         return index
 
+    @api_boundary
     def add_weight(
         # TODO(GEX-2121): Remove `force_initial_weight_on_host`
         self,
@@ -1816,6 +1819,7 @@ class GraphBlock:
         self._block_ctx = None
         return ctx.__exit__(exc_type, exc_val, exc_tb)
 
+    @api_boundary
     def output(
         self,
         *values: Value[Any] | TensorValueLike,
