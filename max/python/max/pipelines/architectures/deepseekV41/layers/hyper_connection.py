@@ -134,8 +134,14 @@ def final_collapse(
     Returns:
         ``[..., hidden_size]``, in ``full_stream``'s dtype.
     """
-    streams = ops.cast(full_stream, DType.float32)
+    # Per-stream slices keep this one elementwise pass, with no float32 copy
+    # of every stream.
     weights = ops.cast(pre_mix, DType.float32)
-    collapsed = ops.sum(ops.unsqueeze(weights, -1) * streams, axis=-2)
-    collapsed = ops.squeeze(collapsed, -2)
+    collapsed = None
+    for i in range(int(full_stream.shape[-2])):
+        term = ops.unsqueeze(weights[..., i], -1) * ops.cast(
+            full_stream[..., i, :], DType.float32
+        )
+        collapsed = term if collapsed is None else collapsed + term
+    assert collapsed is not None
     return ops.cast(collapsed, full_stream.dtype)

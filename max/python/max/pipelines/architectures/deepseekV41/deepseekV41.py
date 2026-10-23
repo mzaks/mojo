@@ -39,6 +39,7 @@ from max.nn.comm.ep import EPBatchManager
 from max.nn.data_parallelism import split_batch_replicated
 from max.nn.embedding import Embedding
 from max.nn.hyper_connection import HyperConnection
+from max.nn.kernels import mhc_post, mhc_post_supports
 from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
 from max.nn.norm.rms_norm import RMSNorm
@@ -275,9 +276,16 @@ def _hc_pre(
 
 
 def _hc_mean(x: TensorValue) -> TensorValue:
-    """Averages ``[1, s, hc, d]`` over the copies, accumulating in float32."""
-    mean = ops.mean(ops.cast(x, DType.float32), axis=2)
-    return ops.cast(ops.squeeze(mean, 2), x.dtype)
+    """Averages ``[1, s, hc, d]`` over the copies, accumulating in float32.
+
+    A sum of per-copy slices is one elementwise pass; a reduce over the cast
+    copies materializes a float32 copy of all of them first.
+    """
+    hc_mult = int(x.shape[2])
+    total = ops.cast(x[:, :, 0, :], DType.float32)
+    for i in range(1, hc_mult):
+        total = total + ops.cast(x[:, :, i, :], DType.float32)
+    return ops.cast(total * (1.0 / hc_mult), x.dtype)
 
 
 @dataclass(frozen=True)
@@ -303,12 +311,66 @@ class HCStreams:
         if self.out is None:
             return self.residual
         assert self.post is not None and self.comb is not None
-        return hc_post(self.out, self.residual, self.post, self.comb)
+        b, s, hc_mult, d = self.residual.shape
+        if not self.residual.device.is_gpu() or not mhc_post_supports(
+            int(hc_mult), int(d), self.residual.dtype
+        ):
+            return hc_post(self.out, self.residual, self.post, self.comb)
+        written = mhc_post(
+            ops.reshape(self.residual, [-1, hc_mult, d]),
+            ops.reshape(ops.cast(self.out, self.residual.dtype), [-1, d]),
+            ops.reshape(self.post, [-1, hc_mult]),
+            ops.reshape(self.comb, [-1, hc_mult, hc_mult]),
+        )
+        return ops.reshape(written, [b, s, hc_mult, d])
 
     def collapse(self) -> TensorValue:
         """Merges the copies with ``pre`` into the final ``[1, s, d]`` state."""
         assert self.pre is not None  # at least one sublayer always runs
         return final_collapse(self.materialize(), self.pre)
+
+
+def _per_token(value: np.ndarray, like: TensorValue) -> TensorValue:
+    """Broadcasts the float32 ``value`` to ``[b, s, *value.shape]`` of ``like``."""
+    return ops.broadcast_to(
+        ops.constant(value, DType.float32, device=like.device),
+        [like.shape[0], like.shape[1], *value.shape],
+    )
+
+
+def _identity_write_back(
+    copies: TensorValue, pre: TensorValue, out: TensorValue
+) -> HCStreams:
+    """Holds ``copies`` as ``out`` still to be written back unchanged.
+
+    With ``post = 0`` and ``comb = I`` the write-back leaves the copies as
+    they are, so the next sublayer takes the fused step instead of the
+    unfused gates and collapse. ``out`` is any finite ``[1, s, d]`` tensor.
+    """
+    hc_mult = int(copies.shape[2])
+    return HCStreams(
+        copies,
+        pre=pre,
+        out=out,
+        post=_per_token(np.zeros(hc_mult, dtype=np.float32), copies),
+        comb=_per_token(np.eye(hc_mult, dtype=np.float32), copies),
+    )
+
+
+def first_streams(x: TensorValue, hc_mult: int) -> HCStreams:
+    """Returns the copies of the ``[1, s, d]`` embedding the first block reads.
+
+    The copies are identical, so ``pre`` selects copy 0.
+    """
+    pre = _per_token(np.eye(hc_mult, dtype=np.float32)[0], x)
+    return _identity_write_back(expand_copies(x, hc_mult), pre, x)
+
+
+def _replace_copies(streams: HCStreams, copies: TensorValue) -> HCStreams:
+    """Returns ``copies`` in place of the copies of ``streams``, with its ``pre``."""
+    if streams.out is None or streams.pre is None:
+        return HCStreams(copies, pre=streams.pre)
+    return _identity_write_back(copies, streams.pre, streams.out)
 
 
 def _hc_enter(
@@ -495,9 +557,9 @@ class DeepseekV41Block(Module):
                 kvs = ops.allgather(kvs, signal_buffers, axis=-1)
             masks = engram_token_masks or [None] * len(blocks)
             streams = [
-                HCStreams(
+                _replace_copies(
+                    stream,
                     _apply_engram(stream.materialize(), engram, kv, mask),
-                    pre=stream.pre,
                 )
                 for stream, engram, kv, mask in zip(
                     streams, engrams, kvs, masks, strict=True
@@ -579,14 +641,14 @@ class DeepseekV41Block(Module):
                 engrams.append(block.engram_fn)
             masks = engram_token_masks or [None] * len(blocks)
             streams = [
-                HCStreams(
+                _replace_copies(
+                    stream,
                     _apply_engram(
                         stream.materialize(),
                         engram,
                         engram.project(operand),
                         mask,
                     ),
-                    pre=stream.pre,
                 )
                 for stream, engram, operand, mask in zip(
                     streams, engrams, engram_operands, masks, strict=True
@@ -693,14 +755,14 @@ class DeepseekV41Block(Module):
                     f"layer {self.layer_info.layer_id} is an Engram layer "
                     "but no engram_operand was given"
                 )
-            streams = HCStreams(
+            streams = _replace_copies(
+                streams,
                 _apply_engram(
                     streams.materialize(),
                     self.engram_fn,
                     self.engram_fn.project(engram_operand),
                     engram_token_mask,
                 ),
-                pre=streams.pre,
             )
 
         h, attn_read = _hc_enter(streams, self.hc_attn, self.attn_norm)
@@ -836,10 +898,8 @@ class DeepseekV41Trunk(Module):
                 "layers"
             )
         taps: list[TensorValue] = []
-        streams = HCStreams(
-            expand_copies(
-                merge_vision(self.embed(tokens), vision), self.config.hc_mult
-            )
+        streams = first_streams(
+            merge_vision(self.embed(tokens), vision), self.config.hc_mult
         )
         engram_token_mask = is_text_token(tokens)
         for layer_info, layer in zip(
@@ -936,10 +996,8 @@ class DeepseekV41Trunk(Module):
             trunks
         )
         streams = [
-            HCStreams(
-                expand_copies(
-                    merge_vision(trunk.embed(tok), vision), lead.config.hc_mult
-                )
+            first_streams(
+                merge_vision(trunk.embed(tok), vision), lead.config.hc_mult
             )
             for trunk, tok, vision in zip(
                 trunks, tokens, per_device, strict=True
@@ -1023,10 +1081,8 @@ class DeepseekV41Trunk(Module):
             trunks
         )
         streams = [
-            HCStreams(
-                expand_copies(
-                    merge_vision(trunk.embed(tok), vision), lead.config.hc_mult
-                )
+            first_streams(
+                merge_vision(trunk.embed(tok), vision), lead.config.hc_mult
             )
             for trunk, tok, vision in zip(
                 trunks, tokens, per_device, strict=True

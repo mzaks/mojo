@@ -89,7 +89,7 @@ from nn.kv_cache_ragged import (
     generic_fused_qkv_matmul_kv_cache_paged_ragged_bias,
 )
 from nn.attention.gpu.mha import MHADecodeDispatchMetadata
-from nn.mhc import hyper_connection_gates, mhc_post
+from nn.mhc import hyper_connection_gates, mhc_post, mhc_post_block_size
 from nn.moe import (
     eplb_remap,
     moe_create_indices,
@@ -2635,7 +2635,12 @@ struct Struct_mhc_post:
         comb: InputTensor[dtype=.float32, rank=3, ...],
         context: DeviceContext,
     ) raises:
-        mhc_post[hc_mult=hc_mult, hidden_size=hidden_size, target=target](
+        mhc_post[
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            target=target,
+            block_size=mhc_post_block_size[dtype, hidden_size](),
+        ](
             output.to_tile_tensor[.int64](),
             streams.to_tile_tensor[.int64]().as_imm(),
             y.to_tile_tensor[.int64]().as_imm(),

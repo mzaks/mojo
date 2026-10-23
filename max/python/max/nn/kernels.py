@@ -14751,8 +14751,9 @@ def hyper_connection_gates(
 
 
 def _mhc_post_block_width(dtype: DType) -> int:
-    # A block of 256 threads covers 256 16-byte vectors of the hidden axis.
-    threads_per_block = 256
+    # The narrowest block, 128 threads, covers 128 16-byte vectors of the
+    # hidden axis; the kernel takes 256 where those divide it.
+    threads_per_block = 128
     vector_bytes = 16
     return threads_per_block * vector_bytes // dtype.size_in_bytes
 
