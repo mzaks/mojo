@@ -106,6 +106,23 @@ This version is still a work in progress.
   dealloc(allocation^)
   ```
 
+- Raising an integral `SIMD` value (including `Int`) or a `SIMDLength` to a
+  negative power now aborts at run time instead of silently returning `0`. Use
+  a floating point base instead.
+
+- Raising an `IntLiteral` to a negative `IntLiteral` power now computes the
+  exact result as a float literal, the reciprocal of the positive power,
+  instead of evaluating to `0`. The result is a float literal even when the
+  base is `1` or `-1`, so `var x = (-1)**-3` is now a `Float64` holding
+  `-1.0`. Zero to a negative power evaluates to `nan`.
+
+  ```mojo
+  var a = 2**-1             # 0.5, same as 1 / 2
+  var b = Float64(2) ** -1  # 0.5
+  var n = 2
+  var c = n**-1             # aborts at run time
+  ```
+
 - Added `FileDescriptor` to `std.io`, an owning wrapper around
   `RawFileDescriptor`. It is a linear type: close it explicitly with
   `fd^.close()`, which raises if the close fails. It is movable but not
