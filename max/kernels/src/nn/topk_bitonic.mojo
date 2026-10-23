@@ -4017,8 +4017,9 @@ def persistent_topk_block_split[
     each producing a sorted top-`_TILE` partial, then merged per row (phase 2).
     All other shapes fall back to `persistent_topk_block` unchanged.
 
-    On SM90+ targets (SM12x excluded), at most `_CTOPK_MAX_ROWS` rows that do
-    not fill the GPU instead take the cluster-cooperative kernel
+    On SM90+ targets (SM12x excluded), up to as many rows as clusters of two
+    keep resident in one wave (`_ctopk_max_rows`) instead take the
+    cluster-cooperative kernel
     (`nn/attention/gpu/nvidia/topk_cluster.mojo`), which spreads each row over
     a thread-block cluster — and only under the
     `ordered=False, deterministic=False` contract, which is all that kernel
@@ -4108,8 +4109,8 @@ def persistent_topk_block_split[
     ):
         comptime if (not ordered) and (not deterministic):
             from nn.attention.gpu.nvidia.topk_cluster import (
-                _CTOPK_MAX_ROWS,
                 _choose_topk_cluster_size,
+                _ctopk_max_rows,
                 topk_cluster_split,
             )
 
@@ -4118,7 +4119,8 @@ def persistent_topk_block_split[
             )
             if (
                 total_seq_len > 0
-                and total_seq_len <= _CTOPK_MAX_ROWS
+                and total_seq_len
+                <= _ctopk_max_rows[ctx.default_device_info.sm_count]()
                 and total_seq_len < sm_count
                 and K <= PERSISTENT_TOPK_MAX_N
             ):
