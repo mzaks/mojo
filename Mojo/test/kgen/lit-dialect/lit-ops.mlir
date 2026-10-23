@@ -606,3 +606,20 @@ lit.fn @has_body_constraints<
   lit.return %none : !kgen.none
   lit.end_fn
 }
+
+// -----
+
+// CHECK-LABEL: lit.package namespace @ns {
+// CHECK-NEXT: lit.package @sub {
+lit.package namespace @ns {
+  lit.package @sub {
+  }
+}
+
+// CHECK-LABEL: lit.package @pkg {
+lit.package @pkg {
+}
+
+// CHECK-LABEL: lit.package @dependent attributes {dependencies = #kgen<link.dependencies[@pkg, @ns::@sub]>} {
+lit.package @dependent attributes {dependencies = #kgen<link.dependencies[@pkg, @ns::@sub]>} {
+}

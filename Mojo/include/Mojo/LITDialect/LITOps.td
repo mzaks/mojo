@@ -384,11 +384,19 @@ def LIT_PackageOp : LITOp<"package", [
     If the package was precompiled it may also contain:
     - The set of link dependencies for this package, `dependencies`.
 
+    A package marked `namespace` models a namespace: plain directories
+    spanning import roots, which group the packages within them but are not a
+    package themselves.
+
     Example:
 
     ```mlir
     lit.package @foo {
       lit.file_module @bar {
+      }
+    }
+    lit.package namespace @ns {
+      lit.package @baz {
       }
     }
     ```
@@ -400,7 +408,8 @@ def LIT_PackageOp : LITOp<"package", [
     OptionalAttr<LIT_DocStringAttr>:$docString,
     // References to the dependencies of this package.
     OptionalAttr<KGEN_LinkDependencyArrayAttr>:$dependencies,
-    OptionalAttr<LIT_DenseResourceElementsArrayAttr>:$externLLVMBitcodeModules
+    OptionalAttr<LIT_DenseResourceElementsArrayAttr>:$externLLVMBitcodeModules,
+    UnitAttr:$isNamespace
   );
   let regions = (region SizedRegion<1>:$bodyRegion);
 
@@ -412,7 +421,9 @@ def LIT_PackageOp : LITOp<"package", [
   let builders = [
     OpBuilder<(ins "StringAttr":$name)>
   ];
-  let assemblyFormat = "$sym_name attr-dict-with-keyword $bodyRegion";
+  let assemblyFormat = [{
+    (`namespace` $isNamespace^)? $sym_name attr-dict-with-keyword $bodyRegion
+  }];
   let hasVerifier = 1;
 }
 

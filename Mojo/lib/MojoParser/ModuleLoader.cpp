@@ -1112,6 +1112,7 @@ ModuleState &ModuleLoader::createPackageState(ModuleSpec moduleSpec,
                                    /*line=*/1, /*column=*/1);
   auto moduleBuilder = parentState.decl->getDeclEndBuilder();
   auto packageOp = PackageOp::create(moduleBuilder, loc, declName);
+  packageOp.setIsNamespace(moduleSpec.isNamespace());
   // Note we intentionally don't set a valid 'loc' here. The real loc is set
   // if/when the module is actually opened on demand.
   auto &decl = cast<PackageASTDecl>(shared.declResolver->addDecl(
