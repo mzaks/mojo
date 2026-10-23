@@ -56,8 +56,8 @@ from .quant import MiMoV2QuantScheme, moe_layers, parse_quant_scheme
 
 # The config helpers and constants above are the graph-API architecture's;
 # the checkpoint's schema does not differ between the ports. Only the config
-# class below differs: it has no graph-API experimental fields and validates
-# the dense-MLP scale-granule split the ModuleV3 build needs at plan time.
+# class below differs: it has no ``use_subgraphs`` switch and validates the
+# dense-MLP scale-granule split the ModuleV3 build needs at plan time.
 
 
 @dataclass(kw_only=True)
@@ -119,6 +119,15 @@ class MiMoV2Config(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
     """Expert-parallel communication config, set by the pipeline model when
     ``runtime.ep_size > 1``. ``None`` leaves the routed experts channel-
     sharded (tensor parallel)."""
+
+    fused_sliding_qkv: bool = False
+    """Whether sliding-window layers prepare Q, K and V with the fused
+    chunked QKV op instead of separate cache stores and RoPE. Off by
+    default; unsupported with data-parallel attention."""
+    fused_full_qkv: bool = False
+    """Whether full-attention layers use fused chunked QKV preparation.
+    Off by default, independently of sliding fusion; unsupported with
+    data-parallel attention."""
 
     data_parallel_degree: int = 1
     """Attention data-parallel replicas. Reserved for the DP coupling; a

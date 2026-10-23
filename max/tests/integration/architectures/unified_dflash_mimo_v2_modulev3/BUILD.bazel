@@ -98,3 +98,27 @@ modular_py_test(
         "//max/python/max/pipelines/weights",
     ],
 )
+
+# The target's fused QKV preparation reaches the spec graph at TP2 and TP4,
+# staged on virtual B200s.
+modular_py_test(
+    name = "test_qkv_fusion",
+    size = "medium",
+    srcs = ["test_qkv_fusion.py"],
+    ignore_extra_deps = [
+        "//max/python/max/_interpreter_ops",
+    ],
+    target_compatible_with = select({
+        "@platforms//os:macos": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":mimo_dflash_v3_fixtures",
+        "//max/python/max/_interpreter_ops",
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/experimental",
+        "//max/python/max/graph",
+        "//max/python/max/pipelines/architectures/unified_dflash_mimo_v2_modulev3",
+    ],
+)

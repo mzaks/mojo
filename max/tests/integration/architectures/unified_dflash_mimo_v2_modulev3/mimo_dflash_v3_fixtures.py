@@ -181,10 +181,12 @@ def target_kv_params(
     devices: list[DeviceRef], *, num_draft_tokens: int
 ) -> MultiKVCacheParams:
     """The target's ``{sliding, full}`` tree at the speculative build's widths."""
+    hf = _FakeAttrConfig
+    n_sliding = sum(hf.hybrid_layer_pattern)
 
-    def group(n_kv_heads: int) -> MHAKVCacheParams:
+    def group(n_kv_heads: int, num_layers: int) -> MHAKVCacheParams:
         return MHAKVCacheParams(
-            num_layers=2,
+            num_layers=num_layers,
             n_kv_heads=n_kv_heads,
             dtype=DType.bfloat16,
             head_dim=256,
@@ -195,7 +197,14 @@ def target_kv_params(
             num_draft_tokens=num_draft_tokens,
         )
 
-    return MultiKVCacheParams.from_params({SLIDING: group(4), FULL: group(4)})
+    return MultiKVCacheParams.from_params(
+        {
+            SLIDING: group(hf.swa_num_key_value_heads, n_sliding),
+            FULL: group(
+                hf.num_key_value_heads, hf.num_hidden_layers - n_sliding
+            ),
+        }
+    )
 
 
 def draft_kv_params(devices: list[DeviceRef]) -> MHAKVCacheParams:

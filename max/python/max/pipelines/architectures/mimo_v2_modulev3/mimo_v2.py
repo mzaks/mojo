@@ -255,6 +255,15 @@ class MiMoV2(Module[..., ModuleV3Outputs]):
                 f"count ({len(config.devices)}); dp x tp meshes are not "
                 "supported yet."
             )
+        # Each DP replica holds every QKV chunk, a layout the fusion has no
+        # parity check for.
+        if self.dp_attention and (
+            config.fused_sliding_qkv or config.fused_full_qkv
+        ):
+            raise NotImplementedError(
+                "MiMo-V2 fused chunked QKV preparation is not supported "
+                "with data-parallel attention."
+            )
         # Both directions of the wiring: an EP mode without its batch
         # manager would silently build the tensor-parallel MoE, and a
         # batch manager without an EP mode is a wiring error too. DP
@@ -340,6 +349,11 @@ class MiMoV2(Module[..., ModuleV3Outputs]):
                 has_sinks=config.sinks[group],
                 quant_config=config.quant.dense,
                 data_parallel=self.dp_attention,
+                fused_qkv=(
+                    config.fused_sliding_qkv
+                    if group == SLIDING
+                    else config.fused_full_qkv
+                ),
             )
             group_layer_counts[group] += 1
             mlp: MiMoV2MLP | MiMoV2MoE
