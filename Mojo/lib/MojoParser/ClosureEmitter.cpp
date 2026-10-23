@@ -1659,7 +1659,7 @@ DefASTDecl *ClosureEmitter::liftClosureIntoMethod(
   // live on the storage struct, so do not prepend them to the method.
   DefASTDecl *promotedDecl =
       promoteClosure(nestedFnDecl, ArrayRef<ParamDeclAttr>{},
-                     /*selfArg=*/selfArg, /*capturingOverride=*/TriBool::yes(),
+                     /*selfArg=*/selfArg, /*capturingOverride=*/TriBool::no(),
                      /*targetParent=*/&storageStructDecl)
           .functionDecl;
   FnOp promotedCallFunction = promotedDecl->getOp();
