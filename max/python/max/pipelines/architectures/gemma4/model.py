@@ -70,6 +70,20 @@ logger = logging.getLogger("max.pipelines")
 _COMPILE_GROUP = "gemma4"
 
 
+def _declared_weights(
+    language_model: Gemma4TextModel, state_dict: Mapping[str, WeightData]
+) -> dict[str, WeightData]:
+    """Returns the weights ``language_model`` declares.
+
+    A pipeline stage declares only its own layers, so it loads only their
+    weights, strictly, and a misnamed one still fails.
+    """
+    declared = language_model.raw_state_dict()
+    return {
+        name: weight for name, weight in state_dict.items() if name in declared
+    }
+
+
 def language_spec(
     config: Gemma4ForConditionalGenerationConfig,
     state_dict: Mapping[str, WeightData],
@@ -93,14 +107,7 @@ def language_spec(
     """
     language_model = Gemma4TextModel(config)
     if stage is not None:
-        # A pipeline stage declares only its own layers, so it loads only
-        # their weights, strictly, and a misnamed one still fails.
-        declared = language_model.raw_state_dict()
-        state_dict = {
-            name: weight
-            for name, weight in state_dict.items()
-            if name in declared
-        }
+        state_dict = _declared_weights(language_model, state_dict)
     language_model.load_state_dict(
         state_dict, weight_alignment=1, strict=strict
     )
@@ -381,6 +388,8 @@ class Gemma3_MultiModalModel(
         state_dict: dict[str, WeightData],
     ) -> Gemma4TextModel:
         language_model = Gemma4TextModel(config)
+        if config.layer_ids is not None:
+            state_dict = _declared_weights(language_model, state_dict)
         language_model.load_state_dict(
             state_dict,
             weight_alignment=1,
