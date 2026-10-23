@@ -319,6 +319,11 @@ def main() raises:
         test[.float32, N=Int(4096), K=Int(11008)](ctx, 23, 4096, 11008)
         test[.float32, N=Int(4096), K=Int(12288)](ctx, 67, 4096, 12288)
         test[.float32, N=Int(4096), K=Int(4096)](ctx, 555, 4096, 4096)
+        # The split-K outlier rows, one M per row.
+        for m in [1, 37, 67, 131]:
+            test[.float32, transpose_b=True, N=Int(512), K=Int(5120)](
+                ctx, m, 512, 5120
+            )
 
         print("===> bfloat16-float32 mma")
         test[
@@ -515,4 +520,12 @@ def main() raises:
         )
         test[.bfloat16, transpose_b=True, N=Int(514), K=Int(4096)](
             ctx, 32, 514, 4096
+        )
+
+        print("===> bfloat16 small N")
+        test[.bfloat16, transpose_b=True, N=Int(32), K=Int(5120)](
+            ctx, 3, 32, 5120
+        )
+        test[.bfloat16, transpose_b=True, N=Int(128), K=Int(512)](
+            ctx, 5, 128, 512
         )
