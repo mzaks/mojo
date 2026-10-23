@@ -10,7 +10,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ##===----------------------------------------------------------------------===##
-# 8x B200 recipe for GLM-5.3-Flash, text-only.
+# 8x B200 recipe for GLM-5.3-Flash: text and image input. Video is not wired
+# yet and is rejected.
 #
 # quantization_encoding is left unset so it resolves from the checkpoint's own
 # blockwise-FP8 quantization_config, and max_length unset so the checkpoint's

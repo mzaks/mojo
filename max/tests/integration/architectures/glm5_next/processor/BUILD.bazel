@@ -1,0 +1,37 @@
+# GLM-5.3-Flash tokenizer and video processor tests.
+
+load(
+    "//bazel:api.bzl",
+    "modular_py_test",
+    "requirement",
+)
+
+package(default_visibility = [
+    "//:__pkg__",
+    "//max/tests:__subpackages__",
+    "//oss/modular/max/tests:__subpackages__",
+])
+
+modular_py_test(
+    name = "test_video_processor",
+    size = "small",
+    srcs = ["test_video_processor.py"],
+    deps = [
+        "//max/python/max/pipelines/architectures/glm5_next",
+        requirement("numpy"),
+        requirement("pillow"),
+    ],
+)
+
+modular_py_test(
+    name = "test_tokenizer",
+    size = "small",
+    srcs = ["test_tokenizer.py"],
+    deps = [
+        "//max/python/max/pipelines/architectures/glm5_next",
+        "//max/python/max/pipelines/context",
+        "//max/python/max/pipelines/modeling",
+        requirement("numpy"),
+        requirement("pillow"),
+    ],
+)
