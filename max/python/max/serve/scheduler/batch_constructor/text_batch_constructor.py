@@ -1857,6 +1857,30 @@ class TextBatchConstructor:
             return True
         return self._prefill_interval_phase == 0
 
+    def _cap_ifb_ce_tokens_to_quota(
+        self, batch: ReplicaBatch, replica_idx: int
+    ) -> None:
+        """Caps what CE adds to an in-flight batching step at the CE quota.
+
+        Decode rows share the budget, so the quota cannot be its capacity.
+        The cap also leaves room for the draft width ``_add_ce_requests``
+        reserves per prompt row, or the chunk comes out short and one the
+        min-chunk floor refuses is reset every step.
+        """
+        if (
+            not self.scheduler_config.enable_in_flight_batching
+            or self._ce_step_quota is None
+            or self._ce_step_quota[replica_idx] <= 0
+        ):
+            return
+        verify_width = self.scheduler_config.spec_decode_mixed_verify_width
+        draft_headroom = verify_width * len(self.replicas[replica_idx].ce_reqs)
+        active = batch.token_budget.token_budgets[0]
+        active.capacity = min(
+            active.capacity,
+            active.used + self._ce_step_quota[replica_idx] + draft_headroom,
+        )
+
     def _construct_replica_batch(
         self, replica_idx: int, priority_override: RequestType | None = None
     ) -> ReplicaBatch:
@@ -1876,8 +1900,8 @@ class TextBatchConstructor:
         if (
             self._ce_step_quota is not None
             and self._ce_step_quota[replica_idx] > 0
-            # Under in-flight batching the TG batch shares this budget; a
-            # small CE quota must not truncate it.
+            # Under in-flight batching the TG batch shares this budget, so
+            # _cap_ifb_ce_tokens_to_quota caps the CE share instead.
             and not self.scheduler_config.enable_in_flight_batching
         ):
             ce_capacity = self._ce_step_quota[replica_idx]
@@ -1896,6 +1920,7 @@ class TextBatchConstructor:
 
         match priority:
             case RequestType.CE:
+                self._cap_ifb_ce_tokens_to_quota(batch, replica_idx)
                 self._add_ce_requests(batch, replica_idx)
 
                 if len(batch) == 0 and priority_override is None:
@@ -1928,6 +1953,7 @@ class TextBatchConstructor:
                         len(batch)
                         * self.scheduler_config.spec_decode_mixed_verify_width
                     )
+                    self._cap_ifb_ce_tokens_to_quota(batch, replica_idx)
                     self._add_ce_requests(batch, replica_idx)
 
             case None:
@@ -1956,21 +1982,25 @@ class TextBatchConstructor:
         - Deferrable mid-prefill tails (per replica, all-or-nothing) and then
           pooled unbound requests are added largest-first wherever they
           strictly improve the step's occupancy (mean/max of per-replica CE
-          tokens, capped at the CE chunk budget). When no replica has TG
-          work, as on a prefill-only worker, pooled requests instead fill
-          the step up to that budget: holding them back would idle the fleet.
+          tokens, capped at the CE chunk budget). With dynamic chunk sizing,
+          a pooled request is priced at the size it would be cut to. When
+          no replica has TG work, as on a prefill-only worker, pooled
+          requests instead fill the step up to that budget: holding them
+          back would idle the fleet.
         - Pooled requests bind to the replica with the lightest queue total
-          plus their own weight, at the moment the planner schedules them:
-          binding is deferred until first run so it uses fresh loads.
+          plus their own weight, ties going to the replica with the fewest
+          queued requests (decode and CE), at the moment the planner
+          schedules them: binding is deferred until first run so it uses
+          fresh loads.
 
         The assembled step is committed when the floor is non-empty (those
         tokens run regardless, so riders only improve the step), when its
         occupancy meets ``dp_ce_balance_threshold``, or when the fleet has
         nothing else to do. With ``dp_ce_balance_enable_dynamic_chunk_size``,
         a below-threshold step with CE work on two or more replicas also
-        commits, at a reduced chunk size: each working replica's CE quota
-        (``_ce_step_quota``, enforced as that replica's CE budget capacity)
-        is reduced to the lightest working replica's level — never below a
+        commits, at a reduced chunk size: each heavier replica's CE quota
+        (``_ce_step_quota``, the most CE tokens it admits this step) is
+        reduced to the lightest working replica's level — never below a
         replica's floor — so the balanced portion runs now as a shorter,
         ~fully-occupied step and only the excess is deferred. Only a single
         replica's deferrable work with no partner anywhere is held outright:
@@ -2007,6 +2037,16 @@ class TextBatchConstructor:
         def _has_seat(replica_idx: int) -> bool:
             return len(queues[replica_idx]) < seats[replica_idx]
 
+        # Ties on CE tokens are common (cross-replica prefix copy prices every
+        # replica the same); breaking them by request count keeps them from
+        # all landing on replica 0 until it runs out of decode seats.
+        def _bind_key(replica_idx: int, weight: int) -> tuple[int, int]:
+            return (
+                sum(queues[replica_idx]) + weight,
+                len(self.replicas[replica_idx].tg_reqs)
+                + len(queues[replica_idx]),
+            )
+
         # Expired pooled requests bind before the step is measured, so the
         # replica they land on is priced with them queued on it -- and, being
         # expired, is then not deferrable, which is what forces the commit.
@@ -2018,7 +2058,7 @@ class TextBatchConstructor:
             if not seated:
                 continue
             weights = self._ce_pending[req_id].weights
-            replica_idx = min(seated, key=lambda i: sum(queues[i]) + weights[i])
+            replica_idx = min(seated, key=lambda i: _bind_key(i, weights[i]))
             # Only a replica with a free seat takes the bind, so its whole
             # queue stays inside the seats the floor prices below, and a
             # rebind moved up to its bind-order turn is priced the same.
@@ -2068,6 +2108,16 @@ class TextBatchConstructor:
         # (otherwise they would queue behind a deferred tail).
         no_tg_work = all(not replica.tg_reqs for replica in self.replicas)
         pool_binds: list[tuple[RequestID, int]] = []
+        dynamic_chunk_size = (
+            self.scheduler_config.dp_ce_balance_enable_dynamic_chunk_size
+        )
+        min_chunk = self.scheduler_config.chunked_prefill_min_chunk_size
+        min_balance_level = min_chunk or target // 2
+        # Dynamic chunk sizing cuts a pooled request heavier than the working
+        # replicas to the balance level, so price it there: at full size it
+        # becomes the new max and is refused until it expires and runs alone.
+        # ``real_load`` keeps the uncut sizes the quotas are cut from.
+        real_load = list(step_load)
         for req_id, pending in sorted(
             self._ce_pending.items(),
             key=lambda item: min(item[1].weights),
@@ -2081,19 +2131,25 @@ class TextBatchConstructor:
             if not eligible:
                 continue
             replica_idx = min(
-                eligible, key=lambda i: sum(queues[i]) + pending.weights[i]
+                eligible, key=lambda i: _bind_key(i, pending.weights[i])
             )
+            weight = pending.weights[replica_idx]
+            priced = weight
+            working = [tokens for tokens in step_load if tokens > 0]
+            if dynamic_chunk_size and working:
+                priced = min(weight, max(min(working), min_balance_level))
             trial = list(step_load)
-            trial[replica_idx] = min(
-                trial[replica_idx] + pending.weights[replica_idx], target
-            )
+            trial[replica_idx] = min(trial[replica_idx] + priced, target)
             if (
                 no_tg_work
                 or max(step_load) == 0
                 or _occupancy(trial) > _occupancy(step_load)
             ):
                 step_load = trial
-                queues[replica_idx].append(pending.weights[replica_idx])
+                real_load[replica_idx] = min(
+                    real_load[replica_idx] + weight, target
+                )
+                queues[replica_idx].append(weight)
                 pool_binds.append((req_id, replica_idx))
 
         floor_exists = any(floor)
@@ -2104,19 +2160,19 @@ class TextBatchConstructor:
         # reducing the heavy replicas' chunk size to the balance level runs
         # the balanced portion now (a shorter, ~100%-occupancy step) and
         # defers only the excess. The balance level must be substantial
-        # (>= half the chunk target): each extra chunk re-reads the
-        # request's full context in attention, so undersized chunks cost
-        # more than the imbalance they avoid. The level never drops below
-        # any replica's floor (expired work is not deferrable and runs to
-        # the full chunk budget regardless).
+        # (>= chunked_prefill_min_chunk_size, else half the chunk target):
+        # each extra chunk re-reads the request's full context in attention,
+        # so undersized chunks cost more than the imbalance they avoid. The
+        # level never drops below any replica's floor (expired work is not
+        # deferrable and runs to the full chunk budget regardless).
         loads_with_work = [tokens for tokens in step_load if tokens > 0]
         balance_level = (
             max(max(floor), min(loads_with_work)) if loads_with_work else 0
         )
         can_reduce_chunk_size = (
-            self.scheduler_config.dp_ce_balance_enable_dynamic_chunk_size
+            dynamic_chunk_size
             and len(loads_with_work) > 1
-            and balance_level >= target // 2
+            and balance_level >= min_balance_level
         )
         if (
             floor_exists
@@ -2128,20 +2184,23 @@ class TextBatchConstructor:
                 self._bind_pooled_request(req_id, replica_idx)
             self._ce_deferred_replicas = deferred
 
+            # Gated on the uncut loads: a step balanced only by binds priced
+            # at the cut still needs the quotas that make the cut.
             if (
-                occupancy < threshold
+                _occupancy(real_load) < threshold
                 and can_reduce_chunk_size
                 and not fleet_idle
             ):
-                quotas = [
-                    self.scheduler_config.target_tokens_per_batch_ce
-                ] * self.num_replicas
-                for replica_idx in range(self.num_replicas):
-                    if step_load[replica_idx] > 0:
-                        quotas[replica_idx] = max(
-                            floor[replica_idx],
-                            min(step_load[replica_idx], balance_level),
-                        )
+                # Only replicas actually cut get a quota (0 = uncapped), since
+                # an exact-fit quota leaves no room for the per-row draft
+                # reserve. Nor is a replica cut if less than a min chunk would
+                # remain: the budget's min-chunk floor would move the cut or
+                # refuse and reset the request.
+                quotas = [0] * self.num_replicas
+                for replica_idx, load in enumerate(real_load):
+                    quota = max(floor[replica_idx], min(load, balance_level))
+                    if quota < load and load - quota >= min_chunk:
+                        quotas[replica_idx] = quota
                 self._ce_step_quota = quotas
         else:
             # No worthwhile balanced step exists (lone replica, or a balance

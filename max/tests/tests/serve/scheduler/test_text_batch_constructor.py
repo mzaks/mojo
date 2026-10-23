@@ -2446,6 +2446,9 @@ def create_dp_balance_constructor(
     hit_counts: list[PrefixCacheHits] | None = None,
     max_batch_total_tokens: int | None = None,
     prefill_schedule_interval: int = 1,
+    enable_in_flight_batching: bool = False,
+    spec_decode_mixed_verify_width: int = 0,
+    chunked_prefill_min_chunk_size: int = 0,
 ) -> TextBatchConstructor:
     """A DP constructor with the CE balancer on and a stubbed cache probe."""
     pipeline = Mock(spec=["release"])
@@ -2466,6 +2469,9 @@ def create_dp_balance_constructor(
         dp_ce_balance_enable_dynamic_chunk_size=enable_dynamic_chunk_size,
         max_batch_total_tokens=max_batch_total_tokens,
         prefill_schedule_interval=prefill_schedule_interval,
+        enable_in_flight_batching=enable_in_flight_batching,
+        spec_decode_mixed_verify_width=spec_decode_mixed_verify_width,
+        chunked_prefill_min_chunk_size=chunked_prefill_min_chunk_size,
     )
     return TextBatchConstructor(
         scheduler_config=scheduler_config,
@@ -2711,11 +2717,12 @@ def test_dp_ce_balance__reduces_chunk_size_to_balance_level() -> None:
 
     # Occupancy (96+60)/(2*96) = 0.81 misses the 0.9 threshold, but both
     # replicas have CE work and the balance level (60) is at least half the
-    # 100-token chunk target, so the step runs with a 60-token chunk size
-    # per replica: the heavy request is chunked at the quota and only its
-    # excess defers.
+    # 100-token chunk target, so the step runs at a 60-token chunk size:
+    # the heavy request is chunked at its quota and only its excess defers.
+    # The light replica already sits at the level, so it is not cut and
+    # keeps no quota (0 = uncapped).
     inputs = batch_constructor.construct_batch()
-    assert batch_constructor._ce_step_quota == [60, 60]
+    assert batch_constructor._ce_step_quota == [60, 0]
     assert batch_constructor._ce_deferred_replicas == set()
     assert has_request(inputs.batches[0], heavy_ce.request_id)
     assert heavy_ce.tokens.active_length == 60
@@ -2751,21 +2758,129 @@ def test_dp_ce_balance__no_chunk_size_reduction_below_half_target() -> None:
 
 
 def test_dp_ce_balance__quota_never_below_floor() -> None:
-    batch_constructor = create_dp_balance_constructor(threshold=0.9)
+    batch_constructor = create_dp_balance_constructor(dp=3, threshold=0.9)
     # Replica 0's CE deadline is blown: it is floor work that runs to the
     # full chunk budget, and the balance level cannot drop below it.
     tg_ctx = create_lora_context(is_tg=True)
     batch_constructor.enqueue_new_request(tg_ctx, replica_idx=0)
-    expired_ce = create_lora_context(seq_len=96)
+    expired_ce = create_lora_context(seq_len=70)
     batch_constructor.enqueue_new_request(expired_ce, replica_idx=0)
     batch_constructor._ce_arrival[expired_ce.request_id] = (
         time.monotonic() - 60.0
     )
-    _add_deferrable_ce(batch_constructor, replica_idx=1, seq_len=60)
+    heavy_ce = _add_deferrable_ce(batch_constructor, replica_idx=1, seq_len=96)
+    _add_deferrable_ce(batch_constructor, replica_idx=2, seq_len=55)
+
+    # Occupancy (70+96+55)/(3*96) = 0.77 misses the threshold. The lightest
+    # replica sits at 55, but the cut stops at the 70-token floor, and only
+    # the replica above it is cut.
+    inputs = batch_constructor.construct_batch()
+    assert batch_constructor._ce_step_quota == [0, 70, 0]
+    assert batch_constructor._ce_deferred_replicas == set()
+    assert has_request(inputs.batches[1], heavy_ce.request_id)
+    assert heavy_ce.tokens.active_length == 70
+
+
+@pytest.mark.parametrize(
+    ("heavy_len", "light_len", "heavy_chunk"), [(96, 40, 40), (80, 60, 80)]
+)
+def test_dp_ce_balance__min_chunk_size_bounds_the_cut(
+    heavy_len: int, light_len: int, heavy_chunk: int
+) -> None:
+    """The min chunk size bounds both the balance level and the remainder.
+
+    A 40-token level is under half the 100-token target but not under the
+    30-token min chunk, so the heavy replica is cut to it. Cutting 80 tokens
+    to 60 would leave 20, which the budget's min-chunk floor would refuse or
+    move, so that step runs uncut.
+    """
+    batch_constructor = create_dp_balance_constructor(
+        threshold=0.9, chunked_prefill_min_chunk_size=30
+    )
+    heavy_ce = _add_deferrable_ce(batch_constructor, 0, heavy_len)
+    _add_deferrable_ce(batch_constructor, 1, light_len)
 
     batch_constructor.construct_batch()
-    assert batch_constructor._ce_step_quota == [96, 60]
-    assert batch_constructor._ce_deferred_replicas == set()
+
+    cut = heavy_chunk if heavy_chunk < heavy_len else 0
+    assert batch_constructor._ce_step_quota == [cut, 0]
+    assert heavy_ce.tokens.active_length == heavy_chunk
+
+
+def test_dp_ce_balance__pooled_request_binds_at_its_cut_size() -> None:
+    """A pooled request heavier than the step binds, cut to the balance level.
+
+    Priced at its full 96 tokens it would lower the step's occupancy and wait
+    until it expired to run alone. Priced at the 25-token cut it balances the
+    step, which still needs the quota that makes the cut.
+    """
+    batch_constructor = create_dp_balance_constructor(
+        dp=4, chunked_prefill_min_chunk_size=25
+    )
+    for replica_idx in range(3):
+        _add_deferrable_ce(batch_constructor, replica_idx, 25)
+    pooled_ctx = create_lora_context(seq_len=96)
+    batch_constructor.enqueue_new_request(pooled_ctx)
+
+    inputs = batch_constructor.construct_batch()
+
+    assert has_request(inputs.batches[3], pooled_ctx.request_id)
+    assert pooled_ctx.tokens.active_length == 25
+    assert batch_constructor._ce_step_quota == [0, 0, 0, 25]
+
+
+def test_dp_ce_balance__quota_caps_prefill_under_in_flight_batching() -> None:
+    """The CE quota holds on a mixed step without truncating its decode rows."""
+    batch_constructor = create_dp_balance_constructor(
+        threshold=0.9,
+        enable_in_flight_batching=True,
+        spec_decode_mixed_verify_width=2,
+    )
+    heavy_ce = _add_deferrable_ce(batch_constructor, replica_idx=0, seq_len=96)
+    light_ce = _add_deferrable_ce(batch_constructor, replica_idx=1, seq_len=60)
+
+    inputs = batch_constructor.construct_batch()
+
+    assert batch_constructor._ce_step_quota == [60, 0]
+    # Each replica runs its decode row and its prompt.
+    assert [len(batch) for batch in inputs.batches] == [2, 2]
+    assert heavy_ce.tokens.active_length == 60
+    assert light_ce.tokens.active_length == 60
+
+
+@pytest.mark.parametrize("timeout_ms", [0.0, 10_000.0])
+def test_dp_ce_balance__bind_tie_goes_to_the_fewest_queued_requests(
+    timeout_ms: float,
+) -> None:
+    """A bind tied on CE tokens goes to the replica with the fewest requests.
+
+    With the new request, replicas 0-2 tie at 70 tokens. Counting decode and
+    prompt requests (2, 3, 1) picks replica 2; counting either alone picks
+    replica 0 or 1. Timeout 0 binds it as expired, a deadline from the pool.
+    """
+    batch_constructor = create_dp_balance_constructor(
+        dp=4, timeout_ms=timeout_ms
+    )
+    for replica_idx, num_tg, seq_lens in (
+        (0, 0, (25, 25)),
+        (1, 2, (50,)),
+        (2, 0, (50,)),
+        (3, 0, (100,)),
+    ):
+        for _ in range(num_tg):
+            batch_constructor.enqueue_new_request(
+                create_lora_context(is_tg=True), replica_idx=replica_idx
+            )
+        for seq_len in seq_lens:
+            batch_constructor.enqueue_new_request(
+                create_lora_context(seq_len=seq_len), replica_idx=replica_idx
+            )
+    ctx = create_lora_context(seq_len=20)
+    batch_constructor.enqueue_new_request(ctx)
+
+    inputs = batch_constructor.construct_batch()
+
+    assert has_request(inputs.batches[2], ctx.request_id)
 
 
 def _long_ce_context(seq_len: int) -> TextContext:

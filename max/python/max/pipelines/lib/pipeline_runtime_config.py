@@ -489,7 +489,9 @@ class PipelineRuntimeConfig(ConfigFileModel):
         description=(
             "Whether a below-threshold CE step with work on 2+ replicas "
             "runs immediately with each replica's chunk size reduced to "
-            "the balance level, deferring only the excess. When False, "
+            "the balance level, deferring only the excess. The balance level "
+            "must be at least ``chunked_prefill_min_chunk_size``, or half of "
+            "``max_batch_input_tokens`` when that is 0. When False, "
             "such steps are held whole until the threshold is met, a "
             "deadline expires, or there is nothing else to run. Only "
             "consulted when ``dp_ce_balance_timeout_ms`` > 0."
