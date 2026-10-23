@@ -39,6 +39,28 @@ template <typename Func, typename... Args>
   return ret;
 }
 
+/// Emits an error at the Mojo location of `arg` of `decl`'s `kind` function. A
+/// shape function lives in its own decl, so its errors point at the struct.
+static mlir::InFlightDiagnostic
+emitMojoArgumentError(KernelDeclOp decl, KernelFunctionKind kind,
+                      const KernelDeclOperandAdaptor &arg) {
+  if (!arg.sourceDescriptor)
+    return mlir::emitError(decl.getMojoFunctionLocation(kind));
+  return mlir::emitError(
+      decl.getMojoArgLocation(kind, arg.sourceDescriptor->position));
+}
+
+/// Whether `arg` is declared as an output tensor, wherever it sits.
+static bool isDeclaredOutput(const KernelDeclOperandAdaptor &arg) {
+  const auto *tensor =
+      std::get_if<KernelDeclTensorAdaptor>(&arg.underlyingType);
+  if (!tensor)
+    return false;
+  if (tensor->traitContract)
+    return tensor->traitContract->role == TensorArgRole::output;
+  return isOutputIOSpec(tensor->ioSpec);
+}
+
 //===----------------------------------------------------------------------===//
 // KernelDeclAdaptor-based verification (mogg.kernel.decl path)
 //===----------------------------------------------------------------------===//
@@ -111,7 +133,7 @@ LogicalResult verifyInputArgumentsAlign(KernelDeclOp decl,
     };
 
     if (!isCompatibleArgs()) {
-      return decl->emitError()
+      return emitMojoArgumentError(decl, lhsKind, *lhsArgOpt)
              << capitalize(rhsName) << " function and " << lhsName
              << " function input argument types do not match. "
              << capitalize(lhsName) << " function input at position "
@@ -139,6 +161,10 @@ LogicalResult verifyInputArgumentsAlign(KernelDeclOp decl,
             ++idx;
           }
         };
+    // Point at the first input the other function lacks.
+    const KernelDeclFunctionAdaptor &extra = lhsEnd ? rhs : lhs;
+    KernelFunctionKind extraKind = lhsEnd ? rhsKind : lhsKind;
+    uint64_t extraIndex = lhsEnd ? rhsIndex : lhsIndex;
     if (lhsEnd) {
       errorMessage << capitalize(rhsName) << " function inputs at positions (";
       appendUnmatchedInputs(rhs.inputArguments, rhsIndex);
@@ -148,7 +174,12 @@ LogicalResult verifyInputArgumentsAlign(KernelDeclOp decl,
       appendUnmatchedInputs(lhs.inputArguments, lhsIndex);
       errorMessage << ") do not appear in the " << rhsName.str() << " function";
     }
-    return decl->emitError(errorMessage.str());
+    std::optional<KernelDeclOperandAdaptor> firstExtra =
+        skipLaunchArg(extra.inputArguments, extraIndex);
+    if (!firstExtra)
+      return decl->emitError(errorMessage.str());
+    return emitMojoArgumentError(decl, extraKind, *firstExtra)
+           << errorMessage.str();
   }
 
   return success();
@@ -297,30 +328,50 @@ LogicalResult
 declVerifyOutputsAppearBeforeInputs(KernelDeclOp decl,
                                     const KernelDeclAdaptor &adaptor) {
   auto outputsBeforeInputs =
-      [&decl](const std::optional<KernelDeclFunctionAdaptor> &func)
-      -> LogicalResult {
+      [&decl](const std::optional<KernelDeclFunctionAdaptor> &func,
+              KernelFunctionKind kind) -> LogicalResult {
     if (!func.has_value())
       return success();
-    int64_t indexOfFirstInput = std::numeric_limits<int64_t>::max();
-    for (const auto &arg : func->inputArguments) {
-      indexOfFirstInput =
-          std::min<int64_t>(indexOfFirstInput, arg.sourceDescriptor->position);
-    }
-    int64_t indexOfLastOutput = std::numeric_limits<int64_t>::min();
-    for (const auto &arg : func->outputArguments) {
-      indexOfLastOutput =
-          std::max<int64_t>(indexOfLastOutput, arg.sourceDescriptor->position);
-    }
-    if (indexOfFirstInput < indexOfLastOutput) {
-      decl->emitError()
-          << "Outputs must appear before inputs in the function signature";
+    auto position = [](const KernelDeclOperandAdaptor &arg) {
+      return arg.sourceDescriptor->position;
+    };
+    // Only leading outputs are classified as outputs, so an output after an
+    // input shows up among the inputs; its declared role still marks it.
+    const KernelDeclOperandAdaptor *firstInput = nullptr;
+    for (const auto &arg : func->inputArguments)
+      if (!isDeclaredOutput(arg) &&
+          (!firstInput || position(arg) < position(*firstInput)))
+        firstInput = &arg;
+    if (!firstInput)
+      return success();
+    // Blame the first output that comes after an input.
+    const KernelDeclOperandAdaptor *lateOutput = nullptr;
+    auto consider = [&](const KernelDeclOperandAdaptor &arg) {
+      if (position(arg) > position(*firstInput) &&
+          (!lateOutput || position(arg) < position(*lateOutput)))
+        lateOutput = &arg;
+    };
+    for (const auto &arg : func->outputArguments)
+      consider(arg);
+    for (const auto &arg : func->inputArguments)
+      if (isDeclaredOutput(arg))
+        consider(arg);
+    if (lateOutput) {
+      emitMojoArgumentError(decl, kind, *lateOutput)
+          << "Outputs must appear before inputs in the function signature: "
+          << "output '" << lateOutput->sourceDescriptor->sourceName.getValue()
+          << "' comes after input '"
+          << firstInput->sourceDescriptor->sourceName.getValue() << "'";
       return failure();
     }
     return success();
   };
 
-  if (outputsBeforeInputs(adaptor.executeFunction).failed() ||
-      outputsBeforeInputs(adaptor.buildGraphFunction).failed())
+  if (outputsBeforeInputs(adaptor.executeFunction, KernelFunctionKind::Execute)
+          .failed() ||
+      outputsBeforeInputs(adaptor.buildGraphFunction,
+                          KernelFunctionKind::BuildGraph)
+          .failed())
     return failure();
   return success();
 }
@@ -333,38 +384,44 @@ LogicalResult declVerifyContextsAppearLastInSignature(
     const std::optional<KernelDeclFunctionAdaptor> &shapeFunction) {
   const auto launchArgsAreLast =
       [&decl](const std::optional<KernelDeclFunctionAdaptor> &func,
-              llvm::StringRef argLower,
+              KernelFunctionKind kind, llvm::StringRef argLower,
               llvm::StringRef argTitle) -> LogicalResult {
     if (!func.has_value())
       return success();
-    if (llvm::count_if(func->inputArguments,
-                       [](const KernelDeclOperandAdaptor &arg) {
-                         return arg.isLaunchArgument();
-                       }) > 1) {
-      decl->emitError() << "There can be at most one " << argLower;
-      return failure();
-    }
+    const KernelDeclOperandAdaptor *launchArg = nullptr;
     int64_t indexOfLastArgument = std::numeric_limits<int64_t>::min();
-    int64_t indexOfLaunchArgument = std::numeric_limits<int64_t>::max();
     for (const auto &arg : func->inputArguments) {
-      if (arg.isLaunchArgument())
-        indexOfLaunchArgument = arg.sourceDescriptor->position;
+      if (arg.isLaunchArgument()) {
+        if (launchArg) {
+          emitMojoArgumentError(decl, kind, arg)
+              << "There can be at most one " << argLower;
+          return failure();
+        }
+        launchArg = &arg;
+      }
       indexOfLastArgument = std::max<int64_t>(indexOfLastArgument,
                                               arg.sourceDescriptor->position);
     }
-    if (indexOfLaunchArgument < indexOfLastArgument) {
-      decl->emitError() << argTitle
-                        << " argument must be the last argument "
-                           "in the function signature";
+    if (launchArg &&
+        static_cast<int64_t>(launchArg->sourceDescriptor->position) <
+            indexOfLastArgument) {
+      emitMojoArgumentError(decl, kind, *launchArg)
+          << argTitle
+          << " argument must be the last argument "
+             "in the function signature";
       return failure();
     }
     return success();
   };
 
-  if (launchArgsAreLast(adaptor.executeFunction, "context", "Context")
+  if (launchArgsAreLast(adaptor.executeFunction, KernelFunctionKind::Execute,
+                        "context", "Context")
           .failed() ||
-      launchArgsAreLast(shapeFunction, "context", "Context").failed() ||
-      launchArgsAreLast(adaptor.buildGraphFunction, "graph builder",
+      launchArgsAreLast(shapeFunction, KernelFunctionKind::Shape, "context",
+                        "Context")
+          .failed() ||
+      launchArgsAreLast(adaptor.buildGraphFunction,
+                        KernelFunctionKind::BuildGraph, "graph builder",
                         "Graph builder")
           .failed())
     return failure();

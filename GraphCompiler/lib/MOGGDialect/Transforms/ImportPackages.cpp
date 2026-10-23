@@ -1069,21 +1069,38 @@ struct ImportPackagesPass
       }
 
       // Always attach the struct decl loc; verification of missing entry
-      // points (no execute / elementwise) blames the struct itself.
+      // points (no execute / elementwise) blames the struct itself. Each loc
+      // is named, `execute` or `execute.arg2`, for `KernelDeclOp`'s location
+      // accessors; being locations, they leave the MEF with the debug info.
       llvm::SmallVector<mlir::Location> fnLocs;
-      fnLocs.push_back(kernel.structDeclOp.getLoc());
-      if (kernel.executeFn)
-        fnLocs.push_back(kernel.executeFn.getLoc());
-      if (kernel.elementwiseFn)
-        fnLocs.push_back(kernel.elementwiseFn.getLoc());
-      if (kernel.tileElementwiseFn)
-        fnLocs.push_back(kernel.tileElementwiseFn.getLoc());
-      if (kernel.buildGraphFn)
-        fnLocs.push_back(kernel.buildGraphFn.getLoc());
-      if (kernel.executeDeviceFn)
-        fnLocs.push_back(kernel.executeDeviceFn.getLoc());
-      if (kernel.executeConfigurationFn)
-        fnLocs.push_back(kernel.executeConfigurationFn.getLoc());
+      auto addNamedLoc = [&](const llvm::Twine &name, mlir::Location loc) {
+        fnLocs.push_back(
+            mlir::NameLoc::get(mlir::StringAttr::get(ctx, name), loc));
+      };
+      addNamedLoc(KernelDeclOp::kStructLocationName,
+                  kernel.structDeclOp.getLoc());
+      auto addFnLocs = [&](KernelFunctionKind kind, KGEN::LIT::FnOp fn) {
+        if (!fn)
+          return;
+        llvm::StringRef name = stringifyKernelFunctionKind(kind);
+        addNamedLoc(name, fn.getLoc());
+        // Only the body's block arguments carry per-argument locations.
+        mlir::Region &body = fn.getBodyRegion();
+        if (body.empty() ||
+            body.getNumArguments() != fn.getArgumentTypes().size())
+          return;
+        for (mlir::BlockArgument arg : body.getArguments())
+          addNamedLoc(
+              KernelDeclOp::getMojoArgLocationName(kind, arg.getArgNumber()),
+              arg.getLoc());
+      };
+      addFnLocs(KernelFunctionKind::Execute, kernel.executeFn);
+      addFnLocs(KernelFunctionKind::Elementwise, kernel.elementwiseFn);
+      addFnLocs(KernelFunctionKind::TileElementwise, kernel.tileElementwiseFn);
+      addFnLocs(KernelFunctionKind::BuildGraph, kernel.buildGraphFn);
+      addFnLocs(KernelFunctionKind::ExecuteDevice, kernel.executeDeviceFn);
+      addFnLocs(KernelFunctionKind::ExecuteConfiguration,
+                kernel.executeConfigurationFn);
 
       // execute / build_graph may return user-defined parameterised opaque
       // structs (e.g. `SIMDPair[P0, P1]`) that `inferOpaqueParameters` needs,

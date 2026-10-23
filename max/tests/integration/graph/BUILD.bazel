@@ -62,12 +62,15 @@ _GRAPH_COMMON_DATA = [
     "//max/tests/integration/Inputs/kernel_override_ops",
     "//max/tests/integration/Inputs/kernel_verification_ops",
     "//max/tests/integration/Inputs/test_user_op",
+    "//max/tests/integration/graph/testdata/bad_kernel_ops",
+    "//max/tests/integration/graph/testdata/bad_kernel_ops:__init__.mojo",
     "//max/tests/integration/graph/testdata/compile_config_ops",
     "//max/tests/integration/graph/testdata/counter_ops",
     "//max/tests/tests/graph/testdata",
 ]
 
 _GRAPH_COMMON_ENV = {
+    "MODULAR_BAD_KERNEL_OPS_PATH": "$(rootpath //max/tests/integration/graph/testdata/bad_kernel_ops)",
     "MODULAR_COUNTER_OPS_PATH": "$(rootpath //max/tests/integration/graph/testdata/counter_ops)",
     "MODULAR_KERNEL_OVERRIDE_OPS_PATH": "$(rootpath //max/tests/integration/Inputs/kernel_override_ops)",
     "MODULAR_KERNEL_VERIFICATION_OPS_PATH": "$(rootpath //max/tests/integration/Inputs/kernel_verification_ops)",

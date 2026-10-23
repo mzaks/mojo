@@ -1163,6 +1163,47 @@ LogicalResult CallBuildGraphOp::emitMojo(EmitMojoState &state) {
 }
 
 //===----------------------------------------------------------------------===//
+// KernelDeclOp
+//===----------------------------------------------------------------------===//
+
+/// Returns the location named `name` among `declLoc`'s fused locations.
+static std::optional<Location> findNamedLoc(Location declLoc, StringRef name) {
+  auto fused = dyn_cast<mlir::FusedLoc>(declLoc);
+  if (!fused)
+    return std::nullopt;
+  for (Location loc : fused.getLocations())
+    if (auto named = dyn_cast<mlir::NameLoc>(loc);
+        named && named.getName() == name)
+      return named.getChildLoc();
+  return std::nullopt;
+}
+
+Location KernelDeclOp::getMojoStructLocation() {
+  return findNamedLoc(getLoc(), kStructLocationName).value_or(getLoc());
+}
+
+Location KernelDeclOp::getMojoFunctionLocation(KernelFunctionKind kind) {
+  if (std::optional<Location> loc =
+          findNamedLoc(getLoc(), stringifyKernelFunctionKind(kind)))
+    return *loc;
+  return getMojoStructLocation();
+}
+
+std::string KernelDeclOp::getMojoArgLocationName(KernelFunctionKind kind,
+                                                 uint64_t position) {
+  return llvm::formatv("{0}.arg{1}", stringifyKernelFunctionKind(kind),
+                       position);
+}
+
+Location KernelDeclOp::getMojoArgLocation(KernelFunctionKind kind,
+                                          uint64_t position) {
+  std::string name = getMojoArgLocationName(kind, position);
+  if (std::optional<Location> loc = findNamedLoc(getLoc(), name))
+    return *loc;
+  return getMojoFunctionLocation(kind);
+}
+
+//===----------------------------------------------------------------------===//
 // Error context helpers (used by FuncOp and AsyncErrorOp)
 //===----------------------------------------------------------------------===//
 

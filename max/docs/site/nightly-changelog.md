@@ -55,6 +55,14 @@ This version is still a work in progress.
 
 ## Python API
 
+- A custom op whose Mojo kernel is registered wrong, or doesn't match its
+  call, now raises `max.graph.KernelRegistrationError`, a `ValueError`
+  subclass. The message points at the Mojo code the way the Mojo compiler
+  does: the file, line and column, the source line and a caret. A custom op
+  package's kernels are now checked when it loads, so a misplaced
+  `DeviceContext` argument fails there instead of while compiling the
+  generated code.
+
 - `max.nn.Transformer`, `DistributedTransformer`, `logits_postprocess()` and
   `distributed_logits_postprocess()` return a
   `max.nn.graph_groups.DecoderOutputs` of named groups instead of a tuple.
