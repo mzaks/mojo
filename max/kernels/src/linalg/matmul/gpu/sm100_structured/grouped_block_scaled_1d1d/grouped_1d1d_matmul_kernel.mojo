@@ -2745,6 +2745,7 @@ struct Grouped1D1DMatmulKernel[
         load_activations: Bool = True,
         wr_mbar: Optional[MbarPtr] = None,
         split_weight_scales: Bool = False,
+        b_peer_rows: Int = Self.BN,
     ):
         """Load A, B, SFA, SFB tiles using TMA.
 
@@ -2818,6 +2819,11 @@ struct Grouped1D1DMatmulKernel[
                 with the activations instead of with the weights, so a
                 pre-wait weight call reads only weight data (defaults to
                 `False`).
+            b_peer_rows: Token rows each CTA of a pair feeds the UMMA when
+                `AB_swapped`. A 2-CTA UMMA of width N takes N / 2 rows from
+                each CTA, so a caller that narrows a tile's UMMA N below
+                `MMA_N` passes N / 2 here and the peer's rows start there
+                (defaults to `BN`).
         """
         comptime assert (
             not split_txn
@@ -2855,7 +2861,7 @@ struct Grouped1D1DMatmulKernel[
             # loads a different portion of the token range.
             b_gmem_n_coord = (
                 peer_rank_m * Self.b_tma_rows
-                + peer_rank_n * Self.BN
+                + peer_rank_n * b_peer_rows
                 + Int(m_coord)
             )
         else:

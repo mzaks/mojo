@@ -1037,6 +1037,24 @@ struct UMMAInsDescriptor[
 
         return Self(inst_desc.desc | sfb_bit)
 
+    def with_n(self, n: UInt32) -> Self:
+        """Returns this descriptor with its N dimension set to `n`.
+
+        N is bits 17-22, as `n >> 3`; every other field is kept, so a
+        run-time `n` narrows one instruction's B operand and accumulator
+        columns without building a new descriptor.
+
+        Args:
+            n: The N dimension: a multiple of 8 below 512 that the
+                instruction kind and CTA group accept.
+
+        Returns:
+            The updated descriptor.
+        """
+
+        comptime n_mask = UInt32(0x3F) << UInt32(17)
+        return Self((self.desc & ~n_mask) | ((n >> 3) << UInt32(17)))
+
 
 # ===----------------------------------------------------------------------=== #
 # MMA Shared Memory Descriptor
