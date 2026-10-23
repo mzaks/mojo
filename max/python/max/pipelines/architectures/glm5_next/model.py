@@ -144,6 +144,11 @@ class Glm5NextModel(DeepseekV3_2Model):
         one."""
         return self._models.get(GraphRole.VISION)
 
+    # Without allreduce, the decoder splits tokens across the TP ranks before
+    # the expert dispatch (`token_parallel.py`), the layout the 2x MI355
+    # recipe serves. Exporters pick the matching EP backend from it.
+    ep_dispatch_token_layout: ClassVar[str] = "tp_sharded"
+
     def _first_mla_layer(self) -> int:
         """Reads the first sparse-MLA layer off the schedule.
 
