@@ -1063,11 +1063,11 @@ kgen.generator @callee<a>(%arg0: index) {
 }
 
 kgen.generator @entry(%arg0: index) {
-  // CHECK: create_closure[(index) -> (): @"callee,a=1"]
-  kgen.create_closure[(index) -> (): @callee<1>]()
+  // CHECK: create_func_ptr[(index) -> (): @"callee,a=1"]
+  kgen.create_func_ptr[(index) -> (): @callee<1>]()
   kgen.param.declare fn: (index) -> () = <@callee<2>>
-  // CHECK: create_closure[(index) -> (): @"callee,a=2"]
-  kgen.create_closure[(index) -> (): fn]()
+  // CHECK: create_func_ptr[(index) -> (): @"callee,a=2"]
+  kgen.create_func_ptr[(index) -> (): fn]()
   hlcf.return
 }
 
@@ -1119,8 +1119,8 @@ kgen.generator @foo_k<N, M>() -> !kgen.scalar<index> {
 // CHECK-LABEL: kgen.func @"foo,N=5"(%arg0: !kgen.scalar<index>) {
 kgen.generator @foo<N>(%arg0: !kgen.scalar<index>) {
   kgen.param.declare k: <index>() -> !kgen.scalar<index> = <@foo_k<N, ?>>
-  // CHECK: kgen.create_closure[() -> !kgen.scalar<index>: @"foo_k,N=5,M=3"]()
-  %1 = kgen.create_closure[() -> !kgen.scalar<index>: bind_params(:<index>() -> !kgen.scalar<index> k, 3)]()
+  // CHECK: kgen.create_func_ptr[() -> !kgen.scalar<index>: @"foo_k,N=5,M=3"]()
+  %1 = kgen.create_func_ptr[() -> !kgen.scalar<index>: bind_params(:<index>() -> !kgen.scalar<index> k, 3)]()
   hlcf.return
 }
 
@@ -1144,8 +1144,8 @@ kgen.generator @bat(%arg0: index) -> index {
 
 // CHECK-LABEL: kgen.func @bat_binder
 kgen.generator @bat_binder(%arg0: index) {
-  // CHECK: kgen.create_closure[(index) -> index: @bat]()
-	%2 = kgen.create_closure[(index) -> index: h]()
+  // CHECK: kgen.create_func_ptr[(index) -> index: @bat]()
+	%2 = kgen.create_func_ptr[(index) -> index: h]()
 	kgen.param.declare h: (index) -> index = <@bat>
 	hlcf.return
 }

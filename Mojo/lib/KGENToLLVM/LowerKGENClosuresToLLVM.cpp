@@ -42,11 +42,11 @@ struct LowerRuntimeClosuresPass
 } // namespace
 
 struct CreateRuntimeClosureOpConversion
-    : public ConvertPOPToLLVMPattern<CreateClosureOp> {
-  using ConvertPOPToLLVMPattern<CreateClosureOp>::ConvertPOPToLLVMPattern;
+    : public ConvertPOPToLLVMPattern<CreateFuncPtrOp> {
+  using ConvertPOPToLLVMPattern<CreateFuncPtrOp>::ConvertPOPToLLVMPattern;
 
-  LogicalResult matchAndRewrite(CreateClosureOp op,
-                                CreateClosureOpAdaptor adaptor,
+  LogicalResult matchAndRewrite(CreateFuncPtrOp op,
+                                CreateFuncPtrOpAdaptor adaptor,
                                 DirectRewriter &rewriter) const override {
     rewriter.replaceOpWithNewOp<LLVM::AddressOfOp>(
         op, convertType(op.getType()),
@@ -147,7 +147,7 @@ void LowerRuntimeClosuresPass::runOnOperation() {
   patterns.insert<CallIndirectOpConversion>(typeConverter);
 
   auto mustConvert = [](Operation *op) {
-    return isa<CreateClosureOp, CallIndirectOp>(op);
+    return isa<CreateFuncPtrOp, CallIndirectOp>(op);
   };
   if (failed(M::applyDirectConversion(theModule, &typeConverter,
                                       std::move(patterns), /*skipOp=*/nullptr,

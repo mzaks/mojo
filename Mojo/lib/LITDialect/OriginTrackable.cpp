@@ -269,8 +269,8 @@ void OperationEffects::analyzeCallOp(Operation &op) {
     conventions = signature.getArgConventions().drop_back(
         signature.getNumAsyncReturnSlots());
 
-    // CreateClosureOp only references the callee and binds no arguments.
-    if (isa<CreateClosureOp>(op))
+    // CreateFuncPtrOp only references the callee and binds no arguments.
+    if (isa<CreateFuncPtrOp>(op))
       conventions = {};
 
     assert(conventions.size() == op.getNumOperands());

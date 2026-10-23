@@ -25,7 +25,7 @@
 # The var holds the promoted function's value, not a closure instance (the
 # NOT precedes the matches: storage structs print before the enclosing fn).
 # CHECK-NOT: @"{{.*}}`lambda_0::__storage"
-# CHECK: kgen.create_closure[{{.*}}("x": !Int) -> !{{.*}}Int{{[0-9]*}}>: @{{.*}}::@"{{.*}}`lambda_0(::SIMD[DType.int, 1]){{.*}}"]()
+# CHECK: kgen.create_func_ptr[{{.*}}("x": !Int) -> !{{.*}}Int{{[0-9]*}}>: @{{.*}}::@"{{.*}}`lambda_0(::SIMD[DType.int, 1]){{.*}}"]()
 
 # The synthetic def is named `lambda_<n> and promoted to module scope; its body
 # (x + 1) is a plain thin function's -- no capture machinery.
@@ -326,8 +326,8 @@ def withComptimeBoundElided() -> Int:
 # COM: the call through the var is indirect.
 
 # CHECK: lit.var.decl "f" var : !lit.ref<!lit.generator<("x": !Int) -> !{{.*}}Int{{[0-9]*}}>
-# CHECK: kgen.create_closure[{{.*}}: @{{.*}}::@"{{.*}}`lambda_0(::SIMD[DType.int, 1]){{.*}}"]()
-# CHECK: kgen.create_closure[{{.*}}: @{{.*}}::@"{{.*}}`lambda_1(::SIMD[DType.int, 1]){{.*}}"]()
+# CHECK: kgen.create_func_ptr[{{.*}}: @{{.*}}::@"{{.*}}`lambda_0(::SIMD[DType.int, 1]){{.*}}"]()
+# CHECK: kgen.create_func_ptr[{{.*}}: @{{.*}}::@"{{.*}}`lambda_1(::SIMD[DType.int, 1]){{.*}}"]()
 # CHECK: lit.call_indirect
 
 
@@ -344,7 +344,7 @@ def typedDecay() -> Int:
 # COM: use site binds it, exactly as a stateless nested `def` using `N` does.
 # COM: (Only a lambda's OWN unbound parameters keep the closure-instance form.)
 
-# CHECK: kgen.create_closure[{{.*}}@"{{.*}}`lambda_0(::SIMD[DType.int, 1]){{.*}}"<:!Int N>]()
+# CHECK: kgen.create_func_ptr[{{.*}}@"{{.*}}`lambda_0(::SIMD[DType.int, 1]){{.*}}"<:!Int N>]()
 # CHECK: lit.call_indirect
 
 

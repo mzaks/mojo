@@ -461,7 +461,7 @@ SRValue IREmitter::emitPValueToSRValue(ASTExprAnd<PValue> value,
     }
 
     return SRValue(
-        CreateClosureOp::create(*builder, location, signature, attr));
+        CreateFuncPtrOp::create(*builder, location, signature, attr));
   }
 
   ASTType valueType = value.ir.getRValueType();

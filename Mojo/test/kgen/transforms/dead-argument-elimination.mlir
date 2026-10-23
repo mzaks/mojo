@@ -81,7 +81,7 @@ kgen.func @f_reference() {
 
 // -----
 
-// COM: Don't do anything for kgen.create_closure's callee.
+// COM: Don't do anything for kgen.create_func_ptr's callee.
 // CHECK-LABEL: kgen.func @closure_callee(%arg0: index, %arg1: index) -> index
  kgen.func @closure_callee(%arg0: index, %arg1: index) -> index {
    hlcf.return %arg1: index
@@ -89,7 +89,7 @@ kgen.func @f_reference() {
 
  kgen.func @closure_caller() -> index {
    %idx0 = index.constant 0
-   %0 = kgen.create_closure[(index, index) -> index: @closure_callee]()
+   %0 = kgen.create_func_ptr[(index, index) -> index: @closure_callee]()
    %1 = kgen.call_indirect %0(%idx0, %idx0) : (index, index) -> index
    hlcf.return %1: index
  }

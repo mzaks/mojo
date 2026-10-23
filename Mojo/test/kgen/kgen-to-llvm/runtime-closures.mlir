@@ -15,7 +15,7 @@ module attributes {M.target_info = #M.target<triple="", arch="", features="", da
   llvm.func internal @main_closure_arg() {
     // CHECK: [[ADDR:%.*]] = llvm.mlir.addressof @h : !llvm.ptr
     // CHECK-NEXT: unrealized_conversion_cast [[ADDR]]
-    %0 = kgen.create_closure[(index) -> index: @h]()
+    %0 = kgen.create_func_ptr[(index) -> index: @h]()
     "use.closure"(%0) : (!kgen.generator<(index) -> index>) -> ()
     llvm.return
   }
@@ -31,7 +31,7 @@ module attributes {M.target_info = #M.target<triple="", arch="", features="", da
   }
   // CHECK-LABEL: llvm.func @tailcall
   llvm.func @tailcall(%arg0: i64) -> i64 {
-    %0 = kgen.create_closure[(i64) -> i64: @h]()
+    %0 = kgen.create_func_ptr[(i64) -> i64: @h]()
     // CHECK: llvm.call musttail
     %1 = kgen.call_indirect musttail %0(%arg0) : (i64) -> i64
     llvm.return %1 : i64

@@ -1022,19 +1022,19 @@ def KGEN_CallIndirectOp : KGENOp<"call_indirect", [
 }
 
 //===----------------------------------------------------------------------===//
-// CreateClosureOp
+// CreateFuncPtrOp
 //===----------------------------------------------------------------------===//
 
-def KGEN_CreateClosureOp : KGEN_CallOpBase<"create_closure", [Pure,
+def KGEN_CreateFuncPtrOp : KGEN_CallOpBase<"create_func_ptr", [Pure,
     InferTypeOpAdaptor,
     DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
   let summary = "Materialize a function as a runtime value.";
   let description = [{
-    The `kgen.create_closure` operation materializes a reference to a function
+    The `kgen.create_func_ptr` operation materializes a reference to a function
     as a runtime function pointer value.
 
     ```mlir
-    %0 = kgen.create_closure[(index) -> index: @h]()
+    %0 = kgen.create_func_ptr[(index) -> index: @h]()
     ```
   }];
 
@@ -1062,10 +1062,10 @@ def KGEN_CreateRegStubOp : KGENOp<"create_reg_stub", [Pure,
   let summary = "Create a stub to enforce by-memory arguments for `callee`.";
   let description = [{
 
-    This op is similar to CreateClosureOp.
+    This op is similar to CreateFuncPtrOp.
     But during LowerArgConvention, some arguments are promoted from by-memory
     to by-value.
-    This would also affect the signature type of CreateClosureOp.
+    This would also affect the signature type of CreateFuncPtrOp.
 
     With CreateRegStubOp, during LowerArgConvention, the signature of `callee`
     might change, but the result signature always remains the same.

@@ -396,7 +396,7 @@ CallParamOp::parametric_interpret(ArrayRef<Attribute> operands,
 
 LogicalResult CallIndirectOp::canonicalize(CallIndirectOp op,
                                            PatternRewriter &b) {
-  auto create = op.getCallee().getDefiningOp<CreateClosureOp>();
+  auto create = op.getCallee().getDefiningOp<CreateFuncPtrOp>();
   if (!create)
     return b.notifyMatchFailure(op.getLoc(), "callee op is not create closure");
   // Replace this with a direct call.
@@ -446,16 +446,16 @@ CallIndirectOp::parametric_interpret(ArrayRef<Attribute> operands,
 }
 
 //===----------------------------------------------------------------------===//
-// CreateClosureOp
+// CreateFuncPtrOp
 //===----------------------------------------------------------------------===//
 
-ErrorTreeOrSuccess CreateClosureOp::interpret(ArrayRef<Attribute> operands,
+ErrorTreeOrSuccess CreateFuncPtrOp::interpret(ArrayRef<Attribute> operands,
                                               InterpreterState &state) {
   return state.mapResults(getCallee());
 }
 
 ErrorTreeOrSuccess
-CreateClosureOp::parametric_interpret(ArrayRef<Attribute> operands,
+CreateFuncPtrOp::parametric_interpret(ArrayRef<Attribute> operands,
                                       ParametricInterpreterState &state) {
   return state.mapResults(state.getReboundAttribute(getCallee()));
 }

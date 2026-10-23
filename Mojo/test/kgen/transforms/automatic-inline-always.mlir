@@ -172,8 +172,8 @@ kgen.func @callee(%arg0: index, %arg1: index) always_inline {
 // CHECK-LABEL: kgen.func @caller
 kgen.func @caller() {
   %idx0 = index.constant 0
-  // CHECK: %0 = kgen.create_closure[(index, index) -> (): @callee]()
-  %0 = kgen.create_closure[(index, index) -> (): @callee]()
+  // CHECK: %0 = kgen.create_func_ptr[(index, index) -> (): @callee]()
+  %0 = kgen.create_func_ptr[(index, index) -> (): @callee]()
   // CHECK-NEXT: call_indirect %0(%idx0, %idx0)
   kgen.call_indirect %0(%idx0, %idx0) : (index, index) -> ()
   hlcf.return

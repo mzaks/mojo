@@ -113,8 +113,8 @@ static void lowerCreateRegStubOp(IRRewriter &b, CreateRegStubOp op,
 
   if (calleeSigGen == resSigGen) {
     // Signatures are equal, no need to transform the arguments.
-    // Directly lower to CreateClosureOp.
-    b.replaceOpWithNewOp<CreateClosureOp>(op, callee);
+    // Directly lower to CreateFuncPtrOp.
+    b.replaceOpWithNewOp<CreateFuncPtrOp>(op, callee);
     return;
   }
 
@@ -176,7 +176,7 @@ static void lowerCreateRegStubOp(IRRewriter &b, CreateRegStubOp op,
   ReturnOp::create(b, loc);
 
   b.setInsertionPoint(op);
-  b.replaceOpWithNewOp<CreateClosureOp>(
+  b.replaceOpWithNewOp<CreateFuncPtrOp>(
       op, SymbolConstantAttr::get(wrapper.getSymNameAttr(), resSigGen));
 }
 

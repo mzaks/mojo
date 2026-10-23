@@ -86,7 +86,7 @@ struct AlwaysInlineGraph
 
   static bool shouldAddToGraph(KGENCallOpInterface call,
                                AlwaysInlineGraphNode *node) {
-    return !isa<CreateClosureOp>(call) && isAlwaysInlineFunction(node->func);
+    return !isa<CreateFuncPtrOp>(call) && isAlwaysInlineFunction(node->func);
   }
 
   LogicalResult diagnoseCycle(ModuleOp module, const SymbolTable &symtab);
@@ -237,7 +237,7 @@ struct CallGraph : CallGraphBase<CallGraph, CallGraphNode> {
   CallGraphNode externalNode;
 
   /// Function symbols referenced by non-call users (e.g. function-pointer
-  /// values taken via `kgen.param.constant` or `kgen.create_closure`).
+  /// values taken via `kgen.param.constant` or `kgen.create_func_ptr`).
   /// Populated by `collectNonCallReferencedSymbols`.
   llvm::DenseSet<mlir::StringAttr> nonCallReferencedSyms;
 
@@ -443,7 +443,7 @@ void CallGraph::inlineNode(CallGraphNode *caller, uint64_t threshold) {
   for (auto [call, callee] : caller->callsites) {
     // Don't attempt to inline functions in the SCCs of their callers or those
     // in unreachable SCCs.
-    if (isa<CreateClosureOp>(call) || !caller->canInlineCallee(callee))
+    if (isa<CreateFuncPtrOp>(call) || !caller->canInlineCallee(callee))
       continue;
     if (seenNodes.insert(callee).second)
       calleeAsynchValues.emplace_back(callee->doneInlining.copy());
@@ -462,7 +462,7 @@ void CallGraph::inlineNode(CallGraphNode *caller, uint64_t threshold) {
     for (auto [call, callee] : caller->callsites) {
       // Make sure we don't call shouldInlineCallee on a callee that we are not
       // waiting on.
-      if (isa<CreateClosureOp>(call) || !caller->canInlineCallee(callee))
+      if (isa<CreateFuncPtrOp>(call) || !caller->canInlineCallee(callee))
         continue;
 
       // Now that the callee has finished processing along with its inner

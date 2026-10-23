@@ -223,10 +223,10 @@ kgen.func @closure_callee(%arg0: index, %arg1: i32) -> i64 {
   hlcf.unreachable
 }
 
-// CHECK-LABEL: @call_create_closure
-kgen.func @call_create_closure(%arg0: index, %arg1: i32) -> i64 {
+// CHECK-LABEL: @call_create_func_ptr
+kgen.func @call_create_func_ptr(%arg0: index, %arg1: i32) -> i64 {
   // CHECK-NEXT: %0 = kgen.call @closure_callee(%arg0, %arg1)
-  %0 = kgen.create_closure[(index, i32) -> i64: @closure_callee]()
+  %0 = kgen.create_func_ptr[(index, i32) -> i64: @closure_callee]()
   %1 = kgen.call_indirect %0(%arg0, %arg1) : (index, i32) -> i64
   // CHECK-NEXT: return %0
   hlcf.return %1 : i64

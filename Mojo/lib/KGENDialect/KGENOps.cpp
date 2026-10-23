@@ -728,29 +728,29 @@ LogicalResult CallParamOp::verify() {
   return verifyCallOp(*this, getOperands(), getCalleeType().getBody());
 }
 //===----------------------------------------------------------------------===//
-// CreateClosureOp
+// CreateFuncPtrOp
 //===----------------------------------------------------------------------===//
 
 LogicalResult
-CreateClosureOp::inferReturnTypes(MLIRContext *ctx, std::optional<Location> loc,
+CreateFuncPtrOp::inferReturnTypes(MLIRContext *ctx, std::optional<Location> loc,
                                   Adaptor adaptor,
                                   SmallVectorImpl<Type> &results) {
   auto callee = dyn_cast_or_null<TypedAttr>(adaptor.getCalleeAttr());
   if (!callee) {
     return mlir::emitOptionalError(
-        loc, "'create_closure' expected TypedAttr 'callee'");
+        loc, "'create_func_ptr' expected TypedAttr 'callee'");
   }
   auto sigGen = dyn_cast<FuncTypeGeneratorType>(callee.getType());
   if (!sigGen) {
     return mlir::emitOptionalError(
         loc,
-        "'create_closure' attribute 'callee' must have FuncTypeGeneratorType");
+        "'create_func_ptr' attribute 'callee' must have FuncTypeGeneratorType");
   }
   results.push_back(sigGen);
   return mlir::success();
 }
 
-FailureOr<InlineResult> CreateClosureOp::prepInline(mlir::RewriterBase &b) {
+FailureOr<InlineResult> CreateFuncPtrOp::prepInline(mlir::RewriterBase &b) {
   // Materializing a function pointer is not a call and cannot be inlined.
   return failure();
 }
