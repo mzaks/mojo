@@ -64,6 +64,7 @@ from shmem.ep import (
     ep_fused_dispatch_kernel_api,
 )
 from shmem.ep_comm import (
+    EP_WARP_TOKENS_MIN_TOKENS,
     BF16TokenFormat,
     BlockwiseFP8TokenFormat,
     EPLocalSyncCounters,
@@ -1641,6 +1642,12 @@ struct DistributedEPDispatchBlockScaledNV:
                 n_nodes,
                 fused_shared_expert,
                 target,
+                # A prefill chunk's dispatch waited on the monitor's serial
+                # per-expert scan and sent one token per CTA at a time; the
+                # histogram count and the warp-per-token send keep the same
+                # bytes and receive layout (KERN-3829). Only single-node NVFP4
+                # without a fused shared expert takes them.
+                dispatch_warp_min_tokens=EP_WARP_TOKENS_MIN_TOKENS,
             ](
                 format_handler,
                 row_offsets[index].to_tile_tensor[.int64](),
