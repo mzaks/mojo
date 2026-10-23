@@ -370,6 +370,7 @@ static constexpr UnfusedExecuteRegistration kUnfusedExecuteRegistrations[] = {
     {"mo.conv_transpose", "cpu"},
     {"mo.conv_transpose", "gpu"},
     {"mo.matmul", "cpu"},
+    {"mo.matmul", "gpu"},
     // Graph compiler test kernels (`GraphCompiler/test/kernels`).
     {"trait_unfused_execute"},
     {"unfused_invalid_both_fused"},

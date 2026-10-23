@@ -106,7 +106,12 @@ from nn.gemv_partial_norm import gemv_and_partial_norm
 from extensibility import InputTensor, OutputTensor
 from extensibility import Tensor, TileTensorable
 from extensibility import Fused, Input, Output, Storable, StoreAccess
-from extensibility import _FusedComputeOutputTensor
+from extensibility import UnsafeFusedView, unsafe_fused_view
+from extensibility import (
+    _FusedComputeOutputTensor,
+    _LegacyComputable,
+    _LegacyComputeOutput,
+)
 from extensibility import (
     _FusedInputTensor as FusedInputTensor,
 )
@@ -350,90 +355,142 @@ struct MatmulCPU:
 
 @extensibility.register("mo.matmul", type="gpu")
 struct MatmulGPU:
-    """Registers the `mo.matmul` graph op for GPU devices."""
+    """Registers the `mo.matmul` graph op for GPU devices.
+
+    Two `execute` overloads under one registration: the graph compiler calls
+    the fused one when the output has a fused epilogue and the plain one when
+    it has none. The fused form takes a `_LegacyComputeOutput` because kernels
+    that write output tiles with a bulk copy, such as TMA on SM100, apply the
+    epilogue's value transform before the write; when the epilogue must own
+    the store instead, the matmul gets only the output's shape. The plain form
+    has the matmul write the output directly. The pair is grandfathered on the
+    graph compiler's allow list; new kernels declare one `execute` with a
+    `StoreAccess` output.
+    """
 
     @staticmethod
     def execute[
         transpose_b: Bool,
         packed_b: Bool,
-        has_epilogue_fusion: Bool,
         target: StaticString,
         _trace_name: StaticString,
     ](
-        c: _FusedComputeOutputTensor[rank=2, ...],
-        a: InputTensor[rank=2, ...],
-        b: InputTensor[rank=2, ...],
+        c: Some[Output & Fused & _LegacyComputeOutput],
+        a: Some[Input & TileTensorable],
+        b: Some[Input & TileTensorable],
         ctx: DeviceContext,
     ) raises:
+        # TODO(KERN-3837): The store-epilogue matmul has no output buffer to
+        # write, yet every GPU matmul interface on its path still takes a
+        # `c: TileTensor`, so the store branch below hands it a tile over a
+        # null pointer (see the TODO there). Once that path takes the output
+        # dtype and layout instead, pass `c`'s layout directly.
         comptime assert not packed_b, "packed B is only supported on CPU"
+        comptime assert type_of(c).rank == 2
+        comptime dtype = type_of(c).dtype
 
-        @inline(.always)
-        def epilogue_fn[
-            _dtype: DType, _width: SIMDLength, *, alignment: Int
-        ](coords: Coord, val: SIMD[_dtype, _width]) {var c}:
+        # The epilogue runs in the kernels the matmul launches, so it
+        # copy-captures the access-enabled view rather than the host proxy.
+        comptime assert conforms_to(type_of(c), UnsafeFusedView)
+
+        comptime if conforms_to(type_of(c), _LegacyComputable):
+            var c_view = unsafe_fused_view(c)
             comptime assert (
-                coords.rank == 2
-            ), "the matmul epilogue contract is rank 2"
-            c._lambda_store[width=_width, element_alignment=alignment](
-                coords,
-                rebind[SIMD[c.dtype, _width]](val),
+                conforms_to(type_of(c_view), Output)
+                and conforms_to(type_of(c_view), _LegacyComputable)
+                and conforms_to(type_of(c_view), TileTensorable)
             )
 
-        @inline(.always)
-        def output_compute_fn[
-            _dtype: DType, _width: SIMDLength, *, alignment: Int
-        ](coords: Coord, val: SIMD[_dtype, _width]) {var c} -> SIMD[
-            _dtype, _width
-        ]:
-            comptime assert (
-                coords.rank == 2
-            ), "the matmul epilogue contract is rank 2"
-            return rebind[SIMD[_dtype, _width]](
-                c._fused_compute_output_lambda[element_alignment=alignment](
-                    coords, rebind[SIMD[c.dtype, _width]](val)
+            @inline(.always)
+            def output_compute_fn[
+                _dtype: DType, _width: SIMDLength, *, alignment: Int
+            ](coords: Coord, val: SIMD[_dtype, _width]) {var c_view} -> SIMD[
+                _dtype, _width
+            ]:
+                comptime assert (
+                    coords.rank == 2
+                ), "the matmul epilogue contract is rank 2"
+                return rebind[SIMD[_dtype, _width]](
+                    c_view.compute[
+                        width=Int(_width), element_alignment=alignment
+                    ](
+                        coords,
+                        rebind[SIMD[type_of(c_view).dtype, Int(_width)]](val),
+                    )
                 )
-            )
 
-        comptime has_compute_lambda = type_of(c)._has_compute_fusion
-
-        comptime if has_epilogue_fusion and has_compute_lambda:
             matmul[
                 transpose_a=False,
                 transpose_b=transpose_b,
                 _trace_description=_trace_name,
                 target=target,
             ](
-                c.to_tile_tensor[.int64](),
-                a.to_tile_tensor[.int64](),
-                b.to_tile_tensor[.int64](),
+                c_view.to_tile_tensor(),
+                a.to_tile_tensor(),
+                b.to_tile_tensor(),
                 output_compute_fn,
                 ctx,
             )
-        elif has_epilogue_fusion:
+        else:
+            var c_view = unsafe_fused_view(c)
+            comptime assert conforms_to(type_of(c_view), Storable)
+
+            @inline(.always)
+            def epilogue_fn[
+                _dtype: DType, _width: SIMDLength, *, alignment: Int
+            ](coords: Coord, val: SIMD[_dtype, _width]) {var c_view}:
+                comptime assert (
+                    coords.rank == 2
+                ), "the matmul epilogue contract is rank 2"
+                c_view.store[width=Int(_width), element_alignment=alignment](
+                    coords,
+                    rebind[SIMD[type_of(c_view).dtype, Int(_width)]](val),
+                )
+
+            # TODO(KERN-3837): `epilogue_fn` owns every output store, so the
+            # matmul gets only `c`'s shape, over a null pointer it never
+            # dereferences. Replace the null tile with the output layout once
+            # the store-epilogue matmul takes one.
+            var c_ptr: Optional[
+                MutPointer[Scalar[dtype], MutUntrackedOrigin]
+            ] = None
             matmul[
                 transpose_a=False,
                 transpose_b=transpose_b,
                 _trace_description=_trace_name,
                 target=target,
             ](
-                c.to_tile_tensor[.int64](),
-                a.to_tile_tensor[.int64](),
-                b.to_tile_tensor[.int64](),
+                TileTensor(c_ptr._unsafe_nullable(), row_major(c.shape())),
+                a.to_tile_tensor(),
+                b.to_tile_tensor(),
                 epilogue_fn,
                 ctx,
             )
-        else:
-            matmul[
-                transpose_a=False,
-                transpose_b=transpose_b,
-                _trace_description=_trace_name,
-                target=target,
-            ](
-                c.to_tile_tensor[.int64](),
-                a.to_tile_tensor[.int64](),
-                b.to_tile_tensor[.int64](),
-                ctx,
-            )
+
+    @staticmethod
+    def execute[
+        transpose_b: Bool,
+        packed_b: Bool,
+        target: StaticString,
+        _trace_name: StaticString,
+    ](
+        c: Some[Output & TileTensorable],
+        a: Some[Input & TileTensorable],
+        b: Some[Input & TileTensorable],
+        ctx: DeviceContext,
+    ) raises where not conforms_to(type_of(c), Fused):
+        comptime assert not packed_b, "packed B is only supported on CPU"
+        matmul[
+            transpose_a=False,
+            transpose_b=transpose_b,
+            _trace_description=_trace_name,
+            target=target,
+        ](
+            c.to_tile_tensor(),
+            a.to_tile_tensor(),
+            b.to_tile_tensor(),
+            ctx,
+        )
 
 
 @extensibility.register("mo.batch_matmul", type="cpu")
