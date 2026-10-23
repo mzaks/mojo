@@ -93,7 +93,6 @@ from extensibility import (
 )
 from builtin_primitives.primitives import (
     _dense_row_major_anchor_stride,
-    foreach,
     view_copy_impl,
 )
 from extensibility import (
@@ -2490,49 +2489,53 @@ struct AdvancedIndexingGetItem:
     @inline(.always)
     @staticmethod
     def execute[
-        input_rank: Int,
-        index_rank: Int,
-        output_rank: Int,
-        input_type: DType,
-        index_type: DType,
-        num_index_tensors: Int,
+        Indices: TypeList[Trait=Input & Fused & LoadAccess, ...],
         //,
         start_axis: Int,
         target: StaticString,
         _trace_name: StaticString,
     ](
-        out_tensor: OutputTensor[dtype=input_type, rank=output_rank, ...],
-        input_tensor: FusedInputTensor[dtype=input_type, rank=input_rank, ...],
-        indices: FusedInputVariadicTensors[
-            dtype=index_type,
-            rank=index_rank,
-            size=num_index_tensors,
-            ...,
-        ],
+        out_tensor: Some[Output & Tensor],
+        input_tensor: Some[Input & Fused & LoadAccess],
+        indices: TensorTuple[*Indices],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(out_tensor), TileTensorable)
+        comptime input_rank = type_of(input_tensor).rank
+        comptime index_rank = Indices[0].rank
+        comptime num_index_tensors = len(Indices)
+        _check_index_tensors[*Indices]()
+        comptime assert type_of(input_tensor).dtype == type_of(out_tensor).dtype
         comptime assert (
-            output_rank == input_rank + index_rank - num_index_tensors
+            type_of(out_tensor).rank
+            == input_rank + index_rank - num_index_tensors
         )
         # Do not support boolean masks at this time.
-        comptime assert index_type != .bool
+        comptime assert Indices[0].dtype != .bool
+
+        comptime assert conforms_to(type_of(input_tensor), UnsafeFusedView)
+        var in_view = unsafe_fused_view(input_tensor)
+        comptime assert conforms_to(type_of(in_view), Loadable)
 
         @inline(.always)
         def input_tensor_fn[
             dtype: DType, width: Int
-        ](idx: Coord) {var input_tensor} -> SIMD[dtype, width]:
-            return rebind[SIMD[dtype, width]](
-                input_tensor._fused_load[width](idx)
-            )
+        ](idx: Coord) {var in_view} -> SIMD[dtype, width]:
+            return rebind[SIMD[dtype, width]](in_view.load[width](idx))
+
+        var index_views = TensorTuple._fused_view(indices)
 
         @inline(.always)
         def indices_fn[
             indices_index: Int,
-        ](coordinates: Coord) {var indices} -> Int:
+        ](coordinates: Coord) {var index_views} -> Int:
             comptime assert (
                 indices_index < num_index_tensors
             ), "tensor index out of bounds"
-            return Int(indices[indices_index]._fused_load[width=1](coordinates))
+            comptime assert conforms_to(
+                type_of(index_views[indices_index]), Loadable
+            )
+            return Int(index_views[indices_index].load[width=1](coordinates))
 
         advanced_indexing_getitem[
             input_rank=input_rank,
@@ -2542,8 +2545,8 @@ struct AdvancedIndexingGetItem:
             target=target,
             trace_description=_trace_name,
         ](
-            out_tensor.to_tile_tensor[.int64](),
-            input_tensor.strides(),
+            out_tensor.to_tile_tensor(),
+            _fused_row_major_strides(input_tensor),
             ctx,
             input_tensor_fn,
             indices_fn,
@@ -2579,6 +2582,89 @@ def advanced_indexing_getitem_shape_fn[
     )
 
 
+def _check_index_tensors[*Indices: Tensor]():
+    """Checks that an advanced-indexing op's index tensors share a dtype and
+    rank."""
+    comptime for i in range(len(Indices)):
+        comptime assert (
+            Indices[i].dtype == Indices[0].dtype
+        ), "indices must share a dtype"
+        comptime assert (
+            Indices[i].rank == Indices[0].rank
+        ), "indices must share a rank"
+
+
+def _fused_row_major_strides(
+    tensor: Some[Tensor],
+) -> IndexList[type_of(tensor).rank]:
+    """Returns the strides a fused tensor argument reads or writes with.
+
+    A fused argument has no buffer of its own. MOGG lays its producer or
+    consumer out row-major over its shape, as it does for the legacy fused
+    slices.
+    """
+    return rebind[IndexList[type_of(tensor).rank]](
+        coord_to_index_list(row_major(tensor.shape()).stride_coord())
+    )
+
+
+@inline(.always)
+def _advanced_indexing_setitem_inplace[
+    Indices: TypeList[Trait=Input & Fused & LoadAccess, ...],
+    //,
+    start_axis: Int,
+    target: StaticString,
+    trace_description: StaticString,
+](
+    input_tile: TileTensor[mut=True, ...],
+    updates: Some[Input & Fused & LoadAccess],
+    indices: TensorTuple[*Indices],
+    ctx: DeviceContext,
+) raises:
+    comptime index_rank = Indices[0].rank
+    comptime num_index_tensors = len(Indices)
+    _check_index_tensors[*Indices]()
+    comptime assert type_of(updates).dtype == input_tile.dtype
+
+    comptime assert conforms_to(type_of(updates), UnsafeFusedView)
+    var updates_view = unsafe_fused_view(updates)
+    comptime assert conforms_to(type_of(updates_view), Loadable)
+
+    @inline(.always)
+    def updates_tensor_fn[
+        dtype: DType, width: Int
+    ](idx: Coord) {var updates_view} -> SIMD[dtype, width]:
+        return rebind[SIMD[dtype, width]](updates_view.load[width](idx))
+
+    var index_views = TensorTuple._fused_view(indices)
+
+    @inline(.always)
+    def indices_fn[
+        indices_index: Int,
+    ](coordinates: Coord) {var index_views} -> Int:
+        comptime assert (
+            indices_index < num_index_tensors
+        ), "tensor index out of bounds"
+        comptime assert conforms_to(
+            type_of(index_views[indices_index]), Loadable
+        )
+        return Int(index_views[indices_index].load[width=1](coordinates))
+
+    advanced_indexing_setitem_inplace[
+        start_axis=start_axis,
+        num_index_tensors=num_index_tensors,
+        target=target,
+        trace_description=trace_description,
+    ](
+        input_tile,
+        rebind[IndexList[index_rank]](coord_to_index_list(indices[0].shape())),
+        _fused_row_major_strides(updates),
+        ctx,
+        updates_tensor_fn,
+        indices_fn,
+    )
+
+
 @extensibility.register("advanced_indexing_setitem_inplace")
 struct AdvancedIndexingSetItemInplace:
     """Registers the `advanced_indexing_setitem_inplace` graph op with the graph compiler.
@@ -2587,57 +2673,23 @@ struct AdvancedIndexingSetItemInplace:
     @inline(.always)
     @staticmethod
     def execute[
-        input_rank: Int,
-        index_rank: Int,
-        updates_rank: Int,
-        input_type: DType,
-        index_type: DType,
-        num_index_tensors: Int,
+        Indices: TypeList[Trait=Input & Fused & LoadAccess, ...],
         //,
         start_axis: Int,
         target: StaticString,
         _trace_name: StaticString,
     ](
-        input_tensor: MutableInputTensor[
-            dtype=input_type, rank=input_rank, ...
-        ],
-        updates: FusedInputTensor[dtype=input_type, rank=updates_rank, ...],
-        indices: FusedInputVariadicTensors[
-            dtype=index_type,
-            rank=index_rank,
-            size=num_index_tensors,
-            ...,
-        ],
+        input_tensor: Some[MutableInput & Tensor],
+        updates: Some[Input & Fused & LoadAccess],
+        indices: TensorTuple[*Indices],
         ctx: DeviceContext,
     ) raises:
-        @inline(.always)
-        def updates_tensor_fn[
-            dtype: DType, width: Int
-        ](idx: Coord) {var updates} -> SIMD[dtype, width]:
-            return rebind[SIMD[dtype, width]](updates._fused_load[width](idx))
-
-        @inline(.always)
-        def indices_fn[
-            indices_index: Int,
-        ](coordinates: Coord) {var indices} -> Int:
-            comptime assert (
-                indices_index < num_index_tensors
-            ), "tensor index out of bounds"
-            return Int(indices[indices_index]._fused_load[width=1](coordinates))
-
-        advanced_indexing_setitem_inplace[
+        comptime assert conforms_to(type_of(input_tensor), TileTensorable)
+        _advanced_indexing_setitem_inplace[
             start_axis=start_axis,
-            num_index_tensors=num_index_tensors,
             target=target,
             trace_description=_trace_name,
-        ](
-            input_tensor.to_tile_tensor[.int64](),
-            indices[0].shape(),
-            updates.strides(),
-            ctx,
-            updates_tensor_fn,
-            indices_fn,
-        )
+        ](input_tensor.to_tile_tensor(), updates, indices, ctx)
 
 
 @extensibility.register("advanced_indexing_setitem")
@@ -2648,62 +2700,64 @@ struct AdvancedIndexingSetItem:
     @inline(.always)
     @staticmethod
     def execute[
-        input_rank: Int,
-        index_rank: Int,
-        updates_rank: Int,
-        input_type: DType,
-        index_type: DType,
-        num_index_tensors: Int,
+        Indices: TypeList[Trait=Input & Fused & LoadAccess, ...],
         //,
         start_axis: Int,
         target: StaticString,
         _trace_name: StaticString,
     ](
-        output_tensor: OutputTensor[dtype=input_type, rank=input_rank, ...],
-        input_tensor: FusedInputTensor[dtype=input_type, rank=input_rank, ...],
-        updates: FusedInputTensor[dtype=input_type, rank=updates_rank, ...],
-        indices: FusedInputVariadicTensors[
-            dtype=index_type,
-            rank=index_rank,
-            size=num_index_tensors,
-            ...,
-        ],
+        output_tensor: Some[Output & Tensor],
+        input_tensor: Some[Input & Fused & LoadAccess],
+        updates: Some[Input & Fused & LoadAccess],
+        indices: TensorTuple[*Indices],
         ctx: DeviceContext,
     ) raises:
         """Implement basic numpy-style advanced indexing with assignment but returns a copy.
         """
+        comptime assert conforms_to(type_of(output_tensor), TileTensorable)
+        comptime dtype = type_of(output_tensor).dtype
+        comptime assert type_of(input_tensor).dtype == dtype
+        comptime assert (
+            type_of(input_tensor).rank == type_of(output_tensor).rank
+        )
+
+        var output_tile = output_tensor.to_tile_tensor()
+        comptime assert conforms_to(type_of(input_tensor), UnsafeFusedView)
+        var in_view = unsafe_fused_view(input_tensor)
+        comptime assert conforms_to(type_of(in_view), Loadable)
 
         # First copy over input tensor into the output
         @inline(.always)
-        def func[
-            width: Int, element_alignment: Int
-        ](idx: IndexList[output_tensor.rank]) {var} -> SIMD[
-            output_tensor.dtype, width
-        ]:
-            return input_tensor._fused_load[
-                width, element_alignment=element_alignment
-            ](idx)
+        def copy_input[
+            width: Int, element_alignment: Int = 1
+        ](index: Coord) {var in_view, var output_tile}:
+            output_tile.store[
+                width=width,
+                alignment=min(
+                    type_of(output_tensor).alignment,
+                    element_alignment * align_of[dtype](),
+                ),
+            ](
+                index,
+                rebind[SIMD[dtype, width]](
+                    in_view.load[
+                        width=width, element_alignment=element_alignment
+                    ](index)
+                ),
+            )
 
-        foreach[target=target, _trace_name=_trace_name + "_p1/2_copy"](
-            func, output_tensor, ctx
-        )
+        elementwise[
+            get_kernel_simd_width[dtype, target](),
+            target=target,
+            _trace_description=_trace_name + "_p1/2_copy",
+        ](copy_input, Coord(output_tensor.shape()).flatten(), ctx)
 
         # Then run the updates in-place.
-        # For type checking
-        var tensor = MutableInputTensor[
-            dtype=input_type,
-            rank=input_rank,
-            static_spec=output_tensor.static_spec,
-        ](
-            output_tensor._ptr,
-            output_tensor.shape(),
-            output_tensor.strides(),
-        )
-        AdvancedIndexingSetItemInplace.execute[
-            target=target,
+        _advanced_indexing_setitem_inplace[
             start_axis=start_axis,
-            _trace_name=_trace_name + "_p2/2_update",
-        ](tensor, updates, indices, ctx)
+            target=target,
+            trace_description=_trace_name + "_p2/2_update",
+        ](output_tile, updates, indices, ctx)
 
 
 @extensibility.register("mo.sliced.add.ragged")

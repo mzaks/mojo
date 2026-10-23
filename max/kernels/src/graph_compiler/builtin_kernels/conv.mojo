@@ -54,7 +54,6 @@ from extensibility import (
     Tensor,
     TileTensorable,
     UnsafeFusedView,
-    to_tile_tensor,
     unsafe_fused_view,
 )
 from extensibility import (
@@ -899,6 +898,12 @@ struct ConvTransposeCPU:
         ctx: DeviceContext,
     ) raises:
         comptime assert conforms_to(type_of(output), Storable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(filter), TileTensorable)
+        comptime assert conforms_to(type_of(strides), TileTensorable)
+        comptime assert conforms_to(type_of(dilation), TileTensorable)
+        comptime assert conforms_to(type_of(paddings), TileTensorable)
+        comptime assert conforms_to(type_of(output_paddings), TileTensorable)
         comptime assert type_of(input).rank == type_of(output).rank
         comptime dtype = type_of(output).dtype
 
@@ -920,12 +925,12 @@ struct ConvTransposeCPU:
         var scratch = TileTensor(scratch_buf, row_major(output.shape()))
         _conv_transpose_cpu[filter_layout, has_epilogue_fusion=True](
             scratch,
-            to_tile_tensor(input),
-            to_tile_tensor(filter),
-            to_tile_tensor(strides),
-            to_tile_tensor(dilation),
-            to_tile_tensor(paddings),
-            to_tile_tensor(output_paddings),
+            input.to_tile_tensor(),
+            filter.to_tile_tensor(),
+            strides.to_tile_tensor(),
+            dilation.to_tile_tensor(),
+            paddings.to_tile_tensor(),
+            output_paddings.to_tile_tensor(),
             output_fn,
             ctx,
         )
@@ -945,15 +950,22 @@ struct ConvTransposeCPU:
         output_paddings: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises where not conforms_to(type_of(output), Fused):
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(filter), TileTensorable)
+        comptime assert conforms_to(type_of(strides), TileTensorable)
+        comptime assert conforms_to(type_of(dilation), TileTensorable)
+        comptime assert conforms_to(type_of(paddings), TileTensorable)
+        comptime assert conforms_to(type_of(output_paddings), TileTensorable)
         comptime assert type_of(input).rank == type_of(output).rank
         _conv_transpose_cpu[filter_layout, has_epilogue_fusion=False](
-            to_tile_tensor(output),
-            to_tile_tensor(input),
-            to_tile_tensor(filter),
-            to_tile_tensor(strides),
-            to_tile_tensor(dilation),
-            to_tile_tensor(paddings),
-            to_tile_tensor(output_paddings),
+            output.to_tile_tensor(),
+            input.to_tile_tensor(),
+            filter.to_tile_tensor(),
+            strides.to_tile_tensor(),
+            dilation.to_tile_tensor(),
+            paddings.to_tile_tensor(),
+            output_paddings.to_tile_tensor(),
             no_conv_simd_epilogue_fn,
             ctx,
         )

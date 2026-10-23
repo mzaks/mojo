@@ -27,6 +27,7 @@ import extensibility
 # ===-----------------------------------------------------------------------===#
 # Kernel imports
 # ===-----------------------------------------------------------------------===#
+from max.algorithm import elementwise
 from comm.allreduce import allreduce
 from internal_utils.fp8_utils import cast_saturating
 
@@ -152,21 +153,28 @@ from state_space.varlen_causal_conv1d import (
 )
 from max.runtime.tracing import trace_arg
 from extensibility import (
+    Fused,
     Input,
     InputTensor,
     InputVariadicTensors,
+    LoadAccess,
+    Loadable,
     ManagedTensorSlice,
     MutableInput,
     Output,
     OutputTensor,
     StableInputVariadicTensors,
+    Storable,
+    StoreAccess,
     Tensor,
     TensorTuple,
     TileTensorable,
+    UnsafeFusedView,
+    get_kernel_simd_width,
     simd_load_from_managed_tensor_slice,
     simd_store_into_managed_tensor_slice,
+    unsafe_fused_view,
 )
-from builtin_primitives.primitives import foreach
 from extensibility import (
     _FusedInputTensor as FusedInputTensor,
 )
@@ -275,22 +283,35 @@ struct Range:
         target: StaticString,
         _trace_name: StaticString,
     ](
-        output: FusedOutputTensor[dtype=dtype, rank=1, ...],
+        output: Some[Output & Fused & StoreAccess],
         start: Scalar[dtype],
         stop: Scalar[dtype],
         step: Scalar[dtype],
         ctx: DeviceContext,
     ) raises:
-        @inline(.always)
-        def func[
-            width: Int, element_alignment: Int
-        ](idx: IndexList[1]) {var start, var step} -> SIMD[dtype, width]:
-            return start + step * (iota[dtype, width](Scalar[dtype](idx[0])))
+        comptime assert type_of(output).dtype == dtype
+        comptime assert type_of(output).rank == 1
 
-        foreach[
+        comptime assert conforms_to(type_of(output), UnsafeFusedView)
+        var out_view = unsafe_fused_view(output)
+        comptime assert conforms_to(type_of(out_view), Storable)
+
+        @inline(.always)
+        def body[
+            width: Int, element_alignment: Int = 1
+        ](index: Coord) {var start, var step, var out_view}:
+            var val = start + step * iota[dtype, width](
+                Scalar[dtype](coord_to_index_list(index)[0])
+            )
+            out_view.store[width=width, element_alignment=element_alignment](
+                index, rebind[SIMD[type_of(out_view).dtype, width]](val)
+            )
+
+        elementwise[
+            get_kernel_simd_width[dtype, target](),
             target=target,
-            _trace_name=_trace_name,
-        ](func, output, ctx)
+            _trace_description=_trace_name,
+        ](body, Coord(output.shape()).flatten(), ctx)
 
 
 @extensibility.register_shape_function("mo.range")
@@ -328,23 +349,37 @@ struct Copy:
     """Registers the `copy` graph op with the graph compiler."""
 
     @staticmethod
-    def execute[
-        dtype: DType,
-        rank: Int,
-    ](
-        output: FusedOutputTensor[dtype=dtype, rank=rank, ...],
-        input: FusedInputTensor[dtype=dtype, rank=rank, ...],
+    def execute(
+        output: Some[Output & Fused & StoreAccess],
+        input: Some[Input & Fused & LoadAccess],
         ctx: DeviceContext,
     ) raises:
-        @inline(.always)
-        def func[
-            width: Int, element_alignment: Int
-        ](idx: IndexList[rank]) {var} -> SIMD[dtype, width]:
-            return input._fused_load[
-                width, element_alignment=element_alignment
-            ](idx)
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(input).dtype == dtype
+        comptime assert type_of(input).rank == type_of(output).rank
 
-        foreach(func, output, ctx)
+        comptime assert conforms_to(type_of(input), UnsafeFusedView)
+        var in_view = unsafe_fused_view(input)
+        comptime assert conforms_to(type_of(in_view), Loadable)
+        comptime assert conforms_to(type_of(output), UnsafeFusedView)
+        var out_view = unsafe_fused_view(output)
+        comptime assert conforms_to(type_of(out_view), Storable)
+
+        @inline(.always)
+        def body[
+            width: Int, element_alignment: Int = 1
+        ](index: Coord) {var in_view, var out_view}:
+            var val = in_view.load[
+                width=width, element_alignment=element_alignment
+            ](index)
+            out_view.store[width=width, element_alignment=element_alignment](
+                index, rebind[SIMD[type_of(out_view).dtype, width]](val)
+            )
+
+        elementwise[
+            get_kernel_simd_width[dtype, "cpu"](),
+            _trace_description="mogg.for_each",
+        ](body, Coord(output.shape()).flatten(), ctx)
 
 
 @extensibility.register("nan_check_count")
