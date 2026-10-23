@@ -91,6 +91,7 @@ from ._device_context_metal import (
 )
 
 from .. import _launch_args
+from .._launch_args import DeviceFunctionWrapper, _IdentityWrapper
 
 from ._device_context_extras import *
 
@@ -2968,23 +2969,6 @@ def _is_path_like(ss: StringSlice) -> Bool:
     return ss.startswith("/") or ss.startswith("~") or ss.startswith("./")
 
 
-struct _FunctionIdentity[FuncType: AnyType, //, func: FuncType]:
-    """Gives a function value a type that is unique to that function."""
-
-    pass
-
-
-def _is_same_function[
-    LhsType: AnyType, RhsType: AnyType, //, lhs: LhsType, rhs: RhsType
-]() -> Bool:
-    """Returns whether `lhs` and `rhs` are the same function.
-
-    Function values have no `__eq__`, and the two sides may have different
-    signatures. Comparing the types of the parametrized wrappers works for both.
-    """
-    return _FunctionIdentity[lhs] == _FunctionIdentity[rhs]
-
-
 # const char *AsyncRT_DeviceContext_loadFunctionWithDebugName(
 #     const DeviceFunction **result, const DeviceContext *ctx,
 #     const char *moduleName, const char *functionName, const char *data,
@@ -3057,10 +3041,11 @@ def _load_function(
 
 
 struct DeviceFunction[
-    func_type: TrivialRegisterPassable,
-    //,
-    func: func_type,
+    ret_type: AnyType,
     declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(*args: *declared_arg_types) thin -> ret_type,
+    Wrapper: DeviceFunctionWrapper = _IdentityWrapper,
     *,
     target: CompilationTarget = default_accelerator(),
     compile_options: StaticString = target.default_compile_options(),
@@ -3073,9 +3058,12 @@ struct DeviceFunction[
     It handles the compilation, loading, and resource management of device functions.
 
     Parameters:
-        func_type: The dtype of the function to compile.
-        func: The function to compile for GPU execution.
-        declared_arg_types: A variadic of the declared dtypes of the kernel signature (empty when the function is compiled without a checked signature).
+        ret_type: The return type of `func` (inferred).
+        declared_arg_types: The argument types of `func` (inferred).
+        func: The kernel to compile for GPU execution.
+        Wrapper: Selects the function that is actually compiled for `func`,
+            such as a generated entry point. Defaults to compiling `func` as
+            written.
         target: The target architecture for compilation. Defaults to the current GPU target.
         compile_options: The string of compilation options to pass to the compiler.
         link_options: The string of linker options to pass to the linker.
@@ -3105,6 +3093,8 @@ struct DeviceFunction[
         _cross_compilation() and Self.target.is_nvidia_gpu()
     ) else "object"
 
+    comptime _wrapped_func = Self.Wrapper.wrap[Self.func]
+
     # ===-------------------------------------------------------------------===#
     # Fields
     # ===-------------------------------------------------------------------===#
@@ -3112,7 +3102,9 @@ struct DeviceFunction[
     var _handle: _DeviceFunctionPtr[mut=True]
     """Internal handle to the compiled device function."""
 
-    var _func_impl: CompiledFunctionInfo[Self.func_type, Self.func, Self.target]
+    var _func_impl: CompiledFunctionInfo[
+        type_of(Self._wrapped_func), Self._wrapped_func, Self.target
+    ]
     """Compilation information for the function."""
 
     var _context: DeviceContext.Generic[Self.target]
@@ -3149,7 +3141,7 @@ struct DeviceFunction[
         ](func_attribute)
 
         self._func_impl = _compile_code[
-            Self.func,
+            Self._wrapped_func,
             emission_kind=self._emission_kind,
             target=Self.target,
             compile_options=Self.compile_options,
@@ -4846,8 +4838,8 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
         *,
         func_attribute: OptionalReg[FuncAttribute] = None,
         out result: DeviceFunction[
-            Self.compile_function_wrapper[func],
-            declared_arg_types,
+            func,
+            Self.FunctionWrapper,
             target=Self.target,
             compile_options=compile_options,
             link_options=link_options,
@@ -4895,9 +4887,7 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
             ), "Requested more than available shared memory."
 
         comptime result_type = type_of(result)
-        comptime if not _is_same_function[
-            Self.compile_function_wrapper[func], func
-        ]():
+        comptime if Self.FunctionWrapper != _IdentityWrapper:
             # Surface the user kernel's name (not the wrapper name) as the
             # dispatch printName for device-level profiling.
             comptime user_name = get_linkage_name[func, target=Self.target]()
@@ -4919,9 +4909,10 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
         ]()
 
     def load_function[
-        func_type: TrivialRegisterPassable,
+        ret_type: AnyType,
+        declared_arg_types: TypeList[Trait=AnyType, ...],
         //,
-        func: func_type,
+        func: def(*args: *declared_arg_types) thin -> ret_type,
     ](
         self,
         *,
@@ -4937,8 +4928,10 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
         existing CUDA/HIP code or for using specialized assembly optimizations.
 
         Parameters:
-            func_type: The dtype of the function to load.
-            func: The function reference.
+            ret_type: The return type of `func` (inferred).
+            declared_arg_types: The argument types of `func` (inferred).
+            func: A function with the loaded kernel's signature. Only its type
+                is used.
 
         Args:
             function_name: The name of the function in the assembly code.
@@ -5170,7 +5163,6 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
 
         var gpu_kernel = DeviceFunction[
             FuncType.__call__,
-            TypeList.of[Trait=AnyType, FuncType](),
             target=launch_target,
             _ptxas_info_verbose=_ptxas_info_verbose,
         ](
@@ -5263,7 +5255,6 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
 
         var gpu_kernel = DeviceFunction[
             FuncType.__call__,
-            TypeList.of[Trait=AnyType, FuncType](),
             target=launch_target,
             _ptxas_info_verbose=_ptxas_info_verbose,
         ](

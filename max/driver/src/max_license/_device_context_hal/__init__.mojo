@@ -94,6 +94,7 @@ from max.gpu.host.info import (
 )
 from max.gpu.host._legacy.func_attribute import Attribute, FuncAttribute
 from max.gpu.host import _launch_args
+from max.gpu.host._launch_args import DeviceFunctionWrapper, _IdentityWrapper
 
 
 def _check_device_context_hal_only_supported_exec_config[
@@ -929,7 +930,7 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
         _ptxas_info_verbose: Bool = False,
     ](
         self, *, func_attribute: OptionalReg[FuncAttribute] = None
-    ) raises -> DeviceFunction[func, declared_arg_types]:
+    ) raises -> DeviceFunction[func]:
         """Compiles the provided `capturing` function for execution on this
         device.
 
@@ -960,7 +961,7 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
         Raises:
             If the operation fails.
         """
-        return DeviceFunction[func, declared_arg_types](
+        return DeviceFunction[func](
             self.assert_default_target(), func_attribute=func_attribute
         )
 
@@ -1067,9 +1068,9 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
             block_dim, location=call_location()
         )
 
-        var gpu_kernel = DeviceFunction[
-            FuncType.__call__, TypeList.of[Trait=AnyType, FuncType]()
-        ](self.assert_default_target())
+        var gpu_kernel = DeviceFunction[FuncType.__call__](
+            self.assert_default_target()
+        )
 
         gpu_kernel._do_call_with_pack_checked(
             self,
@@ -1285,9 +1286,7 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
         _check_dim["DeviceContext.enqueue_function", "block_dim"](
             block_dim, location=call_location()
         )
-        var gpu_kernel = DeviceFunction[
-            FuncType.__call__, TypeList.of[Trait=AnyType, FuncType]()
-        ](
+        var gpu_kernel = DeviceFunction[FuncType.__call__](
             self.assert_default_target(),
             func_attribute=self._func_attribute_for_launch(
                 func_attribute, shared_mem_bytes
@@ -1378,9 +1377,10 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
 
     @inline(.always)
     def load_function[
-        func_type: TrivialRegisterPassable,
+        ret_type: AnyType,
+        declared_arg_types: TypeList[Trait=AnyType, ...],
         //,
-        func: func_type,
+        func: def(*args: *declared_arg_types) thin -> ret_type,
     ](
         self,
         *,
@@ -1395,8 +1395,10 @@ struct DeviceContextBase[target: CompilationTarget = default_accelerator()](
         existing CUDA/HIP code or for using specialized assembly optimizations.
 
         Parameters:
-            func_type: The dtype of the function to load.
-            func: The function reference.
+            ret_type: The return type of `func` (inferred).
+            declared_arg_types: The argument types of `func` (inferred).
+            func: A function with the loaded kernel's signature. Only its type
+                is used.
 
         Args:
             function_name: The name of the function in the assembly code.
@@ -2473,10 +2475,11 @@ struct _DeviceContextScopeHAL(Movable):
 
 
 struct DeviceFunction[
-    func_type: TrivialRegisterPassable,
-    //,
-    func: func_type,
+    ret_type: AnyType,
     declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(*args: *declared_arg_types) thin -> ret_type,
+    Wrapper: DeviceFunctionWrapper = _IdentityWrapper,
 ](ImplicitlyCopyable, Movable):
     """Represents a compiled device function ready for execution on a GPU.
 
@@ -2499,19 +2502,23 @@ struct DeviceFunction[
 
     with DeviceContext() as ctx:
         # Compile the kernel
-        var kernel = ctx.compile_function[my_kernel, my_kernel]()
+        var kernel = ctx.compile_function[my_kernel]()
         # Enqueue the kernel for execution
         ctx.enqueue_function(kernel, grid_dim=1, block_dim=1)
     ```
 
     Parameters:
-        func_type: Type of the kernel function (inferred).
-        func: The kernel function value to compile.
-        declared_arg_types: The kernel argument types used for compile-time
-            validation in `_call_with_pack_checked`.
+        ret_type: The return type of `func` (inferred).
+        declared_arg_types: The argument types of `func` (inferred). Launch
+            arguments are checked against these.
+        func: The kernel to compile.
+        Wrapper: Selects the function that is actually compiled for `func`,
+            such as a generated entry point. Defaults to compiling `func` as
+            written.
     """
 
     comptime _target = DeviceSpec.target[get_device_spec[0]()]()
+    comptime _wrapped_func = Self.Wrapper.wrap[Self.func]
 
     # ===-------------------------------------------------------------------===#
     # Fields
@@ -2522,10 +2529,10 @@ struct DeviceFunction[
     # Null until the C++ runtime shim provides it; read by the CUDA/HIP
     # interop accessors (`_nvidia_cuda` / `_amdgpu_hip`).
     var _handle: _DeviceFunctionPtr[mut=True]
-    # Hold the `CompiledFunctionInfo` by value so the closure environment of
-    # `Self.func` travels with this `DeviceFunction` value.
+    # The compilation result for `Self._wrapped_func`: its assembly and
+    # linkage name.
     var _func_info: CompiledFunctionInfo[
-        Self.func_type, Self.func, Self._target
+        type_of(Self._wrapped_func), Self._wrapped_func, Self._target
     ]
 
     # ===-------------------------------------------------------------------===#
@@ -2551,7 +2558,9 @@ struct DeviceFunction[
             If compilation or function loading fails, or if an unsupported
             function attribute is provided.
         """
-        var info = ctx._context[]._compile_inner[Self.func_type, Self.func]()
+        var info = ctx._context[]._compile_inner[
+            type_of(Self._wrapped_func), Self._wrapped_func
+        ]()
         var attr_code = OptionalReg[Int32](None)
         var attr_value = Int32(0)
         if case .Some(func_attribute) = func_attribute:
@@ -3539,9 +3548,7 @@ struct DeviceStream(ImplicitlyCopyable, Movable, _HALFunctionEnqueuer):
         _check_dim["DeviceStream.enqueue_function", "block_dim"](
             block_dim, location=call_location()
         )
-        var gpu_kernel = DeviceFunction[
-            FuncType.__call__, TypeList.of[Trait=AnyType, FuncType]()
-        ](self._ctx)
+        var gpu_kernel = DeviceFunction[FuncType.__call__](self._ctx)
         gpu_kernel._call_with_pack_checked(
             self,
             host_args=(func,),
@@ -3589,9 +3596,7 @@ struct DeviceStream(ImplicitlyCopyable, Movable, _HALFunctionEnqueuer):
         _check_dim["DeviceStream.enqueue_function", "block_dim"](
             block_dim, location=call_location()
         )
-        var gpu_kernel = DeviceFunction[
-            FuncType.__call__, TypeList.of[Trait=AnyType, FuncType]()
-        ](self._ctx)
+        var gpu_kernel = DeviceFunction[FuncType.__call__](self._ctx)
         gpu_kernel._do_call_with_pack_checked(
             self,
             execution_config,

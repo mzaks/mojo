@@ -1760,7 +1760,6 @@ struct DeviceGraphBuilder[arena_origin: ImmOrigin](Movable):
 
         var gpu_kernel = DeviceFunction[
             FuncType.__call__,
-            TypeList.of[Trait=AnyType, FuncType](),
             target=launch_target,
             _ptxas_info_verbose=_ptxas_info_verbose,
         ](self._ctx, func_attribute=func_attribute)
@@ -1865,7 +1864,6 @@ struct DeviceGraphBuilder[arena_origin: ImmOrigin](Movable):
 
         var gpu_kernel = DeviceFunction[
             FuncType.__call__,
-            TypeList.of[Trait=AnyType, FuncType](),
             target=launch_target,
             _ptxas_info_verbose=_ptxas_info_verbose,
         ](self._ctx, func_attribute=func_attribute)
