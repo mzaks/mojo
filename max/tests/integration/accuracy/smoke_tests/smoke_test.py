@@ -115,6 +115,8 @@ MODEL_RECIPES = CaseInsensitiveDict({
     "nvidia/DeepSeek-V3.1-NVFP4": "max/pipelines/architectures/deepseekV3/recipes/nvfp4_8x_b200.yaml",
     "nvidia/DeepSeek-V3.1-NVFP4__fp8kv": "max/pipelines/architectures/deepseekV3/recipes/nvfp4_fp8kv_8x_b200.yaml",
     "nvidia/DeepSeek-V3.1-NVFP4__mtp": "max/pipelines/architectures/deepseekV3/recipes/nvfp4_mtp_8x_b200.yaml",
+    "poolside/Laguna-S-2.1-NVFP4": "max/pipelines/architectures/laguna/recipes/laguna_s_2_1_nvfp4_1x_b200.yaml",
+    "poolside/Laguna-S-2.1-NVFP4__modulev3": "max/pipelines/architectures/laguna_modulev3/recipes/laguna_s_2_1_nvfp4_1x_b200.yaml",
     "nvidia/DeepSeek-V3.1-NVFP4__mtp_tpep": "max/pipelines/architectures/deepseekV3/recipes/nvfp4_mtp_tpep_8x_b200.yaml",
     "nvidia/DeepSeek-V3.1-NVFP4__tpep": "max/pipelines/architectures/deepseekV3/recipes/nvfp4_tpep_8x_b200.yaml",
     "nvidia/DeepSeek-V3.1-NVFP4__tpep_ar": "max/pipelines/architectures/deepseekV3/recipes/nvfp4_tpep_ar_8x_b200.yaml",
