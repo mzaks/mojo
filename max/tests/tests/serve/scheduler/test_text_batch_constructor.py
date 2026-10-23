@@ -3116,6 +3116,56 @@ def test_dp_ce_balance__pool_wait_restarts_when_a_preempted_request_returns() ->
     assert 0 <= wait_ms < 1000
 
 
+def test_dp_ce_balance__a_cordon_wait_survives_the_return_to_the_pool() -> None:
+    """A request preempted back to the pool keeps the wait it started.
+
+    Without DP balancing it is rebound and keeps it, so with balancing the
+    same preemption must not drop the wait or restart it at a later cordon.
+    """
+    batch_constructor = create_dp_balance_constructor()
+    ctx = create_lora_context(seq_len=50)
+    batch_constructor.enqueue_new_request(ctx, replica_idx=0)
+    batch_constructor._ce_arrival[ctx.request_id] = time.monotonic()
+    batch_constructor._cordon_waits[ctx.request_id] = (
+        text_batch_constructor._CordonWait(
+            since=time.monotonic() - 0.5, pass_idx=0
+        )
+    )
+
+    batch_constructor._preempt_request(
+        ctx, 0, reason=PreemptionReason.KV_CACHE_MEMORY
+    )
+    assert ctx.request_id in batch_constructor._ce_pending
+    with patch(
+        "max.serve.scheduler.batch_constructor.text_batch_constructor.METRICS"
+    ) as mock_metrics:
+        inputs = batch_constructor.construct_batch()
+
+    assert has_request(inputs.batches[0] + inputs.batches[1], ctx.request_id)
+    mock_metrics.connector_cordon_wait_time.assert_called_once()
+    (wait_ms,) = mock_metrics.connector_cordon_wait_time.call_args.args
+    assert 500 <= wait_ms < 1000
+
+
+def test_dp_ce_balance__releasing_a_pooled_request_drops_its_cordon_wait() -> (
+    None
+):
+    batch_constructor = create_dp_balance_constructor()
+    ctx = create_lora_context(seq_len=50)
+    batch_constructor.enqueue_new_request(ctx, replica_idx=0)
+    batch_constructor._ce_arrival[ctx.request_id] = time.monotonic()
+    batch_constructor._cordon_waits[ctx.request_id] = (
+        text_batch_constructor._CordonWait(since=time.monotonic(), pass_idx=0)
+    )
+    batch_constructor._preempt_request(
+        ctx, 0, reason=PreemptionReason.KV_CACHE_MEMORY
+    )
+
+    batch_constructor.release_request(ctx.request_id)
+
+    assert not batch_constructor._cordon_waits
+
+
 def test_dp_ce_balance__preempted_request_returns_to_the_pool() -> None:
     """A preempted pool-managed request must not poison its old replica.
 
@@ -3820,6 +3870,173 @@ def test_text_batch_constructor__rejects_a_negative_lookup_bound(
 
     with pytest.raises(ValueError, match=MAX_PENDING_LOOKUPS_ENV_VAR):
         _batch_constructor_over_jenga(pipeline, _DeferringConnector())
+
+
+@pytest.mark.parametrize(
+    ("reason", "num_tokens", "only_first_looks_up"),
+    [
+        ("budget", 20, False),
+        ("max_pending", 9, False),
+        ("held", 9, True),
+    ],
+)
+def test_text_batch_constructor__counts_each_lookup_admission_stop(
+    pipeline: Pipeline[TextGenerationInputs[TextContext], TextGenerationOutput],
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+    num_tokens: int,
+    only_first_looks_up: bool,
+) -> None:
+    """A pass that stops admission on a deferred lookup says what stopped it.
+
+    ``budget`` is the pass's share of lookup tokens spent, ``max_pending``
+    the replica's bound on unanswered lookups reached, and ``held`` a prompt
+    that arrived behind one still out on its lookup.
+    """
+    monkeypatch.setenv(MAX_PENDING_LOOKUPS_ENV_VAR, "2")
+    connector = _DeferringConnector()
+    batch_constructor, manager = _batch_constructor_over_jenga(
+        pipeline, connector
+    )
+    ctxs = [_ce_ctx_of(num_tokens) for _ in range(4)]
+    if only_first_looks_up:
+        kv_cache = cast(Mock, batch_constructor.kv_cache)
+        kv_cache.starts_lookup = Mock(
+            side_effect=lambda ctx: (
+                ctx is ctxs[0] and manager.starts_lookup(ctx)
+            )
+        )
+    for ctx in ctxs:
+        batch_constructor.enqueue_new_request(ctx)
+
+    with patch(
+        "max.serve.scheduler.batch_constructor.text_batch_constructor.METRICS"
+    ) as mock_metrics:
+        batch_constructor.construct_batch()
+
+    assert mock_metrics.connector_lookup_admission_stop.call_args_list == [
+        call(reason)
+    ]
+
+
+def test_text_batch_constructor__records_the_cordon_wait_once_at_admission(
+    pipeline: Pipeline[TextGenerationInputs[TextContext], TextGenerationOutput],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cordoned prompt's wait is recorded when it is admitted, and only then.
+
+    It runs from the cordon to the admission, and a cordon that clears on
+    the next pass still reads as the one pass it cost.
+    """
+    clock = [10.0]
+    monkeypatch.setattr(
+        text_batch_constructor,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0]),
+    )
+    onload = _IncompleteOnload()
+    kv_cache = _make_cordon_kv_cache(
+        Mock(side_effect=[onload, CompletedTransfer()])
+    )
+    batch_constructor = TextBatchConstructor(
+        scheduler_config=_cordon_config(),
+        pipeline=pipeline,
+        kv_cache=kv_cache,
+    )
+    ctx = _ce_ctx()
+    batch_constructor.enqueue_new_request(ctx)
+
+    with patch(
+        "max.serve.scheduler.batch_constructor.text_batch_constructor.METRICS"
+    ) as mock_metrics:
+        batch_constructor.construct_batch()
+        mock_metrics.connector_cordon_wait_time.assert_not_called()
+
+        clock[0] += 0.25
+        onload.synchronize()
+        inputs = batch_constructor.construct_batch()
+        assert has_request(inputs.batches[0], ctx.request_id)
+        batch_constructor.construct_batch()
+
+    mock_metrics.connector_cordon_wait_time.assert_called_once_with(
+        pytest.approx(250.0)
+    )
+    mock_metrics.connector_cordon_passes.assert_called_once_with(1)
+
+
+def test_text_batch_constructor__an_uncordoned_admission_records_no_wait(
+    pipeline: Pipeline[TextGenerationInputs[TextContext], TextGenerationOutput],
+) -> None:
+    batch_constructor = TextBatchConstructor(
+        scheduler_config=_cordon_config(),
+        pipeline=pipeline,
+        kv_cache=create_mock_kv_cache(),
+    )
+    ctx = _ce_ctx()
+    batch_constructor.enqueue_new_request(ctx)
+
+    with patch(
+        "max.serve.scheduler.batch_constructor.text_batch_constructor.METRICS"
+    ) as mock_metrics:
+        inputs = batch_constructor.construct_batch()
+
+    assert has_request(inputs.batches[0], ctx.request_id)
+    mock_metrics.connector_cordon_wait_time.assert_not_called()
+    mock_metrics.connector_cordon_passes.assert_not_called()
+
+
+def test_text_batch_constructor__the_cordon_wait_spans_lookup_and_onload(
+    pipeline: Pipeline[TextGenerationInputs[TextContext], TextGenerationOutput],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt cordoned on its lookup and then on the onload the answer
+    starts reports one wait, from the lookup's cordon to its admission.
+    """
+    clock = [0.0]
+    monkeypatch.setattr(
+        text_batch_constructor,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0]),
+    )
+    connector = _DeferringOnloadingConnector()
+    batch_constructor, _ = _batch_constructor_over_jenga(pipeline, connector)
+    ctx = _ce_ctx()
+    batch_constructor.enqueue_new_request(ctx)
+
+    admitted_on = None
+    with patch(
+        "max.serve.scheduler.batch_constructor.text_batch_constructor.METRICS"
+    ) as mock_metrics:
+        for pass_idx in range(6):
+            clock[0] = pass_idx * 0.1
+            inputs = batch_constructor.construct_batch()
+            if has_request(inputs.batches[0], ctx.request_id):
+                admitted_on = pass_idx
+                break
+
+    assert admitted_on is not None and admitted_on >= 2, (
+        "admitted before both the lookup and the onload cordoned it"
+    )
+    assert len(connector.started) == 1
+    mock_metrics.connector_cordon_wait_time.assert_called_once_with(
+        pytest.approx(admitted_on * 100.0)
+    )
+    mock_metrics.connector_cordon_passes.assert_called_once_with(admitted_on)
+
+
+def test_text_batch_constructor__release_drops_a_cordon_wait(
+    pipeline: Pipeline[TextGenerationInputs[TextContext], TextGenerationOutput],
+) -> None:
+    connector = _DeferringConnector()
+    batch_constructor, _ = _batch_constructor_over_jenga(pipeline, connector)
+    ctx = _ce_ctx()
+    batch_constructor.enqueue_new_request(ctx)
+    batch_constructor.construct_batch()
+    assert ctx.request_id in batch_constructor._cordon_waits
+
+    batch_constructor.release_request(ctx.request_id)
+
+    assert not batch_constructor._cordon_waits
 
 
 def _claim_tracking_kv_cache(

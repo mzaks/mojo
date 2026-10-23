@@ -36,7 +36,7 @@ from max.pipelines.modeling.types import (
     TextGenerationInputs,
 )
 from max.profiler import traced
-from max.serve.telemetry.metrics import METRICS
+from max.serve.telemetry.metrics import METRICS, LookupAdmissionStop
 
 from ..config import TokenGenerationSchedulerConfig
 from ..dp_padding import DPBatchPadder, DPPaddingInfo
@@ -168,6 +168,21 @@ class _LookupHold:
     replica_idx: int
     seq: int
     since: float
+
+
+@dataclass(frozen=True)
+class _CordonWait:
+    """When a request was first cordoned, on a connector lookup or an onload.
+
+    Kept until the request is admitted or released, through readmissions,
+    re-asks and a preemption back to the DP pool, so the wait recorded at
+    admission is measured the same way with or without DP balancing.
+    ``since`` is on ``time.monotonic`` and ``pass_idx`` counts
+    ``construct_batch`` calls.
+    """
+
+    since: float
+    pass_idx: int
 
 
 def _onload_settled(event: KVTransfer) -> bool:
@@ -600,6 +615,8 @@ class TextBatchConstructor:
         self._bind_seq: dict[RequestID, int] = {}
         self._next_bind_seq = itertools.count()
         self._lookup_holds: dict[RequestID, _LookupHold] = {}
+        self._cordon_waits: dict[RequestID, _CordonWait] = {}
+        self._pass_idx = 0
 
         # DP-balanced CE deferral state. New CE requests wait in
         # ``_ce_pending`` unbound to any replica (insertion order == arrival
@@ -1092,6 +1109,7 @@ class TextBatchConstructor:
             del self._ce_pending[request_id]
             self._ce_arrival.pop(request_id, None)
             self._bind_seq.pop(request_id, None)
+            self._cordon_waits.pop(request_id, None)
             self.pipeline.release(request_id)
             return
 
@@ -1103,6 +1121,7 @@ class TextBatchConstructor:
         self._onloading_reqs.pop(request_id, None)
         self._readmitted_lookups.pop(request_id, None)
         self._lookup_holds.pop(request_id, None)
+        self._cordon_waits.pop(request_id, None)
         self._bind_seq.pop(request_id, None)
 
         bound = self._bound_requests[request_id]
@@ -1439,6 +1458,16 @@ class TextBatchConstructor:
             and self.kv_cache.num_req_blocks(ctx) == 0
         )
 
+    def _record_cordon_wait(self, request_id: RequestID) -> None:
+        """Records how long an admitted request waited cordoned, if it did."""
+        wait = self._cordon_waits.pop(request_id, None)
+        if wait is None:
+            return
+        METRICS.connector_cordon_wait_time(
+            (time.monotonic() - wait.since) * 1000
+        )
+        METRICS.connector_cordon_passes(self._pass_idx - wait.pass_idx)
+
     def _ce_admission_seats(self, replica_idx: int) -> int:
         """How many CE requests ``_add_ce_requests`` can seat here this step.
 
@@ -1548,14 +1577,19 @@ class TextBatchConstructor:
                     ctx
                 )
                 held = self._held_behind_lookup(ctx, replica_idx)
-                if (
+                stop: LookupAdmissionStop | None = None
+                if starts_lookup and lookup_budget <= 0:
+                    stop = "budget"
+                elif (
                     starts_lookup
-                    and (
-                        lookup_budget <= 0
-                        or self._pending_lookup_count(replica_idx)
-                        >= self.max_pending_lookups
-                    )
-                ) or (held and not starts_lookup):
+                    and self._pending_lookup_count(replica_idx)
+                    >= self.max_pending_lookups
+                ):
+                    stop = "max_pending"
+                elif held and not starts_lookup:
+                    stop = "held"
+                if stop is not None:
+                    METRICS.connector_lookup_admission_stop(stop)
                     replica_requests.ce_reqs[req_id] = ctx
                     replica_requests.ce_reqs.move_to_end(req_id, last=False)
                     break
@@ -1628,6 +1662,10 @@ class TextBatchConstructor:
                         event=onload_event,
                         awaiting_lookup=awaiting_lookup,
                     )
+                    if req_id not in self._cordon_waits:
+                        self._cordon_waits[req_id] = _CordonWait(
+                            since=time.monotonic(), pass_idx=self._pass_idx
+                        )
                     if awaiting_lookup:
                         lookup_budget -= self._ce_weight(ctx)
                         if req_id not in self._lookup_holds:
@@ -1665,6 +1703,7 @@ class TextBatchConstructor:
                         return
                     batch.batch[req_id] = ctx
                     self._lookup_holds.pop(req_id, None)
+                    self._record_cordon_wait(req_id)
                     replica_requests.add_active_lora(ctx, self._lora_manager)
                     batch.token_budget.add_to_budget(
                         ctx, request_type=RequestType.CE
@@ -1673,6 +1712,7 @@ class TextBatchConstructor:
                 case BudgetStatus.BUDGET_AVAILABLE:
                     batch.batch[req_id] = ctx
                     self._lookup_holds.pop(req_id, None)
+                    self._record_cordon_wait(req_id)
                     batch.token_budget.add_to_budget(
                         ctx, request_type=RequestType.CE
                     )
@@ -2313,6 +2353,7 @@ class TextBatchConstructor:
 
     def construct_batch(self) -> TextGenerationInputs[TextContext]:
         """Constructs Pipeline Inputs which includes a batch for each replica."""
+        self._pass_idx += 1
 
         # Settle what the last forward left in flight, every iteration and not
         # only when something is admitted. ``kv_cache.alloc`` is the only other

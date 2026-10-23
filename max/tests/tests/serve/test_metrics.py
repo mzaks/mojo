@@ -776,6 +776,111 @@ def test_create_counter_accepts_a_no_op_meter() -> None:
     assert isinstance(counter, NoOpCounter)
 
 
+@pytest.mark.parametrize(
+    ("prompt_tokens", "bucket"),
+    [
+        (0, "0-8k"),
+        (8191, "0-8k"),
+        (8192, "8k-32k"),
+        (32767, "8k-32k"),
+        (32768, "32k-64k"),
+        (65536, "64k-128k"),
+        (131072, "128k-256k"),
+        (262143, "128k-256k"),
+        (262144, "256k-plus"),
+        (1_000_000, "256k-plus"),
+    ],
+)
+def test_prompt_length_bucket_edges(prompt_tokens: int, bucket: str) -> None:
+    """Each bucket includes its lower bound, in 1024-token k."""
+    assert metrics._prompt_length_bucket(prompt_tokens) == bucket
+
+
+def test_ttft_by_prompt_length_carries_the_bucket() -> None:
+    client = mock.Mock()
+    recorder = metrics._AsyncMetrics()
+    recorder.configure(client, {"model": "m"})
+
+    recorder.ttft_by_prompt_length(125.0, 20_000)
+
+    measurement = client.send_measurement.call_args.args[0]
+    assert (
+        measurement.instrument_name,
+        measurement.value,
+        measurement.attributes,
+    ) == (
+        "maxserve.time_to_first_token_by_prompt_length",
+        125.0,
+        {"model": "m", "prompt_length": "8k-32k"},
+    )
+    assert recorder.extra_attributes == {"model": "m"}
+    assert isinstance(
+        metrics.SERVE_METRICS["maxserve.time_to_first_token_by_prompt_length"],
+        _ProxyHistogram,
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "value", "instrument"),
+    [
+        (
+            "connector_cordon_wait_time",
+            42.5,
+            "maxserve.cache.connector_cordon_wait_time",
+        ),
+        (
+            "connector_cordon_passes",
+            3,
+            "maxserve.cache.connector_cordon_passes",
+        ),
+    ],
+)
+def test_connector_cordon_metrics_are_histograms(
+    method: str, value: float, instrument: str
+) -> None:
+    client = mock.Mock()
+    recorder = metrics._AsyncMetrics()
+    recorder.configure(client, {"model": "m"})
+
+    getattr(recorder, method)(value)
+
+    measurement = client.send_measurement.call_args.args[0]
+    assert (
+        measurement.instrument_name,
+        measurement.value,
+        measurement.attributes,
+    ) == (instrument, value, {"model": "m"})
+    assert isinstance(metrics.SERVE_METRICS[instrument], _ProxyHistogram)
+
+
+@pytest.mark.parametrize("reason", ["budget", "max_pending", "held"])
+def test_connector_lookup_admission_stop_carries_the_reason(
+    reason: metrics.LookupAdmissionStop,
+) -> None:
+    client = mock.Mock()
+    recorder = metrics._AsyncMetrics()
+    recorder.configure(client, {"model": "m"})
+
+    recorder.connector_lookup_admission_stop(reason)
+
+    measurement = client.send_measurement.call_args.args[0]
+    assert (
+        measurement.instrument_name,
+        measurement.value,
+        measurement.attributes,
+    ) == (
+        "maxserve.cache.connector_lookup_admission_stops",
+        1,
+        {"model": "m", "reason": reason},
+    )
+    assert isinstance(
+        metrics.SERVE_METRICS[
+            "maxserve.cache.connector_lookup_admission_stops"
+        ],
+        _ProxyCounter,
+    )
+
+
 def test_scheduler_step_time_is_a_separate_histogram() -> None:
     name = "maxserve.scheduler.batch_step_time"
     assert _is_histogram(metrics.SERVE_METRICS[name])

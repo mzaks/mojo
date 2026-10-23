@@ -217,6 +217,8 @@ HISTOGRAM_BUCKETS_BY_METRIC: dict[str, tuple[float, ...]] = {
     "maxserve.input_processing_time": HISTOGRAM_LATENCY_BUCKETS_MS,
     "maxserve.output_processing_time": HISTOGRAM_LATENCY_BUCKETS_MS,
     "maxserve.time_to_first_token": HISTOGRAM_LATENCY_BUCKETS_MS,
+    "maxserve.time_to_first_token_by_prompt_length": HISTOGRAM_LATENCY_BUCKETS_MS,
+    "maxserve.cache.connector_cordon_wait_time": HISTOGRAM_LATENCY_BUCKETS_MS,
     "maxserve.response_queue_time": HISTOGRAM_LATENCY_BUCKETS_MS,
     "maxserve.model_load_time": HISTOGRAM_LATENCY_BUCKETS_MS,
     "maxserve.itl": HISTOGRAM_LATENCY_BUCKETS_MS,
@@ -277,6 +279,8 @@ HISTOGRAM_BUCKETS_BY_METRIC: dict[str, tuple[float, ...]] = {
     # Media items of one kind on a single request; the same ladder as batch
     # size, since both count per-request work items.
     "maxserve.media.items_per_request": HISTOGRAM_BATCH_SIZE_BUCKETS,
+    # Exact through 20 passes, where a cordon that costs a pass or two lives.
+    "maxserve.cache.connector_cordon_passes": HISTOGRAM_BATCH_SIZE_BUCKETS,
     # Throughput (tokens/s)
     "maxserve.batch_prompt_throughput": HISTOGRAM_THROUGHPUT_TOKENS_BUCKETS,
     "maxserve.batch_generation_throughput": HISTOGRAM_THROUGHPUT_TOKENS_BUCKETS,
