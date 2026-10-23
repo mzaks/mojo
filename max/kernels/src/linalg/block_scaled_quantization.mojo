@@ -166,6 +166,7 @@ def quantize_dynamic_scaled_fp4fp8[
     rope_layout: TensorLayout = RowMajorLayout[
         *Coord[Int64, Int64].element_types
     ],
+    grid_by_occupancy: Bool = False,
 ](
     ctx: DeviceContext,
     output_tile: TileTensor[mut=True, out_dtype, address_space=.GENERIC, ...],
@@ -209,6 +210,8 @@ def quantize_dynamic_scaled_fp4fp8[
         rope_head_dim: Columns per head; read only when `rope_dim > 0`.
         rope_inverse: Whether to rotate by the conjugate of `rope_freqs`.
         rope_layout: Layout of `rope_freqs` (inferred).
+        grid_by_occupancy: Whether to size the grid by the blocks an SM
+            holds at the kernel's register use, instead of by threads.
     Args:
         ctx: Device context used to enqueue the kernel.
         output_tile: Output tile for the quantized elements of shape
@@ -272,6 +275,24 @@ def quantize_dynamic_scaled_fp4fp8[
         return
     var num_rows_padded = align_up(num_rows, SF_MN_GROUP_SIZE)
 
+    comptime kernel = quantize_dynamic_scaled_fp4fp8_kernel[
+        out_dtype,
+        scales_dtype,
+        in_dtype,
+        output_tile.LayoutType,
+        scales_tile.LayoutType,
+        input_tile.LayoutType,
+        SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+        ELEMENTS_PER_THREAD=ELEMENTS_PER_THREAD,
+        num_max_threads=num_max_threads,
+        gated=gated,
+        activation=activation,
+        rope_dim=rope_dim,
+        rope_head_dim=rope_head_dim,
+        rope_inverse=rope_inverse,
+        rope_layout=rope_layout,
+    ]
+
     var block_dim = (
         min(num_cols // ELEMENTS_PER_THREAD, num_max_threads),
         1,
@@ -280,6 +301,16 @@ def quantize_dynamic_scaled_fp4fp8[
     var num_blocks_per_SM = max(
         1, B200.gpu_info.threads_per_multiprocessor // block_dim[0]
     )
+    comptime if grid_by_occupancy:
+        # One resident wave: a second, partial wave of blocks waits for the
+        # first one's rows.
+        var func = ctx.compile_function[kernel]()
+        num_blocks_per_SM = max(
+            1,
+            func.occupancy_max_active_blocks_per_multiprocessor(
+                block_dim[0], 0
+            ),
+        )
     var num_slots = num_SMs * num_blocks_per_SM
     var grid_x = min(num_rows_padded, num_slots)
     # A row wider than one block's pass loops over its columns one load
@@ -298,24 +329,6 @@ def quantize_dynamic_scaled_fp4fp8[
     if col_blocks > 1:
         grid_x = min(num_rows_padded, max(num_rows, num_SMs // col_blocks))
     var grid_dim = (grid_x, col_blocks, 1)
-
-    comptime kernel = quantize_dynamic_scaled_fp4fp8_kernel[
-        out_dtype,
-        scales_dtype,
-        in_dtype,
-        output_tile.LayoutType,
-        scales_tile.LayoutType,
-        input_tile.LayoutType,
-        SF_VECTOR_SIZE=SF_VECTOR_SIZE,
-        ELEMENTS_PER_THREAD=ELEMENTS_PER_THREAD,
-        num_max_threads=num_max_threads,
-        gated=gated,
-        activation=activation,
-        rope_dim=rope_dim,
-        rope_head_dim=rope_head_dim,
-        rope_inverse=rope_inverse,
-        rope_layout=rope_layout,
-    ]
 
     ctx.enqueue_function[kernel](
         output_tile,
@@ -3672,23 +3685,41 @@ def rope_quantize_dynamic_block_scaled[
         DType.float32, freqs_device.LayoutType, ImmUnsafeAnyOrigin
     ]
     var freqs = rebind[FreqsTensor](freqs_device.as_unsafe_any_origin())
-    quantize_dynamic_scaled_fp4fp8[
-        SF_VECTOR_SIZE=SF_VECTOR_SIZE,
-        num_max_threads=1024 if is_fp8 else 512,
-        rope_dim=freqs_device.static_shape[1],
-        rope_head_dim=head_dim,
-        rope_inverse=inverse,
-        rope_layout=freqs_device.LayoutType,
-    ](
-        ctx,
-        output_device.as_unsafe_any_origin(),
-        scales_device.as_unsafe_any_origin(),
-        input_device.as_unsafe_any_origin(),
-        num_cols=num_cols,
-        num_cols_padded=num_cols,
-        tensor_sf=tensor_sf,
-        rope_freqs=freqs,
-    )
+
+    def launch[num_max_threads: Int, grid_by_occupancy: Bool]() raises {imm}:
+        quantize_dynamic_scaled_fp4fp8[
+            SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+            num_max_threads=num_max_threads,
+            rope_dim=freqs_device.static_shape[1],
+            rope_head_dim=head_dim,
+            rope_inverse=inverse,
+            rope_layout=freqs_device.LayoutType,
+            grid_by_occupancy=grid_by_occupancy,
+        ](
+            ctx,
+            output_device.as_unsafe_any_origin(),
+            scales_device.as_unsafe_any_origin(),
+            input_device.as_unsafe_any_origin(),
+            num_cols=num_cols,
+            num_cols_padded=num_cols,
+            tensor_sf=tensor_sf,
+            rope_freqs=freqs,
+        )
+
+    comptime if is_fp8:
+        # A 512-thread block fits three times an SM and a 1024-thread block
+        # once. The smaller blocks win at few rows and at many. Between
+        # them, one wave of the larger blocks wins up to about ten rows a
+        # block, then the two waves of a grid sized by threads.
+        var num_rows = Int(input_device.dim(0))
+        if num_rows <= 256 or num_rows > 4096:
+            launch[512, True]()
+        elif num_rows <= 1536:
+            launch[1024, True]()
+        else:
+            launch[1024, False]()
+    else:
+        launch[512, False]()
 
 
 @inline(.always)
