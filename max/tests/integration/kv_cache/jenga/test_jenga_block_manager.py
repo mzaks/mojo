@@ -646,6 +646,28 @@ def test_swa_reserves_every_page_a_decoding_request_holds() -> None:
     assert bm._blocks_to_reserve(4096)[SLIDING] == len(held)
 
 
+@pytest.mark.parametrize("caching", [True, False])
+def test_swa_reserves_a_replay_window_page_with_prefix_caching(
+    caching: bool,
+) -> None:
+    """With caching, one more page keeps the window ending a page earlier.
+
+    A replay of a page-aligned prompt resumes there, one page short of where
+    the prompt ended.
+    """
+    leaf = PagedKVLeafRegion(
+        leaf_id=SLIDING,
+        group_id=KVCacheGroupId("sliding_window", 12),
+        bytes_per_page=1,
+        page_size=4,
+    )
+
+    assert leaf.blocks_to_reserve(99, enable_prefix_caching=caching) == (
+        5 if caching else 4
+    )
+    assert leaf.blocks_to_reserve(2, enable_prefix_caching=caching) == 2
+
+
 def test_swa_reuses_the_blocks_it_freed() -> None:
     """The window walks forward through a pool far smaller than the sequence.
 
