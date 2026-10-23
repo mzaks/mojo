@@ -132,6 +132,7 @@ MODEL_RECIPES = CaseInsensitiveDict({
     "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4__modulev3": "max/pipelines/architectures/nemotron_h_modulev3/recipes/lightning_nvfp4.yaml",
     "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4__modulev3_dspark": "max/pipelines/architectures/nemotron_h_modulev3/recipes/lightning_nvfp4_dspark.yaml",
     "tencent/Hy4-preview-FP8__mtp": "max/pipelines/architectures/hy_v4/recipes/hy4_preview_fp8_tp_ep_8x_b200.yaml",
+    "thinkingmachines/Inkling-Small-NVFP4__modulev3": "max/pipelines/architectures/inkling_modulev3/recipes/inkling_small_nvfp4.yaml",
     "thinkingmachines/Inkling-Small-NVFP4__mtp": "max/pipelines/architectures/inkling/recipes/inkling_small_nvfp4_mtp.yaml",
     "RadixArk/Qwen3.8-27B-NVFP4__mtp": "max/pipelines/architectures/qwen3_5/recipes/qwen38_27b_nvfp4_mtp.yaml",
     "RadixArk/Qwen3.8-27B-NVFP4__dflash2": "max/pipelines/architectures/qwen3_5/recipes/qwen38_27b_nvfp4_dflash2.yaml",

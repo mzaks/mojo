@@ -249,6 +249,11 @@ def register_all_models() -> None:
         _LazyArch(
             "InklingForConditionalGeneration", ".inkling", "inkling_arch"
         ),
+        _LazyArch(
+            "InklingForConditionalGeneration_ModuleV3",
+            ".inkling_modulev3",
+            "inkling_modulev3_arch",
+        ),
         _LazyArch("InternVLChatModel", ".internvl", "internvl_arch"),
         _LazyArch(
             "KimiK25ForConditionalGeneration", ".kimik2_5", "kimik2_5_arch"

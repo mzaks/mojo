@@ -135,6 +135,7 @@ MODELS: Mapping[str, set[str]] = {
     "tencent/Hy4-preview-FP8": NIGHTLY | _8xB200,
     "tencent/Hy4-preview-FP8__mtp": NIGHTLY | VARIANT | _8xB200,
     "thinkingmachines/Inkling-Small-NVFP4": NIGHTLY | _2xB200,
+    "thinkingmachines/Inkling-Small-NVFP4__modulev3": VARIANT | _2xB200,
     "thinkingmachines/Inkling-Small-NVFP4__mtp": NIGHTLY | VARIANT | _2xB200,
     "zai-org/GLM-5.3-Flash__tpep": NIGHTLY | VARIANT | _8xB200,
     "zai-org/GLM-5.3-Flash__tpep_mi355": NIGHTLY | VARIANT | _2xMI355,
