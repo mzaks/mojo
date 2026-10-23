@@ -142,7 +142,9 @@ class _UnifiedSpecDecodeModelMixin:
         graph declares it.
         """
         outputs = self._spec_decode_model.output_metadata
-        if len(outputs) != 4:
+        # Exports may have one distribution per replica; MAX Serve rejects
+        # that layout before constructing its pipeline.
+        if len(outputs) < 4:
             return None
         shape = outputs[3].shape
         assert shape is not None and isinstance(shape[-1], int), (
@@ -1168,7 +1170,9 @@ class SpecDecodePipelineModel(
         graph declares it.
         """
         outputs = self.model.output_metadata
-        if len(outputs) != 4:
+        # Exports may have one distribution per replica; MAX Serve rejects
+        # that layout before constructing its pipeline.
+        if len(outputs) < 4:
             return None
         shape = outputs[3].shape
         assert shape is not None and isinstance(shape[-1], int), (
