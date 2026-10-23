@@ -3996,11 +3996,22 @@ struct Grouped1D1DMatmulKernel[
                         rows_bf[2 * mtx] = pair_bf[0]
                         rows_bf[2 * mtx + 1] = pair_bf[1]
                     var lane_hi, lane_lo = divmod(UInt32(lane_v), UInt32(8))
-                    var row_token = UInt32(r * 8) + lane_lo
                     var row_feature = lane_hi * 8 + warp_row_offset
-                    var row_idx = row_token * UInt32(BM) + row_feature + base
+                    # The swizzle maps whole 1024-element patterns to
+                    # themselves and `base` starts on one, so only the
+                    # offset within a pattern is swizzled. The repeats then
+                    # add immediates instead of each keeping an address.
+                    comptime row_step = r * 8 * BM
+                    comptime row_lo = row_step % 1024
+                    var row_idx = (
+                        SWIZZLE_BF(
+                            lane_lo * UInt32(BM) + row_feature + UInt32(row_lo)
+                        )
+                        + UInt32(row_step - row_lo)
+                        + base
+                    )
                     st_matrix[simd_width=4, transpose=True](
-                        smem_bf16_ptr.unsafe_offset(Int(SWIZZLE_BF(row_idx))),
+                        smem_bf16_ptr.unsafe_offset(Int(row_idx)),
                         bitcast[DType.float32, 4](rows_bf),
                     )
                 else:
@@ -4205,6 +4216,19 @@ struct Grouped1D1DMatmulKernel[
                 # execute a uniform iteration count (comptime for); the per-store
                 # bounds check skips out-of-range tokens.
                 var stage_m_offset = m_abs + UInt32(loop_stage) * UInt32(stageN)
+                # Iteration `it` reads whole token rows past iteration 0's.
+                # Their part in whole 1024-element swizzle patterns passes
+                # through the swizzle, so the iterations share this thread's
+                # swizzled offsets and add immediates.
+                comptime assert (
+                    total_threads % n_threads_per_token == 0
+                ), "a token's threads divide the epilogue threads"
+                var lane_token, lane_hid = divmod(
+                    tid_within_epi, UInt32(n_threads_per_token)
+                )
+                var lane_row = lane_token * UInt32(BM) + lane_hid * UInt32(
+                    2 * src_width
+                )
 
                 comptime for it in range(coop_iters):
                     var linear_var = Int(tid_within_epi) + it * total_threads
@@ -4214,7 +4238,6 @@ struct Grouped1D1DMatmulKernel[
                     )
                     var m_global = stage_m_offset + token_idx
                     var k_post = hid_idx * UInt32(src_width)
-                    var k_raw = 2 * k_post
 
                     # The bf16 XOR swizzle keeps only 8-bf16 contiguity (bits
                     # 0..2), so a wider single load would cross a swizzle
@@ -4222,19 +4245,22 @@ struct Grouped1D1DMatmulKernel[
                     # then deinterleave for the (gate, up) stride-2 split.
                     comptime BF16_LOAD_W = 8
                     comptime n_loads = (2 * src_width) // BF16_LOAD_W
-                    var smem_base = (
-                        UInt32(token_idx) * UInt32(BM)
-                        + UInt32(k_raw)
+                    comptime it_off = (
+                        UInt32(it * (total_threads // n_threads_per_token) * BM)
                         + scratch_base
                     )
+                    comptime it_lo = it_off % 1024
                     var pair_bf = SIMD[.bfloat16, 2 * src_width]()
                     comptime for li in range(n_loads):
+                        var smem_idx = SWIZZLE_BF(
+                            lane_row + it_lo + UInt32(li * BF16_LOAD_W)
+                        ) + (it_off - it_lo)
                         # Without the alignment the load splits into
                         # 2-byte LDS.
                         var chunk = smem_bf16_ptr.unsafe_load[
                             width=BF16_LOAD_W,
                             alignment=BF16_LOAD_W * size_of[BFloat16](),
-                        ](Int(SWIZZLE_BF(smem_base + UInt32(li * BF16_LOAD_W))))
+                        ](Int(smem_idx))
                         comptime for ci in range(BF16_LOAD_W):
                             pair_bf[li * BF16_LOAD_W + ci] = chunk[ci]
                     var pair = pair_bf.cast[.float32]()
