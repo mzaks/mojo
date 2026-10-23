@@ -135,6 +135,17 @@ class PipelineRuntimeConfig(ConfigFileModel):
         ),
     )
 
+    ep_shared_expert_side_stream: Literal["pre", "post"] | None = Field(
+        default=None,
+        description=(
+            "Run the shared expert of a model that dispatches with per-token "
+            "NVFP4 global scales on a side stream, so it overlaps the "
+            "expert-parallel collectives instead of serializing with the "
+            "dispatch. ``pre`` issues it before the dispatch, ``post`` before "
+            "the combine. Unset keeps it inline."
+        ),
+    )
+
     eplb_profile: bool = Field(
         default_factory=lambda: (
             os.getenv("MAX_SERVE_EPLB_PROFILE", "").lower()
