@@ -432,16 +432,21 @@ struct GGMLQ40Dequantize:
     @inline(.always)
     def execute[
         _trace_name: StaticString,
-    ](
-        output: OutputTensor[dtype=.float32, rank=2, ...],
-        input: InputTensor[dtype=.uint8, rank=2, ...],
-    ) raises:
-        var input_tt = input.to_tile_tensor[.int64]()
-        var output_tt = output.to_tile_tensor[.int64]()
+    ](output: Some[Output & Tensor], input: Some[Input & Tensor],) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert type_of(output).rank == 2
+        comptime assert type_of(input).rank == 2
+        var input_tt = input.to_tile_tensor[.uint8]()
+        var output_tt = output.to_tile_tensor[.float32]()
+        # A trait argument's shape() is a Coord, so convert to the IndexList
+        # the dequantize helper takes.
         Q4sym[group_size=32].dequantize_and_write_to_tensor(
             input_tt,
             output_tt,
-            output.shape(),
+            rebind[IndexList[2]](
+                coord_to_index_list(output_tt.layout.shape_coord())
+            ),
         )
 
 
@@ -636,16 +641,21 @@ struct GGMLQ6KDequantize:
     @inline(.always)
     def execute[
         _trace_name: StaticString,
-    ](
-        output: OutputTensor[dtype=.float32, rank=2, ...],
-        input: InputTensor[dtype=.uint8, rank=2, ...],
-    ) raises:
-        var input_tt = input.to_tile_tensor[.int64]()
-        var output_tt = output.to_tile_tensor[.int64]()
+    ](output: Some[Output & Tensor], input: Some[Input & Tensor],) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert type_of(output).rank == 2
+        comptime assert type_of(input).rank == 2
+        var input_tt = input.to_tile_tensor[.uint8]()
+        var output_tt = output.to_tile_tensor[.float32]()
+        # A trait argument's shape() is a Coord, so convert to the IndexList
+        # the dequantize helper takes.
         q6_k_dequantize_impl(
             input_tt,
             output_tt,
-            output.shape(),
+            rebind[IndexList[2]](
+                coord_to_index_list(output_tt.layout.shape_coord())
+            ),
         )
 
 

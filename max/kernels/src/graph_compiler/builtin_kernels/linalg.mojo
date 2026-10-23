@@ -103,10 +103,19 @@ from linalg.matrix_band_part import matrix_band_part
 from linalg.packing import _pack_b_ndbuffer_impl, pack_matmul_b_shape_func
 from nn._ragged_utils import merge_ragged_tensors
 from nn.gemv_partial_norm import gemv_and_partial_norm
-from extensibility import InputTensor, OutputTensor
-from extensibility import Tensor, TileTensorable
-from extensibility import Fused, Input, Output, Storable, StoreAccess
-from extensibility import UnsafeFusedView, unsafe_fused_view
+from extensibility import (
+    Fused,
+    Input,
+    InputTensor,
+    Output,
+    OutputTensor,
+    Storable,
+    StoreAccess,
+    Tensor,
+    TileTensorable,
+    UnsafeFusedView,
+    unsafe_fused_view,
+)
 from extensibility import (
     _FusedComputeOutputTensor,
     _LegacyComputable,
@@ -1833,19 +1842,22 @@ struct Struct_matmul_mxfp4_dequant_fp8:
     @inline(.always)
     @staticmethod
     def execute[
-        c_type: DType,
-        a_type: DType,
-        b_type: DType,
-        b_scales_type: DType,
-        //,
         target: StaticString,
     ](
-        c: OutputTensor[dtype=c_type, rank=2, ...],
-        a: InputTensor[dtype=a_type, rank=2, ...],
-        b: InputTensor[dtype=b_type, rank=2, ...],
-        b_scales: InputTensor[dtype=b_scales_type, rank=2, ...],
+        c: Some[Output & Tensor],
+        a: Some[Input & Tensor],
+        b: Some[Input & Tensor],
+        b_scales: Some[Input & Tensor],
         context: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(c), TileTensorable)
+        comptime assert conforms_to(type_of(a), TileTensorable)
+        comptime assert conforms_to(type_of(b), TileTensorable)
+        comptime assert conforms_to(type_of(b_scales), TileTensorable)
+        comptime c_type = type_of(c).dtype
+        comptime a_type = type_of(a).dtype
+        comptime b_type = type_of(b).dtype
+        comptime b_scales_type = type_of(b_scales).dtype
         comptime assert is_gpu[
             target
         ](), "MXFP4 dequant-to-FP8 matmul only supports GPUs"
@@ -1866,10 +1878,10 @@ struct Struct_matmul_mxfp4_dequant_fp8:
         ), "MXFP4 matmul scales must be float8_e8m0fnu"
 
         mxfp4_matmul_sm90(
-            c.to_tile_tensor[.int64](),
-            a.to_tile_tensor[.int64](),
-            b.to_tile_tensor[.int64](),
-            b_scales.to_tile_tensor[.int64](),
+            c.to_tile_tensor(),
+            a.to_tile_tensor[a_type](),
+            b.to_tile_tensor[b_type](),
+            b_scales.to_tile_tensor[b_scales_type](),
             context,
         )
 
@@ -1890,16 +1902,19 @@ struct Struct_matmul_weight_only_block_scaled_apple:
     @inline(.always)
     @staticmethod
     def execute[
-        c_type: DType,
-        //,
         target: StaticString,
     ](
-        c: OutputTensor[dtype=c_type, rank=2, ...],
-        a: InputTensor[dtype=.bfloat16, rank=2, ...],
-        b: InputTensor[dtype=.uint8, rank=2, ...],
-        b_scales: InputTensor[dtype=.float8_e4m3fn, rank=2, ...],
+        c: Some[Output & Tensor],
+        a: Some[Input & Tensor],
+        b: Some[Input & Tensor],
+        b_scales: Some[Input & Tensor],
         context: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(c), TileTensorable)
+        comptime assert conforms_to(type_of(a), TileTensorable)
+        comptime assert conforms_to(type_of(b), TileTensorable)
+        comptime assert conforms_to(type_of(b_scales), TileTensorable)
+        comptime c_type = type_of(c).dtype
         comptime assert is_gpu[
             target
         ](), "Apple weight-only block-scaled matmul only supports GPUs"
@@ -1909,10 +1924,10 @@ struct Struct_matmul_weight_only_block_scaled_apple:
         )
 
         enqueue_apple_fp4_matmul[c_type=c_type](
-            c.to_tile_tensor[.int64](),
-            a.to_tile_tensor[.int64](),
-            b.to_tile_tensor[.int64](),
-            b_scales.to_tile_tensor[.int64](),
+            c.to_tile_tensor(),
+            a.to_tile_tensor[.bfloat16](),
+            b.to_tile_tensor[.uint8](),
+            b_scales.to_tile_tensor[.float8_e4m3fn](),
             context,
         )
 
@@ -1935,15 +1950,17 @@ struct Struct_matmul_weight_only_scaled_float8_apple:
     @inline(.always)
     @staticmethod
     def execute[
-        c_type: DType,
-        //,
         target: StaticString,
     ](
-        c: OutputTensor[dtype=c_type, rank=2, ...],
-        a: InputTensor[dtype=.bfloat16, rank=2, ...],
-        b: InputTensor[dtype=.float8_e4m3fn, rank=2, ...],
+        c: Some[Output & Tensor],
+        a: Some[Input & Tensor],
+        b: Some[Input & Tensor],
         context: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(c), TileTensorable)
+        comptime assert conforms_to(type_of(a), TileTensorable)
+        comptime assert conforms_to(type_of(b), TileTensorable)
+        comptime c_type = type_of(c).dtype
         comptime assert is_gpu[
             target
         ](), "Apple weight-only scaled FP8 matmul only supports GPUs"
@@ -1953,9 +1970,9 @@ struct Struct_matmul_weight_only_scaled_float8_apple:
         )
 
         enqueue_apple_fp8_matmul[c_type=c_type](
-            c.to_tile_tensor[.int64](),
-            a.to_tile_tensor[.int64](),
-            b.to_tile_tensor[.int64](),
+            c.to_tile_tensor(),
+            a.to_tile_tensor[.bfloat16](),
+            b.to_tile_tensor[.float8_e4m3fn](),
             context,
         )
 
@@ -1965,9 +1982,9 @@ def _apple_int8_w8a8_dispatch[
     c_type: DType, has_bias: Bool, target: StaticString
 ](
     c_tt: TileTensor[mut=True, c_type, ...],
-    a_tt: TileTensor[.bfloat16, ...],
-    b_tt: TileTensor[.int8, Engine=DefaultEngine[], ...],
-    bs_tt: TileTensor[.float32, ...],
+    a_tt: TileTensor[DType.bfloat16, ...],
+    b_tt: TileTensor[DType.int8, ...],
+    bs_tt: TileTensor[DType.float32, ...],
     bias_tt: TileTensor[c_type, ...],
     context: DeviceContext,
 ) raises:
@@ -2036,26 +2053,29 @@ struct Struct_matmul_int8_w8a8_apple:
     @inline(.always)
     @staticmethod
     def execute[
-        c_type: DType,
-        //,
         target: StaticString,
     ](
-        c: OutputTensor[dtype=c_type, rank=2, ...],
-        a: InputTensor[dtype=.bfloat16, rank=2, ...],
-        b: InputTensor[dtype=.int8, rank=2, ...],
-        b_scale: InputTensor[dtype=.float32, rank=1, ...],
+        c: Some[Output & Tensor],
+        a: Some[Input & Tensor],
+        b: Some[Input & Tensor],
+        b_scale: Some[Input & Tensor],
         context: DeviceContext,
     ) raises:
-        var c_tt = c.to_tile_tensor[.int64]()
+        comptime assert conforms_to(type_of(c), TileTensorable)
+        comptime assert conforms_to(type_of(a), TileTensorable)
+        comptime assert conforms_to(type_of(b), TileTensorable)
+        comptime assert conforms_to(type_of(b_scale), TileTensorable)
+        comptime c_type = type_of(c).dtype
+        var c_tt = c.to_tile_tensor()
         # No bias: a length-1 dummy bias TileTensor (the `has_bias=False` GEMM
         # path ignores it). Reuse `b_scale` as the dummy source (same dtype is
         # not required -- it is never read -- but a valid 1-elem view is).
         var dummy_bias = TileTensor(c_tt._storage, row_major(Int64(1))).as_imm()
         _apple_int8_w8a8_dispatch[c_type, has_bias=False, target=target](
             c_tt,
-            a.to_tile_tensor[.int64](),
-            b.to_tile_tensor[.int64](),
-            b_scale.to_tile_tensor[.int64](),
+            a.to_tile_tensor[.bfloat16](),
+            b.to_tile_tensor[.int8](),
+            b_scale.to_tile_tensor[.float32](),
             dummy_bias,
             context,
         )
@@ -2074,23 +2094,27 @@ struct Struct_matmul_int8_w8a8_apple_bias:
     @inline(.always)
     @staticmethod
     def execute[
-        c_type: DType,
-        //,
         target: StaticString,
     ](
-        c: OutputTensor[dtype=c_type, rank=2, ...],
-        a: InputTensor[dtype=.bfloat16, rank=2, ...],
-        b: InputTensor[dtype=.int8, rank=2, ...],
-        b_scale: InputTensor[dtype=.float32, rank=1, ...],
-        bias: InputTensor[dtype=c_type, rank=1, ...],
+        c: Some[Output & Tensor],
+        a: Some[Input & Tensor],
+        b: Some[Input & Tensor],
+        b_scale: Some[Input & Tensor],
+        bias: Some[Input & Tensor],
         context: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(c), TileTensorable)
+        comptime assert conforms_to(type_of(a), TileTensorable)
+        comptime assert conforms_to(type_of(b), TileTensorable)
+        comptime assert conforms_to(type_of(b_scale), TileTensorable)
+        comptime assert conforms_to(type_of(bias), TileTensorable)
+        comptime c_type = type_of(c).dtype
         _apple_int8_w8a8_dispatch[c_type, has_bias=True, target=target](
-            c.to_tile_tensor[.int64](),
-            a.to_tile_tensor[.int64](),
-            b.to_tile_tensor[.int64](),
-            b_scale.to_tile_tensor[.int64](),
-            bias.to_tile_tensor[.int64](),
+            c.to_tile_tensor(),
+            a.to_tile_tensor[.bfloat16](),
+            b.to_tile_tensor[.int8](),
+            b_scale.to_tile_tensor[.float32](),
+            bias.to_tile_tensor[c_type](),
             context,
         )
 
@@ -2110,9 +2134,14 @@ struct LayoutTransformMatmulKN2KNkni:
         c_type: DType,
         c_shape: IntTuple,
     ](
-        output_buffer: OutputTensor[dtype=b_type, rank=2, ...],
-        b_input: InputTensor[dtype=b_type, rank=2, ...],
+        output_buffer: Some[Output & Tensor],
+        b_input: Some[Input & Tensor],
     ) raises:
+        comptime assert conforms_to(type_of(output_buffer), TileTensorable)
+        comptime assert conforms_to(type_of(b_input), TileTensorable)
+        comptime assert type_of(output_buffer).rank == 2
+        comptime assert type_of(b_input).rank == 2
+
         # NOTE `get_kernel_type` expects `m == 0` for dynamic M.
         var kernel_type_m = 0
 
@@ -2123,8 +2152,8 @@ struct LayoutTransformMatmulKN2KNkni:
             c_type=c_type,
             transposed=False,
         ](
-            b_input.to_tile_tensor[.int64](),
-            output_buffer.to_tile_tensor[.int64](),
+            b_input.to_tile_tensor[b_type](),
+            output_buffer.to_tile_tensor[b_type](),
             kernel_type_m,
         )
 
@@ -2144,9 +2173,14 @@ struct LayoutTransformMatmulNK2KNkni:
         c_type: DType,
         c_shape: IntTuple,
     ](
-        output_buffer: OutputTensor[dtype=b_type, rank=2, ...],
-        b_input: InputTensor[dtype=b_type, rank=2, ...],
+        output_buffer: Some[Output & Tensor],
+        b_input: Some[Input & Tensor],
     ) raises:
+        comptime assert conforms_to(type_of(output_buffer), TileTensorable)
+        comptime assert conforms_to(type_of(b_input), TileTensorable)
+        comptime assert type_of(output_buffer).rank == 2
+        comptime assert type_of(b_input).rank == 2
+
         # NOTE `get_kernel_type` expects `m == 0` for dynamic M.
         var kernel_type_m = 0
 
@@ -2157,8 +2191,8 @@ struct LayoutTransformMatmulNK2KNkni:
             c_type=c_type,
             transposed=True,
         ](
-            b_input.to_tile_tensor[.int64](),
-            output_buffer.to_tile_tensor[.int64](),
+            b_input.to_tile_tensor[b_type](),
+            output_buffer.to_tile_tensor[b_type](),
             kernel_type_m,
         )
 

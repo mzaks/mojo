@@ -84,13 +84,17 @@ struct ConvertE4M3FNToE4M3FNUZ:
         target: StaticString,
         _trace_name: StaticString,
     ](
-        output: OutputTensor[dtype=.float8_e4m3fnuz, rank=2, ...],
-        input: InputTensor[dtype=.float8_e4m3fn, rank=2, ...],
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert type_of(output).rank == 2
+        comptime assert type_of(input).rank == 2
         convert_e4m3fn_to_e4m3fnuz(
-            input.to_tile_tensor[.int64](),
-            output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[.float8_e4m3fn](),
+            output.to_tile_tensor[.float8_e4m3fnuz](),
             ctx,
         )
 

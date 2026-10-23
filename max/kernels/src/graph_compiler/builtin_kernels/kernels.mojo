@@ -156,6 +156,7 @@ from extensibility import (
     InputTensor,
     InputVariadicTensors,
     ManagedTensorSlice,
+    MutableInput,
     Output,
     OutputTensor,
     StableInputVariadicTensors,
@@ -3226,29 +3227,35 @@ struct Struct_sampler_apply_penalties:
     @inline(.always)
     @staticmethod
     def execute[
-        logit_type: DType,
-        penalty_type: DType,
-        rank: Int,
         target: StaticString,
         _trace_name: StaticString,
     ](
-        logits: MutableInputTensor[dtype=logit_type, rank=rank, ...],
-        compressed_frequency_data: InputTensor[dtype=.int32, rank=2, ...],
-        frequency_offsets: InputTensor[dtype=.uint32, rank=1, ...],
-        frequency_penalty: InputTensor[dtype=penalty_type, rank=1, ...],
-        presence_penalty: InputTensor[dtype=penalty_type, rank=1, ...],
-        repetition_penalty: InputTensor[dtype=penalty_type, rank=1, ...],
+        logits: Some[MutableInput & Tensor],
+        compressed_frequency_data: Some[Input & Tensor],
+        frequency_offsets: Some[Input & Tensor],
+        frequency_penalty: Some[Input & Tensor],
+        presence_penalty: Some[Input & Tensor],
+        repetition_penalty: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(logits), TileTensorable)
+        comptime assert conforms_to(
+            type_of(compressed_frequency_data), TileTensorable
+        )
+        comptime assert conforms_to(type_of(frequency_offsets), TileTensorable)
+        comptime assert conforms_to(type_of(frequency_penalty), TileTensorable)
+        comptime assert conforms_to(type_of(presence_penalty), TileTensorable)
+        comptime assert conforms_to(type_of(repetition_penalty), TileTensorable)
         comptime assert is_valid_target[target](), "not a valid target"
+        comptime penalty_type = type_of(frequency_penalty).dtype
 
         apply_penalties_to_logits[target=target](
-            logits.to_tile_tensor[.int64](),
-            compressed_frequency_data.to_tile_tensor[.int64](),
-            frequency_offsets.to_tile_tensor[.int64](),
-            frequency_penalty.to_tile_tensor[.int64](),
-            presence_penalty.to_tile_tensor[.int64](),
-            repetition_penalty.to_tile_tensor[.int64](),
+            logits.to_tile_tensor(),
+            compressed_frequency_data.to_tile_tensor[.int32](),
+            frequency_offsets.to_tile_tensor[.uint32](),
+            frequency_penalty.to_tile_tensor[penalty_type](),
+            presence_penalty.to_tile_tensor[penalty_type](),
+            repetition_penalty.to_tile_tensor[penalty_type](),
             ctx,
         )
 
@@ -3307,24 +3314,25 @@ struct Struct_sampler_update_frequency_data:
     @inline(.always)
     @staticmethod
     def execute[
-        token_type: DType,
-        //,
         target: StaticString,
         _trace_name: StaticString,
     ](
-        compressed_frequency_data: MutableInputTensor[
-            dtype=DType.int32, rank=2, ...
-        ],
-        frequency_offsets: InputTensor[dtype=DType.uint32, rank=1, ...],
-        new_tokens: InputTensor[dtype=token_type, rank=1, ...],
+        compressed_frequency_data: Some[MutableInput & Tensor],
+        frequency_offsets: Some[Input & Tensor],
+        new_tokens: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(
+            type_of(compressed_frequency_data), TileTensorable
+        )
+        comptime assert conforms_to(type_of(frequency_offsets), TileTensorable)
+        comptime assert conforms_to(type_of(new_tokens), TileTensorable)
         comptime assert is_valid_target[target](), "not a valid target"
 
         update_frequency_data[target=target](
-            compressed_frequency_data.to_tile_tensor[.int64](),
-            frequency_offsets.to_tile_tensor[.int64](),
-            new_tokens.to_tile_tensor[.int64](),
+            compressed_frequency_data.to_tile_tensor[.int32](),
+            frequency_offsets.to_tile_tensor[.uint32](),
+            new_tokens.to_tile_tensor(),
             ctx,
         )
 
@@ -3708,27 +3716,36 @@ struct Learnable2DInterpPosEmb:
     @inline(.always)
     @staticmethod
     def execute[
-        dtype: DType,
-        //,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=2, ...],
-        x: InputTensor[dtype=dtype, rank=2, ...],
-        weight: InputTensor[dtype=dtype, rank=3, ...],
-        grid_thws: InputTensor[dtype=.int64, rank=2, ...],
-        time_weight: InputTensor[dtype=.float32, rank=2, ...],
+        output: Some[Output & Tensor],
+        x: Some[Input & Tensor],
+        weight: Some[Input & Tensor],
+        grid_thws: Some[Input & Tensor],
+        time_weight: Some[Input & Tensor],
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(x), TileTensorable)
+        comptime assert conforms_to(type_of(weight), TileTensorable)
+        comptime assert conforms_to(type_of(grid_thws), TileTensorable)
+        comptime assert conforms_to(type_of(time_weight), TileTensorable)
         comptime assert is_gpu[
             target
         ](), "learnable_2d_interp_pos_emb only supported on GPUs"
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(output).rank == 2
+        comptime assert type_of(x).rank == 2
+        comptime assert type_of(weight).rank == 3
+        comptime assert type_of(grid_thws).rank == 2
+        comptime assert type_of(time_weight).rank == 2
 
         learnable_2d_interp_pos_emb[dtype](
-            output.to_tile_tensor[.int64](),
-            x.to_tile_tensor[.int64](),
-            weight.to_tile_tensor[.int64](),
+            output.to_tile_tensor(),
+            x.to_tile_tensor[dtype](),
+            weight.to_tile_tensor[dtype](),
             grid_thws.to_tile_tensor[.int64](),
-            time_weight.to_tile_tensor[.int64](),
+            time_weight.to_tile_tensor[.float32](),
             ctx,
         )
 
@@ -3740,22 +3757,27 @@ struct SpatialMerge:
     @inline(.always)
     @staticmethod
     def execute[
-        dtype: DType,
-        //,
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=2, ...],
-        input: InputTensor[dtype=dtype, rank=2, ...],
-        grid_thw: InputTensor[dtype=.int64, rank=2, ...],
+        output: Some[Output & Tensor],
+        input: Some[Input & Tensor],
+        grid_thw: Some[Input & Tensor],
         hidden_size: Int32,
         merge_size: Int32,
         ctx: DeviceContext,
     ) raises:
+        comptime assert conforms_to(type_of(output), TileTensorable)
+        comptime assert conforms_to(type_of(input), TileTensorable)
+        comptime assert conforms_to(type_of(grid_thw), TileTensorable)
         comptime assert is_gpu[target](), "spatial_merge only supported on GPUs"
+        comptime dtype = type_of(output).dtype
+        comptime assert type_of(output).rank == 2
+        comptime assert type_of(input).rank == 2
+        comptime assert type_of(grid_thw).rank == 2
 
         spatial_merge[dtype](
-            output.to_tile_tensor[.int64](),
-            input.to_tile_tensor[.int64](),
+            output.to_tile_tensor(),
+            input.to_tile_tensor[dtype](),
             grid_thw.to_tile_tensor[.int64](),
             Int(hidden_size),
             Int(merge_size),
