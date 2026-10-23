@@ -838,6 +838,45 @@ def test_lru_evicts_the_tail_of_a_released_prefix() -> None:
     assert bm.get_req_blocks_per_leaf(ctxC)[FULL] == [1, 2, 3, 4]
 
 
+def test_lru_keeps_a_turn_beside_a_live_request() -> None:
+    """Eviction takes an older prefix in a parked huge block before the newer
+    one beside a live request's page."""
+    bm = make_manager(
+        {FULL: full(ratio=4)},
+        block_size=1,
+        num_huge_blocks=3,
+        enable_prefix_caching=True,
+    )
+    old = make_ctx_with_tokens([10, 11, 12, 13])
+    bm.claim(old)
+    decode(bm, old)
+    bm.release(old)
+
+    live = make_ctx_with_tokens([20])
+    bm.claim(live)
+    bm.alloc(live)
+
+    turn1 = make_ctx_with_tokens([30, 31, 32])
+    bm.claim(turn1)
+    decode(bm, turn1)
+    live_huge_block = bm.get_req_blocks_per_leaf(live)[FULL][0] // 4
+    assert {bid // 4 for bid in bm.get_req_blocks_per_leaf(turn1)[FULL]} == {
+        live_huge_block
+    }
+    bm.release(turn1)
+
+    # The pool is full, so these pages evict three commits, the oldest ones.
+    other = make_ctx_with_tokens([40, 41, 42])
+    bm.claim(other)
+    bm.alloc(other)
+    bm.release(other)
+
+    turn2 = make_ctx_with_tokens([30, 31, 32, 42, 50])
+    bm.claim(turn2)
+    bm.alloc(turn2)
+    assert turn2.tokens.processed_length == 3
+
+
 def test_reset_prefix_cache_drops_commits_nobody_holds() -> None:
     bm = make_manager(
         {FULL: full(ratio=1)},
