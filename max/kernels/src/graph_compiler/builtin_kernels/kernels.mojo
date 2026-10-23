@@ -4590,6 +4590,11 @@ struct GatedDeltaRecurrenceVerifyRingFwd:
                             ring_tt.LayoutType,
                             ring_slot_idx_tt.LayoutType,
                             recurrence_output_tt.Engine,
+                            # RECORDS_ONLY: the draft-window check above
+                            # bounds every row by ring_len; the kernel's
+                            # safe assert still traps a caller that slips
+                            # a longer ragged row through input_row_offsets.
+                            True,
                         ]
                     ](
                         Int32(shape.batch_size),
