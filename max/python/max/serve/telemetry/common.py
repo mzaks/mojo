@@ -162,8 +162,11 @@ HISTOGRAM_COUNT_BUCKETS: tuple[float, ...] = log_spaced_buckets(
 
 # Batch size (number of requests in a batch), from a single request up to the
 # largest batch the scheduler forms.
-HISTOGRAM_BATCH_SIZE_BUCKETS: tuple[float, ...] = log_spaced_buckets(
-    1.0, 512.0, 1.5
+HISTOGRAM_BATCH_SIZE_BUCKETS: tuple[float, ...] = (
+    0.0,
+    *(float(size) for size in range(1, 21)),  # Tracks exactly for 1-20
+    # [2:] drops the ladder's leading 0.0 and its 20.0, already present.
+    *log_spaced_buckets(20.0, 512.0, 1.05)[2:],  # 5% steps from 21 - 512
 )
 
 # Mean speculative-decode acceptance length per batch. Because it is an average

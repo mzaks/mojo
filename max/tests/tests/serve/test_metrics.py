@@ -317,7 +317,6 @@ def test_log_spaced_bucket_ranges() -> None:
         (common.HISTOGRAM_LATENCY_BUCKETS_MS, 1.0, 8 * 60 * 60 * 1000.0, 1.5),
         (common.HISTOGRAM_COUNT_BUCKETS, 1.0, 100_000_000.0, 1.5),
         (common.HISTOGRAM_THROUGHPUT_TOKENS_BUCKETS, 10.0, 1_000_000.0, 1.5),
-        (common.HISTOGRAM_BATCH_SIZE_BUCKETS, 1.0, 512.0, 1.5),
         (common.HISTOGRAM_GIB_PER_S_BUCKETS, 0.1, 800.0, 2.0),
     ):
         # The leading 0 keeps exact zeros out of the smallest real bucket.
@@ -328,6 +327,21 @@ def test_log_spaced_bucket_ranges() -> None:
         # significant digits nudges individual steps either side of the ratio.
         ratio = (buckets[-1] / buckets[1]) ** (1 / (len(buckets) - 2))
         assert ratio <= max_ratio
+
+
+def test_batch_size_buckets_are_linear_then_log_spaced() -> None:
+    """Pins one bucket per batch size through 20, then 5% steps out to 512.
+
+    Batch sizes are integers, so the linear run gives each small size its own
+    bucket, and the 5% ladder above it keeps a batch at a max_batch_size cap
+    within a few requests instead of a 50%-wide bucket.
+    """
+    buckets = common.HISTOGRAM_BATCH_SIZE_BUCKETS
+    assert buckets[:21] == (0.0, *(float(size) for size in range(1, 21)))
+    assert buckets[-1] == 512.0
+    tail = buckets[20:]
+    ratio = (tail[-1] / tail[0]) ** (1 / (len(tail) - 1))
+    assert ratio <= 1.05
 
 
 def test_percent_buckets_tighten_near_saturation() -> None:
