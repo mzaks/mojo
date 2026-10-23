@@ -56,7 +56,7 @@ LogicalResult declVerifyShapeFunctionReturnsShape(
 }
 
 // Return `s` with its first ASCII letter uppercased, for error messages that
-// start with a role label like "execute".
+// start with a kernel function name like "execute".
 static std::string capitalize(llvm::StringRef s) {
   if (s.empty())
     return "";
@@ -67,8 +67,8 @@ static std::string capitalize(llvm::StringRef s) {
 
 /// Walk the input argument lists of `lhs` and `rhs` in parallel, skipping
 /// launch args (DeviceContext / DeviceGraphBuilder) from either side, and
-/// require pairwise compatibility. `lhsKind` / `rhsKind` are lowercase role
-/// labels used in error messages (e.g. "execute" / "shape").
+/// require pairwise compatibility. `lhsKind` / `rhsKind` name the functions in
+/// error messages.
 ///
 /// A pair is compatible when types match exactly, or when the lhs side has a
 /// `MutableInputTensor` and the rhs side has a non-mutable tensor (shape /
@@ -79,9 +79,11 @@ static std::string capitalize(llvm::StringRef s) {
 /// owns the rules for where stable arguments may appear.
 LogicalResult verifyInputArgumentsAlign(KernelDeclOp decl,
                                         const KernelDeclFunctionAdaptor &lhs,
-                                        llvm::StringRef lhsKind,
+                                        KernelFunctionKind lhsKind,
                                         const KernelDeclFunctionAdaptor &rhs,
-                                        llvm::StringRef rhsKind) {
+                                        KernelFunctionKind rhsKind) {
+  llvm::StringRef lhsName = stringifyKernelFunctionKind(lhsKind);
+  llvm::StringRef rhsName = stringifyKernelFunctionKind(rhsKind);
   auto skipLaunchArg =
       [](const llvm::SmallVector<KernelDeclOperandAdaptor> &inputs,
          uint64_t &idx) -> std::optional<KernelDeclOperandAdaptor> {
@@ -110,11 +112,11 @@ LogicalResult verifyInputArgumentsAlign(KernelDeclOp decl,
 
     if (!isCompatibleArgs()) {
       return decl->emitError()
-             << capitalize(rhsKind) << " function and " << lhsKind
+             << capitalize(rhsName) << " function and " << lhsName
              << " function input argument types do not match. "
-             << capitalize(lhsKind) << " function input at position "
+             << capitalize(lhsName) << " function input at position "
              << lhsArgOpt->sourceDescriptor->position << " is a "
-             << lhsArgOpt->underlyingType << " but corresponding " << rhsKind
+             << lhsArgOpt->underlyingType << " but corresponding " << rhsName
              << " function argument at position " << rhsIndex << " is a "
              << rhsArgOpt->underlyingType;
     }
@@ -127,7 +129,7 @@ LogicalResult verifyInputArgumentsAlign(KernelDeclOp decl,
 
   if (!lhsEnd || !rhsEnd) {
     std::stringstream errorMessage;
-    errorMessage << capitalize(lhsKind) << " and " << rhsKind.str()
+    errorMessage << capitalize(lhsName) << " and " << rhsName.str()
                  << " functions do not have the same input tensors. ";
     auto appendUnmatchedInputs =
         [&](const llvm::SmallVector<KernelDeclOperandAdaptor> &inputs,
@@ -138,13 +140,13 @@ LogicalResult verifyInputArgumentsAlign(KernelDeclOp decl,
           }
         };
     if (lhsEnd) {
-      errorMessage << capitalize(rhsKind) << " function inputs at positions (";
+      errorMessage << capitalize(rhsName) << " function inputs at positions (";
       appendUnmatchedInputs(rhs.inputArguments, rhsIndex);
-      errorMessage << ") do not appear in the " << lhsKind.str() << " function";
+      errorMessage << ") do not appear in the " << lhsName.str() << " function";
     } else {
-      errorMessage << capitalize(lhsKind) << " function inputs at positions (";
+      errorMessage << capitalize(lhsName) << " function inputs at positions (";
       appendUnmatchedInputs(lhs.inputArguments, lhsIndex);
-      errorMessage << ") do not appear in the " << rhsKind.str() << " function";
+      errorMessage << ") do not appear in the " << rhsName.str() << " function";
     }
     return decl->emitError(errorMessage.str());
   }
@@ -159,14 +161,16 @@ LogicalResult declVerifyShapeFunctionInputsMatchExecuteFunction(
     return success();
 
   if (adaptor.executeFunction.has_value() &&
-      verifyInputArgumentsAlign(decl, *adaptor.executeFunction, "execute",
-                                *shapeFunction, "shape")
+      verifyInputArgumentsAlign(decl, *adaptor.executeFunction,
+                                KernelFunctionKind::Execute, *shapeFunction,
+                                KernelFunctionKind::Shape)
           .failed())
     return failure();
 
   if (adaptor.buildGraphFunction.has_value() &&
       verifyInputArgumentsAlign(decl, *adaptor.buildGraphFunction,
-                                "build_graph", *shapeFunction, "shape")
+                                KernelFunctionKind::BuildGraph, *shapeFunction,
+                                KernelFunctionKind::Shape)
           .failed())
     return failure();
 
@@ -184,8 +188,9 @@ declVerifyExecuteMatchesBuildGraph(KernelDeclOp decl,
   if (!adaptor.executeFunction.has_value() ||
       !adaptor.buildGraphFunction.has_value())
     return success();
-  return verifyInputArgumentsAlign(decl, *adaptor.executeFunction, "execute",
-                                   *adaptor.buildGraphFunction, "build_graph");
+  return verifyInputArgumentsAlign(
+      decl, *adaptor.executeFunction, KernelFunctionKind::Execute,
+      *adaptor.buildGraphFunction, KernelFunctionKind::BuildGraph);
 }
 
 /// Slot-backed tensor arguments (`StableTensor` / `StableVariadicTensors`)
@@ -201,7 +206,7 @@ declVerifyStableTensorArguments(KernelDeclOp decl,
   };
 
   auto rejectStable = [&](const std::optional<KernelDeclFunctionAdaptor> &func,
-                          StringRef kind) -> LogicalResult {
+                          KernelFunctionKind kind) -> LogicalResult {
     if (!func.has_value())
       return success();
     for (const auto &args : {func->inputArguments, func->outputArguments})
@@ -209,15 +214,20 @@ declVerifyStableTensorArguments(KernelDeclOp decl,
         if (arg.isStableTensorType())
           return decl->emitError()
                  << "stable tensor arguments (StableTensor / "
-                    "StableVariadicTensors) are only supported on build_graph "
-                    "functions (argument at position "
-                 << positionOf(arg) << " of the " << kind << " function)";
+                    "StableVariadicTensors) are only supported on "
+                 << stringifyKernelFunctionKind(KernelFunctionKind::BuildGraph)
+                 << " functions (argument at position " << positionOf(arg)
+                 << " of the " << stringifyKernelFunctionKind(kind)
+                 << " function)";
     return success();
   };
 
-  if (rejectStable(adaptor.executeFunction, "execute").failed() ||
-      rejectStable(adaptor.elementwiseFunction, "elementwise").failed() ||
-      rejectStable(adaptor.tileElementwiseFunction, "tile_elementwise")
+  if (rejectStable(adaptor.executeFunction, KernelFunctionKind::Execute)
+          .failed() ||
+      rejectStable(adaptor.elementwiseFunction, KernelFunctionKind::Elementwise)
+          .failed() ||
+      rejectStable(adaptor.tileElementwiseFunction,
+                   KernelFunctionKind::TileElementwise)
           .failed())
     return failure();
 
@@ -457,7 +467,7 @@ LogicalResult declVerifyTensorArgsAreBorrowed(
 LogicalResult declVerifyTraitArgFunctionKinds(KernelDeclOp decl,
                                               KernelDeclAdaptor &adaptor) {
   auto rejectTraitArgs = [&decl](std::optional<KernelDeclFunctionAdaptor> &func,
-                                 StringRef kind) -> LogicalResult {
+                                 KernelFunctionKind kind) -> LogicalResult {
     if (!func.has_value())
       return success();
     auto sig = func->attr.getSignature();
@@ -465,9 +475,15 @@ LogicalResult declVerifyTraitArgFunctionKinds(KernelDeclOp decl,
     for (size_t i = 0, n = sig.getNumArguments(); i < n; ++i) {
       if (isTraitBoundTensorArg(sig.getArgument(i))) {
         decl->emitError()
-            << "trait-bound tensor arguments are not supported on " << kind
-            << " functions yet (only `execute`, `execute_device` and "
-               "`execute_configuration`)";
+            << "trait-bound tensor arguments are not supported on "
+            << stringifyKernelFunctionKind(kind) << " functions yet (only `"
+            << stringifyKernelFunctionKind(KernelFunctionKind::Execute)
+            << "`, `"
+            << stringifyKernelFunctionKind(KernelFunctionKind::ExecuteDevice)
+            << "` and `"
+            << stringifyKernelFunctionKind(
+                   KernelFunctionKind::ExecuteConfiguration)
+            << "`)";
         ok = false;
       }
     }
@@ -475,11 +491,16 @@ LogicalResult declVerifyTraitArgFunctionKinds(KernelDeclOp decl,
   };
 
   bool ok = true;
-  if (rejectTraitArgs(adaptor.buildGraphFunction, "build_graph").failed())
+  if (rejectTraitArgs(adaptor.buildGraphFunction,
+                      KernelFunctionKind::BuildGraph)
+          .failed())
     ok = false;
-  if (rejectTraitArgs(adaptor.elementwiseFunction, "elementwise").failed())
+  if (rejectTraitArgs(adaptor.elementwiseFunction,
+                      KernelFunctionKind::Elementwise)
+          .failed())
     ok = false;
-  if (rejectTraitArgs(adaptor.tileElementwiseFunction, "tile_elementwise")
+  if (rejectTraitArgs(adaptor.tileElementwiseFunction,
+                      KernelFunctionKind::TileElementwise)
           .failed())
     ok = false;
   return ok ? success() : failure();
@@ -579,20 +600,28 @@ LogicalResult declVerifyDeclarative(KernelDeclOp decl,
   auto error = [&] {
     return decl->emitError() << "kernel '" << decl.getRegistration() << "': ";
   };
+  StringRef executeName =
+      stringifyKernelFunctionKind(KernelFunctionKind::Execute);
+  StringRef deviceName =
+      stringifyKernelFunctionKind(KernelFunctionKind::ExecuteDevice);
+  StringRef configurationName =
+      stringifyKernelFunctionKind(KernelFunctionKind::ExecuteConfiguration);
   if (adaptor.executeDeviceFunction && decl.getExecute()) {
-    return error() << "a kernel has either 'execute' or 'execute_device'";
+    return error() << "a kernel has either '" << executeName << "' or '"
+                   << deviceName << "'";
   }
   if (!adaptor.executeDeviceFunction || !adaptor.executeConfigurationFunction) {
-    return error() << "a declarative kernel needs both 'execute_device' and "
-                      "'execute_configuration'";
+    return error() << "a declarative kernel needs both '" << deviceName
+                   << "' and '" << configurationName << "'";
   }
 
   const KernelDeclFunctionAdaptor &executeDevice =
       *adaptor.executeDeviceFunction;
   if (executeDevice.attr.getSignature().isThrows())
-    return error() << "'execute_device' runs on the device and must not raise";
+    return error() << "'" << deviceName
+                   << "' runs on the device and must not raise";
   if (executeDevice.outputResult)
-    return error() << "'execute_device' must not return a value";
+    return error() << "'" << deviceName << "' must not return a value";
 
   // `execute_configuration` takes its operands by `Tensor`, which has no io
   // role, so all of them count as inputs; compare the operands in order.
@@ -620,25 +649,24 @@ LogicalResult declVerifyDeclarative(KernelDeclOp decl,
     }
     return success();
   };
-  if (failed(checkOperands("execute_device", deviceOperands)) ||
-      failed(checkOperands("execute_configuration", configurationOperands)))
+  if (failed(checkOperands(deviceName, deviceOperands)) ||
+      failed(checkOperands(configurationName, configurationOperands)))
     return failure();
 
   if (deviceOperands.size() != configurationOperands.size()) {
-    return error() << "'execute_configuration' takes "
-                   << configurationOperands.size()
-                   << " argument(s) but 'execute_device' takes "
-                   << deviceOperands.size()
+    return error() << "'" << configurationName << "' takes "
+                   << configurationOperands.size() << " argument(s) but '"
+                   << deviceName << "' takes " << deviceOperands.size()
                    << "; both take the kernel's operands";
   }
   for (size_t i = 0, e = deviceOperands.size(); i < e; ++i) {
     bool deviceTensor = deviceOperands[i]->isTensorType();
     if (deviceTensor != configurationOperands[i]->isTensorType()) {
       return error() << "operand " << i << " is a "
-                     << (deviceTensor ? "tensor" : "scalar")
-                     << " in 'execute_device' but a "
-                     << (deviceTensor ? "scalar" : "tensor")
-                     << " in 'execute_configuration'";
+                     << (deviceTensor ? "tensor" : "scalar") << " in '"
+                     << deviceName << "' but a "
+                     << (deviceTensor ? "scalar" : "tensor") << " in '"
+                     << configurationName << "'";
     }
   }
   return success();

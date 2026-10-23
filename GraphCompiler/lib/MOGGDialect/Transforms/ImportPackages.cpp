@@ -56,10 +56,6 @@ namespace M::MOGG {
 
 namespace {
 
-// Mojo-source method names of extensibility kernels live in MojoIdentifiers.h
-// (`kMoggExecuteFuncName`, `kMoggShapeFuncName`, `kMoggElementwiseFuncName`,
-// `kMoggBuildGraphFuncName`).
-
 /// Return the slot names of a well-known stdlib parameterised struct whose
 /// decl lives in a dependency package the fast loader skips. A non-empty list
 /// must match `LIT::StructType::getParamValues()` in length, or
@@ -615,16 +611,18 @@ static mlir::LogicalResult scanForKernelDecls(
         continue;
       llvm::StringRef srcName = *srcNameOpt;
       bool recognized = true;
-      if (srcName == kMoggExecuteFuncName)
+      if (srcName == stringifyKernelFunctionKind(KernelFunctionKind::Execute))
         kernel.executeOverloads.push_back(func);
-      else if (srcName == kMoggShapeFuncName) {
+      else if (srcName ==
+               stringifyKernelFunctionKind(KernelFunctionKind::Shape)) {
         func.emitError()
             << "shape functions defined as methods of a kernel struct are no "
                "longer supported; use @extensibility.register_shape_function "
                "instead";
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
-      } else if (srcName == kMoggElementwiseFuncName) {
+      } else if (srcName ==
+                 stringifyKernelFunctionKind(KernelFunctionKind::Elementwise)) {
         // Route to the SIMD or TileTensor slot by return type leaf name,
         // unwrapping LIT::RefType sugar as computeValueParams does.
         bool isTile = false;
@@ -645,11 +643,14 @@ static mlir::LogicalResult scanForKernelDecls(
           kernel.tileElementwiseFn = func;
         else
           kernel.elementwiseFn = func;
-      } else if (srcName == kMoggBuildGraphFuncName)
+      } else if (srcName ==
+                 stringifyKernelFunctionKind(KernelFunctionKind::BuildGraph))
         kernel.buildGraphFn = func;
-      else if (srcName == kMoggExecuteDeviceFuncName)
+      else if (srcName ==
+               stringifyKernelFunctionKind(KernelFunctionKind::ExecuteDevice))
         kernel.executeDeviceFn = func;
-      else if (srcName == kMoggExecuteConfigurationFuncName)
+      else if (srcName == stringifyKernelFunctionKind(
+                              KernelFunctionKind::ExecuteConfiguration))
         kernel.executeConfigurationFn = func;
       else
         recognized = false;

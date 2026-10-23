@@ -57,33 +57,11 @@ namespace M::MOGG {
 constexpr llvm::StringLiteral kOpaqueTypeMappingAttrName =
     "mogg.opaque_type_mapping";
 
-//===----------------------------------------------------------------------===//
-// MOGG kernel function labels
-//===----------------------------------------------------------------------===//
-
-constexpr llvm::StringLiteral kMoggExecuteFunctionLabel = "mogg.execute";
-constexpr llvm::StringLiteral kMoggShapeFunctionLabel = "mogg.shape";
-constexpr llvm::StringLiteral kMoggElementwiseFunctionLabel =
-    "mogg.elementwise";
-constexpr llvm::StringLiteral kMoggTileElementwiseFunctionLabel =
-    "tile_elementwise";
-constexpr llvm::StringLiteral kMoggBuildGraphFunctionLabel = "mogg.build_graph";
-constexpr llvm::StringLiteral kMoggExecuteDeviceFunctionLabel =
-    "mogg.execute_device";
-constexpr llvm::StringLiteral kMoggExecuteConfigurationFunctionLabel =
-    "mogg.execute_configuration";
-
-/// Method names of `@register`-decorated kernel structs. Some are owned by
-/// KGEN's `LITUtils.h`, which the Mojo parser also uses.
+/// The `@register` decorators, owned by KGEN's `LITUtils.h`, which the Mojo
+/// parser also uses. A kernel struct's method names are
+/// `stringifyKernelFunctionKind`'s.
 using KGEN::kFnRegister;
 using KGEN::kFnRegisterInternal;
-using KGEN::kMoggExecuteFuncName;
-constexpr llvm::StringLiteral kMoggShapeFuncName = "shape";
-constexpr llvm::StringLiteral kMoggElementwiseFuncName = "elementwise";
-constexpr llvm::StringLiteral kMoggBuildGraphFuncName = "build_graph";
-constexpr llvm::StringLiteral kMoggExecuteDeviceFuncName = "execute_device";
-constexpr llvm::StringLiteral kMoggExecuteConfigurationFuncName =
-    "execute_configuration";
 
 /// Indices into `getDecoratorLambdaArgument` for `@extensibility.register`.
 constexpr size_t kRegisterDecoratorArgName = 0;
@@ -96,8 +74,6 @@ constexpr llvm::StringLiteral kMoggTargetParameterName = "target";
 
 /// Lowered specially.
 constexpr llvm::StringLiteral kMoggOutputRankParameterName = "output_rank";
-
-constexpr llvm::StringLiteral kMoggNumDpsOutputs = "mogg.num_dps_outputs";
 
 /// Per-stub-argument metadata: `{dtype}` for a trait tensor, else "". The
 /// layout `L` of `_MoggTensorBufferCapture[dtype, L]` is inferred from the

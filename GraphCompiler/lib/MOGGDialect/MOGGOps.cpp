@@ -1144,7 +1144,7 @@ LogicalResult CallBuildGraphOp::emitMojo(EmitMojoState &state) {
     return state.inferDefaultKernelParamValue(*this, paramName);
   };
   auto maybeParams = inferKernelParameters(
-      buildGraphAdaptor, MOGG::kMoggBuildGraphFunctionLabel, inferParam);
+      buildGraphAdaptor, KernelFunctionKind::BuildGraph, inferParam);
   if (maybeParams.isError())
     return emitError() << "Failed to infer all the kernel parameters: "
                        << maybeParams.takeError();
@@ -1820,9 +1820,9 @@ static LogicalResult emitDeclarativeLaunch(
   // Calls `Kernel[...].method[...]` with the given operands.
   using Callee = std::function<MojoValue(ArrayRef<MojoValue>)>;
   auto calleeFor = [&](const KernelDeclFunctionAdaptor &fn,
-                       StringRef label) -> FailureOr<Callee> {
+                       KernelFunctionKind kind) -> FailureOr<Callee> {
     auto params = inferKernelParameters(
-        adaptor, label,
+        adaptor, kind,
         std::function<ErrorOr<MojoValue>(StringRef)>(inferParam));
     if (params.isError()) {
       op.emitError() << "Failed to infer all the parameters of '"
@@ -1840,9 +1840,9 @@ static LogicalResult emitDeclarativeLaunch(
   };
   FailureOr<Callee> executeConfiguration =
       calleeFor(*adaptor.executeConfigurationFunction,
-                MOGG::kMoggExecuteConfigurationFunctionLabel);
+                KernelFunctionKind::ExecuteConfiguration);
   FailureOr<Callee> executeDevice = calleeFor(
-      *adaptor.executeDeviceFunction, MOGG::kMoggExecuteDeviceFunctionLabel);
+      *adaptor.executeDeviceFunction, KernelFunctionKind::ExecuteDevice);
   if (failed(executeConfiguration) || failed(executeDevice))
     return failure();
 
@@ -1916,7 +1916,7 @@ LogicalResult CallOpaqueOp::emitMojo(EmitMojoState &state) {
     kernelOperands.push_back(state.getMojoValueFor(ctx));
 
   auto maybeParams = inferKernelParameters(
-      execAdaptor, MOGG::kMoggExecuteFunctionLabel, inferParam);
+      execAdaptor, KernelFunctionKind::Execute, inferParam);
   if (maybeParams.isError())
     return emitError() << "Failed to infer all the kernel parameters: "
                        << maybeParams.takeError();
@@ -5434,10 +5434,10 @@ LogicalResult CallElementwiseOp::emitMojo(EmitMojoState &state) {
     }
     return state.inferDefaultKernelParamValue(*this, paramName);
   };
-  llvm::StringRef ewFuncLabel = ewAdaptor.isElementwise()
-                                    ? MOGG::kMoggElementwiseFunctionLabel
-                                    : MOGG::kMoggExecuteFunctionLabel;
-  auto maybeParams = inferKernelParameters(ewAdaptor, ewFuncLabel, inferParam);
+  KernelFunctionKind ewKind = ewAdaptor.isElementwise()
+                                  ? KernelFunctionKind::Elementwise
+                                  : KernelFunctionKind::Execute;
+  auto maybeParams = inferKernelParameters(ewAdaptor, ewKind, inferParam);
   if (maybeParams.isError())
     return emitError() << "Failed to infer all the kernel parameters: "
                        << maybeParams.takeError();
