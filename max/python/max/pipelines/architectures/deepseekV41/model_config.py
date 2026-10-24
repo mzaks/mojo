@@ -98,9 +98,10 @@ def mxfp8_splitk_enabled() -> bool:
     """Whether ``attn.wo_b`` and the shared expert run on the cluster
     split-K MXFP8 matmul.
 
-    On (default): at decode sizes each 128-row weight tile's K splits over
-    a cluster of CTAs, and other sizes take the production block-scaled
-    matmul. Off (``MAX_DSV41_MXFP8_SPLITK=0``): production at every size.
+    On (default): each weight shape and M takes cluster split-K or a
+    pair-CTA GEMM (decode or prefill) where measured faster, and the
+    production block-scaled matmul otherwise. Off
+    (``MAX_DSV41_MXFP8_SPLITK=0``): production at every size.
     """
     return _env_switch(MXFP8_SPLITK_ENV)
 

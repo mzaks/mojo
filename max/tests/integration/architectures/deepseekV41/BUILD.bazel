@@ -272,6 +272,33 @@ modular_py_test(
     ],
 )
 
+# Holds mo.matmul.mxfp8.cluster_splitk (Kernels/lib/graph_compiler, built
+# by layers/mxfp8_matmul.py) to the production MXFP8 matmul, bit for bit,
+# through a graph at every DeepSeek-V4.1 weight shape: cluster split-K, the
+# pair-CTA GEMM and the block-scaled fallback.
+modular_py_test(
+    name = "test_mxfp8_matmul_op_gpu",
+    size = "large",
+    srcs = ["test_mxfp8_matmul_op_gpu.py"],
+    exec_properties = {
+        "test.resources:gpu-memory": "8",
+    },
+    gpu_constraints = ["//:b200_gpu"],
+    tags = ["gpu"],
+    # Needs mo.matmul.mxfp8.cluster_splitk, registered only by the
+    # closed-source kernels.
+    target_compatible_with = REQUIRES_INTERNAL_KERNELS,
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/nn",
+        "//max/python/max/pipelines/architectures/deepseekV41",
+        requirement("numpy"),
+    ],
+)
+
 # Guards strict state-dict loading (nn/layer Module.load_state_dict) and
 # weight sharding (graph Weight.shard).
 modular_py_test(

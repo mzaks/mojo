@@ -14,7 +14,9 @@
 
 At decode sizes one CTA per 128-row weight tile leaves most SMs idle, so
 ``mo.matmul.mxfp8.cluster_splitk`` splits each tile's K over a cluster of
-CTAs. Where no split pays it runs the production block-scaled matmul.
+CTAs where that pays. For the weight shapes and M its measured tables name
+it runs a pair-CTA GEMM (the swap-AB decode GEMM or the prefill GEMM), and
+the production block-scaled matmul elsewhere.
 """
 
 from __future__ import annotations
