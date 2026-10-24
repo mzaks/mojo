@@ -838,13 +838,41 @@ def test_prefill_over_a_replica_token_budget_raises() -> None:
     _assert_nothing_held(pipeline, 4)
 
 
-def test_image_generation_models_point_to_serve(
+def test_image_generation_models_point_to_generate_images(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         PIPELINE_REGISTRY,
         "retrieve_context_type",
         lambda pipeline_config: PixelContext,
+    )
+    monkeypatch.setattr(
+        PIPELINE_REGISTRY,
+        "architecture_for_config",
+        lambda pipeline_config: FakeArch(task=PipelineTask.PIXEL_GENERATION),
+    )
+    pipeline = FakePipeline()
+    with pytest.raises(ValueError) as error:
+        GenerateIterator(pipeline, _prompts(1), max_new_tokens=5)
+    assert str(error.value) == (
+        "generate() generates text, and the model uses PixelContext. Use "
+        "generate_images() for image generation models."
+    )
+    assert pipeline.kv_manager.claimed == {}
+
+
+@dataclasses.dataclass(kw_only=True)
+class FakeVideoContext(PixelContext):
+    num_frames: int | None = None
+
+
+def test_video_generation_models_point_to_serve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        PIPELINE_REGISTRY,
+        "retrieve_context_type",
+        lambda pipeline_config: FakeVideoContext,
     )
     monkeypatch.setattr(
         PIPELINE_REGISTRY,
@@ -859,8 +887,9 @@ def test_image_generation_models_point_to_serve(
     with pytest.raises(ValueError) as error:
         GenerateIterator(pipeline, _prompts(1), max_new_tokens=5)
     _assert_points_to_serve(error, "pixel generation")
-    assert "The model uses PixelContext, and generate() generates text" in (
-        str(error.value)
+    assert (
+        "The model uses FakeVideoContext, and generate() generates text"
+        in str(error.value)
     )
     assert pipeline.kv_manager.claimed == {}
 

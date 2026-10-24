@@ -32,6 +32,7 @@ from typing import Protocol
 from max.pipelines.context import GenerationOutput, PixelContext, TextContext
 from max.pipelines.modeling.types import (
     PipelineOutputsDict,
+    PipelineTask,
     PixelGenerationInputs,
     RequestID,
 )
@@ -46,8 +47,8 @@ from max.pipelines.request.provider_options import (
 )
 from PIL import Image
 
-from .config import PipelineConfig
-from .generate import _run_coroutine, _unsupported
+from .config import PipelineArgs, PipelineConfig
+from .generate import _holds_video, _run_coroutine, _unsupported
 from .registry import PIPELINE_REGISTRY
 
 __all__ = [
@@ -117,6 +118,32 @@ def _per_prompt(
     return values
 
 
+def _is_image_generation_model(pipeline_args: PipelineArgs) -> bool:
+    """Returns whether ``pipeline_args`` names a pixel generation model.
+
+    Image and video architectures both count. It needs no :class:`PipelineConfig`,
+    so it runs before one is built.
+    """
+    # A custom architecture that overrides a built-in one has to register
+    # before the lookup reads the registry, as serve does.
+    PIPELINE_REGISTRY._import_custom_architectures(
+        pipeline_args.runtime.custom_architectures
+    )
+    try:
+        name = pipeline_args.main_architecture_name
+    except ValueError:
+        # Leave a missing architecture to the text path.
+        return False
+    # The lookup falls back to an architecture of another task, so the task
+    # it found decides.
+    arch = PIPELINE_REGISTRY.retrieve_architecture(
+        name,
+        prefer_module_v3=pipeline_args.runtime.prefer_module_v3,
+        task=PipelineTask.PIXEL_GENERATION,
+    )
+    return arch is not None and arch.task == PipelineTask.PIXEL_GENERATION
+
+
 def _check_image_model(pipeline_config: PipelineConfig, caller: str) -> None:
     context_type = PIPELINE_REGISTRY.retrieve_context_type(pipeline_config)
     if not issubclass(context_type, PixelContext):
@@ -129,10 +156,7 @@ def _check_image_model(pipeline_config: PipelineConfig, caller: str) -> None:
             f"{caller} runs image generation models, and this model uses "
             f"{context_type.__name__}.{hint}"
         )
-    # Only a video model's context carries a frame count.
-    if any(
-        field.name == "num_frames" for field in dataclasses.fields(context_type)
-    ):
+    if _holds_video(context_type):
         raise _unsupported(
             pipeline_config,
             "video generation",

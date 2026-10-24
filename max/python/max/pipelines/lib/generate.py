@@ -47,6 +47,7 @@ from max.pipelines.context import (
     EOSTracker,
     InputError,
     LogProbabilities,
+    PixelContext,
     ProcessorInputs,
     SamplingParams,
     SamplingParamsInput,
@@ -798,6 +799,13 @@ def _unsupported(
     return ValueError(message)
 
 
+def _holds_video(context_type: type[PixelContext]) -> bool:
+    # Only a video model's context carries a frame count.
+    return any(
+        field.name == "num_frames" for field in dataclasses.fields(context_type)
+    )
+
+
 def _check_supported(
     pipeline_config: PipelineConfig, caller: str = "generate()"
 ) -> type[TextContext]:
@@ -811,6 +819,14 @@ def _check_supported(
     """
     context_type = PIPELINE_REGISTRY.retrieve_context_type(pipeline_config)
     arch = PIPELINE_REGISTRY.architecture_for_config(pipeline_config)
+    if issubclass(context_type, PixelContext) and not _holds_video(
+        context_type
+    ):
+        raise ValueError(
+            f"{caller} generates text, and the model uses "
+            f"{context_type.__name__}. Use generate_images() for image "
+            "generation models."
+        )
     if not issubclass(context_type, TextContext):
         raise _unsupported(
             pipeline_config,
@@ -1246,12 +1262,15 @@ class GenerateIterator:
             ``images`` is not a list of lists of encoded bytes or PIL
             images.
         ValueError: If the request needs a feature GenerateIterator leaves to
-            ``max serve``: LoRA, a model that does not generate text, a block
-            diffusion model, video inputs, device graph capture with
+            ``max serve``: LoRA, a model that generates neither text nor
+            images, a video model, a block diffusion model, video inputs,
+            device graph capture with
             ``data_parallel_degree > 1`` on a warmed-up pipeline, or a batch
             that only fits by scheduling or chunked prefill (more rows than
             the planned max batch size, or a replica's prompts over its
-            per-replica prefill budget or the batch total-token cap). Also
+            per-replica prefill budget or the batch total-token cap). An
+            image generation model raises it pointing to
+            :func:`~max.pipelines.lib.generate_images.generate_images`. Also
             raised for a prompt with no
             room to generate within the planned max length, an invalid
             sampling value, penalties on a pipeline built without

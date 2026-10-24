@@ -188,6 +188,17 @@ This version is still a work in progress.
   request `max serve` builds for it, so the model's defaults are the same as in
   serve.
 
+- `AutoModel` now loads image generation models such as FLUX.2, and
+  `AutoModel.generate(prompt=...)` runs them and returns a
+  `GenerateImagesResult`. Text models keep the same `generate()` call and
+  result. An argument for the other kind of model raises a `ValueError` that
+  names it. Image models need `max_batch_size=1` and no device graph capture.
+  `AutoPipeline` runs image models too, through
+  `AutoModel.generate(prompt=...)`, and returns a prompt's list of images.
+  On an image model, `AutoModel.generate_iter()` points to
+  `AutoModel.generate(prompt=...)`, and `generate()` points to
+  `generate_images()`.
+
 - Removed the `blocking_sync`, `disable_timing` and `interprocess` parameters
   from the Mojo `DeviceContext.create_event()`, along with `EventFlags`. Events
   never record timing; use `DeviceContext.execution_time()` to time kernels.
