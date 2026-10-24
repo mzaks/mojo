@@ -16,6 +16,10 @@ This version is still a work in progress.
 - `__exit__(self, error: E)` now additionally supports `var self` and
   `deinit self`, similar to the non-error `__exit__`.
 
+- You can transfer ownership of a payload from an rvalue enum subject with a
+  `var` case binding, such as `case .Some(var value):`. This allows `match` and
+  `if case` statements work more conveniently with linear types.
+
 ## Language changes
 
 - `@explicit_destroy("<message>")` on a struct is deprecated and now emits a

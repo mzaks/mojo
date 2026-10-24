@@ -933,17 +933,21 @@ LogicalResult InferredAttributeRefNode::buildCheckList(
 
 CValue PatternEmitState::getPathValue(IREmitter &emitter,
                                       const PatternPath *path,
-                                      const ExprNode *expr) {
+                                      const ExprNode *expr, bool consume) {
   assert(path && "null pattern path");
-  if (auto it = pathValues.find(path); it != pathValues.end())
-    return it->second;
+  if (!consume) {
+    if (auto it = pathValues.find(path); it != pathValues.end())
+      return it->second;
+  }
 
   if (path->kind == PatternPath::Root) {
     assert(path == rootPath && "unexpected root path");
+    if (consume)
+      return rootSubject;
     return pathValues[path] = rootSubject;
   }
 
-  CValue parent = getPathValue(emitter, path->parent, expr);
+  CValue parent = getPathValue(emitter, path->parent, expr, consume);
   if (!parent)
     return {};
 
@@ -994,6 +998,31 @@ CValue PatternEmitState::getPathValue(IREmitter &emitter,
     CValue payload = emitter.emitExprCValue(&payloadCall, EC_MatchSubject);
     if (!payload)
       return {};
+
+    // If we are allowed to consume the subject and it is an RValue, we do a
+    // little dance to mark the enum as destroyed while keeping the reference
+    // we got back from _unsafe_get_enum_payload alive.  This allows us to bind
+    // var patterns to enum payloads without them even needing to be movable.
+    if (consume && parent.getIfMRValue()) {
+      auto parentRef = parent.getMValueReference();
+      auto payloadRef = payload.getMValueReference();
+      assert(payloadRef && "enum payload projection requires memory values");
+      Location loc = expr->getLocation(emitter);
+      Value payloadPtr =
+          RefToPointerOp::create(*emitter.builder, loc, payloadRef);
+      // Propagate the origin, but transfer ownership to the new value.
+      auto origin = cast<RefType>(parentRef.getType()).getOrigin();
+      StringAttr name = StringAttr::get(emitter.getContext(), "(enum payload)");
+      // The new value will own the original value, but define the start of a
+      // new live range.
+      Value ownedPayload = RefFromPointerOp::create(
+          *emitter.builder, loc, payloadPtr, origin, name,
+          /*startsUninit=*/false, /*endsUninit=*/true);
+      // Make the parent subject look consumed here on after.
+      OwnershipMarkDestroyedOp::create(*emitter.builder, loc, parentRef);
+      return MRValue(ownedPayload);
+    }
+
     return pathValues[path] = payload;
   }
   case PatternPath::ListElement:
@@ -1303,8 +1332,8 @@ FailureOr<TypedAttr> PatternEmitState::emitComptimeCondition(
       CValue subject = getPathValue(emitter, cmd->path, cmd->expr);
       if (!subject)
         return failure();
-      bindings.push_back(
-          {cmd->bindData.bindName, subject, cmd->bindData.declKind});
+      bindings.push_back({cmd->bindData.bindName, subject,
+                          cmd->bindData.declKind, cmd->path, cmd->expr});
       continue;
     }
     case PatternCommand::Or: {
@@ -1425,8 +1454,8 @@ PatternEmitState::emitCommands(OpBuilder &builder,
       CValue subject = getPathValue(emitter, cmd->path, cmd->expr);
       if (!subject)
         return failure();
-      bindings.push_back(
-          {cmd->bindData.bindName, subject, cmd->bindData.declKind});
+      bindings.push_back({cmd->bindData.bindName, subject,
+                          cmd->bindData.declKind, cmd->path, cmd->expr});
       break;
     }
     case PatternCommand::Or:
@@ -1570,7 +1599,8 @@ initOrBindings(const OpBuilder &builder, HLCF::MatchOp matchOp, SMLoc loc,
 
     CValue slot =
         isRefOrBind ? CValue(RLValue(varDecl)) : CValue(MLValue(varDecl));
-    aggregateBindings.push_back({bn.name, slot, bn.bindingKind, varDecl});
+    aggregateBindings.push_back(
+        {bn.name, slot, bn.bindingKind, nullptr, nullptr, varDecl});
   }
   return success();
 }
@@ -1723,8 +1753,8 @@ PatternEmitState::emitOr(OpBuilder &builder, const PatternCommand &cmd,
       Value refVal = RefLoadOp::create(builder, loc, rl);
       resultBinding = CValue::getMValueForRef(refVal);
     }
-    bindings.push_back(
-        {bn.name, resultBinding, bn.bindingKind, bn.declaration});
+    bindings.push_back({bn.name, resultBinding, bn.bindingKind, nullptr,
+                        nullptr, bn.declaration});
   }
   return success();
 }

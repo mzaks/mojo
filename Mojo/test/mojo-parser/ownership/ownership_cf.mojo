@@ -788,6 +788,21 @@ def make_optional_string() -> Optional[String]:
 def make_optional_int() -> Optional[Int]:
     return Optional[Int](None)
 
+
+def make_optional_movable() -> Optional[MyStringReturningCtx]:
+    return MyStringReturningCtx()
+
+
+# The rvalue `Optional` must transfer its payload into `x` rather than borrow
+# the payload and require a copy.
+def extract_temporary_optional_payload() -> MyStringReturningCtx:
+    match make_optional_movable():
+        case .Some(var x):
+            return x^
+        case .None:
+            abort()
+
+
 # The enum payload reference is tied to the temporary returned by
 # `make_optional_string()`.
 def match_temporary_optional_payload():

@@ -991,6 +991,10 @@ def use(imm value: SomeLinearType):
     pass
 
 
+def make_linear_optional() -> Optional[SomeLinearType]:
+    return SomeLinearType()
+
+
 # A final `var` binding can take an rvalue match subject. Earlier immutable
 # bindings only borrow it.
 # CHECK-LABEL: lit.fn @"match_rvalue_var_binding
@@ -1012,6 +1016,43 @@ def match_rvalue_var_binding(var arg: SomeLinearType, a: SomeLinearType):
         use(a)
     case var x:
         x^.consume()
+
+
+# CHECK-LABEL: lit.fn @"if_case_rvalue_optional_var_binding
+# CHECK-NEXT:    [[SUBJECT:%.*]] = lit.var.decl "__call_result_tmp__" synth
+# CHECK-NEXT:    {{.*}}@"make_linear_optional{{.*}}([[SUBJECT]])
+# CHECK-NEXT:    hlcf.match {
+# CHECK-NEXT:      [[TAG_REF:%.*]] = lit.ref.immut [[SUBJECT]]
+# CHECK-NEXT:      [[TAG:%.*]] = lit.call {{.*}}@"_get_enum_discriminant{{.*}}([[TAG_REF]])
+# CHECK-NEXT:      [[REBIND:%.*]] = kgen.rebind [[TAG]]
+# CHECK-NEXT:      [[SOME:%.*]] = kgen.param.constant
+# CHECK-NEXT:      [[IS_SOME:%.*]] = lit.call {{.*}}@"__eq__{{.*}}([[REBIND]], [[SOME]])
+# CHECK-NEXT:      [[COND:%.*]] = lit.call {{.*}}@"__mlir_bool{{.*}}([[IS_SOME]])
+# CHECK-NEXT:      hlcf.if [[COND]] {
+# CHECK-NEXT:        hlcf.yield
+# CHECK-NEXT:      } else {
+# CHECK-NEXT:        hlcf.match.next
+# CHECK-NEXT:      }
+# CHECK-NEXT:      [[PAYLOAD_REF:%.*]] = lit.ref.immut [[SUBJECT]]
+# CHECK-NEXT:      [[PAYLOAD:%.*]] = lit.call {{.*}}@"_unsafe_get_enum_payload{{.*}}([[PAYLOAD_REF]])
+# CHECK-NEXT:      [[X:%.*]] = lit.var.decl "x" var
+# CHECK-NEXT:      [[CONSUMING_REF:%.*]] = lit.ref.immut [[SUBJECT]]
+# CHECK-NEXT:      [[CONSUMING_PAYLOAD:%.*]] = lit.call {{.*}}@"_unsafe_get_enum_payload{{.*}}([[CONSUMING_REF]])
+# CHECK-NEXT:      [[PAYLOAD_PTR:%.*]] = lit.ref.to_pointer [[CONSUMING_PAYLOAD]]
+# CHECK-NEXT:      [[OWNED_PAYLOAD:%.*]] = lit.ref.from_pointer [[PAYLOAD_PTR]] end_uninit
+# CHECK-NEXT:      lit.ownership.mark_destroyed [[SUBJECT]]
+# CHECK-NEXT:      {{.*}}@"__init__(move{{.*}}([[OWNED_PAYLOAD]], [[X]])
+# CHECK-NEXT:      lit.ownership.use [[X]]
+# CHECK-NEXT:      {{.*}}@"consume{{.*}}([[X]])
+# CHECK-NEXT:      hlcf.match.complete
+# CHECK-NEXT:    } else {
+# CHECK-NEXT:      hlcf.yield
+# CHECK-NEXT:    }
+def if_case_rvalue_optional_var_binding():
+    if case .Some(var x) = make_linear_optional():
+        x^.consume()
+    else:
+        pass
 
 
 # CHECK-LABEL: lit.fn @"match_optional

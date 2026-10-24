@@ -152,6 +152,9 @@ struct PatternBoundName {
   StringRef name;
   CValue value;
   PatternDeclKind bindingKind;
+  /// The source path can be re-emitted after a case has committed.
+  const PatternPath *path = nullptr;
+  const ExprNode *expr = nullptr;
   /// Shared declaration already emitted for an Or-pattern binding.
   VarDeclOp declaration{};
 };
@@ -213,7 +216,7 @@ struct PatternEmitState {
   DenseMap<const PatternPath *, CValue> pathValues;
 
   CValue getPathValue(IREmitter &emitter, const PatternPath *path,
-                      const ExprNode *expr);
+                      const ExprNode *expr, bool consume = false);
 
   LogicalResult emitCommands(OpBuilder &builder,
                              ArrayRef<const PatternCommand *> commands,
