@@ -10,13 +10,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""Re-exports the `machine` names `_hal` uses.
+"""The HAL `DeviceContext` compat layer.
 
-Here `machine` is a sibling top-level package; in the staged `max` overlay it
-is nested inside `_hal`, and this file is shadowed by a variant importing from
-that location (see `_hal_staged_layer` in this package's BUILD.bazel). `_hal` sources import these
-names relatively (`from ._machine import ...`), which resolves in both
-compilation contexts.
+Compiles in every configuration as `max._driver.max_license.device_context_hal`.
+Under --config=hal-device-context, `_dcc_overlay.mojo` replaces
+`max/gpu/host/_overlay.mojo`, so `max.gpu.host` resolves to the DeviceContext
+defined here.
 """
-
-from machine import MachineDefinition, DeviceRef, DeviceSpec

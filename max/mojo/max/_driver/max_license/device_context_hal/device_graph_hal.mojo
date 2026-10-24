@@ -20,7 +20,7 @@ graph-compiler primitives to compile; none of them can be meaningfully
 constructed or used at runtime.
 """
 
-from .device_context import DeviceBuffer, DeviceContext
+from .device_context_hal import DeviceBuffer, DeviceContext
 
 
 struct _DeviceGraphBuilderCpp:

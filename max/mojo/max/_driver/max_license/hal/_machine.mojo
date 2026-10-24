@@ -10,12 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""Staged-tree variant of `_hal/_machine.mojo`.
+"""Re-exports the `machine` names `hal` uses."""
 
-The `max.gpu.host` overlay stages the `machine` package inside `_hal`, so the
-re-exported names resolve relative to it. Staged over `_hal/_machine.mojo` by
-`_hal_staged_layer` (see `max/driver/src/max_license/_hal/BUILD.bazel`); never
-compiled at this location.
-"""
-
-from .machine import MachineDefinition, DeviceRef, DeviceSpec
+from ..machine import MachineDefinition, DeviceRef, DeviceSpec

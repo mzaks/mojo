@@ -20,14 +20,14 @@ handling paths.
 
 from std.os import getenv
 from std.memory import alloc
-from max.gpu.host._hal import Driver, copy, fill, set_memory
-from max.gpu.host._hal.context import Context
-from max.gpu.host._hal.device import Device, get_device_spec
-from max.gpu.host._hal.queue import Queue
-from max.gpu.host._hal.stream import Stream
-from max.gpu.host._hal.event import Event, EVENT_FLAG_CPU_VISIBLE
-from max.gpu.host._hal.extensions.traits import SupportsPeerAccessV1
-from max.gpu.host._hal.status import (
+from max._driver import Driver, copy, fill, set_memory
+from max._driver.max_license.hal.context import Context
+from max._driver.max_license.hal.device import Device, get_device_spec
+from max._driver.max_license.hal.queue import Queue
+from max._driver.max_license.hal.stream import Stream
+from max._driver.max_license.hal.event import Event, EVENT_FLAG_CPU_VISIBLE
+from max._driver.max_license.hal.extensions.traits import SupportsPeerAccessV1
+from max._driver.max_license.hal.status import (
     STATUS_SUCCESS,
     STATUS_INCOMPATIBLE_VERSION,
     STATUS_UNKNOWN_ERROR,

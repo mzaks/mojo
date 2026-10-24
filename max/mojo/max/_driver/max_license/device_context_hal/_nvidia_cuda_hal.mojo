@@ -12,7 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 """CUDA native-handle accessors for the HAL `DeviceContext`."""
 
-from .device_context import DeviceContext, DeviceFunction, DeviceStream
+from .device_context_hal import DeviceContext, DeviceFunction, DeviceStream
 from std.memory.unsafe_pointer import unsafe_cast
 
 

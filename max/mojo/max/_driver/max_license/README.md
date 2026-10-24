@@ -15,10 +15,10 @@ The code lives in these places:
 
 | Component                    | Path                                               | Contents                                                            |
 |------------------------------|----------------------------------------------------|---------------------------------------------------------------------|
-| Client API                   | [`_hal/`](_hal/)                                   | `Driver`, `Device`, `Context`, `Queue`, `Stream`, `Event`, `Buffer` |
-| `DeviceContext` compat layer | [`_device_context_hal/`](_device_context_hal/)     | The `DeviceContext` API, rebuilt on top of the client API           |
-| Execution configurations     | [`_hal/execution_config/`](_hal/execution_config/) | Launch configuration traits and per-vendor implementations          |
-| Extensions                   | [`_hal/extensions/`](_hal/extensions/)             | Capability traits and per-vendor extension sets                     |
+| Client API                   | [`hal/`](hal/)                                     | `Driver`, `Device`, `Context`, `Queue`, `Stream`, `Event`, `Buffer` |
+| `DeviceContext` compat layer | [`device_context_hal/`](device_context_hal/)       | The `DeviceContext` API, rebuilt on top of the client API           |
+| Execution configurations     | [`hal/execution_config/`](hal/execution_config/)   | Launch configuration traits and per-vendor implementations          |
+| Extensions                   | [`hal/extensions/`](hal/extensions/)               | Capability traits and per-vendor extension sets                     |
 | Hardware abstraction layer   | `SDK/include/HAL/`                                 | The `M_driver_*` C interface that every plugin implements           |
 
 > [!NOTE]
@@ -238,7 +238,7 @@ metaprogram lowers it so that:
   carried at run time.
 
 Each backend declares its launch configuration type, and the traits it conforms
-to in [`execution_config/`](_hal/execution_config/) say what it
+to in [`execution_config/`](hal/execution_config/) say what it
 supports: `GridBlockExecutionConfig` for GPU-style grids and blocks,
 `CoresExecutionConfig` for a core count, and others. Generic code branches on
 those traits instead of on a vendor. The same approach works through the
@@ -299,7 +299,7 @@ function prototypes. A shared conformance test suite runs against every plugin.
 Plugin hooks are compile-time Mojo implementations of behavior specific to a
 device or vendor behind a common API. Each backend declares a `HalPluginHooks`
 struct (see
-[`_hal/_plugin/_trait.mojo`](_hal/_plugin/_trait.mojo)) with its
+[`hal/_plugin/_trait.mojo`](hal/_plugin/_trait.mojo)) with its
 execution configuration type and its extension set. Optional hooks left as
 `None` add no cost.
 

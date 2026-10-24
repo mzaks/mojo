@@ -10,11 +10,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""The HAL `DeviceContext` compat layer.
-
-Staged as `max.gpu.host._device_context_hal` so it compiles alongside the
-legacy `DeviceContext`, but nothing imports it from here yet. Under
---config=hal-device-context its modules are instead staged over the
-`max.gpu.host` modules they replace (see
-`max/driver/src/max_license/BUILD.bazel`); this file is not staged there.
-"""
+"""The NeoDriver sources: the HAL client API (`hal`), `machine`, and the HAL
+`DeviceContext` compat layer (`device_context_hal`)."""

@@ -13,8 +13,12 @@
 """Tests the HAL `Context` loaded-function cache."""
 
 from std.os import getenv
-from max.gpu.host._hal import Context, Driver
-from max.gpu.host._hal.device import Device, DeviceSpec, get_device_spec
+from max._driver import Context, Driver
+from max._driver.max_license.hal.device import (
+    Device,
+    DeviceSpec,
+    get_device_spec,
+)
 from max.gpu import global_idx
 from std.memory import (
     ArcPointer,

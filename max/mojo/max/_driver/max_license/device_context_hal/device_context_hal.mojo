@@ -53,7 +53,7 @@ from std.reflection import call_location, reflect, SourceLocation
 from std.sys import bit_width_of, size_of, CompilationTarget
 from std.sys.info import is_gpu
 from std.time import monotonic
-from max.gpu.host._hal import (
+from ..hal import (
     Buffer,
     Context,
     Device,
@@ -64,10 +64,10 @@ from max.gpu.host._hal import (
     Stream,
     get_device_spec,
 )
-from max.gpu.host._hal._machine import DeviceSpec
-from max.gpu.host._hal.event import EVENT_FLAG_CPU_VISIBLE
-from max.gpu.host._hal.extensions.traits import SupportsPeerAccessV1
-from max.gpu.host._hal.execution_config import (
+from ..hal._machine import DeviceSpec
+from ..hal.event import EVENT_FLAG_CPU_VISIBLE
+from ..hal.extensions.traits import SupportsPeerAccessV1
+from ..hal.execution_config import (
     ExecutionConfig,
     BlockExecutionConfig,
     GridBlockExecutionConfig,
