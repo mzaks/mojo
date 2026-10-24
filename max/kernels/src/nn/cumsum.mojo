@@ -45,15 +45,19 @@ from std.utils.numerics import get_accum_type
 
 # Row-scan geometries. Long integral rows are scanned in one trip per block:
 # 512 threads folding 16 elements each, one wide access per thread, covers an
-# 8192-element row. Other rows stay on the small tile, where a wide geometry's
-# mostly idle block costs more than it saves, and floating rows keep that tile
-# so their rounding sequence is the one the previous revision produced.
+# 8192-element row; past 12288 elements 1024 threads cover up to 16384 in one
+# trip. Other rows stay on the small tile, where a wide geometry's mostly idle
+# block costs more than it saves, and floating rows keep that tile so their
+# rounding sequence is the one the previous revision produced.
 comptime _CUMSUM_SCAN_THREADS = 512
 comptime _CUMSUM_SCAN_ITEMS = 16
+comptime _CUMSUM_LONG_THREADS = 1024
+comptime _CUMSUM_LONG_ITEMS = 16
 comptime _CUMSUM_NARROW_THREADS = 256
 comptime _CUMSUM_NARROW_ITEMS = 4
-# Integral rows at least this long take the wide geometry.
+# Integral rows at least this long take the wide geometry, and the longer one.
 comptime _CUMSUM_WIDE_MIN_LEN = 4096
+comptime _CUMSUM_LONG_MIN_LEN = 12288
 # Threads per block of the chunk-sum kernel, and the independent loads each
 # thread keeps in flight per trip.
 comptime _CUMSUM_BLOCK_SIZE = 256
@@ -389,6 +393,44 @@ def _cumsum_row_scan_kernel[
 
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32(_CUMSUM_LONG_THREADS)
+    )
+)
+@__name(t"cumsum_row_scan_long_{dtype}_{exclusive}_{reverse}_{has_carry}")
+def _cumsum_row_scan_long_kernel[
+    dtype: DType,
+    accum_type: DType,
+    exclusive: Bool,
+    reverse: Bool,
+    has_carry: Bool,
+    OutLayoutType: TensorLayout,
+    InLayoutType: TensorLayout,
+    CarryLayoutType: TensorLayout,
+](
+    output: TileTensor[dtype, OutLayoutType, MutAnyOrigin],
+    input: TileTensor[dtype, InLayoutType, ImmutAnyOrigin],
+    carry: TileTensor[accum_type, CarryLayoutType, ImmutAnyOrigin],
+    chunk_len_arg: Int32,
+):
+    """Scans a chunk of a long row: 1024 threads x 16 elements, one trip to
+    16384 elements."""
+    _row_scan_body[
+        dtype,
+        accum_type,
+        exclusive,
+        reverse,
+        has_carry,
+        _CUMSUM_LONG_THREADS,
+        _CUMSUM_LONG_ITEMS,
+        True,
+        OutLayoutType,
+        InLayoutType,
+        CarryLayoutType,
+    ](output, input, carry, Int(chunk_len_arg))
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
         Int32(_CUMSUM_NARROW_THREADS)
     )
 )
@@ -599,6 +641,26 @@ def _enqueue_scan[
         var in_rows = input.reshape(rows_layout)
         # `_chunk_len` tiles a row with the geometry this shape takes.
         if wide:
+            if axis_len >= _CUMSUM_LONG_MIN_LEN:
+                comptime kernel = _cumsum_row_scan_long_kernel[
+                    dtype,
+                    accum_type,
+                    exclusive,
+                    reverse,
+                    has_carry,
+                    out_rows.LayoutType,
+                    in_rows.LayoutType,
+                    carry.LayoutType,
+                ]
+                ctx.enqueue_function[kernel](
+                    out_rows,
+                    in_rows.as_imm(),
+                    carry,
+                    Int32(chunk_len),
+                    grid_dim=num_rows * num_chunks,
+                    block_dim=_CUMSUM_LONG_THREADS,
+                )
+                return
             comptime kernel = _cumsum_row_scan_kernel[
                 dtype,
                 accum_type,
@@ -725,11 +787,13 @@ def _chunk_len(
         if num_lines >= _CUMSUM_FILL_BLOCKS_PER_SM * sm_count:
             return axis_len
         # The tile of the geometry `_enqueue_scan` picks for this row.
-        var tile = (
-            _CUMSUM_SCAN_THREADS
-            * _CUMSUM_SCAN_ITEMS if wide else _CUMSUM_NARROW_THREADS
-            * _CUMSUM_NARROW_ITEMS
-        )
+        var tile: Int
+        if not wide:
+            tile = _CUMSUM_NARROW_THREADS * _CUMSUM_NARROW_ITEMS
+        elif axis_len >= _CUMSUM_LONG_MIN_LEN:
+            tile = _CUMSUM_LONG_THREADS * _CUMSUM_LONG_ITEMS
+        else:
+            tile = _CUMSUM_SCAN_THREADS * _CUMSUM_SCAN_ITEMS
         var num_chunks = ceildiv(
             _CUMSUM_TARGET_BLOCKS_PER_SM * sm_count, num_lines
         )
