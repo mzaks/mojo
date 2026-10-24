@@ -1759,7 +1759,11 @@ def paramfor_next_value[
         abort()
 
 
-struct Optional[T: Movable](Copyable, EnumLike):
+struct Optional[T: Movable](
+    Copyable,
+    EnumLike,
+    RegisterPassable where conforms_to(T, RegisterPassable),
+):
     def __deinit__(deinit self):
         pass
 

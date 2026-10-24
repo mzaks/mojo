@@ -139,6 +139,10 @@ struct PatternCommand {
             .bindData = {bindName, declKind}};
   }
 
+  /// Return true if this pattern command is binding a "var" pattern, or is an
+  /// "or" pattern that recursively has them.
+  bool hasVarBinding() const;
+
   void print(raw_ostream &os, unsigned indent = 0) const;
   LLVM_DUMP_METHOD void dump() const;
 };

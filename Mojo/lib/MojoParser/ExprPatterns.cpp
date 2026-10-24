@@ -120,6 +120,18 @@ void PatternPath::dump() const {
   llvm::errs() << "\n";
 }
 
+bool PatternCommand::hasVarBinding() const {
+  if (kind == Bind)
+    return bindData.declKind == PatternDeclKind::kVar;
+  if (kind != Or)
+    return false;
+  return llvm::any_of(orAlternatives, [](PatternCommandList alternative) {
+    return llvm::any_of(alternative, [](const PatternCommand *command) {
+      return command->hasVarBinding();
+    });
+  });
+}
+
 void PatternCommand::print(raw_ostream &os, unsigned indent) const {
   os.indent(indent);
   switch (kind) {
@@ -1617,7 +1629,7 @@ static LogicalResult checkOrBindings(
       assert(rl && "aggregate or-pattern bindings are ML/RLValues");
       destLV = LValue(rl);
     }
-    ExprDest storeDest(destLV, EC_VarInit);
+    ExprDest storeDest(destLV, EC_VarInitMatchBinding);
     SyntheticNode locExpr(loc);
     IREmitter emitter(curDeclScope, builder);
     CValue caseValue = caseBN.value;

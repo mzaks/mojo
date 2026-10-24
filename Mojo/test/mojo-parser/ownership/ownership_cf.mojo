@@ -780,3 +780,25 @@ def noreturn_except_after_try() raises:
     except e:
         abort()
     use(mem)
+
+
+def make_optional_string() -> Optional[String]:
+    return String("payload")
+
+def make_optional_int() -> Optional[Int]:
+    return Optional[Int](None)
+
+# The enum payload reference is tied to the temporary returned by
+# `make_optional_string()`.
+def match_temporary_optional_payload():
+    match make_optional_string():
+    case .Some(payload):
+        use(payload)
+    case .None:
+        pass
+
+    match make_optional_string():
+    case .Some(payload):
+        _ = payload
+    case .None:
+        pass

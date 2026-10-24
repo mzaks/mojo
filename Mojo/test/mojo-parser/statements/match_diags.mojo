@@ -13,6 +13,29 @@
 
 # RUN: %parse-mojo-isolated -verify-diagnostics %s
 
+struct SomeLinearType(Movable):
+    def __init__(out self):
+        pass
+
+    def __init__(out self, *, deinit move: Self):
+        pass
+
+    def consume(deinit self):
+        pass
+
+
+def match_guarded_var_binding_requires_copy(
+    var value: SomeLinearType, somecond: Bool
+):
+    match value^:
+    # A guard can fail and advance to the next case, so this binding must copy.
+    # expected-error @+1 {{value of type 'SomeLinearType' cannot be implicitly copied, it does not conform to 'ImplicitlyCopyable'}}
+    case var x if somecond:
+        x^.consume()
+    case _:
+        pass
+
+
 def match_bad_subject_skips_same_indent_cases():
     # expected-error @+1 {{use of unknown declaration 'no_such_subject'}}
     match no_such_subject:
@@ -99,7 +122,6 @@ def various_match_issues(a: Int, point: Tuple[Int, Int], value: String):
         pass
 
     match Int():
-    # expected-error @+1 {{value of type 'Int' doesn't have a memory origin in 'ref' binding}}
     case ref z:
         pass
 

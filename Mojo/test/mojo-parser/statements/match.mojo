@@ -977,6 +977,43 @@ def match_optional_refined_payload(opt: Optional[Int]):
         case_callee[2]()
 
 
+struct SomeLinearType(Movable):
+    def __init__(out self): pass
+    # Explicit move ctor so we can see where it happens.
+    def __init__(out self, *, deinit move: Self): pass
+    def consume(deinit self): pass
+
+    def __eq__(self, other: Self) -> Bool:
+        return False
+
+
+def use(imm value: SomeLinearType):
+    pass
+
+
+# A final `var` binding can take an rvalue match subject. Earlier immutable
+# bindings only borrow it.
+# CHECK-LABEL: lit.fn @"match_rvalue_var_binding
+# CHECK-NEXT:    lit.ownership.use %arg
+# CHECK-NEXT:    hlcf.match {
+# CHECK-NEXT:      [[BORROWED_ARG:%.*]] = lit.ref.immut %arg
+# CHECK-NEXT:      {{.*}}@"__eq__{{.*}}([[BORROWED_ARG]], %a)
+# CHECK:           hlcf.match.complete
+# CHECK-NEXT:    }
+# CHECK-NEXT:    case {
+# CHECK-NEXT:      [[X:%.*]] = lit.var.decl "x" var
+# CHECK-NOT:       lit.memcpy
+# CHECK-NEXT:      {{.*}}@"__init__(move{{.*}}(%arg, [[X]])
+# CHECK-NEXT:      lit.ownership.use [[X]]
+# CHECK-NEXT:      {{.*}}@"consume{{.*}}([[X]])
+def match_rvalue_var_binding(var arg: SomeLinearType, a: SomeLinearType):
+    match arg^:
+    case == a:
+        use(a)
+    case var x:
+        x^.consume()
+
+
 # CHECK-LABEL: lit.fn @"match_optional
 def match_optional(opt: Optional[Int], mut mut_opt: Optional[Int]):
     # Immutable Optional: Some is tested and None is its exclusive complement.
