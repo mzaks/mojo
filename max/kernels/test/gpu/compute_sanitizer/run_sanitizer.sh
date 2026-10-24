@@ -23,15 +23,19 @@
 #                use `redzone` to catch realistic off-by-one global overflows.
 #   racecheck  - intra-block shared-memory data races (pool-independent).
 #   initcheck  - uninitialized global-memory reads.
-#   synccheck  - divergent / mismatched __syncthreads / named-barrier. NOTE:
-#                this lane reports "Divergent thread(s) in block" for every
+#   synccheck  - divergent / mismatched __syncthreads / named-barrier. This
+#                lane reports "Divergent thread(s) in block" for every
 #                `named_barrier` in the warp-specialized SM100 attention/MLA
 #                family. PTX permits warps to arrive at different `bar.sync`
 #                instructions sharing a barrier name -- exactly what those
 #                partial-CTA rendezvous do -- but synccheck accepts arrivals
 #                from only one instruction address, and NVIDIA supports
 #                `--suppressions` for memcheck/initcheck/racecheck but NOT for
-#                synccheck. Expect ~48 noise findings on SM100. KERN-3536.
+#                synccheck. `classify_synccheck.py` filters that one class out
+#                by resolving each report to its source line, so the lane gates
+#                on the rest. `negative_control_synccheck_named_barrier.mojo`
+#                is the proof the class is tool noise and the calibration for
+#                the rule.
 #   redzone    - MAX's own guard-region allocator (no compute-sanitizer): fast,
 #                catches small global OOB at free time (host alloc/free trace).
 #
@@ -59,6 +63,7 @@ cd "$WORKDIR" || exit 1
 CS="${COMPUTE_SANITIZER:-/usr/local/cuda/bin/compute-sanitizer}"
 RESULTS="${CS_RESULTS_DIR:-$WORKDIR/.derived/cs-findings}/$TOOL"
 mkdir -p "$RESULTS"
+CLASSIFY="$WORKDIR/max/kernels/test/gpu/compute_sanitizer/classify_synccheck.py"
 
 COMMON=(
   # Build the test binaries under the shared CI GPU config (same as the
@@ -250,7 +255,19 @@ for tgt in "${EXPANDED[@]}"; do
   rel="${tgt#//}"; rel="${rel/://}"
   tl="bazel-testlogs/$rel/test.log"
   [ -f "$tl" ] || continue
-  hits="$(grep -nE "$MARKERS" "$tl" 2>/dev/null | grep -vE 'ERROR SUMMARY: 0 errors' | head -40)"
+  if [ "$TOOL" = synccheck ]; then
+    # Same marker set, minus the one class we can prove is the tool's own gap:
+    # a divergence attributed to a `named_barrier` call site. PTX permits one
+    # barrier name to be reached from several instruction addresses (that IS a
+    # partial-CTA rendezvous); synccheck models a barrier as one address and
+    # reports every SM100 attention/MLA rendezvous as divergent. NVIDIA has no
+    # `--suppressions` for synccheck, so the filter lives here. It removes
+    # nothing else -- a plain `barrier()` divergence, which is what a real
+    # desynchronized block looks like, still reports.
+    hits="$("$CLASSIFY" --markers "$MARKERS" "$tl" 2>>"$LOG" | head -40)"
+  else
+    hits="$(grep -nE "$MARKERS" "$tl" 2>/dev/null | grep -vE 'ERROR SUMMARY: 0 errors' | head -40)"
+  fi
   if [ -n "$hits" ]; then
     found_any=1
     echo "" | tee -a "$LOG"
