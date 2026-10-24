@@ -3405,8 +3405,7 @@ auto SubscriptNode::emitLCVIR(ExprDest &dest, IREmitter &emitter,
 
         auto callOv =
             OverloadSet::lookup(emitter.getDeclScope(), ty, "__call__", base,
-                                CallSyntax::kMethodCallSynthetic,
-                                /*contextualType=*/ty);
+                                CallSyntax::kMethodCallSynthetic);
 
         if (!callOv.isNull()) {
           assert(callOv.explicitParamBindings.empty() &&
@@ -3772,8 +3771,10 @@ static AnyValue emitBinOpCall(ASTExprAnd<AnyValue> lhs,
                         {lhs, rhs});
 
   // `a in b` => `b.__contains__(a)` and there is no reversed form.
-  if (kind == ExprNode::Kind::kCmpIn)
+  if (kind == ExprNode::Kind::kCmpIn) {
     std::swap(operands[0], operands[1]);
+    std::swap(lhs, rhs);
+  }
 
   // Check to see if we have a forward version of this function on the primary
   // receiver.
