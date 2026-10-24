@@ -1264,40 +1264,92 @@ def _cumsum_gpu[
     # Split each line into chunks: sum every chunk, scan the sums into
     # per-chunk carries, then scan each chunk starting from its carry.
     var num_chunks = ceildiv(axis_len, chunk_len)
-    if (
-        row_scan
-        and wide_rows
-        # Two chunks do not repay the extra launches: one block walking two
-        # trips is what the two blocks cost, less the second launch and the
-        # handoff (the same finding as the earlier campaign's two-chunk split).
-        and 2 < num_chunks
-        and num_chunks <= _CUMSUM_CHAIN_MAX_CHUNKS
-        and num_lines * num_chunks <= _CUMSUM_CHAIN_BLOCKS_PER_SM * sm_count
-    ):
-        # One launch for the whole split: every chunk publishes its own sum in
-        # its block and reads the sums of the chunks before it, so a split row
-        # costs one launch instead of the totals and carries ones. The row's
-        # publish mask is zeroed first, so it only counts this launch's
-        # publishes; its byte per chunk caps the split at eight chunks.
-        var totals_buf = ctx.enqueue_create_buffer[accum_type](
-            num_lines * num_chunks
-        )
-        var masks_buf = ctx.enqueue_create_buffer[DType.uint64](num_lines)
-        var masks = TileTensor(masks_buf, row_major((num_lines,)))
-        comptime clear_kernel = _cumsum_row_chain_clear_kernel[masks.LayoutType]
-        ctx.enqueue_function[clear_kernel](
-            masks,
-            Int32(num_lines),
-            grid_dim=ceildiv(num_lines, _CUMSUM_CHAIN_CLEAR_THREADS),
-            block_dim=_CUMSUM_CHAIN_CLEAR_THREADS,
-        )
-        var chunks_layout = row_major((num_lines, num_chunks))
-        var totals = TileTensor(totals_buf, chunks_layout)
-        var rows_layout = row_major((num_rows, axis_len))
-        var chain_out = output.reshape(rows_layout)
-        var chain_in = input.reshape(rows_layout)
-        if long_ok and axis_len >= _CUMSUM_LONG_MIN_LEN:
-            comptime chain_kernel = _cumsum_row_chain_long_kernel[
+    # The handshake is two 64-bit atomics with release/acquire orderings, and
+    # Metal lowers neither 64-bit RMWs nor those orderings, so the chain stays
+    # out of the Apple build entirely -- the launch gate would not be enough,
+    # since the params still instantiate (see `algorithm/gpu/rowwise.mojo`).
+    comptime if not ctx.target.is_apple_gpu():
+        if (
+            row_scan
+            and wide_rows
+            # Two chunks do not repay the extra launches: one block walking two
+            # trips is what the two blocks cost, less the second launch and the
+            # handoff (the same finding as the earlier campaign's two-chunk split).
+            and 2 < num_chunks
+            and num_chunks <= _CUMSUM_CHAIN_MAX_CHUNKS
+            and num_lines * num_chunks <= _CUMSUM_CHAIN_BLOCKS_PER_SM * sm_count
+        ):
+            # One launch for the whole split: every chunk publishes its own sum in
+            # its block and reads the sums of the chunks before it, so a split row
+            # costs one launch instead of the totals and carries ones. The row's
+            # publish mask is zeroed first, so it only counts this launch's
+            # publishes; its byte per chunk caps the split at eight chunks.
+            var totals_buf = ctx.enqueue_create_buffer[accum_type](
+                num_lines * num_chunks
+            )
+            var masks_buf = ctx.enqueue_create_buffer[DType.uint64](num_lines)
+            var masks = TileTensor(masks_buf, row_major((num_lines,)))
+            comptime clear_kernel = _cumsum_row_chain_clear_kernel[
+                masks.LayoutType
+            ]
+            ctx.enqueue_function[clear_kernel](
+                masks,
+                Int32(num_lines),
+                grid_dim=ceildiv(num_lines, _CUMSUM_CHAIN_CLEAR_THREADS),
+                block_dim=_CUMSUM_CHAIN_CLEAR_THREADS,
+            )
+            var chunks_layout = row_major((num_lines, num_chunks))
+            var totals = TileTensor(totals_buf, chunks_layout)
+            var rows_layout = row_major((num_rows, axis_len))
+            var chain_out = output.reshape(rows_layout)
+            var chain_in = input.reshape(rows_layout)
+            if long_ok and axis_len >= _CUMSUM_LONG_MIN_LEN:
+                comptime chain_kernel = _cumsum_row_chain_long_kernel[
+                    dtype,
+                    accum_type,
+                    exclusive,
+                    reverse,
+                    chain_out.LayoutType,
+                    chain_in.LayoutType,
+                    totals.LayoutType,
+                    masks.LayoutType,
+                ]
+                ctx.enqueue_function[chain_kernel](
+                    chain_out,
+                    chain_in.as_imm(),
+                    totals,
+                    masks,
+                    Int32(chunk_len),
+                    grid_dim=num_rows * num_chunks,
+                    block_dim=_CUMSUM_LONG_THREADS,
+                )
+                return
+            if wide64:
+                comptime chain_kernel64 = _cumsum_row_chain64_kernel[
+                    dtype,
+                    accum_type,
+                    exclusive,
+                    reverse,
+                    chain_out.LayoutType,
+                    chain_in.LayoutType,
+                    totals.LayoutType,
+                    masks.LayoutType,
+                ]
+                ctx.enqueue_function[chain_kernel64](
+                    chain_out,
+                    chain_in.as_imm(),
+                    totals,
+                    masks,
+                    Int32(chunk_len),
+                    grid_dim=num_rows * num_chunks,
+                    block_dim=_CUMSUM_WIDE64_THREADS,
+                )
+                return
+            # Reachable by construction, not in fact: only 4-byte rows reach
+            # the chain with a 16384-element tile, and 8-byte ones take the
+            # geometry above, so this is the mirror of `_enqueue_scan`'s live
+            # 512-thread case rather than a path a caller reaches.
+            comptime chain_kernel = _cumsum_row_chain_kernel[
                 dtype,
                 accum_type,
                 exclusive,
@@ -1314,50 +1366,9 @@ def _cumsum_gpu[
                 masks,
                 Int32(chunk_len),
                 grid_dim=num_rows * num_chunks,
-                block_dim=_CUMSUM_LONG_THREADS,
+                block_dim=_CUMSUM_SCAN_THREADS,
             )
             return
-        if wide64:
-            comptime chain_kernel64 = _cumsum_row_chain64_kernel[
-                dtype,
-                accum_type,
-                exclusive,
-                reverse,
-                chain_out.LayoutType,
-                chain_in.LayoutType,
-                totals.LayoutType,
-                masks.LayoutType,
-            ]
-            ctx.enqueue_function[chain_kernel64](
-                chain_out,
-                chain_in.as_imm(),
-                totals,
-                masks,
-                Int32(chunk_len),
-                grid_dim=num_rows * num_chunks,
-                block_dim=_CUMSUM_WIDE64_THREADS,
-            )
-            return
-        comptime chain_kernel = _cumsum_row_chain_kernel[
-            dtype,
-            accum_type,
-            exclusive,
-            reverse,
-            chain_out.LayoutType,
-            chain_in.LayoutType,
-            totals.LayoutType,
-            masks.LayoutType,
-        ]
-        ctx.enqueue_function[chain_kernel](
-            chain_out,
-            chain_in.as_imm(),
-            totals,
-            masks,
-            Int32(chunk_len),
-            grid_dim=num_rows * num_chunks,
-            block_dim=_CUMSUM_SCAN_THREADS,
-        )
-        return
 
     var totals_buf = ctx.enqueue_create_buffer[accum_type](
         num_lines * num_chunks
