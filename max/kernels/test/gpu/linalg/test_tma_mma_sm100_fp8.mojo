@@ -236,7 +236,7 @@ def tma_umma_kernel_ss[
         accum_type,
         a_type,
         b_type,
-        Index[dtype=.uint32](mma_shape[0], mma_shape[1]),
+        (UInt32(mma_shape[0]), UInt32(mma_shape[1])),
         transpose_a=transpose_a,
         transpose_b=transpose_b,
     ]()
@@ -468,7 +468,7 @@ def tma_umma_kernel_ts_fp8[
         accum_type,
         a_type,
         b_type,
-        Index[dtype=.uint32](mma_shape[0], mma_shape[1]),
+        (UInt32(mma_shape[0]), UInt32(mma_shape[1])),
         transpose_b=transpose_b,
     ]()
 

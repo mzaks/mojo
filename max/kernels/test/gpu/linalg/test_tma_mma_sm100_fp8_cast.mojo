@@ -243,7 +243,7 @@ def tma_umma_kernel_sgs[
         accum_type,
         a_type,
         b_smem_type,  # bfloat16
-        Index[dtype=.uint32](mma_shape[0], mma_shape[1]),
+        (UInt32(mma_shape[0]), UInt32(mma_shape[1])),
         transpose_a=False,  # A is not transposed
         transpose_b=transpose_b,
     ]()

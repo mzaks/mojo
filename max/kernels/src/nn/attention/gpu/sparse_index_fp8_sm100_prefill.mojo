@@ -2288,7 +2288,7 @@ def _fp8_index_score_prefill_kernel_sm100[
                                 DType.uint8,
                                 DType.uint8,
                                 DType.float8_e8m0fnu,
-                                Index[dtype=DType.uint32](BM_key, MMA_N),
+                                (UInt32(BM_key), UInt32(MMA_N)),
                                 transpose_b=True,
                             ]()
                             var a_desc = _create_mma_desc_k_major[dtype, SW](

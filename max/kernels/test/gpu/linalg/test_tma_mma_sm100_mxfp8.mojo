@@ -279,7 +279,7 @@ def block_scaled_mxfp8_kernel[
         a_type,
         b_type,
         a_scales_type,
-        Index[dtype=.uint32](umma_shape[0], umma_shape[1]),
+        (UInt32(umma_shape[0]), UInt32(umma_shape[1])),
         transpose_b=transpose_b,
     ]()
 

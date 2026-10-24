@@ -949,7 +949,7 @@ struct SM100TensorAccumulator[
         Self.accum_t,
         Self.operand_t,
         Self.operand_t,
-        Index[dtype=DType.uint32](Self.MMA_M, Self.MMA_N),
+        (UInt32(Self.MMA_M), UInt32(Self.MMA_N)),
         transpose_b=Self.transpose_b,
     ]()
 

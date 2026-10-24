@@ -307,7 +307,7 @@ def blockscaled_pair_cta_mxfp8[
         a_type,
         b_type,
         a_scales_type,
-        Index[dtype=.uint32](mma_shape[0], mma_shape[1]),
+        (UInt32(mma_shape[0]), UInt32(mma_shape[1])),
         transpose_b=transpose_b,
     ]()
 

@@ -4655,7 +4655,7 @@ def _build_im2col_descriptor[
 
     var swizzle = _SwizzleMode(Int32(Int(swizzle_mode)))
 
-    var tensormap = _create_tensormap_im2col[dtype, 4, 2](
+    var tensormap = _create_tensormap_im2col[dtype](
         global_buf,
         global_shape,
         global_strides,

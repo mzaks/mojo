@@ -32,6 +32,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 from max.gpu.host.info import A100
 from layout.tensor_core import get_mma_shape
 
+from std.utils.coord import DynamicCoord
 from std.utils.index import Index, IndexList
 from std.utils.numerics import get_accum_type
 
@@ -238,15 +239,15 @@ struct MatmulConfig[
             self.num_warp_k_partitions,
         )
 
-    def grid_dim(self, m: Int, n: Int) -> IndexList[3]:
-        return Index(
+    def grid_dim(self, m: Int, n: Int) -> DynamicCoord[.int, 3]:
+        return (
             uceildiv(n, self.block_tile_shape[1]),
             uceildiv(m, self.block_tile_shape[0]),
             self.num_k_partitions,
         )
 
-    def block_dim(self) -> IndexList[3]:
-        return Index(self.num_threads(), 1, 1)
+    def block_dim(self) -> DynamicCoord[.int, 3]:
+        return (self.num_threads(), 1, 1)
 
     def work_space_size(self, M: Int, N: Int) -> Int:
         return M * N * (self.num_k_partitions - 1)

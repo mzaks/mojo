@@ -2564,7 +2564,7 @@ struct DecodeSM100QKTSS[
         Self.accum_type,
         Self.operand_type,
         Self.operand_type,
-        Index[dtype=DType.uint32](Self.MMA_M, Self.MMA_N),
+        (UInt32(Self.MMA_M), UInt32(Self.MMA_N)),
         transpose_b=True,  # QKᵀ
     ]()
 
@@ -2691,7 +2691,7 @@ struct DecodeSM100PVSS[
         Self.accum_type,
         Self.operand_type,
         Self.operand_type,
-        Index[dtype=DType.uint32](Self.MMA_M, Self.MMA_N),
+        (UInt32(Self.MMA_M), UInt32(Self.MMA_N)),
         transpose_b=False,  # P (k-major) * V (mn-major) = no transpose
     ]()
 
@@ -2785,7 +2785,7 @@ struct DecodeSM100QKTTS[
         Self.accum_type,
         Self.operand_type,
         Self.operand_type,
-        Index[dtype=DType.uint32](Self.MMA_M, Self.MMA_N),
+        (UInt32(Self.MMA_M), UInt32(Self.MMA_N)),
         transpose_b=True,  # QKᵀ
     ]()
 
@@ -2860,7 +2860,7 @@ struct DecodeSM100QKTSS_FP8[
         Self.accum_type,
         Self.operand_type,
         Self.operand_type,
-        Index[dtype=DType.uint32](Self.MMA_M, Self.MMA_N),
+        (UInt32(Self.MMA_M), UInt32(Self.MMA_N)),
         transpose_b=True,  # QKT
     ]()
 
@@ -2956,7 +2956,7 @@ struct DecodeSM100QKTSS_Content_FP8[
         Self.accum_type,
         Self.operand_type,
         Self.operand_type,
-        Index[dtype=DType.uint32](Self.MMA_M, Self.MMA_N),
+        (UInt32(Self.MMA_M), UInt32(Self.MMA_N)),
         transpose_b=True,  # QK^T
     ]()
 
@@ -3052,7 +3052,7 @@ struct DecodeSM100QKTSS_Rope_BF16[
         Self.accum_type,
         Self.operand_type,
         Self.operand_type,
-        Index[dtype=DType.uint32](Self.MMA_M, Self.MMA_N),
+        (UInt32(Self.MMA_M), UInt32(Self.MMA_N)),
         transpose_b=True,  # QK^T
     ]()
 
@@ -3149,7 +3149,7 @@ struct DecodeSM100PVSS_FP8[
         Self.accum_type,
         Self.operand_type,
         Self.operand_type,
-        Index[dtype=DType.uint32](Self.MMA_M, Self.MMA_N),
+        (UInt32(Self.MMA_M), UInt32(Self.MMA_N)),
         transpose_b=False,  # P (k-major) * V (mn-major) = no transpose
     ]()
 
