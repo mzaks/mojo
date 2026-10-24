@@ -15,11 +15,12 @@
 from std.algorithm import vectorize
 from std.math import align_up, ceildiv
 from std.memory import stack_allocation
-from std.sys import bit_width_of
+from std.sys import align_of, bit_width_of
 from std.sys.info import simd_width_of
 from std.utils.static_tuple import StaticTuple
 
 from layout import (
+    Coord,
     ImmTileTensor,
     MutTileTensor,
     TensorLayout,
@@ -42,19 +43,27 @@ from max.runtime.tracing import Trace, TraceLevel, get_safe_task_id
 
 from std.utils.numerics import get_accum_type
 
-# Threads per block, and contiguous elements per thread, for the row-scan
-# kernel. Each block covers `_CUMSUM_BLOCK_SIZE * _CUMSUM_ITEMS` elements of a
-# row per loop trip.
+# Row-scan geometries. Long integral rows are scanned in one trip per block:
+# 512 threads folding 16 elements each, one wide access per thread, covers an
+# 8192-element row. Other rows stay on the small tile, where a wide geometry's
+# mostly idle block costs more than it saves, and floating rows keep that tile
+# so their rounding sequence is the one the previous revision produced.
+comptime _CUMSUM_SCAN_THREADS = 512
+comptime _CUMSUM_SCAN_ITEMS = 16
+comptime _CUMSUM_NARROW_THREADS = 256
+comptime _CUMSUM_NARROW_ITEMS = 4
+# Integral rows at least this long take the wide geometry.
+comptime _CUMSUM_WIDE_MIN_LEN = 4096
+# Threads per block of the chunk-sum kernel, and the independent loads each
+# thread keeps in flight per trip.
 comptime _CUMSUM_BLOCK_SIZE = 256
-comptime _CUMSUM_ITEMS = 4
-# Independent loads each thread keeps in flight per trip in the chunk-sum
-# kernel.
 comptime _CUMSUM_TOTAL_ITEMS = 16
 
 # Contiguous rows at least this long always take the row-scan kernel. Shorter
 # rows take it only when they are too few to occupy the GPU one thread each
-# (see `_use_row_scan`): with many short rows, a 256-thread block per row is
-# mostly idle threads, and one thread per row is faster.
+# (see `_use_row_scan`): with many short rows, a block of
+# `_CUMSUM_NARROW_THREADS` threads per row is mostly idle threads, and one
+# thread per row is faster.
 comptime _CUMSUM_MIN_ROW_SCAN_LEN = 128
 
 # Threads per block of the one-thread-per-line kernels.
@@ -195,11 +204,158 @@ def _scan_pos[reverse: Bool](index: Int, axis_len: Int) -> Int:
     return index
 
 
+@inline(.always)
+def _fold_lanes[
+    accum_type: DType, exclusive: Bool, width: Int
+](values: SIMD[accum_type, width], mut running: Scalar[accum_type]) -> SIMD[
+    accum_type, width
+]:
+    """Folds `values` into `running` in lane order and returns the inclusive
+    prefixes of the lanes, or the exclusive ones (`running` before each lane)
+    when `exclusive`. Lanes past a chunk's end are zero, so a ragged tail adds
+    nothing."""
+    var prefixes = SIMD[accum_type, width](0)
+    comptime for k in range(width):
+        comptime if exclusive:
+            prefixes[k] = running
+            running += values[k]
+        else:
+            running += values[k]
+            prefixes[k] = running
+    return prefixes
+
+
+@inline(.always)
+def _row_scan_body[
+    dtype: DType,
+    accum_type: DType,
+    exclusive: Bool,
+    reverse: Bool,
+    has_carry: Bool,
+    threads: Int,
+    items: Int,
+    wide: Bool,
+    OutLayoutType: TensorLayout,
+    InLayoutType: TensorLayout,
+    CarryLayoutType: TensorLayout,
+](
+    output: TileTensor[dtype, OutLayoutType, MutAnyOrigin],
+    input: TileTensor[dtype, InLayoutType, ImmutAnyOrigin],
+    carry: TileTensor[accum_type, CarryLayoutType, ImmutAnyOrigin],
+    chunk_len: Int,
+):
+    """Scans one `chunk_len`-long chunk of a row of a `[num_rows, axis_len]`
+    input; block `block_idx.x` takes chunk `block_idx.x % num_chunks` of row
+    `block_idx.x // num_chunks`.
+
+    `threads` threads each fold `items` consecutive elements -- as one wide
+    access when `wide` and the addresses allow it, else one element at a time --
+    and a block scan over the per-thread totals places each thread. The tile
+    total carries into the next trip along the chunk; a chunk that fits in one
+    tile has no next trip and skips that handoff. With `has_carry`, the sum of
+    all earlier chunks of the row, `carry[row, chunk]`, seeds the first trip.
+    """
+    comptime assert input.flat_rank == 2 and output.flat_rank == 2
+    comptime tile = threads * items
+    var axis_len = Int(input.dim[1]())
+    # Without a carry, the chunk is the whole row; skip the 64-bit division.
+    var row = block_idx.x
+    var chunk = 0
+    comptime if has_carry:
+        row, chunk = divmod(block_idx.x, ceildiv(axis_len, chunk_len))
+    var begin = chunk * chunk_len
+    var end = min(begin + chunk_len, axis_len)
+    var tid = thread_idx.x
+    # A wide access promises the alignment of the whole access, which is the
+    # default `alignment` of `load`/`store`. `first`, `begin` and the row
+    # starts are multiples of `items` elements, but a view into a larger buffer
+    # need not start at one, so require it of both operands and fold element by
+    # element otherwise.
+    comptime wide_align = align_of[SIMD[dtype, items]]()
+    var wide_ok = (
+        (row * axis_len) % items == 0
+        and begin % items == 0
+        and Int(input.ptr) % wide_align == 0
+        and Int(output.ptr) % wide_align == 0
+    )
+    var tile_total = stack_allocation[
+        1, Scalar[accum_type], address_space=AddressSpace.SHARED
+    ]()
+
+    var carry_in: Scalar[accum_type] = 0
+    comptime if has_carry:
+        carry_in = carry[row, chunk]
+    for tile_start in range(begin, end, tile):
+        var first = tile_start + tid * items
+        var vector = wide and wide_ok and first + items <= end
+        # Gather the thread's `items` elements in scan order -- one access per
+        # lane, one wide access for the whole group when the tile, the row and
+        # the buffers line up -- then fold them in one place.
+        var values = SIMD[accum_type, items](0)
+        comptime if reverse:
+            # A reverse scan reads the axis backwards, so the elements one
+            # thread owns are not contiguous in memory.
+            comptime for k in range(items):
+                if first + k < end:
+                    values[k] = input[
+                        row, _scan_pos[reverse](first + k, axis_len)
+                    ].cast[accum_type]()
+        else:
+            if vector:
+                # One index per mode: a single flat index is distributed
+                # across the modes, which only coincides with the element
+                # offset when the row count is one.
+                values = input.load[width=items](Coord(row, first)).cast[
+                    accum_type
+                ]()
+            else:
+                # Ragged tail of the chunk: element at a time.
+                comptime for k in range(items):
+                    if first + k < end:
+                        values[k] = input[row, first + k].cast[accum_type]()
+        var thread_sum: Scalar[accum_type] = 0
+        var partial = _fold_lanes[accum_type, exclusive](values, thread_sum)
+
+        var offset = carry_in + block.prefix_sum[
+            block_size=threads, exclusive=True
+        ](thread_sum)
+
+        comptime if reverse:
+            comptime for k in range(items):
+                if first + k < end:
+                    output[row, _scan_pos[reverse](first + k, axis_len)] = (
+                        offset + partial[k]
+                    ).cast[dtype]()
+        else:
+            if vector:
+                var out_vec = (partial + SIMD[accum_type, items](offset)).cast[
+                    dtype
+                ]()
+                output.store[width=items](Coord(row, first), out_vec)
+            else:
+                comptime for k in range(items):
+                    if first + k < end:
+                        output[row, first + k] = (offset + partial[k]).cast[
+                            dtype
+                        ]()
+
+        # A chunk that fits in one tile has no next trip to carry into, so it
+        # skips the handoff and its two barriers.
+        if tile < chunk_len:
+            if tid == threads - 1:
+                tile_total[0] = offset + thread_sum
+            barrier()
+            carry_in = tile_total[0]
+            # The last thread rewrites `tile_total` on the next trip.
+            barrier()
+
+
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(_CUMSUM_BLOCK_SIZE)
+        Int32(_CUMSUM_SCAN_THREADS)
     )
 )
+@__name(t"cumsum_row_scan_{dtype}_{exclusive}_{reverse}_{has_carry}")
 def _cumsum_row_scan_kernel[
     dtype: DType,
     accum_type: DType,
@@ -215,67 +371,57 @@ def _cumsum_row_scan_kernel[
     carry: TileTensor[accum_type, CarryLayoutType, ImmutAnyOrigin],
     chunk_len_arg: Int32,
 ):
-    """Scans one `chunk_len`-long chunk of a row of a `[num_rows, axis_len]`
-    input; block `block_idx.x` takes chunk `block_idx.x % num_chunks` of row
-    `block_idx.x // num_chunks`.
+    """Scans a chunk of a long row with the wide one-trip geometry."""
+    _row_scan_body[
+        dtype,
+        accum_type,
+        exclusive,
+        reverse,
+        has_carry,
+        _CUMSUM_SCAN_THREADS,
+        _CUMSUM_SCAN_ITEMS,
+        True,
+        OutLayoutType,
+        InLayoutType,
+        CarryLayoutType,
+    ](output, input, carry, Int(chunk_len_arg))
 
-    Each thread folds `_CUMSUM_ITEMS` consecutive elements serially, a block
-    scan over the per-thread totals places each thread, and the tile total
-    carries into the next trip along the chunk. With `has_carry`, the sum of
-    all earlier chunks of the row, `carry[row, chunk]`, seeds the first trip.
-    """
-    comptime assert input.flat_rank == 2 and output.flat_rank == 2
-    comptime tile = _CUMSUM_BLOCK_SIZE * _CUMSUM_ITEMS
-    var chunk_len = Int(chunk_len_arg)
-    var axis_len = Int(input.dim[1]())
-    # Without a carry, the chunk is the whole row; skip the 64-bit division.
-    var row = block_idx.x
-    var chunk = 0
-    comptime if has_carry:
-        row, chunk = divmod(block_idx.x, ceildiv(axis_len, chunk_len))
-    var begin = chunk * chunk_len
-    var end = min(begin + chunk_len, axis_len)
-    var tid = thread_idx.x
-    var tile_total = stack_allocation[
-        1, Scalar[accum_type], address_space=AddressSpace.SHARED
-    ]()
 
-    var carry_in: Scalar[accum_type] = 0
-    comptime if has_carry:
-        carry_in = carry[row, chunk]
-    for tile_start in range(begin, end, tile):
-        var first = tile_start + tid * _CUMSUM_ITEMS
-        var partial = SIMD[accum_type, _CUMSUM_ITEMS](0)
-        var thread_sum: Scalar[accum_type] = 0
-        comptime for k in range(_CUMSUM_ITEMS):
-            var val: Scalar[accum_type] = 0
-            if first + k < end:
-                val = input[row, _scan_pos[reverse](first + k, axis_len)].cast[
-                    accum_type
-                ]()
-            comptime if exclusive:
-                partial[k] = thread_sum
-                thread_sum += val
-            else:
-                thread_sum += val
-                partial[k] = thread_sum
-
-        var offset = carry_in + block.prefix_sum[
-            block_size=_CUMSUM_BLOCK_SIZE, exclusive=True
-        ](thread_sum)
-
-        comptime for k in range(_CUMSUM_ITEMS):
-            if first + k < end:
-                output[row, _scan_pos[reverse](first + k, axis_len)] = (
-                    offset + partial[k]
-                ).cast[dtype]()
-
-        if tid == _CUMSUM_BLOCK_SIZE - 1:
-            tile_total[0] = offset + thread_sum
-        barrier()
-        carry_in = tile_total[0]
-        # The last thread rewrites `tile_total` on the next trip.
-        barrier()
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32(_CUMSUM_NARROW_THREADS)
+    )
+)
+@__name(t"cumsum_row_scan_narrow_{dtype}_{exclusive}_{reverse}_{has_carry}")
+def _cumsum_row_scan_narrow_kernel[
+    dtype: DType,
+    accum_type: DType,
+    exclusive: Bool,
+    reverse: Bool,
+    has_carry: Bool,
+    OutLayoutType: TensorLayout,
+    InLayoutType: TensorLayout,
+    CarryLayoutType: TensorLayout,
+](
+    output: TileTensor[dtype, OutLayoutType, MutAnyOrigin],
+    input: TileTensor[dtype, InLayoutType, ImmutAnyOrigin],
+    carry: TileTensor[accum_type, CarryLayoutType, ImmutAnyOrigin],
+    chunk_len_arg: Int32,
+):
+    """Scans a chunk of a short row, one element per thread at a time."""
+    _row_scan_body[
+        dtype,
+        accum_type,
+        exclusive,
+        reverse,
+        has_carry,
+        _CUMSUM_NARROW_THREADS,
+        _CUMSUM_NARROW_ITEMS,
+        False,
+        OutLayoutType,
+        InLayoutType,
+        CarryLayoutType,
+    ](output, input, carry, Int(chunk_len_arg))
 
 
 @__llvm_metadata(
@@ -283,6 +429,7 @@ def _cumsum_row_scan_kernel[
         Int32(_CUMSUM_BLOCK_SIZE)
     )
 )
+@__name(t"cumsum_row_total_{dtype}_{reverse}")
 def _cumsum_row_total_kernel[
     dtype: DType,
     accum_type: DType,
@@ -324,6 +471,7 @@ def _cumsum_row_total_kernel[
         Int32(_CUMSUM_SERIAL_BLOCK_SIZE)
     )
 )
+@__name(t"cumsum_serial_{dtype}_{exclusive}_{reverse}_{has_carry}")
 def _cumsum_serial_kernel[
     dtype: DType,
     accum_type: DType,
@@ -384,6 +532,7 @@ def _cumsum_serial_kernel[
         Int32(_CUMSUM_SERIAL_BLOCK_SIZE)
     )
 )
+@__name(t"cumsum_serial_total_{dtype}_{reverse}")
 def _cumsum_serial_total_kernel[
     dtype: DType,
     accum_type: DType,
@@ -433,20 +582,43 @@ def _enqueue_scan[
     stride: Int,
     chunk_len: Int,
     row_scan: Bool,
+    wide: Bool,
     ctx: DeviceContext,
 ) raises:
     """Scans every `chunk_len`-long chunk of `[num_rows, axis_len, stride]`.
 
     Without `has_carry` each line is one chunk starting at zero (`chunk_len`
     must be `axis_len`) and `carry` is never read. `row_scan` selects
-    the block-per-chunk kernel, which needs `stride == 1`.
+    the block-per-chunk kernel, which needs `stride == 1`; `wide` selects the
+    wide geometry over the narrow one within that kernel.
     """
     var num_chunks = ceildiv(axis_len, chunk_len)
     if row_scan:
         var rows_layout = row_major((num_rows, axis_len))
         var out_rows = output.reshape(rows_layout)
         var in_rows = input.reshape(rows_layout)
-        comptime kernel = _cumsum_row_scan_kernel[
+        # `_chunk_len` tiles a row with the geometry this shape takes.
+        if wide:
+            comptime kernel = _cumsum_row_scan_kernel[
+                dtype,
+                accum_type,
+                exclusive,
+                reverse,
+                has_carry,
+                out_rows.LayoutType,
+                in_rows.LayoutType,
+                carry.LayoutType,
+            ]
+            ctx.enqueue_function[kernel](
+                out_rows,
+                in_rows.as_imm(),
+                carry,
+                Int32(chunk_len),
+                grid_dim=num_rows * num_chunks,
+                block_dim=_CUMSUM_SCAN_THREADS,
+            )
+            return
+        comptime kernel = _cumsum_row_scan_narrow_kernel[
             dtype,
             accum_type,
             exclusive,
@@ -462,7 +634,7 @@ def _enqueue_scan[
             carry,
             Int32(chunk_len),
             grid_dim=num_rows * num_chunks,
-            block_dim=_CUMSUM_BLOCK_SIZE,
+            block_dim=_CUMSUM_NARROW_THREADS,
         )
         return
 
@@ -540,7 +712,7 @@ def _enqueue_chunk_totals[
 
 
 def _chunk_len(
-    row_scan: Bool, num_lines: Int, axis_len: Int, sm_count: Int
+    row_scan: Bool, num_lines: Int, axis_len: Int, sm_count: Int, wide: Bool
 ) -> Int:
     """Returns the axis span one block (or thread) scans; `axis_len` means the
     axis is not split.
@@ -552,7 +724,12 @@ def _chunk_len(
     if row_scan:
         if num_lines >= _CUMSUM_FILL_BLOCKS_PER_SM * sm_count:
             return axis_len
-        comptime tile = _CUMSUM_BLOCK_SIZE * _CUMSUM_ITEMS
+        # The tile of the geometry `_enqueue_scan` picks for this row.
+        var tile = (
+            _CUMSUM_SCAN_THREADS
+            * _CUMSUM_SCAN_ITEMS if wide else _CUMSUM_NARROW_THREADS
+            * _CUMSUM_NARROW_ITEMS
+        )
         var num_chunks = ceildiv(
             _CUMSUM_TARGET_BLOCKS_PER_SM * sm_count, num_lines
         )
@@ -584,7 +761,7 @@ def _use_row_scan(
         return False
     return (
         axis_len >= _CUMSUM_MIN_ROW_SCAN_LEN
-        or _chunk_len(False, num_lines, axis_len, sm_count) < axis_len
+        or _chunk_len(False, num_lines, axis_len, sm_count, False) < axis_len
     )
 
 
@@ -611,7 +788,19 @@ def _cumsum_gpu[
     var num_lines = num_rows * stride
     var sm_count = ctx.default_device_info.sm_count
     var row_scan = _use_row_scan(num_lines, axis_len, stride, sm_count)
-    var chunk_len = _chunk_len(row_scan, num_lines, axis_len, sm_count)
+    # Floating rows keep the narrow geometry so their rounding sequence is
+    # exactly the one before the wide geometry -- not a tighter error bound
+    # (both geometries drift about the same, ~10 ulp of the running magnitude),
+    # but bit-for-bit agreement with the previous revision, which is what the
+    # in-tree GPU test's float32 `[1, 1_048_583]` case (atol 1e-3 against the
+    # CPU's float64 reference) is calibrated for. Widening floating rows again
+    # will hit that tolerance unless the comparison changes first. Integral
+    # scans are exact in any grouping, and they are the shapes serving runs.
+    comptime exact = dtype.is_integral()
+    var wide_rows = exact and axis_len >= _CUMSUM_WIDE_MIN_LEN
+    var chunk_len = _chunk_len(
+        row_scan, num_lines, axis_len, sm_count, wide_rows
+    )
     # Stands in for `carry` wherever `has_carry` is False; never read.
     var no_carry = input.bitcast[accum_type]().reshape(row_major((1, 1)))
     if chunk_len == axis_len:
@@ -624,6 +813,7 @@ def _cumsum_gpu[
             stride,
             axis_len,
             row_scan,
+            wide_rows,
             ctx,
         )
         return
@@ -652,6 +842,7 @@ def _cumsum_gpu[
         1,
         num_chunks,
         _use_row_scan(num_lines, num_chunks, 1, sm_count),
+        wide_rows,
         ctx,
     )
     _enqueue_scan[dtype, accum_type, exclusive, reverse, True](
@@ -663,6 +854,7 @@ def _cumsum_gpu[
         stride,
         chunk_len,
         row_scan,
+        wide_rows,
         ctx,
     )
 
