@@ -87,6 +87,7 @@ def mha_operand_tma_copy_kernel[
 
     if thread_idx.x == 0:
         mbar.init()
+    barrier()
 
     var phase: UInt32 = 0
 
