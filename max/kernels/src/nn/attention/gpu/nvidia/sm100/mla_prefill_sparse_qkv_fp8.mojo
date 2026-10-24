@@ -50,7 +50,6 @@ and head=128 (cta_group=2, 2-CTA f8f6f4) are follow-ups.
 """
 
 from std.sys import size_of
-from std.utils.index import Index
 from std.utils.static_tuple import StaticTuple
 from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
@@ -1103,7 +1102,7 @@ struct MLAPrefillSparseQKVFP8[
                             NoneType
                         ](),
                         prologue_q[].unsafe_ptr(),
-                        Index(
+                        (
                             j * Self.Q_SWIZZLE_COLS,
                             Int(head_coord),
                             Int(seq_idx),

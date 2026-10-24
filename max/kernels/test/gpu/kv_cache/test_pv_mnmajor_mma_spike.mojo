@@ -75,6 +75,8 @@ from layout import (
     TileTensor,
     coord,
     row_major,
+    coord,
+    Idx,
 )
 from layout._fillers import arange
 from layout._host_device_tile_tensor import HostDeviceTileTensor
@@ -471,9 +473,6 @@ def run_pv_spike[
     comptime block_dim = 128
     comptime smem_use = (BM + BN) * size_of[ab_type]() * BK + 64
     comptime native_box = coord[_CM_NUM_ROWS, gran]
-    # `create_tma_descriptor` still takes IndexList for shared_mem_shape (low-level
-    # TMA-builder API); only the high-level TMATensorTile uses Coord.
-    comptime native_box_idx = Index(_CM_NUM_ROWS, gran)
 
     # The kernel + enqueue is duplicated in each comptime-if arm (rather than
     # factored into a shared closure) because the two arms produce V tiles with
@@ -489,16 +488,16 @@ def run_pv_spike[
     # and wrap the raw descriptor via TMATensorTile's @implicit constructor.
     comptime if use_native_mn:
         var v_ptr = v.device_tensor().unsafe_ptr()
-        var v_desc = create_tma_descriptor[ab_type, 2, swizzle_mode](
+        var v_desc = create_tma_descriptor[ab_type, swizzle_mode=swizzle_mode](
             DeviceBuffer(
                 ctx,
                 v_ptr,
                 1,
                 owning=False,
             ),
-            Index(K, N),  # gmem [seq_k, head_v], row-major
-            Index(N, 1),  # head_v contiguous
-            native_box_idx,  # (_CM_NUM_ROWS, gran) core-matrix box
+            coord[K, N],  # gmem [seq_k, head_v], row-major
+            (N, 1),  # head_v contiguous
+            native_box,  # (_CM_NUM_ROWS, gran) core-matrix box
         )
         var v_tma_op = TMATensorTile[
             ab_type, coord[BK, BN], native_box, is_k_major=False

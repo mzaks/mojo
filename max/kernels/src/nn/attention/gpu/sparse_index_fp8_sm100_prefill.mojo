@@ -126,7 +126,7 @@ from std.bit import next_power_of_two
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.math import align_down, align_up, ceildiv, clamp, lcm
 from std.sys import get_defined_dtype, get_defined_int, size_of
-from std.utils.index import Index, IndexList
+from std.utils.index import Index
 from std.utils.static_tuple import StaticTuple
 
 from layout import (
@@ -136,6 +136,8 @@ from layout import (
     TileTensor,
     UNKNOWN_VALUE,
     coord,
+    coord,
+    Idx,
 )
 from layout.tile_layout import row_major as tt_row_major
 from layout.tma_async import (
@@ -2695,11 +2697,11 @@ def _create_prefill_q_tma[
             depth * size_of[dtype]() == SW.bytes()
         ), "interleaved Q needs depth rows of exactly one swizzle atom"
         var q_buf = DeviceBuffer(ctx, q_ptr, 1, owning=False)
-        var desc = create_tma_descriptor[dtype, 3, SW](
+        var desc = create_tma_descriptor[dtype, swizzle_mode=SW](
             q_buf,
-            IndexList[3](num_heads, num_q_tokens, depth),
-            IndexList[3](depth, num_heads * depth, 1),
-            IndexList[3](num_heads, N_TOKENS, depth),
+            (num_heads, num_q_tokens, depth),
+            (depth, num_heads * depth, Idx[1]),
+            (num_heads, Idx[N_TOKENS], depth),
         )
         res = QTMATileT[dtype, N_TOKENS * num_heads, depth](desc)
     else:
