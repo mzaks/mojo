@@ -330,6 +330,12 @@ struct IntLiteral[value: __mlir_type.`!pop.int_literal`](
     ]:
         return {}
 
+    @always_inline("builtin")
+    def __truediv__(
+        self, rhs: FloatLiteral
+    ) -> type_of(FloatLiteral(self) / rhs):
+        return {}
+
 
 @__nonmaterializable(FloatDyn)
 struct FloatLiteral[value: __mlir_type.`!pop.float_literal`](

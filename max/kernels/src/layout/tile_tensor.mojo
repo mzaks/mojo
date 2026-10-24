@@ -1972,9 +1972,9 @@ struct TileTensor[
                     dst_ptr.unsafe_offset(swizzled_idx),
                 )
 
-    @__allow_legacy_custom_self_type
+    @__unsafe_nested_origins_read_only
     def _distance(
-        self: Self.Immut,
+        self,
         other: TileTensor[
             mut=False, Self.dtype, _, address_space=Self.address_space, ...
         ],
