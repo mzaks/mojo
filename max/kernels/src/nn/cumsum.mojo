@@ -55,9 +55,20 @@ comptime _CUMSUM_LONG_THREADS = 1024
 comptime _CUMSUM_LONG_ITEMS = 16
 comptime _CUMSUM_NARROW_THREADS = 256
 comptime _CUMSUM_NARROW_ITEMS = 4
-# Integral rows at least this long take the wide geometry, and the longer one.
+# Integral rows at least this long take the wide geometry, and the longer one;
+# the second bound is the 512-thread tile plus one, so no wide row takes two
+# trips (int32[10240]: 10.30 us at 512 threads, 4.17 us here). Rows past one
+# long trip keep the long tile too: capping it there fixes int32[102400]
+# (20.53 us behind the long tile, 10.31 us capped and split) but costs
+# int32[65536] (12.37 us behind the long tile, 14.40 us capped), and which
+# side wins turns on whether the row splits. Open, in the shapes campaign.
 comptime _CUMSUM_WIDE_MIN_LEN = 4096
-comptime _CUMSUM_LONG_MIN_LEN = 12288
+comptime _CUMSUM_LONG_MIN_LEN = 8193
+# The long geometry keeps 16 elements per thread, which is 64 bytes at 4-byte
+# elements. At 8 bytes it is 128 bytes per thread, and 1024 threads per block
+# leaves 64 registers each, so 8-byte integrals spill there: int64[65536] reads
+# 12.37 us on the 512-thread geometry and 38.97 us on the long one. They stay.
+comptime _CUMSUM_LONG_MAX_WIDTH = 32
 # Threads per block of the chunk-sum kernel, and the independent loads each
 # thread keeps in flight per trip.
 comptime _CUMSUM_BLOCK_SIZE = 256
@@ -625,6 +636,7 @@ def _enqueue_scan[
     chunk_len: Int,
     row_scan: Bool,
     wide: Bool,
+    long_ok: Bool,
     ctx: DeviceContext,
 ) raises:
     """Scans every `chunk_len`-long chunk of `[num_rows, axis_len, stride]`.
@@ -641,7 +653,7 @@ def _enqueue_scan[
         var in_rows = input.reshape(rows_layout)
         # `_chunk_len` tiles a row with the geometry this shape takes.
         if wide:
-            if axis_len >= _CUMSUM_LONG_MIN_LEN:
+            if long_ok and axis_len >= _CUMSUM_LONG_MIN_LEN:
                 comptime kernel = _cumsum_row_scan_long_kernel[
                     dtype,
                     accum_type,
@@ -774,7 +786,12 @@ def _enqueue_chunk_totals[
 
 
 def _chunk_len(
-    row_scan: Bool, num_lines: Int, axis_len: Int, sm_count: Int, wide: Bool
+    row_scan: Bool,
+    num_lines: Int,
+    axis_len: Int,
+    sm_count: Int,
+    wide: Bool,
+    long_ok: Bool,
 ) -> Int:
     """Returns the axis span one block (or thread) scans; `axis_len` means the
     axis is not split.
@@ -790,7 +807,7 @@ def _chunk_len(
         var tile: Int
         if not wide:
             tile = _CUMSUM_NARROW_THREADS * _CUMSUM_NARROW_ITEMS
-        elif axis_len >= _CUMSUM_LONG_MIN_LEN:
+        elif long_ok and axis_len >= _CUMSUM_LONG_MIN_LEN:
             tile = _CUMSUM_LONG_THREADS * _CUMSUM_LONG_ITEMS
         else:
             tile = _CUMSUM_SCAN_THREADS * _CUMSUM_SCAN_ITEMS
@@ -825,7 +842,8 @@ def _use_row_scan(
         return False
     return (
         axis_len >= _CUMSUM_MIN_ROW_SCAN_LEN
-        or _chunk_len(False, num_lines, axis_len, sm_count, False) < axis_len
+        or _chunk_len(False, num_lines, axis_len, sm_count, False, False)
+        < axis_len
     )
 
 
@@ -861,9 +879,10 @@ def _cumsum_gpu[
     # will hit that tolerance unless the comparison changes first. Integral
     # scans are exact in any grouping, and they are the shapes serving runs.
     comptime exact = dtype.is_integral()
+    comptime long_ok = exact and bit_width_of[dtype]() <= _CUMSUM_LONG_MAX_WIDTH
     var wide_rows = exact and axis_len >= _CUMSUM_WIDE_MIN_LEN
     var chunk_len = _chunk_len(
-        row_scan, num_lines, axis_len, sm_count, wide_rows
+        row_scan, num_lines, axis_len, sm_count, wide_rows, long_ok
     )
     # Stands in for `carry` wherever `has_carry` is False; never read.
     var no_carry = input.bitcast[accum_type]().reshape(row_major((1, 1)))
@@ -878,6 +897,7 @@ def _cumsum_gpu[
             axis_len,
             row_scan,
             wide_rows,
+            long_ok,
             ctx,
         )
         return
@@ -907,6 +927,7 @@ def _cumsum_gpu[
         num_chunks,
         _use_row_scan(num_lines, num_chunks, 1, sm_count),
         wide_rows,
+        long_ok,
         ctx,
     )
     _enqueue_scan[dtype, accum_type, exclusive, reverse, True](
@@ -919,6 +940,7 @@ def _cumsum_gpu[
         chunk_len,
         row_scan,
         wide_rows,
+        long_ok,
         ctx,
     )
 
