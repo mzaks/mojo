@@ -1515,9 +1515,9 @@ struct Pointer[
         ]
         # Do this delicately since we're manufacturing an interior origin here.
         return __get_litref_as_mvalue(
-            __mlir_op.`lit.ref.from_pointer`[_type=ptr_type._mlir_lit_ref](
-                self._mlir_value
-            )
+            __mlir_op.`lit.ref.from_pointer`[
+                _type=ptr_type._mlir_lit_ref, name="(pointer pointee)".value
+            ](self._mlir_value)
         )
 
     @always_inline
