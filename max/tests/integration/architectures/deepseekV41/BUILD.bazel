@@ -578,3 +578,26 @@ modular_py_test(
         requirement("torch"),
     ],
 )
+
+# The block-diagonal MXFP8 matmul on the cluster split-K kernel
+# (layers/mxfp8_matmul.py), against the production block-diagonal matmul.
+modular_py_test(
+    name = "test_mxfp8_block_diagonal_gpu",
+    srcs = ["test_mxfp8_block_diagonal_gpu.py"],
+    exec_properties = {
+        "test.resources:gpu-memory": "2",
+    },
+    gpu_constraints = ["//:b200_gpu"],
+    tags = ["gpu"],
+    target_compatible_with = REQUIRES_INTERNAL_KERNELS,
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/nn",
+        "//max/python/max/pipelines/architectures/deepseekV41",
+        requirement("numpy"),
+        requirement("torch"),
+    ],
+)

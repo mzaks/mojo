@@ -95,8 +95,8 @@ MXFP8_SPLITK_ENV = "MAX_DSV41_MXFP8_SPLITK"
 
 
 def mxfp8_splitk_enabled() -> bool:
-    """Whether ``attn.wo_b`` and the shared expert run on the cluster
-    split-K MXFP8 matmul.
+    """Whether ``attn.wo_a``, ``attn.wo_b`` and the shared expert run on
+    the cluster split-K MXFP8 matmul.
 
     On (default): each weight shape and M takes cluster split-K or a
     pair-CTA GEMM (decode or prefill) where measured faster, and the

@@ -38,7 +38,6 @@ from max.graph import (
     ops,
 )
 from max.nn.kernels import (
-    block_diagonal_block_scaled_matmul,
     quantize_dynamic_block_scaled,
     rope_quantize_dynamic_block_scaled,
 )
@@ -90,7 +89,7 @@ from .indexer import (
     select_index_keys_masked,
     store_index_keys,
 )
-from .mxfp8_matmul import mxfp8_linear
+from .mxfp8_matmul import mxfp8_block_diagonal, mxfp8_linear
 from .query import DeepseekV41Query
 from .ragged import V41RaggedRows as RaggedRows
 from .reuse import ForwardSelection, bind_cache_sources, selection_for_layer
@@ -391,7 +390,7 @@ def mxfp8_grouped_projection(
             out_type=DType.float8_e4m3fn,
         )
     rows, k = (int(d) for d in weight.shape)
-    return block_diagonal_block_scaled_matmul(
+    return mxfp8_block_diagonal(
         x_q,
         weight,
         x_scales,
