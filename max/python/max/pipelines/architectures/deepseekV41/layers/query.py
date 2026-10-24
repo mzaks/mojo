@@ -24,6 +24,7 @@ from max.nn.linear import Linear
 from max.nn.norm.rms_norm import RMSNorm
 from max.nn.quant_config import QuantConfig, QuantFormat
 
+from .hyper_connection import Mxfp8Rows
 from .mxfp8_matmul import mxfp8_linear, mxfp8_linear_rope_tail
 
 
@@ -134,8 +135,23 @@ class DeepseekV41Query(Module):
             and self.head_dim % 256 == 0
         )
 
+    def reads_mxfp8(self) -> bool:
+        """Whether :meth:`call_fused` applies and can take its input in
+        MXFP8."""
+        quant_config = self.fused_wqa_wkv.quant_config
+        return (
+            self.can_fuse_norm_quant()
+            and quant_config is not None
+            and quant_config.format == QuantFormat.MXFP8
+            and self.fused_wqa_wkv.weight_scale is not None
+        )
+
     def call_fused(
-        self, x: TensorValue, freqs_cis: TensorValue, kv_norm: RMSNorm
+        self,
+        x: TensorValue,
+        freqs_cis: TensorValue,
+        kv_norm: RMSNorm,
+        x_mxfp8: Mxfp8Rows | None = None,
     ) -> FusedQueryProjectionOutput:
         """Like :meth:`__call__`, with one kernel for both norms and the quantize.
 
@@ -148,6 +164,8 @@ class DeepseekV41Query(Module):
             freqs_cis: ``[T, rope_head_dim // 2, 2]``, already gathered at
                 these tokens' positions.
             kv_norm: The KV latent's norm.
+            x_mxfp8: ``x`` already in MXFP8, ``[T, hidden_size]``, when its
+                producer wrote it; only valid when :meth:`reads_mxfp8`.
 
         Returns:
             ``qr`` ``[T, q_lora_rank]`` float8 with its block scales, ``q``
@@ -156,7 +174,11 @@ class DeepseekV41Query(Module):
         """
         t = x.shape[-2]
         projected = ops.reshape(
-            mxfp8_linear(self.fused_wqa_wkv, x),
+            mxfp8_linear(self.fused_wqa_wkv, x)
+            if x_mxfp8 is None
+            else mxfp8_linear(
+                self.fused_wqa_wkv, x_mxfp8.values, x_scales=x_mxfp8.scales
+            ),
             [t, self.q_lora_rank + self.head_dim],
         )
         assert self.q_norm.eps == kv_norm.eps

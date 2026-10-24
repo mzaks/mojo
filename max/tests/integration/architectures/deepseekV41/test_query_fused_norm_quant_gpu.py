@@ -16,6 +16,9 @@ One graph runs both on the same MXFP8 weights: ``__call__`` then the layer's
 ``kv_norm`` and a quantize of ``qr``, and ``call_fused``. The fused kernel's
 sum of squares runs in a different order, so a rare byte or element may round
 the other way. Everything else must agree.
+
+``call_fused`` given its input already in MXFP8 must give the same bytes as
+quantizing that input itself.
 """
 
 from __future__ import annotations
@@ -34,6 +37,9 @@ from max.nn.norm.rms_norm import RMSNorm
 from max.pipelines.architectures.deepseekV41.layers.dspark import (
     dspark_main_proj_quant_config,
 )
+from max.pipelines.architectures.deepseekV41.layers.hyper_connection import (
+    Mxfp8Rows,
+)
 from max.pipelines.architectures.deepseekV41.layers.query import (
     DeepseekV41Query,
 )
@@ -47,8 +53,20 @@ ROPE_DIM = 64
 EPS = 1e-20
 
 
+def _quantize(x: TensorValue) -> Mxfp8Rows:
+    values, scales = quantize_dynamic_block_scaled(
+        ops.reshape(x, [-1, HIDDEN]),
+        sf_vector_size=32,
+        scales_type=DType.float8_e8m0fnu,
+        out_type=DType.float8_e4m3fn,
+    )
+    return Mxfp8Rows(values, scales)
+
+
 class _FusedAndUnfused(Module):
-    def __init__(self, kv_fault: bool = False) -> None:
+    def __init__(
+        self, kv_fault: bool = False, mxfp8_fault: bool = False
+    ) -> None:
         super().__init__()
         self.query = DeepseekV41Query(
             HIDDEN,
@@ -62,6 +80,7 @@ class _FusedAndUnfused(Module):
         )
         self.kv_norm = RMSNorm(HEAD_DIM, DType.float32, EPS)
         self.kv_fault = kv_fault
+        self.mxfp8_fault = mxfp8_fault
         if kv_fault:
             # A planted fault: the fused path normalizes kv with another weight.
             self.fused_kv_norm = RMSNorm(HEAD_DIM, DType.float32, EPS)
@@ -82,6 +101,12 @@ class _FusedAndUnfused(Module):
             freqs_cis,
             self.fused_kv_norm if self.kv_fault else self.kv_norm,
         )
+        # A planted fault: the input's rows rotated by one. Scaling the input
+        # would not do, since the norms on qr and kv cancel any scale.
+        copy = _quantize(
+            ops.concat([x[:, 1:], x[:, :1]], axis=1) if self.mxfp8_fault else x
+        )
+        from_copy = self.query.call_fused(x, freqs_cis, self.kv_norm, copy)
         return (
             ref_q8,
             ref_scales,
@@ -91,6 +116,10 @@ class _FusedAndUnfused(Module):
             fused.qr_scales,
             fused.q,
             fused.kv,
+            from_copy.qr,
+            from_copy.qr_scales,
+            from_copy.q,
+            from_copy.kv,
         )
 
 
@@ -136,9 +165,12 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _build(
-    session: InferenceSession, device: DeviceRef, kv_fault: bool = False
+    session: InferenceSession,
+    device: DeviceRef,
+    kv_fault: bool = False,
+    mxfp8_fault: bool = False,
 ) -> Model:
-    layer = _FusedAndUnfused(kv_fault)
+    layer = _FusedAndUnfused(kv_fault, mxfp8_fault)
     layer.load_state_dict(_weights(np.random.default_rng(0), kv_fault))
     graph = Graph(
         "query_fused",
@@ -172,7 +204,7 @@ def _run(model: Model, accel: Accelerator, m: int) -> list[torch.Tensor]:
 
 
 def _check(outs: list[torch.Tensor]) -> None:
-    ref_q8, ref_scales, ref_q, ref_kv, q8, scales, q, kv = outs
+    ref_q8, ref_scales, ref_q, ref_kv, q8, scales, q, kv = outs[:8]
     assert q8.shape == ref_q8.shape and scales.shape == ref_scales.shape
     # The same pre-rounding sum order flips about one byte in a million.
     assert (q8 != ref_q8).float().mean() < 1e-3
@@ -183,6 +215,12 @@ def _check(outs: list[torch.Tensor]) -> None:
     # The comparison must be able to fail: the outputs are not all zero.
     assert float(ref_q.float().abs().max()) > 0
     assert float(ref_kv.float().abs().max()) > 0
+
+
+def _check_copy(outs: list[torch.Tensor]) -> None:
+    for want, got in zip(outs[4:8], outs[8:], strict=True):
+        assert got.shape == want.shape
+        assert torch.equal(got, want)
 
 
 @pytest.fixture(scope="module")
@@ -213,7 +251,9 @@ def model(session: InferenceSession, device: DeviceRef) -> Model:
 def test_call_fused_matches_call(
     model: Model, accel: Accelerator, m: int
 ) -> None:
-    _check(_run(model, accel, m))
+    outs = _run(model, accel, m)
+    _check(outs)
+    _check_copy(outs)
 
 
 def test_planted_faults_fail(
@@ -229,3 +269,5 @@ def test_planted_faults_fail(
     outs[6] = outs[6].roll(1, dims=1)
     with pytest.raises(AssertionError):
         _check(outs)
+    with pytest.raises(AssertionError):
+        _check_copy(_run(_build(session, device, mxfp8_fault=True), accel, 129))

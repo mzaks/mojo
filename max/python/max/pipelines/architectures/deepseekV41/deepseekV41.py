@@ -422,6 +422,27 @@ def _hc_enter_quantized(
     return h, h_mxfp8, HCStreams(residual, pre=pre, post=post, comb=comb)
 
 
+def _attn_reads_mxfp8(attn: Module) -> bool:
+    """Whether ``attn`` can read its input in MXFP8."""
+    return (
+        mhc_mxfp8_enabled()
+        and isinstance(attn, CSA2Attention)
+        and attn.reads_mxfp8()
+    )
+
+
+def _attend(
+    attn: Module,
+    h: TensorValue,
+    rows: RaggedRows,
+    cache: object | None,
+    h_mxfp8: Mxfp8Rows | None,
+) -> TensorValue:
+    if h_mxfp8 is None:
+        return attn(h, rows, cache)
+    return attn(h, rows, cache, h_mxfp8=h_mxfp8)
+
+
 def _ffn_reads_mxfp8(ffn: Module) -> bool:
     """Whether ``ffn``'s shared expert can read its input in MXFP8."""
     return (
@@ -597,25 +618,26 @@ class DeepseekV41Block(Module):
                 )
             ]
 
-        attn_entered = [
-            _hc_enter(stream, block.hc_attn, block.attn_norm)
-            for block, stream in zip(blocks, streams, strict=True)
-        ]
+        attn_entered = DeepseekV41Block._attn_enter(blocks, streams)
         if not isinstance(blocks[0].attn, CSA2Attention):
             partials = [
                 block.attn(h, row, cache)
-                for block, (h, _), row, cache in zip(
+                for block, (h, _, _), row, cache in zip(
                     blocks, attn_entered, rows, caches, strict=True
                 )
             ]
         else:
             partials = DeepseekV41Block._csa2_partials(
-                blocks, [h for h, _ in attn_entered], rows, caches
+                blocks,
+                [h for h, _, _ in attn_entered],
+                [q for _, q, _ in attn_entered],
+                rows,
+                caches,
             )
         attended = ops.allreduce.sum(partials, signal_buffers)
         streams = [
             _with_out(read, h)
-            for h, (_, read) in zip(attended, attn_entered, strict=True)
+            for h, (_, _, read) in zip(attended, attn_entered, strict=True)
         ]
         return DeepseekV41Block._ffn_parallel(
             blocks,
@@ -623,7 +645,7 @@ class DeepseekV41Block(Module):
             lambda normed, quantized: DeepseekV41MoE.tensor_parallel(
                 moes, normed, token_ids, signal_buffers, quantized
             ),
-        ), [read.residual for _, read in attn_entered]
+        ), [read.residual for _, _, read in attn_entered]
 
     @staticmethod
     def data_parallel(
@@ -686,13 +708,10 @@ class DeepseekV41Block(Module):
                 )
             ]
 
-        attn_entered = [
-            _hc_enter(stream, block.hc_attn, block.attn_norm)
-            for block, stream in zip(blocks, streams, strict=True)
-        ]
+        attn_entered = DeepseekV41Block._attn_enter(blocks, streams)
         streams = [
-            _with_out(read, block.attn(h, row, cache))
-            for block, (h, read), row, cache in zip(
+            _with_out(read, _attend(block.attn, h, row, cache, q))
+            for block, (h, q, read), row, cache in zip(
                 blocks, attn_entered, rows, caches, strict=True
             )
         ]
@@ -707,12 +726,13 @@ class DeepseekV41Block(Module):
                 signal_buffers,
                 quantized,
             ),
-        ), [read.residual for _, read in attn_entered]
+        ), [read.residual for _, _, read in attn_entered]
 
     @staticmethod
     def _csa2_partials(
         blocks: Sequence[DeepseekV41Block],
         normed: Sequence[TensorValue],
+        normed_mxfp8: Sequence[Mxfp8Rows | None],
         rows: Sequence[RaggedRows],
         caches: Sequence[object],
     ) -> list[TensorValue]:
@@ -722,14 +742,27 @@ class DeepseekV41Block(Module):
             assert isinstance(block.attn, CSA2Attention)
             attns.append(block.attn)
         states = [
-            attn.begin(h, row, cache)
-            for attn, h, row, cache in zip(
-                attns, normed, rows, caches, strict=True
+            attn.begin(h, row, cache, h_mxfp8=q)
+            for attn, h, q, row, cache in zip(
+                attns, normed, normed_mxfp8, rows, caches, strict=True
             )
         ]
         return [
             attn.end(state, row)
             for attn, state, row in zip(attns, states, rows, strict=True)
+        ]
+
+    @staticmethod
+    def _attn_enter(
+        blocks: Sequence[DeepseekV41Block], streams: Sequence[HCStreams]
+    ) -> list[tuple[TensorValue, Mxfp8Rows | None, HCStreams]]:
+        """Enters every device's attention sublayer."""
+        mxfp8 = all(_attn_reads_mxfp8(block.attn) for block in blocks)
+        return [
+            _hc_enter_quantized(
+                stream, block.hc_attn, block.attn_norm, mxfp8=mxfp8
+            )
+            for block, stream in zip(blocks, streams, strict=True)
         ]
 
     @staticmethod
@@ -809,8 +842,15 @@ class DeepseekV41Block(Module):
                 ),
             )
 
-        h, attn_read = _hc_enter(streams, self.hc_attn, self.attn_norm)
-        streams = _with_out(attn_read, self.attn(h, rows, cache))
+        h, h_mxfp8, attn_read = _hc_enter_quantized(
+            streams,
+            self.hc_attn,
+            self.attn_norm,
+            mxfp8=_attn_reads_mxfp8(self.attn),
+        )
+        streams = _with_out(
+            attn_read, _attend(self.attn, h, rows, cache, h_mxfp8)
+        )
 
         h, h_mxfp8, ffn_read = _hc_enter_quantized(
             streams,

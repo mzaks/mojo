@@ -111,12 +111,12 @@ MHC_MXFP8_ENV = "MAX_DSV41_MHC_MXFP8"
 
 
 def mhc_mxfp8_enabled() -> bool:
-    """Whether the hyper-connection step before each FFN also writes its
-    input in MXFP8.
+    """Whether each hyper-connection step also writes its sublayer's input
+    in MXFP8.
 
-    On (default): on SM100 the shared expert reads that copy instead of
-    quantizing its input. Off (``MAX_DSV41_MHC_MXFP8=0``): the shared expert
-    quantizes its own input.
+    On (default): on SM100 the shared expert and the attention's fused
+    ``wq_a``/``wkv`` projection read that copy instead of quantizing their
+    input. Off (``MAX_DSV41_MHC_MXFP8=0``): each quantizes its own input.
     """
     return _env_switch(MHC_MXFP8_ENV)
 

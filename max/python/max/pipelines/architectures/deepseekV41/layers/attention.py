@@ -77,6 +77,7 @@ from .csa2 import (
     store_compressed_kv,
     store_window_kv,
 )
+from .hyper_connection import Mxfp8Rows
 from .indexer import (
     DeepseekV41Indexer,
     candidate_keep_blocks,
@@ -723,15 +724,36 @@ class CSA2Attention(Module):
         cache: object | None,
         *,
         swa_valid_from: TensorValue | None = None,
+        h_mxfp8: Mxfp8Rows | None = None,
     ) -> TensorValue:
         return self.end(
-            self.begin(h, rows, cache), rows, swa_valid_from=swa_valid_from
+            self.begin(h, rows, cache, h_mxfp8=h_mxfp8),
+            rows,
+            swa_valid_from=swa_valid_from,
         )
 
+    def reads_mxfp8(self) -> bool:
+        """Whether :meth:`begin` can take ``h`` already in MXFP8."""
+        return self._fuses_query() and self.query_proj.reads_mxfp8()
+
+    def _fuses_query(self) -> bool:
+        indexer_mxfp8 = (
+            self.indexer is None or self.indexer.wq_b.quant_config is not None
+        )
+        return self.query_proj.can_fuse_norm_quant() and indexer_mxfp8
+
     def begin(
-        self, h: TensorValue, rows: RaggedRows, cache: object | None
+        self,
+        h: TensorValue,
+        rows: RaggedRows,
+        cache: object | None,
+        h_mxfp8: Mxfp8Rows | None = None,
     ) -> PendingCSA2Attention:
-        """Runs :meth:`__call__` up to the indexer's top-k."""
+        """Runs :meth:`__call__` up to the indexer's top-k.
+
+        ``h_mxfp8``, when given, is ``h`` already in MXFP8, ``[T, hidden]``;
+        only valid when :meth:`reads_mxfp8`.
+        """
         if not isinstance(cache, CSA2Cache):
             raise TypeError(
                 f"CSA2Attention requires a CSA2Cache, got {type(cache)!r}"
@@ -744,12 +766,9 @@ class CSA2Attention(Module):
             self.rope.freqs_cis_base(), rows.positions, axis=0
         )
         qr_scales = None
-        indexer_mxfp8 = (
-            self.indexer is None or self.indexer.wq_b.quant_config is not None
-        )
-        if self.query_proj.can_fuse_norm_quant() and indexer_mxfp8:
+        if self._fuses_query():
             qr, qr_scales, q, kv = self.query_proj.call_fused(
-                h_flat, freqs_cis, self.kv_norm
+                h_flat, freqs_cis, self.kv_norm, h_mxfp8
             )
         else:
             qr, q, kv_raw = self.query_proj(h_flat, freqs_cis)

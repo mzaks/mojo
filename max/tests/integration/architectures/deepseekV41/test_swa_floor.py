@@ -164,7 +164,9 @@ def _index_graph(
                     result = attention(
                         positions, rows, None, swa_valid_from=boundary
                     )
-                    begin.assert_called_once_with(positions, rows, None)
+                    begin.assert_called_once_with(
+                        positions, rows, None, h_mxfp8=None
+                    )
                 else:
                     result = attention.end(state, rows, swa_valid_from=boundary)
                     begin.assert_not_called()
