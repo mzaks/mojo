@@ -781,6 +781,17 @@
                 },
                 {
                   "type": "category",
+                  "label": "generate_images",
+                  "link": {
+                    "type": "doc",
+                    "id": "api/python/pipelines.lib.generate_images"
+                  },
+                  "items": [
+                    "__AUTOGEN:max.pipelines.lib.generate_images__"
+                  ]
+                },
+                {
+                  "type": "category",
                   "label": "interfaces",
                   "link": {
                     "type": "doc",

@@ -182,6 +182,12 @@ This version is still a work in progress.
   an `image_url` part, now raises `ValueError` pointing to `AutoProcessor`,
   even when `images` gives the row the right count.
 
+- Added `generate_images()` in `max.pipelines.lib.generate_images`, which runs
+  an image generation pipeline such as FLUX.2 in your own process and returns
+  one list of PIL images per prompt, in prompt order. Each prompt runs as the
+  request `max serve` builds for it, so the model's defaults are the same as in
+  serve.
+
 - Removed the `blocking_sync`, `disable_timing` and `interprocess` parameters
   from the Mojo `DeviceContext.create_event()`, along with `EventFlags`. Events
   never record timing; use `DeviceContext.execution_time()` to time kernels.
