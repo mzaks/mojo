@@ -39,7 +39,7 @@ from max.nn.comm.ep import EPBatchManager
 from max.nn.data_parallelism import split_batch_replicated
 from max.nn.embedding import Embedding
 from max.nn.hyper_connection import HyperConnection
-from max.nn.kernels import mhc_post, mhc_post_supports
+from max.nn.kernels import _is_sm10x_gpu, mhc_post, mhc_post_supports
 from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
 from max.nn.norm.rms_norm import RMSNorm
@@ -78,6 +78,7 @@ from .layers.engram_lookup import (
     EngramPending,
     EngramTokens,
 )
+from .layers.hyper_connection import Mxfp8Rows
 from .layers.moe import (
     IMAGE_SENTINEL_BASE_ID,
     DeepseekV41MoE,
@@ -88,6 +89,7 @@ from .layers.ragged import V41RaggedRows as RaggedRows
 from .model_config import (
     DeepseekV41Config,
     head_bf16_enabled,
+    mhc_mxfp8_enabled,
     position_capacity,
 )
 
@@ -386,14 +388,28 @@ def _hc_enter(
     Returns the input and the copies the sublayer reads, with its own
     ``post``, ``comb`` and ``pre``; set ``out`` on them once it runs.
     """
+    h, _, read = _hc_enter_quantized(streams, hc, norm, mxfp8=False)
+    return h, read
+
+
+def _hc_enter_quantized(
+    streams: HCStreams, hc: HyperConnection, norm: RMSNorm, *, mxfp8: bool
+) -> tuple[TensorValue, Mxfp8Rows | None, HCStreams]:
+    """:func:`_hc_enter`, plus the input in MXFP8 when ``mxfp8`` is set.
+
+    Only the fused step writes MXFP8, so the first block's attention input
+    never has it.
+    """
     if streams.out is None:
         h, post, comb, pre = _hc_pre(streams.residual, hc, streams.pre)
-        return norm(h), HCStreams(
-            streams.residual, pre=pre, post=post, comb=comb
+        return (
+            norm(h),
+            None,
+            HCStreams(streams.residual, pre=pre, post=post, comb=comb),
         )
     assert streams.post is not None and streams.comb is not None
     assert streams.pre is not None
-    h, residual, post, comb, pre = fused_hc_step(
+    h, residual, post, comb, pre, h_mxfp8 = fused_hc_step(
         streams.out,
         streams.residual,
         streams.post,
@@ -401,8 +417,18 @@ def _hc_enter(
         streams.pre,
         hc,
         norm,
+        mxfp8=mxfp8,
     )
-    return h, HCStreams(residual, pre=pre, post=post, comb=comb)
+    return h, h_mxfp8, HCStreams(residual, pre=pre, post=post, comb=comb)
+
+
+def _ffn_reads_mxfp8(ffn: Module) -> bool:
+    """Whether ``ffn``'s shared expert can read its input in MXFP8."""
+    return (
+        mhc_mxfp8_enabled()
+        and _is_sm10x_gpu()
+        and isinstance(ffn, (DeepseekV41MoE, DeepseekV41DSparkMoE))
+    )
 
 
 def _with_out(streams: HCStreams, out: TensorValue) -> HCStreams:
@@ -594,8 +620,8 @@ class DeepseekV41Block(Module):
         return DeepseekV41Block._ffn_parallel(
             blocks,
             streams,
-            lambda normed: DeepseekV41MoE.tensor_parallel(
-                moes, normed, token_ids, signal_buffers
+            lambda normed, quantized: DeepseekV41MoE.tensor_parallel(
+                moes, normed, token_ids, signal_buffers, quantized
             ),
         ), [read.residual for _, read in attn_entered]
 
@@ -673,8 +699,13 @@ class DeepseekV41Block(Module):
         return DeepseekV41Block._ffn_parallel(
             blocks,
             streams,
-            lambda normed: DeepseekV41MoE.data_parallel(
-                moes, normed, batch_token_ids, replica_tokens, signal_buffers
+            lambda normed, quantized: DeepseekV41MoE.data_parallel(
+                moes,
+                normed,
+                batch_token_ids,
+                replica_tokens,
+                signal_buffers,
+                quantized,
             ),
         ), [read.residual for _, read in attn_entered]
 
@@ -705,21 +736,29 @@ class DeepseekV41Block(Module):
     def _ffn_parallel(
         blocks: Sequence[DeepseekV41Block],
         streams: Sequence[HCStreams],
-        moe: Callable[[list[TensorValue]], list[TensorValue]],
+        moe: Callable[
+            [list[TensorValue], list[Mxfp8Rows | None]], list[TensorValue]
+        ],
     ) -> list[HCStreams]:
         """Runs the FFN half of a multi-device block.
 
         The attention sublayer's ``pre`` weights merge the FFN's input;
-        ``moe`` maps every device's normed input to its FFN output.
+        ``moe`` maps every device's normed input, and the same input in
+        MXFP8 where the step wrote one, to its FFN output.
         """
+        mxfp8 = all(_ffn_reads_mxfp8(block.ffn) for block in blocks)
         ffn_entered = [
-            _hc_enter(stream, block.hc_ffn, block.ffn_norm)
+            _hc_enter_quantized(
+                stream, block.hc_ffn, block.ffn_norm, mxfp8=mxfp8
+            )
             for block, stream in zip(blocks, streams, strict=True)
         ]
-        moved = moe([h for h, _ in ffn_entered])
+        moved = moe(
+            [h for h, _, _ in ffn_entered], [q for _, q, _ in ffn_entered]
+        )
         return [
             _with_out(read, h)
-            for h, (_, read) in zip(moved, ffn_entered, strict=True)
+            for h, (_, _, read) in zip(moved, ffn_entered, strict=True)
         ]
 
     def __call__(
@@ -773,8 +812,17 @@ class DeepseekV41Block(Module):
         h, attn_read = _hc_enter(streams, self.hc_attn, self.attn_norm)
         streams = _with_out(attn_read, self.attn(h, rows, cache))
 
-        h, ffn_read = _hc_enter(streams, self.hc_ffn, self.ffn_norm)
-        return _with_out(ffn_read, self.ffn(h, token_ids)), attn_read.residual
+        h, h_mxfp8, ffn_read = _hc_enter_quantized(
+            streams,
+            self.hc_ffn,
+            self.ffn_norm,
+            mxfp8=_ffn_reads_mxfp8(self.ffn),
+        )
+        if h_mxfp8 is None:
+            out = self.ffn(h, token_ids)
+        else:
+            out = self.ffn(h, token_ids, h_mxfp8)
+        return _with_out(ffn_read, out), attn_read.residual
 
 
 class DeepseekV41Trunk(Module):

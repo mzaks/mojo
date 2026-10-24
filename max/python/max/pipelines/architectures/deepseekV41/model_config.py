@@ -106,6 +106,21 @@ def mxfp8_splitk_enabled() -> bool:
     return _env_switch(MXFP8_SPLITK_ENV)
 
 
+# The FFN input in MXFP8 from the hyper-connection step (default on).
+MHC_MXFP8_ENV = "MAX_DSV41_MHC_MXFP8"
+
+
+def mhc_mxfp8_enabled() -> bool:
+    """Whether the hyper-connection step before each FFN also writes its
+    input in MXFP8.
+
+    On (default): on SM100 the shared expert reads that copy instead of
+    quantizing its input. Off (``MAX_DSV41_MHC_MXFP8=0``): the shared expert
+    quantizes its own input.
+    """
+    return _env_switch(MHC_MXFP8_ENV)
+
+
 ENGRAM_HOST_GATHER_ENV = "MAX_ENGRAM_HOST_GATHER"
 
 
