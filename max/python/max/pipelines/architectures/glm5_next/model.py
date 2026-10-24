@@ -98,7 +98,9 @@ class _VisionTowers(Module):
         self.devices = config.devices
         self.towers = LayerList(
             [
-                Glm5NextVisionTransformer(vision_config, device)
+                Glm5NextVisionTransformer(
+                    vision_config, device, use_subgraphs=config.use_subgraphs
+                )
                 for device in config.devices
             ]
         )

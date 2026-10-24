@@ -30,6 +30,7 @@ from max.graph import DeviceRef, TensorValue, Weight, ops
 from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
 from max.nn.norm import LayerNorm, RMSNorm
+from max.nn.transformer import forward_sequential_layers
 
 from ..layers.clamped_swiglu import clamped_swiglu
 from ..model_config import Glm5NextVisionConfig
@@ -217,7 +218,15 @@ class Glm5NextVisionRotaryEmbedding(Module):
 
 
 class Glm5NextVisionBlock(Module):
-    """Pre-norm block: RMSNorm, full attention, RMSNorm, clamped SwiGLU MLP."""
+    """Pre-norm block: RMSNorm, full attention, RMSNorm, clamped SwiGLU MLP.
+
+    The block's own ``norm1`` is applied by whatever precedes it, and the block
+    ends by applying the norm that reads its output: the next block's
+    ``norm1``, or the tower's ``post_layernorm``. That keeps each residual add
+    in the same graph as its norm when the blocks are subgraphs, so the
+    compiler still fuses the pair and the output stays bit-identical to the
+    inlined tower; split across the boundary, they round differently.
+    """
 
     def __init__(self, config: Glm5NextVisionConfig, device: DeviceRef) -> None:
         super().__init__()
@@ -257,17 +266,32 @@ class Glm5NextVisionBlock(Module):
     def __call__(
         self,
         x: TensorValue,
+        normed_x: TensorValue,
+        next_norm_weight: TensorValue,
         position_embeddings: tuple[TensorValue, TensorValue],
         input_row_offsets: TensorValue,
         max_seqlen: TensorValue,
-    ) -> TensorValue:
+    ) -> tuple[TensorValue, TensorValue]:
+        """Returns the block's output, and that output normalized.
+
+        Args:
+            x: The residual stream entering the block.
+            normed_x: ``x`` through this block's ``norm1``.
+            next_norm_weight: Weight of the norm that reads the output.
+            position_embeddings: ``(cos, sin)``, each ``(seq_len, head_dim)``.
+            input_row_offsets: Per-frame attention segment offsets.
+            max_seqlen: Longest frame length, as a ``(1,)`` uint32 tensor.
+        """
         x = x + self.attn(
-            self.norm1(x),
+            normed_x,
             position_embeddings=position_embeddings,
             input_row_offsets=input_row_offsets,
             max_seqlen=max_seqlen,
         )
-        return x + self.mlp(self.norm2(x))
+        x = x + self.mlp(self.norm2(x))
+        return x, ops.rms_norm(
+            x, next_norm_weight, self.norm1.eps, multiply_before_cast=False
+        )
 
 
 class Glm5NextVisionPatchMerger(Module):
@@ -348,6 +372,7 @@ class Glm5NextVisionTransformer(Module):
         config: Glm5NextVisionConfig,
         device: DeviceRef,
         llm_dtype: DType | None = None,
+        use_subgraphs: bool = True,
     ) -> None:
         """
         Args:
@@ -357,9 +382,13 @@ class Glm5NextVisionTransformer(Module):
                 scattered onto the decoder's embeddings. Defaults to the
                 tower's own dtype, which is what the real checkpoint wants:
                 the tower and the decoder embeddings are both BF16.
+            use_subgraphs: Whether the blocks share one compiled subgraph
+                rather than being inlined ``depth`` times.
         """
         super().__init__()
         self.config = config
+        self.device = device
+        self.use_subgraphs = use_subgraphs
         self.llm_dtype = llm_dtype if llm_dtype is not None else config.dtype
         self.patch_embed = Glm5NextVisionPatchEmbed(config, device)
         self.rotary_pos_emb = Glm5NextVisionRotaryEmbedding(
@@ -376,6 +405,27 @@ class Glm5NextVisionTransformer(Module):
         )
         self.downsample = Glm5NextVisionSpatialMerge(config, device)
         self.merger = Glm5NextVisionPatchMerger(config, device)
+
+    def _block(self, index: int) -> Glm5NextVisionBlock:
+        block = self.blocks[index]
+        assert isinstance(block, Glm5NextVisionBlock)
+        return block
+
+    def _block_weight_prefix(self, index: int) -> str:
+        """Returns the prefix ``load_state_dict`` gave block ``index``.
+
+        Read off the weights rather than assumed, because it depends on which
+        module the weights were loaded through: ``blocks.N.`` for a standalone
+        tower, ``towers.R.blocks.N.`` for replica ``R`` in ``Glm5NextModel``.
+        """
+        name = self._block(index).norm1.weight.name
+        prefix = name.removesuffix("norm1.weight")
+        if not prefix.endswith(f"blocks.{index}."):
+            raise ValueError(
+                f"vision block {index} holds weight {name!r}; load the tower's"
+                " weights before building its graph with subgraphs"
+            )
+        return prefix
 
     def __call__(
         self,
@@ -407,17 +457,53 @@ class Glm5NextVisionTransformer(Module):
             stages.append(h)
 
         position_embeddings = self.rotary_pos_emb(rot_pos_ids)
-        for block in self.blocks:
-            h = block(
-                h,
-                position_embeddings=position_embeddings,
-                input_row_offsets=input_row_offsets,
-                max_seqlen=max_seqlen,
-            )
-            if stages is not None:
-                stages.append(h)
 
-        h = self.post_layernorm(h)
+        def record(_index: int, outputs: list[TensorValue]) -> None:
+            if stages is not None:
+                stages.append(outputs[0])
+
+        depth = len(self.blocks)
+        # Defense-in-depth: `forward_sequential_layers` reads
+        # `weight_prefix_for_layer` before `build_subgraph` strips block
+        # 0's weight names; reading the live names up front keeps this
+        # correct even if that ordering regresses.
+        prefixes = (
+            [self._block_weight_prefix(i) for i in range(depth)]
+            if self.use_subgraphs
+            else []
+        )
+        norms = [self._block(i).norm1 for i in range(depth)]
+        norms.append(self.post_layernorm)
+        # Block i applies norms[i + 1]; passed in rather than read inside, so
+        # the subgraph's per-block weight prefix cannot rebind it.
+        next_norm_weights = [
+            norm.weight.cast(h.dtype).to(h.device) for norm in norms[1:]
+        ]
+        # The last block's normalized output is `post_layernorm`'s.
+        _, h = forward_sequential_layers(
+            list(self.blocks),
+            inputs_for_layer=lambda index, hs: [
+                hs[0],
+                hs[1],
+                next_norm_weights[index],
+                position_embeddings,
+                input_row_offsets,
+                max_seqlen,
+            ],
+            initial_hidden_states=[h, norms[0](h)],
+            on_layer_output=record,
+            subgraph_layer_groups=(
+                [list(range(depth))] if self.use_subgraphs else None
+            ),
+            # A subgraph's types carry its device, so replicas cannot share a
+            # body: one per device, rather than one per block per device.
+            name_for_subgraph=lambda _: (
+                f"glm5_next_vision_block_{self.device.device_type}"
+                f"{self.device.id}"
+            ),
+            weight_prefix_for_layer=prefixes.__getitem__,
+        )
+
         merge_unit = _spatial_merge_unit(self.config)
         seq_len, hidden = h.shape
         # The patch count is a multiple of the merge unit by construction, but
