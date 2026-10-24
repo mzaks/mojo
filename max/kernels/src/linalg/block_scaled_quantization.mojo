@@ -2949,6 +2949,9 @@ def block_scaled_matmul[
     transpose_a: Bool = False,
     has_epilogue_fn: Bool = False,
     has_compute_fn: Bool = False,
+    compute_fn_needs_vectors: Bool = False,
+    compute_fn_col_period: Int = 0,
+    compute_fn_col_start: Int = 0,
     pdl_level: PDLLevel = PDLLevel.OFF,
     _trace_description: StaticString = "",
     target: StaticString = "cpu",
@@ -2991,6 +2994,15 @@ def block_scaled_matmul[
             of the kernel writing `c_device`.
         has_compute_fn: Whether `compute_fn` maps each output value before
             it is stored.
+        compute_fn_needs_vectors: Whether `compute_fn` reads each value
+            with its neighbors in the row, so it must get consecutive columns
+            rather than one element at a time.
+        compute_fn_col_period: When nonzero, `compute_fn` returns its
+            input unchanged at every column whose index modulo this
+            period is below `compute_fn_col_start`, so an unfused pass
+            visits only the remaining columns.
+        compute_fn_col_start: The first column of each period that
+            `compute_fn` may change.
         pdl_level: Programmatic dependency launch level for the
             heuristic dispatch kernel (defaults to `PDLLevel.OFF`).
         _trace_description: Extra label appended to the trace event
@@ -3159,6 +3171,9 @@ def block_scaled_matmul[
             transpose_b=transpose_b,
             has_epilogue_fn=has_epilogue_fn,
             has_compute_fn=has_compute_fn,
+            compute_fn_needs_vectors=compute_fn_needs_vectors,
+            compute_fn_col_period=compute_fn_col_period,
+            compute_fn_col_start=compute_fn_col_start,
             pdl_level=pdl_level,
         ](
             c_device,
@@ -3227,6 +3242,9 @@ def block_scaled_matmul[
                     transpose_b=transpose_b,
                     has_epilogue_fn=has_epilogue_fn,
                     has_compute_fn=has_compute_fn,
+                    compute_fn_needs_vectors=compute_fn_needs_vectors,
+                    compute_fn_col_period=compute_fn_col_period,
+                    compute_fn_col_start=compute_fn_col_start,
                     pdl_level=pdl_level,
                 ](
                     c_device,
@@ -3279,6 +3297,9 @@ def _heuristic_and_outliers_dispatch_any_epilogue[
     transpose_b: Bool,
     has_epilogue_fn: Bool,
     has_compute_fn: Bool,
+    compute_fn_needs_vectors: Bool,
+    compute_fn_col_period: Int,
+    compute_fn_col_start: Int,
     pdl_level: PDLLevel,
 ](
     c: TileTensor[mut=True, c_type, ...],
@@ -3302,6 +3323,9 @@ def _heuristic_and_outliers_dispatch_any_epilogue[
             SF_VECTOR_SIZE=SF_VECTOR_SIZE,
             transpose_b=transpose_b,
             pdl_level=pdl_level,
+            compute_fn_needs_vectors=compute_fn_needs_vectors,
+            compute_fn_col_period=compute_fn_col_period,
+            compute_fn_col_start=compute_fn_col_start,
         ](c, a, b, a_scales, b_scales, tensor_sf, compute_fn, ctx)
     else:
         return heuristic_and_outliers_dispatch[

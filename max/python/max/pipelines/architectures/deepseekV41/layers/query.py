@@ -21,8 +21,9 @@ from max.graph import DeviceRef, TensorValue, ops
 from max.nn.layer import Module
 from max.nn.linear import Linear
 from max.nn.norm.rms_norm import RMSNorm
+from max.nn.quant_config import QuantConfig
 
-from ...deepseekV4.layers.rope import apply_rope_tail
+from .mxfp8_matmul import mxfp8_linear, mxfp8_linear_rope_tail
 
 
 class QueryProjectionOutput(NamedTuple):
@@ -50,16 +51,27 @@ class DeepseekV41Query(Module):
         eps: float,
         dtype: DType,
         device: DeviceRef,
+        quant_config: QuantConfig | None = None,
     ) -> None:
+        """Initializes the projections.
+
+        Args:
+            quant_config: An MXFP8 config makes both projections
+                ``float8_e4m3fn`` with block scales; ``None`` keeps them
+                in ``dtype``.
+        """
         super().__init__()
         self.q_lora_rank = q_lora_rank
         self.head_dim = head_dim
         self.local_num_heads = local_num_heads
+        if quant_config is not None:
+            dtype = DType.float8_e4m3fn
         self.fused_wqa_wkv = Linear(
             hidden_size,
             q_lora_rank + head_dim,
             dtype,
             device,
+            quant_config=quant_config,
         )
         self.q_norm = RMSNorm(q_lora_rank, DType.float32, eps)
         self.wq_b = Linear(
@@ -67,6 +79,7 @@ class DeepseekV41Query(Module):
             local_num_heads * head_dim,
             dtype,
             device,
+            quant_config=quant_config,
         )
 
     def __call__(
@@ -85,7 +98,7 @@ class DeepseekV41Query(Module):
             projection ``kv_raw`` ``[1, T, head_dim]``.
         """
         t = x.shape[-2]
-        projected = self.fused_wqa_wkv(x)
+        projected = mxfp8_linear(self.fused_wqa_wkv, x)
         qr_raw = ops.slice_tensor(
             projected, [slice(None), slice(None), slice(0, self.q_lora_rank)]
         )
@@ -94,7 +107,7 @@ class DeepseekV41Query(Module):
         )
         qr = self.q_norm(qr_raw)
         q = ops.reshape(
-            self.wq_b(qr), [1, t, self.local_num_heads, self.head_dim]
+            mxfp8_linear_rope_tail(self.wq_b, qr, freqs_cis, self.head_dim),
+            [1, t, self.local_num_heads, self.head_dim],
         )
-        q = apply_rope_tail(q, freqs_cis, int(freqs_cis.shape[-2]) * 2)
         return QueryProjectionOutput(qr=qr, q=q, kv_raw=kv_raw)

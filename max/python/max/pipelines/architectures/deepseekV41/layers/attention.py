@@ -62,6 +62,7 @@ from ..model_config import (
     DeepseekV41Config,
     compressor_bf16_enabled,
     index_list_fused_enabled,
+    q_mxfp8_enabled,
     woa_mxfp8_enabled,
 )
 from .compressor import DeepseekV41Compressor, ring_save_slots, ring_slots
@@ -140,7 +141,7 @@ def prefill_rows_bound(
 
 
 def _output_projection_quant_config() -> QuantConfig:
-    """Returns the MXFP8 ``QuantConfig`` for the attention output projections.
+    """Returns the MXFP8 ``QuantConfig`` for the attention projections.
 
     ``block_size=(1, 32)`` declares ``weight_scale`` as
     ``[out_dim, in_dim / 32]``: the checkpoint's 32x32 block scale expanded
@@ -560,8 +561,10 @@ class CSA2Attention(Module):
         self.rope = rope_for_layer(
             config, layer_info.layer_id, max_seq_len, device
         )
-        # bf16, not `config.dtype` (the packed quantized dtype): these
-        # Linears load host-dequantized weights.
+        # MXFP8, or bf16 host-dequantized weights with `MAX_DSV41_Q_MXFP8=0`.
+        q_quant_config = (
+            _output_projection_quant_config() if q_mxfp8_enabled() else None
+        )
         self.query_proj = DeepseekV41Query(
             hidden_size,
             config.q_lora_rank,
@@ -570,6 +573,7 @@ class CSA2Attention(Module):
             config.rms_norm_eps,
             DType.bfloat16,
             device,
+            quant_config=q_quant_config,
         )
         # Top-level so its checkpoint path is `attn.kv_norm.weight`.
         self.kv_norm = RMSNorm(head_dim, DType.float32, config.rms_norm_eps)
@@ -587,6 +591,7 @@ class CSA2Attention(Module):
                 DType.bfloat16,
                 device,
                 owns_k=layer_info.attention_mode == "Full",
+                wq_b_quant_config=q_quant_config,
             )
             if layer_info.has_indexer
             else None

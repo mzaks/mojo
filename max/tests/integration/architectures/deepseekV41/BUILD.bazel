@@ -441,6 +441,28 @@ modular_py_test(
     ],
 )
 
+# Guards mo.matmul.mxfp8.rope_tail (Kernels/lib/graph_compiler/mxfp8_rope.mojo)
+# against the MXFP8 matmul followed by apply_rope_tail.
+modular_py_test(
+    name = "test_mxfp8_rope_tail_gpu",
+    srcs = ["test_mxfp8_rope_tail_gpu.py"],
+    exec_properties = {
+        "test.resources:gpu-memory": "8",
+    },
+    gpu_constraints = ["//:b200_gpu"],
+    tags = ["gpu"],
+    target_compatible_with = REQUIRES_INTERNAL_KERNELS,
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/nn",
+        "//max/python/max/pipelines/architectures/deepseekV4",
+        requirement("numpy"),
+    ],
+)
+
 # Checks the absolute-slot boundary used by trimmed decoder SWA reads.
 modular_py_test(
     name = "test_swa_floor",

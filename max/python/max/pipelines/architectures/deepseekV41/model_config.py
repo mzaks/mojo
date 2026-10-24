@@ -52,8 +52,9 @@ from typing_extensions import Self, override
 
 from . import kv_leaves
 
-# Precision switches. Both default on.
+# Precision switches. All default on.
 WOA_MXFP8_ENV = "MAX_DSV41_WOA_MXFP8"
+Q_MXFP8_ENV = "MAX_DSV41_Q_MXFP8"
 HEAD_BF16_ENV = "MAX_DSV41_HEAD_BF16"
 
 
@@ -75,6 +76,18 @@ def woa_mxfp8_enabled() -> bool:
     host.
     """
     return _env_switch(WOA_MXFP8_ENV)
+
+
+def q_mxfp8_enabled() -> bool:
+    """Whether the query-side projections run as MXFP8 matmuls.
+
+    Covers ``attn.wq_a``, ``attn.wkv``, ``attn.wq_b`` and
+    ``attn.indexer.wq_b`` in the trunk and DSpark's ``mtp.*`` stages. On
+    (default): the FP8 weights load as-is with row-expanded E8M0 scales,
+    and the inputs are quantized to MXFP8. Off (``MAX_DSV41_Q_MXFP8=0``):
+    the weights are dequantized to bf16 on the host.
+    """
+    return _env_switch(Q_MXFP8_ENV)
 
 
 # MXFP8 projections on the cluster split-K matmul (default on).

@@ -30,6 +30,7 @@ from max.nn.linear import Linear
 from max.nn.quant_config import QuantFormat
 from max.nn.quant_ops import _matmul_float8_mxfp8
 
+from ...deepseekV4.layers.rope import apply_rope_tail
 from ..model_config import mxfp8_splitk_enabled
 
 # One E8M0 scale per 32 elements.
@@ -102,3 +103,65 @@ def mxfp8_linear(
         ],
     )[0].tensor
     return ops.reshape(out, [*leading, weight.shape[0]])
+
+
+def mxfp8_linear_rope_tail(
+    layer: Linear, x: TensorValue, freqs_cis: TensorValue, head_dim: int
+) -> TensorValue:
+    """Applies ``layer``, then rotates the RoPE tail of each output head.
+
+    On SM100 an MXFP8 ``layer`` rotates in its matmul's epilogue, so the
+    output is written once. Otherwise this is :func:`mxfp8_linear`, then
+    :func:`apply_rope_tail` on the heads.
+
+    Args:
+        layer: The projection; its output is whole ``head_dim`` heads.
+        x: The bf16 input, ``[..., in_dim]``, one row per token.
+        freqs_cis: ``[T, rope_dim // 2, 2]`` float32 cos/sin at each row's
+            position.
+        head_dim: Channels per output head.
+
+    Returns:
+        ``[..., out_dim]`` bf16.
+    """
+    rope_dim = int(freqs_cis.shape[-2]) * 2
+    out_dim = int(layer.weight.shape[0])
+    leading = list(x.shape[:-1])
+    if (
+        layer.quant_config is None
+        or layer.quant_config.format != QuantFormat.MXFP8
+        or layer.weight_scale is None
+        or layer.bias is not None
+        or not _is_sm10x_gpu()
+    ):
+        out = mxfp8_linear(layer, x)
+        heads = ops.reshape(out, [1, -1, out_dim // head_dim, head_dim])
+        return ops.reshape(
+            apply_rope_tail(heads, freqs_cis, rope_dim), [*leading, out_dim]
+        )
+    rows = Dim(1)
+    for d in leading:
+        rows = rows * d
+    x_fp8, x_scales = quantize_dynamic_block_scaled(
+        ops.reshape(x, [rows, x.shape[-1]]),
+        sf_vector_size=_MXFP8_BLOCK_SIZE,
+        scales_type=DType.float8_e8m0fnu,
+        out_type=DType.float8_e4m3fn,
+    )
+    w_scales = block_scales_interleave(
+        layer.weight_scale.to(x.device), sf_vector_size=_MXFP8_BLOCK_SIZE
+    )
+    out = ops.custom(
+        "mo.matmul.mxfp8.rope_tail",
+        device=x.device,
+        values=[
+            x_fp8,
+            layer.weight.to(x.device),
+            x_scales,
+            w_scales,
+            ops.reshape(freqs_cis, [-1, rope_dim]),
+        ],
+        out_types=[TensorType(DType.bfloat16, [rows, out_dim], x.device)],
+        parameters={"head_dim": head_dim, "rope_dim": rope_dim},
+    )[0].tensor
+    return ops.reshape(out, [*leading, out_dim])
