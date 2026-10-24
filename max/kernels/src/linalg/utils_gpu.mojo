@@ -32,7 +32,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 from max.gpu.host.info import A100
 from layout.tensor_core import get_mma_shape
 
-from std.utils.coord import DynamicCoord
+from std.utils.coord import Coord, DynamicCoord, coord_to_index_list
 from std.utils.index import Index, IndexList
 from std.utils.numerics import get_accum_type
 
@@ -174,7 +174,9 @@ struct MatmulConfig[
         *,
         block_tile_shape: IndexList[3] = Index(128, 128, 32),
         warp_tile_shape: IndexList[3] = Index(64, 64, 32),
-        mma_shape: IndexList[3] = get_mma_shape[Self.a_type, Self.accum_type](),
+        mma_shape: DynamicCoord[.int, 3] = get_mma_shape[
+            Self.a_type, Self.accum_type
+        ](),
         cluster_shape: IndexList[3] = Index(1, 1, 1),
         num_pipeline_stages: Int = 4,
         num_k_partitions: Int = 1,
@@ -186,7 +188,7 @@ struct MatmulConfig[
     ):
         self.block_tile_shape = block_tile_shape
         self.warp_tile_shape = warp_tile_shape
-        self.mma_shape = mma_shape
+        self.mma_shape = coord_to_index_list(mma_shape)
         self.num_pipeline_stages = num_pipeline_stages
         self.num_k_partitions = num_k_partitions
         self.k_group_size = k_group_size

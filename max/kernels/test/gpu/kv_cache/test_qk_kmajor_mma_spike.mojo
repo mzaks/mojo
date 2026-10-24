@@ -102,6 +102,7 @@ from layout.tma_async import (
     create_tensor_tile,
 )
 
+from std.utils.coord import DynamicCoord
 from std.testing import assert_almost_equal
 from std.utils.index import Index, IndexList
 from std.utils.numerics import get_accum_type
@@ -251,7 +252,7 @@ def qk_mma_kernel[
     k_desc_shape: Coord,
     c_layout: TensorLayout,
     block_tile_shape: IndexList[3],
-    mma_shape: IndexList[3],
+    mma_shape: DynamicCoord[.int, 3],
     swizzle_mode: TensorMapSwizzle,
     use_native: Bool,
     num_threads: Int = 128,
@@ -478,8 +479,8 @@ def run_qk_spike[
     comptime MMA_M = 64
     comptime MMA_N = N
     comptime MMA_K = 16  # tcgen05 bf16/F16 native instruction-K (fp8 would be 32)
-    comptime block_tile_shape = Index(BM, BN, BK)
-    comptime mma_shape = Index(MMA_M, MMA_N, MMA_K)
+    comptime block_tile_shape = (BM, BN, BK)
+    comptime mma_shape = (MMA_M, MMA_N, MMA_K)
     comptime gran = swizzle_mode.bytes() // size_of[ab_type]()
 
     print(
