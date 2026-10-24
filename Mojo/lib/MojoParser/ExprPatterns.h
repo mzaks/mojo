@@ -218,6 +218,13 @@ struct PatternEmitState {
   CValue getPathValue(IREmitter &emitter, const PatternPath *path,
                       const ExprNode *expr, bool consume = false);
 
+  /// Transfer the direct children of an rvalue aggregate before materializing
+  /// its bindings.  Unbound children are retained in synthesized temporaries
+  /// so normal lifetime lowering destroys them.
+  LogicalResult getConsumedBindingValues(IREmitter &emitter,
+                                         ArrayRef<PatternBoundName> bindings,
+                                         SmallVectorImpl<CValue> &values);
+
   LogicalResult emitCommands(OpBuilder &builder,
                              ArrayRef<const PatternCommand *> commands,
                              SmallVectorImpl<PatternBoundName> &bindings);

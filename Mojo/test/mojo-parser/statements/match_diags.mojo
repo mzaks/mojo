@@ -36,6 +36,28 @@ def match_guarded_var_binding_requires_copy(
         pass
 
 
+def match_tuple_var_binding_requires_copy(
+    pair: Tuple[SomeLinearType, SomeLinearType]
+):
+    # A borrowed tuple subject cannot transfer either element.
+    match pair:
+    # expected-error @+1 {{value of type 'SomeLinearType' cannot be implicitly copied, it does not conform to 'ImplicitlyCopyable'}}
+    case (var x, _):
+        x^.consume()
+
+
+def match_guarded_tuple_var_binding_requires_copy(
+    var pair: Tuple[SomeLinearType, SomeLinearType], somecond: Bool
+):
+    # A guard can reject the arm after the tuple pattern succeeds.
+    match pair^:
+    # expected-error @+1 {{value of type 'SomeLinearType' cannot be implicitly copied, it does not conform to 'ImplicitlyCopyable'}}
+    case (var x, _) if somecond:
+        x^.consume()
+    case _:
+        pass
+
+
 def match_bad_subject_skips_same_indent_cases():
     # expected-error @+1 {{use of unknown declaration 'no_such_subject'}}
     match no_such_subject:

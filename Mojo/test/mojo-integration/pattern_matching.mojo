@@ -69,6 +69,16 @@ def take_optional_linear_payload() -> Int:
             abort("unreachable")
 
 
+def make_linear_payload_pair() -> Tuple[LinearPayload, LinearPayload]:
+    return (LinearPayload(17), LinearPayload(25))
+
+
+def take_tuple_linear_payload() -> Int:
+    match make_linear_payload_pair():
+        case (var payload, _):
+            return payload^.take()
+
+
 def describe_token(tok: Token) -> String:
     match tok:
         case .eof:
@@ -245,6 +255,11 @@ def take_if_case_optional_linear_payload() -> Int:
         abort("unreachable")
 
 
+def take_if_case_tuple_linear_payload() -> Int:
+    if case (var payload, _) = make_linear_payload_pair():
+        return payload^.take()
+
+
 def classify_while_case(var pair: Tuple[Int, Int]) -> String:
     var result = String("miss")
     while case ((0, value) | (value, 1)) as matched = pair:
@@ -333,6 +348,8 @@ def test_optional():
 
     # CHECK: moved-linear: 42
     print("moved-linear:", take_optional_linear_payload())
+    # CHECK: moved-tuple-linear: 17
+    print("moved-tuple-linear:", take_tuple_linear_payload())
 
 
 def test_enum_like_token():
@@ -521,6 +538,8 @@ def test_if_case():
 
     # CHECK: if-case-moved-linear: 42
     print("if-case-moved-linear:", take_if_case_optional_linear_payload())
+    # CHECK: if-case-moved-tuple-linear: 17
+    print("if-case-moved-tuple-linear:", take_if_case_tuple_linear_payload())
 
 
 def test_while_case():

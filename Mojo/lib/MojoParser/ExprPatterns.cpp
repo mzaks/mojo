@@ -1184,6 +1184,105 @@ RValue PatternEmitState::emitListLengthTest(IREmitter &emitter,
 
 /// Given an Equal/EnumTag command, emit the subject and (if an enum) extract
 /// the discriminant.
+LogicalResult
+PatternEmitState::getConsumedBindingValues(IREmitter &emitter,
+                                           ArrayRef<PatternBoundName> bindings,
+                                           SmallVectorImpl<CValue> &values) {
+  // Pattern tests must borrow the subject: a failed case can still fall
+  // through.  Once an unguarded arm commits, however, its var bindings may
+  // transfer ownership out of an rvalue aggregate.
+  values.clear();
+  for (const PatternBoundName &binding : bindings)
+    values.push_back(binding.value);
+  if (!rootSubject.getIfMRValue() || bindings.empty())
+    return success();
+
+  const ExprNode *expr = bindings.front().expr;
+  if (!expr)
+    return success();
+
+  bool hasVarBinding = llvm::any_of(bindings, [](const PatternBoundName &b) {
+    return b.bindingKind == PatternDeclKind::kVar && b.path &&
+           b.path->parent != nullptr;
+  });
+  if (!hasVarBinding)
+    return success();
+
+  SmallVector<PatternPath, 4> children;
+  ASTType rootType = rootPath->type;
+  auto tupleElements =
+      rootType.getParamBindings().size() == 2
+          ? sugarDynCastIfPresent<ParamListAttr>(rootType.getParamBindings()[0])
+          : ParamListAttr();
+  if (tupleElements) {
+    // Wildcards do not have binding paths, but they still need to be projected
+    // and owned so that their destructors run after the tuple is disarmed.
+    for (auto [index, type] : llvm::enumerate(tupleElements.getValues())) {
+      PatternPath child{};
+      child.kind = PatternPath::TupleElement;
+      child.parent = rootPath;
+      child.type = ASTType(type);
+      child.index = index;
+      children.push_back(child);
+    }
+  } else {
+    auto payload = llvm::find_if(bindings, [](const PatternBoundName &binding) {
+      return binding.bindingKind == PatternDeclKind::kVar && binding.path &&
+             binding.path->kind == PatternPath::EnumPayload;
+    });
+    if (payload == bindings.end())
+      return success();
+    children.push_back(*payload->path);
+  }
+
+  auto rootRef = rootSubject.getMValueReference();
+  if (!rootRef)
+    return success();
+  Location loc = expr->getLocation(emitter);
+  SmallVector<CValue, 4> ownedChildren;
+  for (const PatternPath &childPath : children) {
+    CValue child = getPathValue(emitter, &childPath, expr);
+    auto childRef = child.getMValueReference();
+    if (!childRef)
+      return failure();
+    Value pointer = RefToPointerOp::create(*emitter.builder, loc, childRef);
+    Value owned = RefFromPointerOp::create(
+        *emitter.builder, loc, pointer,
+        cast<RefType>(rootRef.getType()).getOrigin(),
+        StringAttr::get(emitter.getContext(), "(pattern child)"),
+        /*startsUninit=*/false, /*endsUninit=*/true);
+    ownedChildren.push_back(MRValue(owned));
+  }
+  // Every child now has its own owning reference, so it is safe to suppress
+  // the aggregate destructor without invalidating later sibling projections.
+  OwnershipMarkDestroyedOp::create(*emitter.builder, loc, rootRef);
+
+  for (auto [childIndex, childPath] : llvm::enumerate(children)) {
+    auto binding =
+        llvm::find_if(bindings, [&](const PatternBoundName &binding) {
+          return binding.bindingKind == PatternDeclKind::kVar && binding.path &&
+                 binding.path->kind == childPath.kind &&
+                 binding.path->parent == rootPath &&
+                 binding.path->index == childPath.index;
+        });
+    if (binding != bindings.end()) {
+      values[std::distance(bindings.begin(), binding)] =
+          ownedChildren[childIndex];
+      continue;
+    }
+    // Keep unbound children live in a synthesized slot. Lifetime lowering will
+    // emit their destructors at the end of the successful arm.
+    VarDeclOp cleanup = emitter.emitVarDecl("anonymous*", childPath.type, loc,
+                                            VarDeclKind::Synthesized);
+    if (!cleanup)
+      return failure();
+    ExprDest cleanupDest(MLValue(cleanup), EC_MatchSubject);
+    if (!emitter.emitCResult(ownedChildren[childIndex], expr, cleanupDest))
+      return failure();
+  }
+  return success();
+}
+
 CValue PatternEmitState::emitTestableValue(IREmitter &emitter,
                                            const PatternCommand *command) {
   assert(command->kind == PatternCommand::Equal ||

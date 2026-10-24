@@ -2533,7 +2533,11 @@ void StmtParser::emitCases(ArrayRef<MatchCaseEntry> caseEntries,
                                  ArrayRef<PatternBoundName> bindings,
                                  bool borrowVarBindings) -> LogicalResult {
     IREmitter emitter = getEmitter();
-    for (const PatternBoundName &binding : bindings) {
+    SmallVector<CValue, 4> bindingValues;
+    if (!borrowVarBindings && failed(emissionState.getConsumedBindingValues(
+                                  emitter, bindings, bindingValues)))
+      return failure();
+    for (auto [bindingIndex, binding] : llvm::enumerate(bindings)) {
       DeclRefNode nameNode(binding.name);
       ExprDest declDest(LValueInitializerType{binding.value.getRValueType()},
                         EC_VarInitMatchBinding);
@@ -2543,9 +2547,11 @@ void StmtParser::emitCases(ArrayRef<MatchCaseEntry> caseEntries,
         return failure();
 
       ExprDest storeDest(bindingLV, EC_VarInitMatchBinding);
-      CValue bindingValue = binding.value;
+      CValue bindingValue =
+          bindingValues.empty() ? binding.value : bindingValues[bindingIndex];
       if (!borrowVarBindings && binding.bindingKind == PatternDeclKind::kVar &&
-          emissionState.rootSubject.getIfRValue() && binding.path) {
+          emissionState.rootSubject.getIfRValue() && binding.path &&
+          bindingValues.empty()) {
         bindingValue = emissionState.getPathValue(
             emitter, binding.path, binding.expr, /*consume=*/true);
         if (!bindingValue)
@@ -4084,7 +4090,11 @@ ParseResult StmtParser::parseIf(Location ifLoc, LexerCursor startCursor,
         [&](PatternEmitState &emissionState,
             ArrayRef<PatternBoundName> bindings) -> LogicalResult {
       IREmitter emitter = getEmitter();
-      for (const PatternBoundName &binding : bindings) {
+      SmallVector<CValue, 4> bindingValues;
+      if (failed(emissionState.getConsumedBindingValues(emitter, bindings,
+                                                        bindingValues)))
+        return failure();
+      for (auto [bindingIndex, binding] : llvm::enumerate(bindings)) {
         DeclRefNode nameNode(binding.name);
         ExprDest declDest(LValueInitializerType{binding.value.getRValueType()},
                           EC_VarInitMatchBinding);
@@ -4094,9 +4104,11 @@ ParseResult StmtParser::parseIf(Location ifLoc, LexerCursor startCursor,
           return failure();
 
         ExprDest storeDest(bindingLV, EC_VarInitMatchBinding);
-        CValue bindingValue = binding.value;
+        CValue bindingValue =
+            bindingValues.empty() ? binding.value : bindingValues[bindingIndex];
         if (binding.bindingKind == PatternDeclKind::kVar &&
-            emissionState.rootSubject.getIfRValue() && binding.path) {
+            emissionState.rootSubject.getIfRValue() && binding.path &&
+            bindingValues.empty()) {
           bindingValue = emissionState.getPathValue(
               emitter, binding.path, binding.expr, /*consume=*/true);
           if (!bindingValue)
