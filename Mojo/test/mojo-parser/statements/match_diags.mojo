@@ -96,6 +96,13 @@ match 1:
 
 def various_match_issues(a: Int, point: Tuple[Int, Int], value: String):
     match a:
+    # expected-error @+1 {{expression is not a valid match pattern; use '==' to compare against its value}}
+    case -(2):
+        pass
+    case _:
+        pass
+
+    match a:
     case 0:
         var x = 42
     case _:

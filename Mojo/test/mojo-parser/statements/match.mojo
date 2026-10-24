@@ -195,7 +195,7 @@ def match_tuple_subject(point: Tuple[Int, Int]):
     match point:
     case (0, 0):
         case_callee[0]()
-    case (-0x1, -(2)):
+    case (-0x1, -2):
         case_callee[2]()
     case _:
         case_callee[1]()

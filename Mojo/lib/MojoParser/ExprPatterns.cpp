@@ -200,10 +200,12 @@ void PatternCommand::dump() const { print(llvm::errs()); }
 // Per-ExprNode Support for Matching.
 //===----------------------------------------------------------------------===//
 
+// Return true if this is a negated numeric literal, such as `-1.0`. We don't
+// want patterns to support arbitrary expressions, just "literals", so we don't
+// accept parenthesis, or unary plus.
 static bool isNegatedNumericLiteral(const ExprNode *expr) {
-  return expr->kind == ExprNode::kNeg &&
-         isa<IntLiteralNode, FloatLiteralNode>(
-             cast<UnaryOpNode>(expr)->subExpr->getWithoutParens());
+  return expr->kind == ExprNode::kNeg && isa<IntLiteralNode, FloatLiteralNode>(
+                                             cast<UnaryOpNode>(expr)->subExpr);
 }
 
 LogicalResult
@@ -232,9 +234,7 @@ StringRef FloatLiteralNode::getLiteralSpelling() const { return spelling; }
 StringRef UnaryOpNode::getLiteralSpelling() const {
   if (isNegatedNumericLiteral(this)) {
     const char *startPos = opLoc.getPointer();
-    const char *lastPos = isa<ParenNode>(subExpr)
-                              ? subExpr->getRangeEnd().getPointer() + 1
-                              : subExpr->getLiteralSpelling().end();
+    const char *lastPos = subExpr->getLiteralSpelling().end();
     return StringRef(startPos, lastPos - startPos);
   }
   return {};
