@@ -11,10 +11,10 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 from std.os import getenv
-from _hal import Driver, Context, copy
-from _hal.device import Device, DeviceSpec, get_device_spec
-from _hal.status import HALError
-from _hal.plugin import MemoryHandle
+from max.gpu.host._hal import Driver, Context, copy
+from max.gpu.host._hal.device import Device, DeviceSpec, get_device_spec
+from max.gpu.host._hal.status import HALError
+from max.gpu.host._hal.plugin import MemoryHandle
 from max.gpu import global_idx
 from std.memory import alloc, ArcPointer, OpaquePointer, Pointer
 from std.sys import size_of
