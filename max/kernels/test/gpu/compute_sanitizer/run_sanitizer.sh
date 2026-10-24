@@ -134,6 +134,8 @@ esac
 # child process killed by oom killer") on the line-tables build only, which
 # cost the whole invocation its results (KERN-3802's sibling failure mode).
 NO_LINE_TABLES_TARGETS=(
+  //max/kernels/test/gpu/nn:attention/test_mha_sm100_qkv_fp8_d64_prefill.mojo.test
+  //max/kernels/test/gpu/nn:attention/test_mha_sm100_qkv_fp8_d128_prefill.mojo.test
   //max/kernels/test/gpu/nn:attention/test_mha_sm100_ws_bm32.mojo.test
   //max/kernels/test/gpu/nn:attention/test_mha_sm100_ws_bm32_splitk.mojo.test
   //max/kernels/test/gpu/nn:attention/test_mha_sm100_qkv_fp8_d64_prefill.mojo.test
@@ -200,7 +202,9 @@ if [ "$TOOL" = "redzone" ]; then
     --test_env=MODULAR_DEBUG_DEVICE_ALLOCATOR=out-of-bounds \
     -- "$@"
 else
-  RUNUNDER="$CS --tool $TOOL --target-processes all --launch-timeout 0 --error-exitcode 1 $EXTRA"
+  # --require-cuda-init no: tests that only print generated assembly never
+  # initialize CUDA, which the tool otherwise reports as an error.
+  RUNUNDER="$CS --tool $TOOL --target-processes all --launch-timeout 0 --error-exitcode 1 --require-cuda-init no $EXTRA"
   # Exclude filecheck tests under the compute-sanitizer lanes: they can't run
   # under `--run_under`, and one (test_gather_nd_oob) is a deliberate
   # expect_crash OOB that would surface a spurious memcheck "out of bounds"

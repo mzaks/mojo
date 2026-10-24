@@ -149,6 +149,12 @@ def _check_decode_pipelined[dtype: DType, keys: Int](ctx: DeviceContext) raises:
     )
     ctx.enqueue_copy(out_host, out_buffer)
     ctx.synchronize()
+    # The kernel reads these through raw pointers, so keep them alive past it.
+    _ = q_buffer^
+    _ = k_buffer^
+    _ = v_buffer^
+    _ = exp_sum_buffer^
+    _ = qk_max_buffer^
 
     for head in range(heads):
         var max_score = Float64(-1e30)
