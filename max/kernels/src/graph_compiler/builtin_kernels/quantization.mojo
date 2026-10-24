@@ -52,6 +52,7 @@ from linalg.block_scaled_quantization import (
     grouped_quantize_nvfp4_row_amax,
     block_scales_interleave,
     quantize_dynamic_block_scaled_mxfp4,
+    rms_norm_quantize_mxfp8_q_kv,
     rope_quantize_dynamic_block_scaled,
     swiglu_quantize_dynamic_block_scaled,
 )
@@ -1082,6 +1083,56 @@ struct Struct_rope_quantize_dynamic_block_scaled:
             input.to_tile_tensor[.int64](),
             freqs.to_tile_tensor[.int64](),
             tensor_sf,
+            context,
+        )
+
+
+@extensibility.register("mo.rms_norm.quantize.mxfp8.q_kv")
+struct Struct_rms_norm_quantize_mxfp8_q_kv:
+    """Registers the `mo.rms_norm.quantize.mxfp8.q_kv` graph op with the graph compiler.
+    """
+
+    @inline(.always)
+    @staticmethod
+    def execute[
+        target: StaticString,
+    ](
+        output: OutputTensor[dtype=DType.float8_e4m3fn, rank=2, ...],
+        scales: OutputTensor[dtype=DType.float8_e8m0fnu, rank=5, ...],
+        kv_output: OutputTensor[dtype=DType.bfloat16, rank=2, ...],
+        input: InputTensor[dtype=DType.bfloat16, rank=2, ...],
+        q_gamma: InputTensor[dtype=DType.bfloat16, rank=1, ...],
+        kv_gamma: InputTensor[dtype=DType.bfloat16, rank=1, ...],
+        epsilon: Float32,
+        context: DeviceContext,
+    ) raises:
+        """RMS-normalizes the q and kv parts of each row, quantizing q to MXFP8.
+
+        Parameters:
+            target: The target GPU device.
+
+        Args:
+            output: The quantized q of shape `[M, q_cols]`.
+            scales: The block scales of q in the 5D TCGEN interleaved layout.
+            kv_output: The normalized kv of shape `[M, kv_cols]`.
+            input: The input of shape `[M, q_cols + kv_cols]`, q then kv.
+            q_gamma: The q weight.
+            kv_gamma: The kv weight.
+            epsilon: The RMS norm epsilon.
+            context: The device context.
+        """
+        comptime assert is_gpu[target](), (
+            "RMS norm MXFP8 quantization only supports GPUs with native"
+            " block scaled support"
+        )
+        rms_norm_quantize_mxfp8_q_kv(
+            output.to_tile_tensor[.int64](),
+            scales.to_tile_tensor[.int64](),
+            kv_output.to_tile_tensor[.int64](),
+            input.to_tile_tensor[.int64](),
+            q_gamma.to_tile_tensor[.int64](),
+            kv_gamma.to_tile_tensor[.int64](),
+            epsilon,
             context,
         )
 

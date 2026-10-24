@@ -744,7 +744,17 @@ class CSA2Attention(Module):
         freqs_cis = ops.gather(
             self.rope.freqs_cis_base(), rows.positions, axis=0
         )
-        qr, q, kv_raw = self.query_proj(h_flat, freqs_cis)
+        qr_scales = None
+        indexer_mxfp8 = (
+            self.indexer is None or self.indexer.wq_b.quant_config is not None
+        )
+        if self.query_proj.can_fuse_norm_quant() and indexer_mxfp8:
+            qr, qr_scales, q, kv = self.query_proj.call_fused(
+                h_flat, freqs_cis, self.kv_norm
+            )
+        else:
+            qr, q, kv_raw = self.query_proj(h_flat, freqs_cis)
+            kv = ops.cast(self.kv_norm(kv_raw), DType.bfloat16)
         q = ops.reshape(q, [-1, self.num_heads, self.head_dim])
         state = PendingCSA2Attention(
             q=q,
@@ -762,10 +772,7 @@ class CSA2Attention(Module):
         swa = cache.swa_collection
         store_window_kv(
             swa.kv_blocks,
-            ops.reshape(
-                ops.cast(self.kv_norm(kv_raw), DType.bfloat16),
-                [-1, self.head_dim],
-            ),
+            ops.reshape(kv, [-1, self.head_dim]),
             rows.positions,
             rope_table,
             leaf_slots(swa, rows.bid, rows.positions, layer.layer_id),
@@ -789,7 +796,7 @@ class CSA2Attention(Module):
         if layer.attention_mode in ("Full", "Reindex"):
             indexer = self.indexer
             assert indexer is not None
-            index_queries, index_weights = indexer(qr, h_flat)
+            index_queries, index_weights = indexer(qr, h_flat, qr_scales)
             state.index_q = quantize_queries(
                 index_queries,
                 index_weights,

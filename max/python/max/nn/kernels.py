@@ -11395,6 +11395,90 @@ def rope_quantize_dynamic_block_scaled(
     return result[0].tensor, result[1].tensor
 
 
+def rms_norm_quantize_mxfp8_q_kv(
+    x: TensorValue,
+    q_weight: TensorValue,
+    kv_weight: TensorValue,
+    epsilon: float,
+    q_cols: int,
+) -> tuple[TensorValue, TensorValue, TensorValue]:
+    """RMS-normalizes the q and kv parts of each row and quantizes q to MXFP8.
+
+    Each row of ``x`` is ``q_cols`` columns of q then the rest as kv. One
+    kernel computes what :func:`~max.graph.ops.rms_norm` on each part,
+    then :func:`quantize_dynamic_block_scaled` on the normalized q, would,
+    without writing the normalized q out. The normalized rows are rounded
+    to bfloat16 where ``rms_norm`` rounds them. The two paths differ only in
+    the order of each row's sum of squares. Runs on NVIDIA SM100 and SM120.
+
+    Args:
+        x: The bfloat16 input. Shape: ``[M, q_cols + kv_cols]``.
+        q_weight: The bfloat16 q weight. Shape: ``[q_cols]``.
+        kv_weight: The bfloat16 kv weight. Shape: ``[kv_cols]``.
+        epsilon: Added to each row's mean square.
+        q_cols: The width of the q part. ``q_cols`` and ``kv_cols`` must each
+            be a multiple of 256.
+
+    Returns:
+        The float8_e4m3fn q ``[M, q_cols]``, its float8_e8m0fnu scales in
+        the rank-5 interleaved layout, and the bfloat16 normalized kv
+        ``[M, kv_cols]``.
+
+    Raises:
+        ValueError: If the GPU is not SM100 or SM120, or the shapes and
+            dtypes are not as above.
+    """
+    if not (_is_sm10x_gpu() or _is_sm12x_gpu()):
+        raise ValueError(
+            "rms_norm_quantize_mxfp8_q_kv requires an NVIDIA SM100 or SM120 GPU"
+        )
+    if x.rank != 2 or x.dtype != DType.bfloat16:
+        raise ValueError("x must be a rank 2 bfloat16 tensor")
+    width = x.shape[1]
+    if not isinstance(width, StaticDim):
+        raise ValueError(f"x.shape[1] must be static, got {width}")
+    kv_cols = int(width) - q_cols
+    if q_cols <= 0 or kv_cols <= 0 or q_cols % 256 or kv_cols % 256:
+        raise ValueError(
+            "q_cols and the kv width must each be a positive multiple of 256,"
+            f" got {q_cols} and {kv_cols}"
+        )
+    for name, weight, cols in (
+        ("q_weight", q_weight, q_cols),
+        ("kv_weight", kv_weight, kv_cols),
+    ):
+        if weight.dtype != DType.bfloat16 or list(weight.shape) != [cols]:
+            raise ValueError(
+                f"{name} must be a bfloat16 tensor of shape [{cols}]"
+            )
+
+    q_type, scales_type = _block_scaled_quantize_out_types(
+        x.shape[0],
+        Dim(q_cols),
+        "q_cols",
+        32,
+        DType.float8_e8m0fnu,
+        DType.float8_e4m3fn,
+        x.device,
+    )
+    result = ops.custom(
+        "mo.rms_norm.quantize.mxfp8.q_kv",
+        device=x.device,
+        values=[
+            x,
+            q_weight,
+            kv_weight,
+            ops.constant(epsilon, DType.float32, device=DeviceRef.CPU()),
+        ],
+        out_types=[
+            q_type,
+            scales_type,
+            TensorType(DType.bfloat16, [x.shape[0], kv_cols], x.device),
+        ],
+    )
+    return result[0].tensor, result[1].tensor, result[2].tensor
+
+
 def grouped_quantize_dynamic_block_scaled(
     input: TensorValue,
     row_offsets: TensorValue,

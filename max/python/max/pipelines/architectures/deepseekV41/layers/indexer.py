@@ -124,13 +124,18 @@ class DeepseekV41Indexer(Module):
             self.k_norm = RMSNorm(self.head_dim, DType.float32, rms_norm_eps)
 
     def __call__(
-        self, qr: TensorValue, x: TensorValue
+        self,
+        qr: TensorValue,
+        x: TensorValue,
+        qr_scales: TensorValue | None = None,
     ) -> tuple[TensorValue, TensorValue]:
         """Projects the index queries and per-head weights.
 
         Args:
-            qr: ``[..., T, q_lora_rank]`` normalized low-rank query.
+            qr: ``[..., T, q_lora_rank]`` normalized low-rank query, or its
+                ``float8_e4m3fn`` quantization when ``qr_scales`` is given.
             x: ``[..., T, hidden_size]`` raw hidden state.
+            qr_scales: The E8M0 block scales of a quantized ``qr``.
 
         Returns:
             ``([T, n_heads * head_dim] queries, [T, n_heads] weights)``,
@@ -138,7 +143,8 @@ class DeepseekV41Indexer(Module):
         """
         return (
             ops.reshape(
-                mxfp8_linear(self.wq_b, qr), [-1, self.n_heads * self.head_dim]
+                mxfp8_linear(self.wq_b, qr, qr_scales),
+                [-1, self.n_heads * self.head_dim],
             ),
             ops.reshape(self.weights_proj(x), [-1, self.n_heads]),
         )

@@ -106,7 +106,11 @@ def mxfp8_linear(
 
 
 def mxfp8_linear_rope_tail(
-    layer: Linear, x: TensorValue, freqs_cis: TensorValue, head_dim: int
+    layer: Linear,
+    x: TensorValue,
+    freqs_cis: TensorValue,
+    head_dim: int,
+    x_scales: TensorValue | None = None,
 ) -> TensorValue:
     """Applies ``layer``, then rotates the RoPE tail of each output head.
 
@@ -120,6 +124,9 @@ def mxfp8_linear_rope_tail(
         freqs_cis: ``[T, rope_dim // 2, 2]`` float32 cos/sin at each row's
             position.
         head_dim: Channels per output head.
+        x_scales: The E8M0 block scales of ``x`` when it arrives already
+            ``float8_e4m3fn`` from a fused quantize. Only the SM100 MXFP8
+            path takes it.
 
     Returns:
         ``[..., out_dim]`` bf16.
@@ -134,6 +141,7 @@ def mxfp8_linear_rope_tail(
         or layer.bias is not None
         or not _is_sm10x_gpu()
     ):
+        assert x_scales is None, "pre-quantized input needs the SM100 path"
         out = mxfp8_linear(layer, x)
         heads = ops.reshape(out, [1, -1, out_dim // head_dim, head_dim])
         return ops.reshape(
@@ -142,12 +150,14 @@ def mxfp8_linear_rope_tail(
     rows = Dim(1)
     for d in leading:
         rows = rows * d
-    x_fp8, x_scales = quantize_dynamic_block_scaled(
-        ops.reshape(x, [rows, x.shape[-1]]),
-        sf_vector_size=_MXFP8_BLOCK_SIZE,
-        scales_type=DType.float8_e8m0fnu,
-        out_type=DType.float8_e4m3fn,
-    )
+    x_fp8 = ops.reshape(x, [rows, x.shape[-1]])
+    if x_scales is None:
+        x_fp8, x_scales = quantize_dynamic_block_scaled(
+            x_fp8,
+            sf_vector_size=_MXFP8_BLOCK_SIZE,
+            scales_type=DType.float8_e8m0fnu,
+            out_type=DType.float8_e4m3fn,
+        )
     w_scales = block_scales_interleave(
         layer.weight_scale.to(x.device), sf_vector_size=_MXFP8_BLOCK_SIZE
     )

@@ -13,7 +13,7 @@
 
 """Provides block-scaled quantization kernels for NVFP4, MXFP4, and MXFP8."""
 
-from std.math import align_up, ceildiv
+from std.math import align_up, ceildiv, rsqrt
 from std.math.uutils import uceildiv, udivmod, ufloordiv
 from std.memory import unsafe_stack_allocation
 from max.gpu import (
@@ -23,6 +23,7 @@ from max.gpu import (
     block_dim,
     global_idx,
     lane_id,
+    warp_id,
     WARP_SIZE,
     MAX_THREADS_PER_BLOCK_METADATA,
 )
@@ -3870,6 +3871,222 @@ def quantize_mxfp8_lane_group[
     if block_is_dead:
         data = type_of(data)(0.0)
     return ((data * out_scale).cast[out_dtype](), e8m0_scale)
+
+
+comptime _MXFP8_Q_DTYPE = DType.float8_e4m3fn
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32((q_cols + kv_cols) // 8)
+    )
+)
+@__name("rms_norm_quantize_mxfp8_q_kv_kernel")
+def rms_norm_quantize_mxfp8_q_kv_kernel[
+    output_layout: TensorLayout,
+    scales_layout: TensorLayout,
+    kv_layout: TensorLayout,
+    input_layout: TensorLayout,
+    q_gamma_layout: TensorLayout,
+    kv_gamma_layout: TensorLayout,
+    *,
+    q_cols: Int,
+    kv_cols: Int,
+](
+    output: TileTensor[_MXFP8_Q_DTYPE, output_layout, MutAnyOrigin],
+    scales: TileTensor[MXFP8_SF_DTYPE, scales_layout, MutAnyOrigin],
+    kv_output: TileTensor[DType.bfloat16, kv_layout, MutAnyOrigin],
+    input: TileTensor[DType.bfloat16, input_layout, ImmutAnyOrigin],
+    q_gamma: TileTensor[DType.bfloat16, q_gamma_layout, ImmutAnyOrigin],
+    kv_gamma: TileTensor[DType.bfloat16, kv_gamma_layout, ImmutAnyOrigin],
+    epsilon: Float32,
+    num_rows: Int32,
+):
+    comptime ELEMENTS_PER_THREAD = 8
+    comptime q_threads = q_cols // ELEMENTS_PER_THREAD
+    comptime q_warps = q_threads // WARP_SIZE
+    comptime num_warps = (q_cols + kv_cols) // ELEMENTS_PER_THREAD // WARP_SIZE
+    comptime assert (
+        q_cols % (ELEMENTS_PER_THREAD * WARP_SIZE) == 0
+        and kv_cols % (ELEMENTS_PER_THREAD * WARP_SIZE) == 0
+    ), "q and kv rows must be whole warps of 8-element chunks"
+    # Scale columns past the row's last block would need zeroing.
+    comptime assert (
+        q_cols % (MXFP8_SF_VECTOR_SIZE * SF_ATOM_K) == 0
+    ), "q row must be whole scale atoms"
+
+    var row = UInt32(block_idx.x)
+    var tid = UInt32(thread_idx.x)
+    var is_q = tid < UInt32(q_threads)
+    var col = (tid if is_q else tid - UInt32(q_threads)) * UInt32(
+        ELEMENTS_PER_THREAD
+    )
+    var sf_offset = scales.layout[linear_idx_type=.uint32](
+        Coord(
+            row // UInt32(SF_MN_GROUP_SIZE),
+            col // UInt32(MXFP8_SF_VECTOR_SIZE * SF_ATOM_K),
+            row % UInt32(SF_ATOM_M[0]),
+            row % UInt32(SF_MN_GROUP_SIZE) // UInt32(SF_ATOM_M[0]),
+            col // UInt32(MXFP8_SF_VECTOR_SIZE) % UInt32(SF_ATOM_K),
+        )
+    )
+
+    with PDL[overlap_at_beginning=True]():
+        if row >= UInt32(num_rows):
+            # Tensor cores read the scales of padding rows, so they must be 0.
+            if is_q and col % UInt32(MXFP8_SF_VECTOR_SIZE) == 0:
+                scales.raw_store(sf_offset, Scalar[MXFP8_SF_DTYPE](0.0))
+        else:
+            var x: SIMD[DType.float32, ELEMENTS_PER_THREAD] = input.load[
+                width=ELEMENTS_PER_THREAD
+            ]((Int(row), Int(col) + (0 if is_q else q_cols))).cast[.float32]()
+
+            # Loaded before the reduction so its latency overlaps the barrier.
+            var gamma: SIMD[DType.bfloat16, ELEMENTS_PER_THREAD]
+            if is_q:
+                gamma = q_gamma.load[width=ELEMENTS_PER_THREAD]((Int(col),))
+            else:
+                gamma = kv_gamma.load[width=ELEMENTS_PER_THREAD]((Int(col),))
+
+            # One reduction per row: q warps, then kv warps, of one block.
+            var warp_sums = unsafe_stack_allocation[
+                num_warps, DType.float32, address_space=.SHARED
+            ]()
+            var warp_ssq = warp.sum((x * x).reduce_add())
+            if lane_id() == 0:
+                warp_sums[warp_id()] = warp_ssq
+            barrier()
+            var ssq = Float32(0)
+            if is_q:
+                comptime for w in range(q_warps):
+                    ssq += warp_sums[w]
+            else:
+                comptime for w in range(q_warps, num_warps):
+                    ssq += warp_sums[w]
+            var inv_rms = rsqrt(
+                ssq / Float32(q_cols if is_q else kv_cols) + epsilon
+            )
+
+            # `rms_norm` rounds the normalized row to bfloat16 before it is
+            # quantized or stored.
+            var normed: SIMD[DType.bfloat16, ELEMENTS_PER_THREAD] = (
+                (x * inv_rms) * gamma.cast[.float32]()
+            ).cast[DType.bfloat16]()
+
+            if is_q:
+                var group_max = lane_group_max[
+                    num_lanes=MXFP8_SF_VECTOR_SIZE // ELEMENTS_PER_THREAD
+                ](abs(normed).reduce_max()).cast[.float32]()
+                var e8m0_scale: Scalar[MXFP8_SF_DTYPE]
+                var out_scale: Float32
+                var block_is_dead: Bool
+                e8m0_scale, out_scale, block_is_dead = (
+                    compute_mxfp8_block_scale[MXFP8_SF_DTYPE](group_max)
+                )
+                var quantized = (normed.cast[.float32]() * out_scale).cast[
+                    _MXFP8_Q_DTYPE
+                ]()
+                # A dead block's multiplier is 0; store zeros, not inf * 0.
+                if block_is_dead:
+                    quantized = type_of(quantized)(0)
+                output.store((Int(row), Int(col)), quantized)
+                if col % UInt32(MXFP8_SF_VECTOR_SIZE) == 0:
+                    scales.raw_store(sf_offset, e8m0_scale)
+            else:
+                kv_output.store((Int(row), Int(col)), normed)
+
+
+def rms_norm_quantize_mxfp8_q_kv(
+    output_device: TileTensor[
+        mut=True, _MXFP8_Q_DTYPE, address_space=.GENERIC, ...
+    ],
+    scales_device: TileTensor[
+        mut=True, MXFP8_SF_DTYPE, address_space=.GENERIC, ...
+    ],
+    kv_output_device: TileTensor[
+        mut=True, DType.bfloat16, address_space=.GENERIC, ...
+    ],
+    input_device: TileTensor[
+        mut=False, DType.bfloat16, address_space=.GENERIC, ...
+    ],
+    q_gamma_device: TileTensor[
+        mut=False, DType.bfloat16, address_space=.GENERIC, ...
+    ],
+    kv_gamma_device: TileTensor[
+        mut=False, DType.bfloat16, address_space=.GENERIC, ...
+    ],
+    epsilon: Float32,
+    ctx: DeviceContext,
+) raises:
+    """RMS-normalizes the q and kv parts of each row and quantizes the q part to MXFP8 with block scales.
+
+    One block per row holds the whole `[q | kv]` row in registers. Its q warps
+    reduce the sum of squares of the q part, its kv warps that of the kv part.
+    The q part is quantized as `quantize_dynamic_block_scaled` would, and the
+    kv part is written normalized in bfloat16. Both normalized parts are
+    rounded to bfloat16 where `rms_norm` rounds them, so the bytes match the
+    unfused kernels up to the order of the sum of squares. SM100 and SM120
+    only.
+
+    Args:
+        output_device: Quantized q of shape `[M, q_cols]`.
+        scales_device: Block scales of q in the 5D TCGEN interleaved layout.
+        kv_output_device: Normalized kv of shape `[M, kv_cols]`.
+        input_device: Input of shape `[M, q_cols + kv_cols]`, q then kv.
+        q_gamma_device: The q weight, `[q_cols]`.
+        kv_gamma_device: The kv weight, `[kv_cols]`.
+        epsilon: Added to each mean square. Rounded to bfloat16 first, as
+            `rms_norm` does.
+        ctx: Device context used to enqueue the kernel.
+    """
+    comptime assert _is_sm10x_gpu(ctx.default_device_info) or _is_sm12x_gpu(
+        ctx.default_device_info
+    ), "RMS norm MXFP8 quantization only runs on SM100 or SM120"
+    comptime assert (
+        output_device.rank == 2
+        and kv_output_device.rank == 2
+        and input_device.rank == 2
+        and q_gamma_device.rank == 1
+        and kv_gamma_device.rank == 1
+    ), "wrong tensor ranks"
+    comptime assert (
+        scales_device.rank == 5 and scales_device.flat_rank == 5
+    ), "scales must be rank 5"
+    comptime q_cols = output_device.static_shape[1]
+    comptime kv_cols = kv_output_device.static_shape[1]
+    comptime assert (
+        q_cols > 0
+        and kv_cols > 0
+        and input_device.static_shape[1] == q_cols + kv_cols
+    ), "the input must hold the static q and kv widths"
+
+    var num_rows = Int(input_device.dim(0))
+    if num_rows == 0:
+        return
+
+    comptime kernel = rms_norm_quantize_mxfp8_q_kv_kernel[
+        output_device.LayoutType,
+        scales_device.LayoutType,
+        kv_output_device.LayoutType,
+        input_device.LayoutType,
+        q_gamma_device.LayoutType,
+        kv_gamma_device.LayoutType,
+        q_cols=q_cols,
+        kv_cols=kv_cols,
+    ]
+    ctx.enqueue_function[kernel](
+        output_device.as_unsafe_any_origin(),
+        scales_device.as_unsafe_any_origin(),
+        kv_output_device.as_unsafe_any_origin(),
+        input_device.as_unsafe_any_origin(),
+        q_gamma_device.as_unsafe_any_origin(),
+        kv_gamma_device.as_unsafe_any_origin(),
+        epsilon.cast[DType.bfloat16]().cast[.float32](),
+        Int32(num_rows),
+        grid_dim=align_up(num_rows, SF_MN_GROUP_SIZE),
+        block_dim=(q_cols + kv_cols) // 8,
+        attributes=pdl_launch_attributes(PDLLevel.ON),
+    )
 
 
 @__llvm_metadata(

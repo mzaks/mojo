@@ -18,10 +18,11 @@ from typing import NamedTuple
 
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, ops
+from max.nn.kernels import _is_sm10x_gpu, rms_norm_quantize_mxfp8_q_kv
 from max.nn.layer import Module
 from max.nn.linear import Linear
 from max.nn.norm.rms_norm import RMSNorm
-from max.nn.quant_config import QuantConfig
+from max.nn.quant_config import QuantConfig, QuantFormat
 
 from .mxfp8_matmul import mxfp8_linear, mxfp8_linear_rope_tail
 
@@ -32,6 +33,15 @@ class QueryProjectionOutput(NamedTuple):
     qr: TensorValue
     q: TensorValue
     kv_raw: TensorValue
+
+
+class FusedQueryProjectionOutput(NamedTuple):
+    """Quantized low-rank query, its rotated heads, and the normalized KV."""
+
+    qr: TensorValue
+    qr_scales: TensorValue
+    q: TensorValue
+    kv: TensorValue
 
 
 class DeepseekV41Query(Module):
@@ -111,3 +121,58 @@ class DeepseekV41Query(Module):
             [1, t, self.local_num_heads, self.head_dim],
         )
         return QueryProjectionOutput(qr=qr, q=q, kv_raw=kv_raw)
+
+    def can_fuse_norm_quant(self) -> bool:
+        """Whether :meth:`call_fused` applies: SM100 and an MXFP8 ``wq_b``."""
+        quant_config = self.wq_b.quant_config
+        return (
+            _is_sm10x_gpu()
+            and quant_config is not None
+            and quant_config.format == QuantFormat.MXFP8
+            and self.wq_b.weight_scale is not None
+            and self.q_lora_rank % 256 == 0
+            and self.head_dim % 256 == 0
+        )
+
+    def call_fused(
+        self, x: TensorValue, freqs_cis: TensorValue, kv_norm: RMSNorm
+    ) -> FusedQueryProjectionOutput:
+        """Like :meth:`__call__`, with one kernel for both norms and the quantize.
+
+        The kernel normalizes the low-rank query and the KV with ``kv_norm``
+        and quantizes the query to MXFP8, so ``wq_b`` and any other MXFP8
+        consumer of ``qr`` skip their own quantize.
+
+        Args:
+            x: ``[1, T, hidden_size]`` hidden states.
+            freqs_cis: ``[T, rope_head_dim // 2, 2]``, already gathered at
+                these tokens' positions.
+            kv_norm: The KV latent's norm.
+
+        Returns:
+            ``qr`` ``[T, q_lora_rank]`` float8 with its block scales, ``q``
+            ``[1, T, local_num_heads, head_dim]`` and the normalized ``kv``
+            ``[T, head_dim]``.
+        """
+        t = x.shape[-2]
+        projected = ops.reshape(
+            mxfp8_linear(self.fused_wqa_wkv, x),
+            [t, self.q_lora_rank + self.head_dim],
+        )
+        assert self.q_norm.eps == kv_norm.eps
+        qr, qr_scales, kv = rms_norm_quantize_mxfp8_q_kv(
+            projected,
+            self.q_norm.weight.cast(DType.bfloat16).to(x.device),
+            kv_norm.weight.cast(DType.bfloat16).to(x.device),
+            self.q_norm.eps,
+            self.q_lora_rank,
+        )
+        q = ops.reshape(
+            mxfp8_linear_rope_tail(
+                self.wq_b, qr, freqs_cis, self.head_dim, qr_scales
+            ),
+            [1, t, self.local_num_heads, self.head_dim],
+        )
+        return FusedQueryProjectionOutput(
+            qr=qr, qr_scales=qr_scales, q=q, kv=kv
+        )
