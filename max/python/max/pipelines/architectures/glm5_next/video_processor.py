@@ -232,7 +232,7 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
 
     def decode(
         self, source: VideoSource, max_decoded_bytes: int | None = None
-    ) -> tuple[list[Image.Image], list[int], float]:
+    ) -> tuple[list[npt.NDArray[np.uint8]], list[int], float]:
         """Decodes the frames :meth:`sample_frames` picks from a clip.
 
         The duration is the frame count over the frame rate, as transformers'
@@ -249,9 +249,12 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
             max_decoded_bytes: Ceiling on the decoded frames' footprint.
 
         Returns:
-            The sampled frames, their source indices, and the frame rate the
-            indices count in, which the timestamps in the prompt are built
-            from.
+            The sampled frames as ``(height, width, 3)`` uint8 RGB arrays,
+            their source indices, and the frame rate the indices count in,
+            which the timestamps in the prompt are built from. The frames
+            stay the arrays the budget sized: converting the clip to Pillow
+            images up front, at four bytes an RGB pixel, would briefly hold
+            7/3 of it.
         """
 
         def sample(total: int, fps: float, max_frames: int | None) -> list[int]:
@@ -280,7 +283,7 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
             max_decoded_bytes=max_decoded_bytes,
             default_fps=_DEFAULT_FPS,
         )
-        return sampled.images, sampled.indices, sampled.info.fps or _DEFAULT_FPS
+        return sampled.frames, sampled.indices, sampled.info.fps or _DEFAULT_FPS
 
     def canvas_size(
         self, height: int, width: int, num_frames: int | None = None
@@ -310,9 +313,11 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
             max_image_tokens=self.max_entry_tokens,
         )
 
-    def grid_thw(self, frames: Sequence[Image.Image]) -> tuple[int, int, int]:
+    def grid_thw(
+        self, frames: Sequence[npt.NDArray[np.uint8]]
+    ) -> tuple[int, int, int]:
         """Returns a clip's ``(t, h, w)`` grid without touching the pixels."""
-        width, height = frames[0].size
+        height, width = frames[0].shape[:2]
         num_frames = len(frames)
         canvas_height, canvas_width = self.canvas_size(
             height, width, num_frames
@@ -328,7 +333,7 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
         )
 
     def preprocess(
-        self, frames: Sequence[Image.Image]
+        self, frames: Sequence[npt.NDArray[np.uint8]]
     ) -> tuple[npt.NDArray[np.float32], tuple[int, int, int]]:
         """Patchifies an already-sampled clip.
 
@@ -337,7 +342,8 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
         ``(t, h, w)`` grid per clip.
 
         Args:
-            frames: The sampled frames, in order.
+            frames: The sampled ``(height, width, 3)`` uint8 RGB frames, in
+                order. Each is a Pillow image only while it is resized.
 
         Returns:
             The ``(num_patches, 3 * temporal_patch_size * patch_size**2)``
@@ -348,13 +354,13 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
         """
         if not frames:
             raise ValueError("A clip needs at least one frame.")
-        sizes = {frame.size for frame in frames}
-        if len(sizes) != 1:
+        shapes = {frame.shape for frame in frames}
+        if len(shapes) != 1:
             raise ValueError(
-                f"All frames of a clip must share one size, got {sizes}."
+                f"All frames of a clip must share one size, got {shapes}."
             )
 
-        width, height = frames[0].size
+        height, width = frames[0].shape[:2]
         num_frames = len(frames)
         canvas_height, canvas_width = self.canvas_size(
             height, width, num_frames
@@ -387,7 +393,7 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
             pair = frames[t * step : (t + 1) * step]
             for frame, canvas in zip(pair, canvases.padded, strict=False):
                 self.resize_and_pad(
-                    frame,
+                    Image.fromarray(frame),
                     canvas_height,
                     canvas_width,
                     content_height,
@@ -410,7 +416,7 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
         return patches, (grid_t, grid_h, grid_w)
 
     def __call__(
-        self, clips: Sequence[Sequence[Image.Image]]
+        self, clips: Sequence[Sequence[npt.NDArray[np.uint8]]]
     ) -> tuple[list[npt.NDArray[np.float32]], npt.NDArray[np.int32]]:
         """Patchifies each clip, returning per-clip patches and the grids."""
         processed = [self.preprocess(clip) for clip in clips]

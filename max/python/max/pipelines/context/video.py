@@ -262,11 +262,16 @@ def _declared_frame_count(
     return max(total, 0)
 
 
-def probe_video(source: VideoSource) -> VideoStreamInfo:
+def probe_video(
+    source: VideoSource, default_fps: float = _DEFAULT_FPS
+) -> VideoStreamInfo:
     """Reads a video's header without decoding any frame.
 
     Args:
         source: The video to probe.
+        default_fps: Frame rate assumed when the container declares none,
+            to estimate the frame count from the duration. Pass the rate the
+            caller indexes frames at, or its targets miss the real stream.
 
     Returns:
         The stream metadata. ``num_frames`` is the header's best-effort count
@@ -286,7 +291,7 @@ def probe_video(source: VideoSource) -> VideoStreamInfo:
             return VideoStreamInfo(
                 fps=fps,
                 num_frames=_declared_frame_count(
-                    stream, container, fps or _DEFAULT_FPS
+                    stream, container, fps or default_fps
                 ),
                 width=stream.width or 0,
                 height=stream.height or 0,
@@ -805,7 +810,7 @@ def decode_video_frames(
             "sample_indices replaces num_frames / target_fps; pass one"
         )
 
-    info = probe_video(source)
+    info = probe_video(source, default_fps)
     fps = info.fps or default_fps
     budget_frames = _budget_frame_limit(info, max_decoded_bytes)
     worker_count = _decode_threads() if threads is None else max(1, threads)

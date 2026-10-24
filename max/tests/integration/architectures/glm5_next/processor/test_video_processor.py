@@ -24,11 +24,11 @@ import tracemalloc
 
 import av
 import numpy as np
+import numpy.typing as npt
 import pytest
 from max.pipelines.architectures.glm5_next.video_processor import (
     Glm5NextVideoProcessor,
 )
-from PIL import Image
 
 # Verbatim from the checkpoint's processor_config.json, `video_processor` key.
 _PROCESSOR_CONFIG = {
@@ -48,11 +48,9 @@ def _processor() -> Glm5NextVideoProcessor:
     return Glm5NextVideoProcessor.from_processor_config(_PROCESSOR_CONFIG)
 
 
-def _frame(height: int, width: int, seed: int) -> Image.Image:
+def _frame(height: int, width: int, seed: int) -> npt.NDArray[np.uint8]:
     rng = np.random.default_rng(seed)
-    return Image.fromarray(
-        rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
-    )
+    return rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
 
 
 @pytest.mark.parametrize(
@@ -182,8 +180,8 @@ def _mp4(num_frames: int, fps: int, width: int = 32, height: int = 32) -> bytes:
     return buffer.getvalue()
 
 
-def _grey_levels(frames: list[Image.Image]) -> list[int]:
-    return [round(float(np.asarray(frame).mean()) / 8) for frame in frames]
+def _grey_levels(frames: list[npt.NDArray[np.uint8]]) -> list[int]:
+    return [round(float(frame.mean()) / 8) for frame in frames]
 
 
 def test_decode_fetches_the_frames_sample_frames_picks() -> None:

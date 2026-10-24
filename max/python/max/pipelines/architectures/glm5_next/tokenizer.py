@@ -30,7 +30,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from functools import partial
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -42,7 +43,11 @@ from max.pipelines.context import (
     TokenBuffer,
 )
 from max.pipelines.context.exceptions import PromptTooLongError
-from max.pipelines.lib import PipelineConfig, max_tokens_to_generate
+from max.pipelines.lib import (
+    PipelineConfig,
+    VisionPreprocessCache,
+    max_tokens_to_generate,
+)
 from max.pipelines.lib.tokenizer import (
     encode_dkv_cache_hint,
     open_image,
@@ -51,6 +56,7 @@ from max.pipelines.lib.tokenizer import (
 from max.pipelines.modeling.types import (
     TextGenerationRequest,
     TextGenerationRequestMessage,
+    VisionPreprocessCacheStats,
 )
 from max.support.image import hash_image
 from PIL import Image
@@ -65,6 +71,9 @@ logger = logging.getLogger("max.pipelines")
 __all__ = ["Glm5NextTokenizer"]
 
 _PROCESSOR_CONFIG = "processor_config.json"
+
+# An image's patch rows and its `(t, h, w)` grid.
+_PreprocessedImage = tuple[npt.NDArray[np.float32], tuple[int, int, int]]
 
 
 def _load_processor_config(
@@ -157,15 +166,34 @@ class Glm5NextTokenizer(GlmTokenizer):
             if self.max_length
             else None
         )
-        self._hash_images = (
+        self._preprocess_cache: VisionPreprocessCache[_PreprocessedImage] = (
+            VisionPreprocessCache.for_images(pipeline_config.runtime)
+        )
+        self._video_preprocess_cache: VisionPreprocessCache[_Video] = (
+            VisionPreprocessCache.for_videos(pipeline_config.runtime)
+        )
+        caches_by_hash = (
             pipeline_config.model.kv_cache.enable_prefix_caching
             or pipeline_config.runtime.vision_cache_utilization != 0
+        )
+        self._hash_images = caches_by_hash or self._preprocess_cache.enabled
+        self._hash_videos = (
+            caches_by_hash or self._video_preprocess_cache.enabled
         )
 
     @property
     def expects_content_wrapping(self) -> bool:
         """Keeps image and video parts as placeholders for the chat template."""
         return True
+
+    def preprocess_cache_stats(
+        self,
+    ) -> Mapping[str, VisionPreprocessCacheStats]:
+        """This tokenizer's :class:`PreprocessCacheStatsProbe` snapshot."""
+        return {
+            "image": self._preprocess_cache.stats(),
+            "video": self._video_preprocess_cache.stats(),
+        }
 
     def _flatten_message(
         self, message: TextGenerationRequestMessage
@@ -283,21 +311,46 @@ class Glm5NextTokenizer(GlmTokenizer):
         ]
         return replacement, entries
 
-    def _preprocess_videos(
-        self,
-        videos: Sequence[bytes],
-        content_hashes: Sequence[int | None],
-        max_decoded_bytes: int | None,
-    ) -> list[_Video]:
-        """Decodes, samples and patchifies each clip."""
-        processed: list[_Video] = []
-        for raw, content_hash in zip(videos, content_hashes, strict=True):
+    def _preprocess_video(
+        self, raw: bytes, max_decoded_bytes: int | None
+    ) -> _Video:
+        """Hashes, decodes, samples and patchifies one clip, or reuses it.
+
+        Runs in the executor with the decode: an encoded clip can run to
+        gigabytes, so hashing it on the event loop would stall every request.
+        """
+        # Keyed on the encoded bytes alone: each temporal patch's key adds
+        # the frames and the canvas it was sampled at.
+        content_hash = (
+            hash_image(raw, self.video_processor.max_image_tokens)
+            if self._hash_videos
+            else None
+        )
+
+        def preprocess() -> _Video:
             frames, indices, fps = self.video_processor.decode(
                 raw, max_decoded_bytes
             )
             patches, grid = self.video_processor.preprocess(frames)
-            processed.append(_Video(patches, grid, indices, fps, content_hash))
-        return processed
+            return _Video(patches, grid, indices, fps, content_hash)
+
+        # The decode budget can lower the frame cap, so the sample depends on
+        # it as well as on the bytes.
+        budget = -1 if max_decoded_bytes is None else max_decoded_bytes
+        key = (
+            None
+            if content_hash is None
+            else hash_image(np.array([content_hash, budget], dtype=np.int64))
+        )
+        return self._video_preprocess_cache.get_or_preprocess(key, preprocess)
+
+    def _preprocess_videos(
+        self, videos: Sequence[bytes], max_decoded_bytes: int | None
+    ) -> list[_Video]:
+        """Preprocesses each clip, for the executor."""
+        return [
+            self._preprocess_video(raw, max_decoded_bytes) for raw in videos
+        ]
 
     def expand_image_placeholders(
         self,
@@ -371,7 +424,12 @@ class Glm5NextTokenizer(GlmTokenizer):
         for position, image, count, image_hash in zip(
             image_positions, opened, counts, image_hashes, strict=True
         ):
-            patches, grid = self.image_processor.preprocess(image)
+            # Keyed on the hash the encoder cache uses: the bytes and the
+            # token budget fix the patches, so a hit skips the resize and
+            # patchify.
+            patches, grid = self._preprocess_cache.get_or_preprocess(
+                image_hash, partial(self.image_processor.preprocess, image)
+            )
             edits.append(
                 (
                     int(position),
@@ -437,18 +495,10 @@ class Glm5NextTokenizer(GlmTokenizer):
             else None
             for raw in request.images
         ]
-        # Keyed on the encoded bytes alone: each temporal patch's key adds
-        # the frames and the canvas it was sampled at.
         videos = (
             await run_with_default_executor(
                 self._preprocess_videos,
                 request.videos,
-                [
-                    hash_image(raw, self.video_processor.max_image_tokens)
-                    if self._hash_images
-                    else None
-                    for raw in request.videos
-                ],
                 request.max_decoded_bytes,
             )
             if request.videos

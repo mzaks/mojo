@@ -48,6 +48,7 @@ from max.pipelines.architectures.glm5_next.video_processor import (
     Glm5NextVideoProcessor,
 )
 from max.pipelines.context.exceptions import PromptTooLongError
+from max.pipelines.lib import VisionPreprocessCache
 from max.pipelines.modeling.types import (
     RequestID,
     TextGenerationRequest,
@@ -112,7 +113,10 @@ def _tokenizer() -> Glm5NextTokenizer:
         max_image_tokens=_MAX_IMAGE_TOKENS
     )
     tokenizer.video_processor = Glm5NextVideoProcessor()
+    tokenizer._preprocess_cache = VisionPreprocessCache(0)
+    tokenizer._video_preprocess_cache = VisionPreprocessCache(0)
     tokenizer._hash_images = True
+    tokenizer._hash_videos = True
     tokenizer.max_length = 1 << 20
     tokenizer._eos_token_ids = {_EOS}
     tokenizer.delegate = MagicMock()
@@ -281,3 +285,48 @@ def test_video_placeholder_count_must_match_videos() -> None:
     )
     with pytest.raises(ValueError, match="0 video placeholders"):
         tokenizer.expand_image_placeholders(_prompt(0), [], [], [video])
+
+
+def test_repeated_image_is_preprocessed_once() -> None:
+    """A resent image reuses its patches rather than resizing them again."""
+    tokenizer = _tokenizer()
+    tokenizer._preprocess_cache = VisionPreprocessCache(1 << 30)
+    image = _png(*_IMAGE_SIZES[0], seed=0)
+
+    with patch.object(
+        tokenizer.image_processor,
+        "preprocess",
+        wraps=tokenizer.image_processor.preprocess,
+    ) as preprocess:
+        _, first, _ = tokenizer.expand_image_placeholders(
+            _prompt(1), [image], [7]
+        )
+        _, second, _ = tokenizer.expand_image_placeholders(
+            _prompt(1), [image], [7]
+        )
+
+    assert preprocess.call_count == 1
+    assert second[0].pixel_values is first[0].pixel_values
+
+
+def test_repeated_clip_is_decoded_once_per_budget() -> None:
+    """A resent clip reuses its patches unless its decode budget differs.
+
+    The budget can lower the frame cap, so it keys the sample too.
+    """
+    tokenizer = _tokenizer()
+    tokenizer._video_preprocess_cache = VisionPreprocessCache(1 << 30)
+    frames = [np.zeros((56, 56, 3), dtype=np.uint8)] * 2
+
+    with patch.object(
+        tokenizer.video_processor,
+        "decode",
+        return_value=(frames, [0, 1], 1.0),
+    ) as decode:
+        first = tokenizer._preprocess_videos([b"clip"], None)
+        second = tokenizer._preprocess_videos([b"clip"], None)
+        tokenizer._preprocess_videos([b"clip"], 1 << 20)
+
+    assert decode.call_count == 2
+    assert second[0] is first[0]
+    assert first[0].content_hash is not None

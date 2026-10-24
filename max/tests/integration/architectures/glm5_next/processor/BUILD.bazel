@@ -25,7 +25,6 @@ modular_py_test(
         "//max/python/max/pipelines/architectures/glm5_next",
         requirement("av"),
         requirement("numpy"),
-        requirement("pillow"),
     ],
 )
 
@@ -36,6 +35,7 @@ modular_py_test(
     deps = [
         "//max/python/max/pipelines/architectures/glm5_next",
         "//max/python/max/pipelines/context",
+        "//max/python/max/pipelines/lib",
         "//max/python/max/pipelines/modeling",
         requirement("numpy"),
         requirement("pillow"),

@@ -83,15 +83,17 @@ def _mla_cache_dtype(config: Glm5NextConfig) -> DType:
 
 
 class _VisionTowers(Module):
-    """One vision tower replica per device, all encoding the same patches.
+    """The vision tower, its output rows returned once per device.
 
-    Replicated rather than sharded: the encoder cache stores one copy of each
-    output row per device, and at 0.56B parameters the replicas cost about
-    1.1 GB each. Every replica reads the same inputs, so each device computes
-    its own copy rather than receiving one over the interconnect.
+    Either every device runs a replica on the same patches, or device 0 runs
+    the only tower and copies its rows to the others, as deepseekV41 does. A
+    replica costs about 1.1 GB of weights and repeats the encode's FLOPs, and
+    the patches it reads cross the interconnect as well: 18.8 KB of float32
+    per merged token, against 8.2 KB of bfloat16 rows. The encoder cache
+    stores one copy of each row per device either way.
     """
 
-    def __init__(self, config: Glm5NextConfig) -> None:
+    def __init__(self, config: Glm5NextConfig, *, replicate: bool) -> None:
         super().__init__()
         vision_config = config.vision_config
         assert vision_config is not None
@@ -101,7 +103,9 @@ class _VisionTowers(Module):
                 Glm5NextVisionTransformer(
                     vision_config, device, use_subgraphs=config.use_subgraphs
                 )
-                for device in config.devices
+                for device in (
+                    config.devices if replicate else config.devices[:1]
+                )
             ]
         )
 
@@ -112,6 +116,10 @@ class _VisionTowers(Module):
         row_offsets: TensorValue,
         max_seqlen: TensorValue,
     ) -> tuple[TensorValue, ...]:
+        if len(self.towers) == 1:
+            (tower,) = self.towers
+            rows = tower(pixel_values, rot_pos_ids, row_offsets, max_seqlen)
+            return tuple(rows.to(device) for device in self.devices)
         return tuple(
             tower(
                 pixel_values.to(device),
@@ -139,6 +147,13 @@ class Glm5NextModel(DeepseekV3_2Model):
 
     _vision_weights_dict: dict[str, WeightData]
     _empty_vision_embeddings: list[Buffer] | None = None
+
+    #: Whether every device runs its own vision tower rather than device 0
+    #: encoding and copying the rows. Replicated until encode time and memory
+    #: are measured both ways. The memory planner charges a tower and its
+    #: activations per device either way: device 0 holds both regardless,
+    #: and it bounds the evenly split KV cache.
+    replicate_vision_tower: ClassVar[bool] = True
 
     @property
     def vision_model(self) -> Model | None:
@@ -256,16 +271,16 @@ class Glm5NextModel(DeepseekV3_2Model):
     def _vision_spec(
         self, config: Glm5NextConfig, state_dict: dict[str, WeightData]
     ) -> GraphSpec:
-        """Returns the vision graph: one tower replica per device, built from
-        shared host weights."""
+        """Returns the vision graph: its towers, built from shared host
+        weights."""
         vision_config = config.vision_config
         assert vision_config is not None
-        towers = _VisionTowers(config)
+        towers = _VisionTowers(config, replicate=self.replicate_vision_tower)
         # Keyed by replica index; the host arrays are shared, not copied.
         towers.load_state_dict(
             {
                 f"towers.{replica}.{name}": weight
-                for replica in range(len(config.devices))
+                for replica in range(len(towers.towers))
                 for name, weight in state_dict.items()
             },
             weight_alignment=1,
