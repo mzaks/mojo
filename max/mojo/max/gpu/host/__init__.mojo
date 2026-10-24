@@ -17,7 +17,7 @@ from .info import default_accelerator, get_gpu_target
 
 from ._legacy.constant_memory_mapping import ConstantMemoryMapping
 from ._legacy.device_attribute import DeviceAttribute
-from ._legacy.device_context import (
+from ._overlay import (
     CompletionFlag,
     DefaultDeviceTypeEncoder,
     DeviceBuffer,
@@ -46,7 +46,7 @@ from ._legacy.launch_attribute import (
     LaunchAttributeID,
     LaunchAttributeValue,
 )
-from ._legacy.device_graph import (
+from ._overlay import (
     DeviceGraph,
     DeviceGraphBuilder,
     DeviceGraphCache,
@@ -55,7 +55,7 @@ from ._legacy.device_graph import (
     DeviceGraphNode,
     StableAddr,
 )
-from ._legacy._nvidia_cuda import (
+from ._overlay import (
     CUDA,
     CUDA_MODULE,
     CUDA_get_current_context,
