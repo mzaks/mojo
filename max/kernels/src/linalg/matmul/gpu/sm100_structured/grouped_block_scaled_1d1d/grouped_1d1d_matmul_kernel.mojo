@@ -3098,6 +3098,7 @@ struct Grouped1D1DMatmulKernel[
     def mma[
         tiles_origin: MutOrigin,
         //,
+        partial_k_group: Bool = False,
     ](
         tiles: ConsumerTiles[
             tiles_origin,
@@ -3111,6 +3112,7 @@ struct Grouped1D1DMatmulKernel[
         iter_idx: UInt32,
         k_start: UInt32,
         sfb_tmem_adj: UInt32,
+        k_end: UInt32 = 0,
     ):
         """Execute MMA operations.
 
@@ -3123,6 +3125,8 @@ struct Grouped1D1DMatmulKernel[
         Parameters:
             tiles_origin: Memory origin of the consumer tiles payload
                 (inferred).
+            partial_k_group: Whether the group can run past the last
+                k-tile, so its k-tiles from `k_end` on are skipped.
 
         Args:
             tiles: Consumer tiles holding the A, B, SFA, and SFB
@@ -3143,30 +3147,40 @@ struct Grouped1D1DMatmulKernel[
                 tile, computed by `_compute_sfb_tmem_adj`, that
                 accounts for the SFB layout offset at this `(m, n,
                 m_start)` position.
+            k_end: The tile's k-tile count. Read only with
+                `partial_k_group`.
         """
         if elect_one_sync():
             comptime for jj in range(Self.config.k_group_size):
                 var j = UInt32(jj)
-                var a_tt, b_tt, sfa_tt, sfb_tt = tiles.payload().get_tile[
-                    Self.config.k_group_size
-                ](tiles.stage(), jj)
-                var tile_idx = (
-                    Int(tiles.stage()) * Self.config.k_group_size + jj
-                )
-                var sfa_tmem_offset = UInt32(tmem_region.sfa(tile_idx).col_addr)
-                var sfb_tmem_offset = UInt32(tmem_region.sfb(tile_idx).col_addr)
-                var is_first_k = (iter_idx + j) == k_start
-                mma_op.mma(
-                    a_tt,
-                    b_tt,
-                    sfa_tt,
-                    sfb_tt,
-                    tmem_addr,
-                    sfa_tmem_offset,
-                    sfb_tmem_offset,
-                    init_c=is_first_k,
-                    sfb_tmem_adj=sfb_tmem_adj,
-                )
+                var live = True
+                comptime if partial_k_group and jj > 0:
+                    live = iter_idx + j < k_end
+                if live:
+                    var a_tt, b_tt, sfa_tt, sfb_tt = tiles.payload().get_tile[
+                        Self.config.k_group_size
+                    ](tiles.stage(), jj)
+                    var tile_idx = (
+                        Int(tiles.stage()) * Self.config.k_group_size + jj
+                    )
+                    var sfa_tmem_offset = UInt32(
+                        tmem_region.sfa(tile_idx).col_addr
+                    )
+                    var sfb_tmem_offset = UInt32(
+                        tmem_region.sfb(tile_idx).col_addr
+                    )
+                    var is_first_k = (iter_idx + j) == k_start
+                    mma_op.mma(
+                        a_tt,
+                        b_tt,
+                        sfa_tt,
+                        sfb_tt,
+                        tmem_addr,
+                        sfa_tmem_offset,
+                        sfb_tmem_offset,
+                        init_c=is_first_k,
+                        sfb_tmem_adj=sfb_tmem_adj,
+                    )
             mma_op.commit(tiles.mbar())
 
     # ========== Epilogue ==========
