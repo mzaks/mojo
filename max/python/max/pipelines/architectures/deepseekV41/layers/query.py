@@ -24,6 +24,7 @@ from max.nn.linear import Linear
 from max.nn.norm.rms_norm import RMSNorm
 from max.nn.quant_config import QuantConfig, QuantFormat
 
+from .csa2 import WindowStore, norm_quantize_q_store_kv
 from .hyper_connection import Mxfp8Rows
 from .mxfp8_matmul import mxfp8_linear, mxfp8_linear_rope_tail
 
@@ -172,29 +173,88 @@ class DeepseekV41Query(Module):
             ``[1, T, local_num_heads, head_dim]`` and the normalized ``kv``
             ``[T, head_dim]``.
         """
-        t = x.shape[-2]
+        projected, q_weight, kv_weight = self._fused_norm_inputs(
+            x, kv_norm, x_mxfp8
+        )
+        qr, qr_scales, kv = rms_norm_quantize_mxfp8_q_kv(
+            projected, q_weight, kv_weight, self.q_norm.eps, self.q_lora_rank
+        )
+        return FusedQueryProjectionOutput(
+            qr=qr,
+            qr_scales=qr_scales,
+            q=self._rope_heads(qr, qr_scales, freqs_cis),
+            kv=kv,
+        )
+
+    def call_fused_store_kv(
+        self,
+        x: TensorValue,
+        freqs_cis: TensorValue,
+        kv_norm: RMSNorm,
+        window: WindowStore,
+        x_mxfp8: Mxfp8Rows | None = None,
+    ) -> tuple[TensorValue, TensorValue, TensorValue]:
+        """Like :meth:`call_fused`, storing the KV as window records.
+
+        The kernel that normalizes and quantizes writes each token's MXFP8
+        window record instead of the normalized KV, so no separate store
+        runs.
+
+        Args:
+            x: ``[1, T, hidden_size]`` hidden states.
+            freqs_cis: ``[T, rope_head_dim // 2, 2]``, already gathered at
+                these tokens' positions.
+            kv_norm: The KV latent's norm.
+            window: Where the KV's records go.
+            x_mxfp8: As in :meth:`call_fused`.
+
+        Returns:
+            ``qr`` ``[T, q_lora_rank]`` float8 with its block scales, and
+            ``q`` ``[1, T, local_num_heads, head_dim]``.
+        """
+        projected, q_weight, kv_weight = self._fused_norm_inputs(
+            x, kv_norm, x_mxfp8
+        )
+        qr, qr_scales = norm_quantize_q_store_kv(
+            projected,
+            q_weight,
+            kv_weight,
+            self.q_norm.eps,
+            self.q_lora_rank,
+            window,
+        )
+        return qr, qr_scales, self._rope_heads(qr, qr_scales, freqs_cis)
+
+    def _fused_norm_inputs(
+        self,
+        x: TensorValue,
+        kv_norm: RMSNorm,
+        x_mxfp8: Mxfp8Rows | None = None,
+    ) -> tuple[TensorValue, TensorValue, TensorValue]:
+        """Returns the ``[T, q_lora_rank + head_dim]`` projection of ``x``, or
+        of ``x_mxfp8`` when given, and both norms' bf16 weights."""
+        assert self.q_norm.eps == kv_norm.eps
         projected = ops.reshape(
             mxfp8_linear(self.fused_wqa_wkv, x)
             if x_mxfp8 is None
             else mxfp8_linear(
                 self.fused_wqa_wkv, x_mxfp8.values, x_scales=x_mxfp8.scales
             ),
-            [t, self.q_lora_rank + self.head_dim],
+            [x.shape[-2], self.q_lora_rank + self.head_dim],
         )
-        assert self.q_norm.eps == kv_norm.eps
-        qr, qr_scales, kv = rms_norm_quantize_mxfp8_q_kv(
+        return (
             projected,
             self.q_norm.weight.cast(DType.bfloat16).to(x.device),
             kv_norm.weight.cast(DType.bfloat16).to(x.device),
-            self.q_norm.eps,
-            self.q_lora_rank,
         )
-        q = ops.reshape(
+
+    def _rope_heads(
+        self, qr: TensorValue, qr_scales: TensorValue, freqs_cis: TensorValue
+    ) -> TensorValue:
+        """Returns the rotated local heads of the quantized ``[T, ...]`` ``qr``."""
+        return ops.reshape(
             mxfp8_linear_rope_tail(
                 self.wq_b, qr, freqs_cis, self.head_dim, qr_scales
             ),
-            [1, t, self.local_num_heads, self.head_dim],
-        )
-        return FusedQueryProjectionOutput(
-            qr=qr, qr_scales=qr_scales, q=q, kv=kv
+            [1, qr.shape[0], self.local_num_heads, self.head_dim],
         )

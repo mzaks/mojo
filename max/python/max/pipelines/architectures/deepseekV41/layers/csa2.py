@@ -35,6 +35,8 @@ joins the denominator only. Each record is both key and value.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from max.dtype import DType
 from max.graph import (
     BufferValue,
@@ -360,6 +362,89 @@ def store_window_kv(
         ],
         parameters={"page_size": records_per_page(cache)},
     )
+
+
+class WindowStore(NamedTuple):
+    """Where a forward step's KV latents go as window records."""
+
+    cache: BufferValue
+    """The window cache leaf's blocks."""
+    positions: TensorValue
+    """``[T]`` token positions."""
+    rope_table: TensorValue
+    """``[rows, 64]`` float32 cosines then sines per position."""
+    slots: TensorValue
+    """``[T]`` absolute slots, negative to skip a row."""
+    block_stride: TensorValue
+    """Host ``[1]`` int64 block stride in bytes, as for
+    :func:`store_window_kv`."""
+
+    def store(self, latent: TensorValue) -> None:
+        """Stores ``latent``'s ``[T, 512]`` rows with :func:`store_window_kv`."""
+        store_window_kv(
+            self.cache,
+            latent,
+            self.positions,
+            self.rope_table,
+            self.slots,
+            block_stride=self.block_stride,
+        )
+
+
+def norm_quantize_q_store_kv(
+    x: TensorValue,
+    q_weight: TensorValue,
+    kv_weight: TensorValue,
+    epsilon: float,
+    q_cols: int,
+    window: WindowStore,
+) -> tuple[TensorValue, TensorValue]:
+    """Normalizes ``[q | kv]`` rows, quantizes q to MXFP8 and stores kv.
+
+    One launch computes what
+    :func:`~max.nn.kernels.rms_norm_quantize_mxfp8_q_kv` and then
+    :meth:`WindowStore.store` on its normalized kv compute, bit for bit,
+    without writing the normalized kv out.
+
+    Args:
+        x: ``[T, q_cols + 512]`` bf16 rows, q then kv.
+        q_weight: ``[q_cols]`` bf16 q norm weight.
+        kv_weight: ``[512]`` bf16 kv norm weight.
+        epsilon: Added to each row's mean square.
+        q_cols: The width of the q part, a multiple of 256.
+        window: Where the kv rows' records go.
+
+    Returns:
+        The float8_e4m3fn q ``[T, q_cols]`` and its float8_e8m0fnu scales in
+        the rank-5 interleaved layout.
+    """
+    q_type, scales_type = _block_scaled_quantize_out_types(
+        x.shape[0],
+        Dim(q_cols),
+        "q_cols",
+        32,
+        DType.float8_e8m0fnu,
+        DType.float8_e4m3fn,
+        x.device,
+    )
+    q, scales = ops.inplace_custom(
+        "mo.csa.rms_norm_quantize_q_store_kv",
+        device=x.device,
+        values=[
+            x,
+            q_weight,
+            kv_weight,
+            ops.cast(window.positions, DType.int64),
+            window.rope_table,
+            ops.cast(window.slots, DType.int64),
+            window.cache,
+            window.block_stride,
+            ops.constant(epsilon, DType.float32, device=DeviceRef.CPU()),
+        ],
+        out_types=[q_type, scales_type],
+        parameters={"page_size": records_per_page(window.cache)},
+    )
+    return q.tensor, scales.tensor
 
 
 def store_compressed_kv(

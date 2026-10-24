@@ -61,6 +61,7 @@ from ..model_config import (
     DeepseekV41Config,
     compressor_bf16_enabled,
     csa2_mxfp8_enabled,
+    fused_kv_store_enabled,
     index_list_fused_enabled,
     q_mxfp8_enabled,
     woa_mxfp8_enabled,
@@ -71,13 +72,13 @@ from .csa2 import (
     MAX_COMPRESSED,
     PREFILL_ROWS,
     WINDOW_ENTRIES,
+    WindowStore,
     csa2_attention,
     csa2_attention_mxfp8,
     index_list,
     index_list_ops,
     leaf_slots,
     store_compressed_kv,
-    store_window_kv,
 )
 from .hyper_connection import Mxfp8Rows
 from .indexer import (
@@ -799,14 +800,34 @@ class CSA2Attention(Module):
         freqs_cis = ops.gather(
             self.rope.freqs_cis_base(), rows.positions, axis=0
         )
+        rope_table = rope_cos_sin_table(self.rope.freqs_cis_base())
+        # The window record: full-width RMSNorm of the KV latent, RoPE on its
+        # trailing dims, then MXFP8. Every layer, including "SWA-only", owns
+        # its sliding-window slot.
+        swa = cache.swa_collection
+        window = WindowStore(
+            swa.kv_blocks,
+            rows.positions,
+            rope_table,
+            leaf_slots(swa, rows.bid, rows.positions, layer.layer_id),
+            swa.page_stride,
+        )
         qr_scales = None
+        kv: TensorValue | None = None
         if self._fuses_query():
-            qr, qr_scales, q, kv = self.query_proj.call_fused(
-                h_flat, freqs_cis, self.kv_norm, h_mxfp8
-            )
+            if fused_kv_store_enabled():
+                qr, qr_scales, q = self.query_proj.call_fused_store_kv(
+                    h_flat, freqs_cis, self.kv_norm, window, h_mxfp8
+                )
+            else:
+                qr, qr_scales, q, kv = self.query_proj.call_fused(
+                    h_flat, freqs_cis, self.kv_norm, h_mxfp8
+                )
         else:
             qr, q, kv_raw = self.query_proj(h_flat, freqs_cis)
             kv = ops.cast(self.kv_norm(kv_raw), DType.bfloat16)
+        if kv is not None:
+            window.store(ops.reshape(kv, [-1, self.head_dim]))
         q = ops.reshape(q, [-1, self.num_heads, self.head_dim])
         state = PendingCSA2Attention(
             q=q,
@@ -816,19 +837,6 @@ class CSA2Attention(Module):
             comp_collection=None,
             comp_index=None,
             layer_comp=None,
-        )
-        rope_table = rope_cos_sin_table(self.rope.freqs_cis_base())
-        # The window record: full-width RMSNorm of the KV latent; the store
-        # applies RoPE to its trailing dims and quantizes it to MXFP8.
-        # Every layer, including "SWA-only", owns its sliding-window slot.
-        swa = cache.swa_collection
-        store_window_kv(
-            swa.kv_blocks,
-            ops.reshape(kv, [-1, self.head_dim]),
-            rows.positions,
-            rope_table,
-            leaf_slots(swa, rows.bid, rows.positions, layer.layer_id),
-            block_stride=swa.page_stride,
         )
         if layer.attention_mode == "SWA-only":
             return state

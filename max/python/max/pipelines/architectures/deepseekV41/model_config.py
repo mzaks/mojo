@@ -90,6 +90,22 @@ def q_mxfp8_enabled() -> bool:
     return _env_switch(Q_MXFP8_ENV)
 
 
+# The window KV store inside the fused q/kv norm and quantize (default on).
+FUSED_KV_STORE_ENV = "MAX_DSV41_FUSED_KV_STORE"
+
+
+def fused_kv_store_enabled() -> bool:
+    """Whether the fused q/kv norm and quantize also stores the KV.
+
+    On (default): wherever the fused kernel runs, it writes each token's
+    MXFP8 window record itself, and DSpark's block attention normalizes and
+    quantizes its query with it too. Off (``MAX_DSV41_FUSED_KV_STORE=0``):
+    the trunk writes the normalized KV out for a separate store, and DSpark
+    keeps its unfused query norm and store.
+    """
+    return _env_switch(FUSED_KV_STORE_ENV)
+
+
 # The CSA2 attention writing wo_a's MXFP8 input (default on).
 CSA2_MXFP8_ENV = "MAX_DSV41_CSA2_MXFP8"
 
