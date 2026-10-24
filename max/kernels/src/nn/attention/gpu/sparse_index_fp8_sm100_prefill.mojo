@@ -91,13 +91,19 @@ from max.gpu import (
     thread_idx,
     warp_id,
 )
-from max.gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
+from max.gpu.host import (
+    DeviceAttribute,
+    DeviceBuffer,
+    DeviceContext,
+    FuncAttribute,
+)
 from max.gpu.host.info import B200
 from max.gpu.host.nvidia.tma import (
     TensorMapSwizzle,
     create_tma_descriptor,
 )
 from max.gpu.memory import (
+    CacheEviction,
     external_memory,
     fence_async_view_proxy,
     fence_mbarrier_init,
@@ -539,6 +545,8 @@ comptime _PROD_REG_FORCE = get_defined_int["FP8_INDEX_PROD_REG", 0]()
 # NON-MONOTONE -- deriving it from a bigger budget measured WORSE in both
 # regimes -- so treat a forced value as a sweep point, not an improvement.
 comptime _K_STAGES_FORCE = get_defined_int["FP8_INDEX_K_STAGES", 0]()
+# 1 or 0 forces evict-first K loads on or off; -1 lets each launch decide.
+comptime _K_EVICT_FORCE = get_defined_int["FP8_INDEX_K_EVICT_FIRST", -1]()
 
 # CLC work stealing. A CTA walks a stream of work items through a depth-2 ring
 # of Q slots, each carrying its item's Q tile, its q-scales (by TMA) and the
@@ -1260,6 +1268,7 @@ def _fp8_index_score_prefill_kernel_sm100[
     num_key_parts_dev: Int32,
     out_row_begin_dev: Int32,
     out_row_end_dev: Int32,
+    evict_k_dev: Int32,
     score_hook: H,
 ):
     comptime assert valid_length.flat_rank == 1
@@ -2382,12 +2391,18 @@ def _fp8_index_score_prefill_kernel_sm100[
                         ),
                         k_box_layout,
                     )
-                    k_tma.async_copy_4d_elect(
-                        k_dst,
-                        k_full[s],
-                        (0, 0, Int(k_row0) // pool_row_tokens, Int(k_block)),
-                        e,
+                    var k_coords = (
+                        0,
+                        0,
+                        Int(k_row0) // pool_row_tokens,
+                        Int(k_block),
                     )
+                    if evict_k_dev != 0:
+                        k_tma.async_copy_4d_elect[
+                            eviction_policy=CacheEviction.EVICT_FIRST
+                        ](k_dst, k_full[s], k_coords, e)
+                    else:
+                        k_tma.async_copy_4d_elect(k_dst, k_full[s], k_coords, e)
                 # The scales ride the K tile's barrier: the bytes are summed
                 # into the one `expect_tx`, so the slot opens when the last byte
                 # of either copy lands and the consumer needs no wait of its own
@@ -2907,6 +2922,20 @@ def fp8_index_score_sm100_prefill[
     var num_key_parts = _clc_key_parts(
         split_shape, key_tiles, (CTAS_PER_SM * sm_count) // base_ctas
     )
+    # The top-k reads the scores right after this kernel. When the scores and
+    # the K stream together overflow L2, K tiles loaded evict-first leave the
+    # scores resident. Decode shapes only: there each K tile is read once,
+    # while a prefill shape rereads it from L2 for every token block.
+    var evict_k = _K_EVICT_FORCE == 1
+    if _K_EVICT_FORCE < 0 and _is_keysplit_shape[num_heads, BM_key](
+        max_seq_len, max_num_keys
+    ):
+        var score_rows = min(out_rows, batch_size * max_seq_len)
+        var score_bytes = score_rows * max_num_keys * size_of[out_dtype]()
+        var k_bytes = batch_size * max_num_keys * depth * size_of[dtype]()
+        evict_k = score_bytes + k_bytes > ctx.get_attribute(
+            DeviceAttribute.L2_CACHE_SIZE
+        )
 
     comptime KS_KEYS_E = _ks_copy_keys[
         KSOperand.dtype, BM_key, pool_row_tokens, k_box_rows
@@ -3031,6 +3060,7 @@ def fp8_index_score_sm100_prefill[
         Int32(num_key_parts),
         Int32(out_row_begin),
         Int32(out_row_begin + out_rows),
+        Int32(evict_k),
         score_hook,
         grid_dim=(
             batch_size,
