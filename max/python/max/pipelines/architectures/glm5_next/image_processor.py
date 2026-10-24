@@ -184,8 +184,8 @@ class Glm5NextPatchifier:
         self.min_image_tokens = min_image_tokens
         self.max_image_tokens = max_image_tokens
         self.rescale_factor = rescale_factor
-        self.image_mean = np.array(image_mean, dtype=np.float32)
-        self.image_std = np.array(image_std, dtype=np.float32)
+        self.image_mean = np.array(image_mean, dtype=np.float32, ndmin=1)
+        self.image_std = np.array(image_std, dtype=np.float32, ndmin=1)
 
     #: Key of the section :meth:`from_processor_config` reads out of
     #: ``processor_config.json``. The video processor overrides it.
@@ -287,12 +287,17 @@ class Glm5NextPatchifier:
         canvas_width: int,
         content_height: int,
         content_width: int,
+        out: npt.NDArray[np.uint8] | None = None,
     ) -> npt.NDArray[np.uint8]:
         """Resizes one frame's content and zero-pads it up to the canvas.
 
         Padding runs on raw pixels, so a padded patch normalizes to
         ``-mean/std`` rather than zero. Padding after normalization would be a
         different tensor and a silently worse tower input.
+
+        ``out``, a canvas whose padding is already zero, is written in place:
+        a clip's frames share one content size, so a worker reuses one canvas
+        rather than zeroing a fresh one per frame.
         """
         # HF converts with PIL's own RGB conversion, which drops alpha rather
         # than compositing it onto white the way qwen_vl_utils does.
@@ -302,35 +307,42 @@ class Glm5NextPatchifier:
             image = image.resize(
                 (content_width, content_height), Image.Resampling.BICUBIC
             )
-        padded = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
-        padded[:content_height, :content_width] = np.asarray(
-            image, dtype=np.uint8
-        )
-        return padded
+        if out is None:
+            out = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+        out[:content_height, :content_width] = np.asarray(image, dtype=np.uint8)
+        return out
 
-    def normalize(
-        self, padded: npt.NDArray[np.uint8]
-    ) -> npt.NDArray[np.float32]:
+    def normalize(self, patches: npt.NDArray[np.float32]) -> None:
         """Rescales in float64 and normalizes in float32, in that order.
 
         Matching the reference's dtypes exactly: folding the two into one
         float32 multiply-add (as the qwen2_5vl processor does) perturbs the last
-        mantissa bits.
-        """
-        pixels: npt.NDArray[np.float32] = (
-            padded.astype(np.float64) * self.rescale_factor
-        ).astype(np.float32)
-        return (pixels - self.image_mean) / self.image_std
-
-    def patchify(
-        self, frames: npt.NDArray[np.float32]
-    ) -> tuple[npt.NDArray[np.float32], tuple[int, int, int]]:
-        """Reorders normalized frames into vision-tower patch rows.
+        mantissa bits. Works in place, since a clip's patches run to
+        gigabytes.
 
         Args:
-            frames: ``(num_frames, height, width, 3)`` normalized pixels. A
-                frame count that is not a multiple of ``temporal_patch_size``
-                is padded by repeating the last frame, as the reference does.
+            patches: ``(num_patches, 3, k)`` pixel values, channel second.
+        """
+        np.multiply(patches, self.rescale_factor, out=patches, dtype=np.float64)
+        np.subtract(patches, self.image_mean[:, np.newaxis], out=patches)
+        np.divide(patches, self.image_std[:, np.newaxis], out=patches)
+
+    def patchify(
+        self,
+        frames: npt.NDArray[np.uint8],
+        out: npt.NDArray[np.float32] | None = None,
+    ) -> tuple[npt.NDArray[np.float32], tuple[int, int, int]]:
+        """Reorders padded frames into normalized vision-tower patch rows.
+
+        The bytes are reordered first and normalized in place after, so the
+        only allocation the size of the result is the result itself.
+
+        Args:
+            frames: ``(num_frames, height, width, 3)`` padded pixels. A frame
+                count that is not a multiple of ``temporal_patch_size`` is
+                padded by repeating the last frame, as the reference does.
+            out: Rows to write the patches into, for a caller assembling one
+                tensor from several calls. Allocated when ``None``.
 
         Returns:
             The ``(num_patches, 3 * temporal * patch**2)`` float32 patch tensor
@@ -340,38 +352,44 @@ class Glm5NextPatchifier:
         merge_size = self.merge_size
         temporal_patch_size = self.temporal_patch_size
 
-        # (num_frames, 3, height, width) -- channel-first, as the reference
-        # patchifies.
-        stacked = np.transpose(frames, (0, 3, 1, 2))
-        remainder = stacked.shape[0] % temporal_patch_size
+        remainder = frames.shape[0] % temporal_patch_size
         if remainder != 0:
             repeats = np.repeat(
-                stacked[-1:], temporal_patch_size - remainder, axis=0
+                frames[-1:], temporal_patch_size - remainder, axis=0
             )
-            stacked = np.concatenate([stacked, repeats], axis=0)
+            frames = np.concatenate([frames, repeats], axis=0)
 
-        num_frames, channels, height, width = stacked.shape
+        num_frames, height, width, channels = frames.shape
         grid_t = num_frames // temporal_patch_size
         grid_h = height // patch_size
         grid_w = width // patch_size
+        num_patches = grid_t * grid_h * grid_w
 
-        patches = stacked.reshape(
+        patches = frames.reshape(
             grid_t,
             temporal_patch_size,
-            channels,
             grid_h // merge_size,
             merge_size,
             patch_size,
             grid_w // merge_size,
             merge_size,
             patch_size,
+            channels,
         )
-        patches = np.transpose(patches, (0, 3, 6, 4, 7, 2, 1, 5, 8))
-        flat_patches = patches.reshape(
-            grid_t * grid_h * grid_w,
-            channels * temporal_patch_size * patch_size * patch_size,
-        )
-        return flat_patches, (grid_t, grid_h, grid_w)
+        # The reference's row order, (t, h block, w block, h merge, w merge)
+        # by (channel, temporal, y, x), read from channel-last pixels.
+        patches = np.transpose(patches, (0, 2, 5, 3, 6, 8, 1, 4, 7))
+        if out is None:
+            out = np.empty(
+                (num_patches, channels * temporal_patch_size * patch_size**2),
+                dtype=np.float32,
+            )
+        # A reshape of a non-contiguous `out` would copy, and the writes below
+        # would land in the copy.
+        assert out.flags.c_contiguous
+        np.copyto(out.reshape(patches.shape), patches)
+        self.normalize(out.reshape(num_patches, channels, -1))
+        return out, (grid_t, grid_h, grid_w)
 
 
 class Glm5NextImageProcessor(Glm5NextPatchifier):
@@ -413,7 +431,7 @@ class Glm5NextImageProcessor(Glm5NextPatchifier):
         )
         # A still image fills the temporal patch with copies of itself, which
         # `patchify`'s repeat-the-last-frame padding does.
-        return self.patchify(self.normalize(padded)[np.newaxis])
+        return self.patchify(padded[np.newaxis])
 
     def __call__(
         self, images: Sequence[Image.Image]

@@ -31,7 +31,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 import numpy.typing as npt
-from max.driver import Buffer, Device
+from max.driver import Buffer, Device, Usage
 from max.dtype import DType
 from max.engine import Model
 from max.graph import DeviceRef, TensorType, TensorValue
@@ -376,10 +376,28 @@ class Glm5NextModel(DeepseekV3_2Model):
         max_seqlen = np.array(
             [np.diff(row_offsets.astype(np.int64)).max()], dtype=np.uint32
         )
+        # Packed straight into staging memory: a concatenated numpy copy is a
+        # fresh allocation of up to hundreds of MB per chunk, and on a host
+        # with a fragmented page cache its huge-page faults compact
+        # synchronously.
+        pixels = Buffer(
+            dtype=DType.float32,
+            shape=(
+                sum(len(entry) for entry, _ in entries),
+                entries[0][0].shape[1],
+            ),
+            device=device0,
+            usage=Usage.DEFAULT
+            if device0.is_host
+            else Usage.STAGING | Usage.UNTRACKED,
+        )
+        staged = pixels.to_numpy()
+        row = 0
+        for entry, _ in entries:
+            staged[row : row + len(entry)] = entry
+            row += len(entry)
         outputs = self.vision_model.execute(
-            Buffer.from_numpy(
-                np.concatenate([pixels for pixels, _ in entries])
-            ).to(device0),
+            pixels.to(device0),
             Buffer.from_numpy(
                 vision_position_ids(
                     grids, config.vision_config.spatial_merge_size

@@ -44,7 +44,10 @@ from __future__ import annotations
 
 import logging
 import math
+import mmap
+import threading
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -61,6 +64,9 @@ logger = logging.getLogger("max.pipelines")
 
 # The reference processor's frame rate for a clip that declares none.
 _DEFAULT_FPS = 24.0
+
+# Workers that resize and patchify one clip's temporal patches.
+_PREPROCESS_THREADS = 16
 
 
 def _second_boundary_walk(
@@ -356,21 +362,52 @@ class Glm5NextVideoProcessor(Glm5NextPatchifier):
         content_height, content_width = self.content_size(
             height, width, canvas_height, canvas_width, num_frames
         )
-        normalized = np.stack(
-            [
-                self.normalize(
-                    self.resize_and_pad(
-                        frame,
-                        canvas_height,
-                        canvas_width,
-                        content_height,
-                        content_width,
-                    )
+        step = self.temporal_patch_size
+        grid_t = -(-num_frames // step)
+        grid_h = canvas_height // self.patch_size
+        grid_w = canvas_width // self.patch_size
+        rows = grid_h * grid_w
+        # Anonymous pages rather than NumPy's: NumPy advises huge pages for a
+        # large array, and where a big page cache has fragmented memory each
+        # huge-page fault compacts synchronously, which costs minutes on a
+        # clip's 4.5 GB against about a second of small-page faults.
+        row_size = 3 * step * self.patch_size**2
+        patches = np.frombuffer(
+            mmap.mmap(-1, grid_t * rows * row_size * np.float32().itemsize),
+            dtype=np.float32,
+        ).reshape(grid_t * rows, row_size)
+
+        canvases = threading.local()
+
+        def patchify_temporal_patch(t: int) -> None:
+            if not hasattr(canvases, "padded"):
+                canvases.padded = np.zeros(
+                    (step, canvas_height, canvas_width, 3), dtype=np.uint8
                 )
-                for frame in frames
-            ]
-        )
-        return self.patchify(normalized)
+            pair = frames[t * step : (t + 1) * step]
+            for frame, canvas in zip(pair, canvases.padded, strict=False):
+                self.resize_and_pad(
+                    frame,
+                    canvas_height,
+                    canvas_width,
+                    content_height,
+                    content_width,
+                    out=canvas,
+                )
+            self.patchify(
+                canvases.padded[: len(pair)],
+                out=patches[t * rows : (t + 1) * rows],
+            )
+
+        # A long clip is hundreds of frames, and both the resize and the
+        # patchify release the GIL. Each worker reuses one canvas: under
+        # jemalloc a fresh zeroed one per frame is a page fault per 4 KiB, and
+        # the faults of many threads contend.
+        with ThreadPoolExecutor(
+            max_workers=min(_PREPROCESS_THREADS, grid_t)
+        ) as pool:
+            list(pool.map(patchify_temporal_patch, range(grid_t)))
+        return patches, (grid_t, grid_h, grid_w)
 
     def __call__(
         self, clips: Sequence[Sequence[Image.Image]]
