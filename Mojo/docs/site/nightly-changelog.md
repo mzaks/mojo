@@ -139,6 +139,9 @@ This version is still a work in progress.
   of a `FileDescriptor` that carries the owner's origin, so it can be
   passed around without closing the descriptor or outliving its owner.
 
+- `ArcPointer` element types no longer need to be `Deinitable`. Destroy an
+  `ArcPointer` of a non-`Deinitable` type with the new `deinit_with()` method.
+
 ## GPU programming
 
 - Added the `apple-m6` and `apple-m6-metal4` accelerator targets, and
