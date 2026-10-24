@@ -141,7 +141,8 @@ def _index_graph(
                     TensorValue, CandidateBlocks
                 ](source_layer_id=20, indices=selected)
             # Keep end's real selection and index-list paths, replacing only
-            # GPU attention and the output projection with an index-list probe.
+            # GPU attention and its output projection (`_attend`) with an
+            # index-list probe.
             with (
                 patch.object(
                     CSA2Attention, "begin", return_value=state
@@ -153,11 +154,6 @@ def _index_graph(
                     CSA2Attention,
                     "_attend",
                     side_effect=lambda state, rows, idx: idx,
-                ),
-                patch.object(
-                    CSA2Attention,
-                    "_output_projection",
-                    side_effect=lambda out, freqs: out,
                 ),
             ):
                 if route == "call":

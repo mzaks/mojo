@@ -90,6 +90,20 @@ def q_mxfp8_enabled() -> bool:
     return _env_switch(Q_MXFP8_ENV)
 
 
+# The CSA2 attention writing wo_a's MXFP8 input (default on).
+CSA2_MXFP8_ENV = "MAX_DSV41_CSA2_MXFP8"
+
+
+def csa2_mxfp8_enabled() -> bool:
+    """Whether the CSA2 attention writes ``attn.wo_a``'s MXFP8 input itself.
+
+    Applies with ``wo_a`` in MXFP8 on SM100. Off
+    (``MAX_DSV41_CSA2_MXFP8=0``): the attention writes bf16, and a separate
+    kernel rotates and quantizes it.
+    """
+    return _env_switch(CSA2_MXFP8_ENV)
+
+
 # MXFP8 projections on the cluster split-K matmul (default on).
 MXFP8_SPLITK_ENV = "MAX_DSV41_MXFP8_SPLITK"
 
