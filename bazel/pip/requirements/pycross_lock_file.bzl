@@ -2421,87 +2421,87 @@ def targets():
         testonly = "botocore-stubs" in _TESTONLY_DEPS,
     )
 
-    _brotli_1_2_0_build_deps = [
+    _brotli_1_2_1_build_deps = [
         ":setuptools",
         ":wheel",
     ]
 
     native.alias(
-        name = "_sdist_brotli@1.2.0",
-        actual = "@pycross_lock_file_sdist_brotli_1.2.0//file",
+        name = "_sdist_brotli@1.2.1",
+        actual = "@pycross_lock_file_sdist_brotli_1.2.1//file",
     )
 
     pycross_wheel_build(
-        name = "_build_brotli@1.2.0",
-        sdist = ":_sdist_brotli@1.2.0",
+        name = "_build_brotli@1.2.1",
+        sdist = ":_sdist_brotli@1.2.1",
         target_environment = _target,
-        deps = _brotli_1_2_0_build_deps,
+        deps = _brotli_1_2_1_build_deps,
         testonly = "brotli" in _TESTONLY_DEPS,
         **extra_build_args
     )
 
     native.alias(
-        name = "_wheel_brotli@1.2.0",
+        name = "_wheel_brotli@1.2.1",
         actual = select({
-            ":_env_python_3.10_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotli_1.2.0_cp310_cp310_macosx_10_9_universal2//file",
-            ":_env_python_3.10_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.0_cp310_cp310_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.10_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.0_cp310_cp310_manylinux2014_x86_64.manylinux_2_17_x86_64//file",
-            ":_env_python_3.11_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotli_1.2.0_cp311_cp311_macosx_10_9_universal2//file",
-            ":_env_python_3.11_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.0_cp311_cp311_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.11_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.0_cp311_cp311_manylinux2014_x86_64.manylinux_2_17_x86_64//file",
-            ":_env_python_3.12_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotli_1.2.0_cp312_cp312_macosx_10_13_universal2//file",
-            ":_env_python_3.12_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.0_cp312_cp312_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.12_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.0_cp312_cp312_manylinux2014_x86_64.manylinux_2_17_x86_64//file",
-            ":_env_python_3.13_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotli_1.2.0_cp313_cp313_macosx_10_13_universal2//file",
-            ":_env_python_3.13_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.0_cp313_cp313_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.13_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.0_cp313_cp313_manylinux2014_x86_64.manylinux_2_17_x86_64//file",
-            ":_env_python_3.14_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotli_1.2.0_cp314_cp314_macosx_10_15_universal2//file",
-            ":_env_python_3.14_aarch64-apple-darwin-freethreaded": ":_build_brotli@1.2.0",
-            ":_env_python_3.14_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.0_cp314_cp314_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.14_aarch64-unknown-linux-gnu-freethreaded": ":_build_brotli@1.2.0",
-            ":_env_python_3.14_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.0_cp314_cp314_manylinux2014_x86_64.manylinux_2_17_x86_64//file",
-            ":_env_python_3.14_x86_64-unknown-linux-gnu-freethreaded": ":_build_brotli@1.2.0",
+            ":_env_python_3.10_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotli_1.2.1_cp310_cp310_macosx_10_9_universal2//file",
+            ":_env_python_3.10_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.1_cp310_cp310_manylinux2014_aarch64.manylinux_2_17_aarch64//file",
+            ":_env_python_3.10_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.1_cp310_cp310_manylinux2014_x86_64.manylinux_2_17_x86_64//file",
+            ":_env_python_3.11_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotli_1.2.1_cp311_cp311_macosx_10_9_universal2//file",
+            ":_env_python_3.11_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.1_cp311_cp311_manylinux2014_aarch64.manylinux_2_17_aarch64//file",
+            ":_env_python_3.11_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.1_cp311_cp311_manylinux2014_x86_64.manylinux_2_17_x86_64//file",
+            ":_env_python_3.12_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotli_1.2.1_cp312_cp312_macosx_10_13_universal2//file",
+            ":_env_python_3.12_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.1_cp312_cp312_manylinux2014_aarch64.manylinux_2_17_aarch64//file",
+            ":_env_python_3.12_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.1_cp312_cp312_manylinux2014_x86_64.manylinux_2_17_x86_64//file",
+            ":_env_python_3.13_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotli_1.2.1_cp313_cp313_macosx_10_13_universal2//file",
+            ":_env_python_3.13_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.1_cp313_cp313_manylinux2014_aarch64.manylinux_2_17_aarch64//file",
+            ":_env_python_3.13_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.1_cp313_cp313_manylinux2014_x86_64.manylinux_2_17_x86_64//file",
+            ":_env_python_3.14_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotli_1.2.1_cp314_cp314_macosx_10_15_universal2//file",
+            ":_env_python_3.14_aarch64-apple-darwin-freethreaded": ":_build_brotli@1.2.1",
+            ":_env_python_3.14_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.1_cp314_cp314_manylinux2014_aarch64.manylinux_2_17_aarch64//file",
+            ":_env_python_3.14_aarch64-unknown-linux-gnu-freethreaded": ":_build_brotli@1.2.1",
+            ":_env_python_3.14_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotli_1.2.1_cp314_cp314_manylinux2014_x86_64.manylinux_2_17_x86_64//file",
+            ":_env_python_3.14_x86_64-unknown-linux-gnu-freethreaded": ":_build_brotli@1.2.1",
         }),
     )
 
     pycross_wheel_library(
-        name = "brotli@1.2.0",
-        wheel = ":_wheel_brotli@1.2.0",
+        name = "brotli@1.2.1",
+        wheel = ":_wheel_brotli@1.2.1",
         testonly = "brotli" in _TESTONLY_DEPS,
     )
 
-    _brotlicffi_1_2_0_1_deps = [
+    _brotlicffi_1_2_1_0_deps = [
         ":cffi@2.0.0",
     ]
 
     native.alias(
-        name = "_wheel_brotlicffi@1.2.0.1",
+        name = "_wheel_brotlicffi@1.2.1.0",
         actual = select({
-            ":_env_python_3.10_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_macosx_11_0_arm64//file",
-            ":_env_python_3.10_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.10_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
-            ":_env_python_3.11_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_macosx_11_0_arm64//file",
-            ":_env_python_3.11_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.11_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
-            ":_env_python_3.12_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_macosx_11_0_arm64//file",
-            ":_env_python_3.12_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.12_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
-            ":_env_python_3.13_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_macosx_11_0_arm64//file",
-            ":_env_python_3.13_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.13_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
-            ":_env_python_3.14_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_macosx_11_0_arm64//file",
-            ":_env_python_3.14_aarch64-apple-darwin-freethreaded": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp314_cp314t_macosx_11_0_arm64//file",
-            ":_env_python_3.14_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.14_aarch64-unknown-linux-gnu-freethreaded": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp314_cp314t_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
-            ":_env_python_3.14_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
-            ":_env_python_3.14_x86_64-unknown-linux-gnu-freethreaded": "@pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp314_cp314t_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
+            ":_env_python_3.10_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_macosx_11_0_arm64//file",
+            ":_env_python_3.10_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
+            ":_env_python_3.10_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
+            ":_env_python_3.11_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_macosx_11_0_arm64//file",
+            ":_env_python_3.11_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
+            ":_env_python_3.11_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
+            ":_env_python_3.12_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_macosx_11_0_arm64//file",
+            ":_env_python_3.12_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
+            ":_env_python_3.12_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
+            ":_env_python_3.13_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_macosx_11_0_arm64//file",
+            ":_env_python_3.13_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
+            ":_env_python_3.13_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
+            ":_env_python_3.14_aarch64-apple-darwin": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_macosx_11_0_arm64//file",
+            ":_env_python_3.14_aarch64-apple-darwin-freethreaded": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp314_cp314t_macosx_11_0_arm64//file",
+            ":_env_python_3.14_aarch64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
+            ":_env_python_3.14_aarch64-unknown-linux-gnu-freethreaded": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp314_cp314t_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64//file",
+            ":_env_python_3.14_x86_64-unknown-linux-gnu": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
+            ":_env_python_3.14_x86_64-unknown-linux-gnu-freethreaded": "@pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp314_cp314t_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64//file",
         }),
     )
 
     pycross_wheel_library(
-        name = "brotlicffi@1.2.0.1",
-        deps = _brotlicffi_1_2_0_1_deps,
-        wheel = ":_wheel_brotlicffi@1.2.0.1",
+        name = "brotlicffi@1.2.1.0",
+        deps = _brotlicffi_1_2_1_0_deps,
+        wheel = ":_wheel_brotlicffi@1.2.1.0",
         testonly = "brotlicffi" in _TESTONLY_DEPS,
     )
 
@@ -5498,7 +5498,7 @@ def targets():
     )
 
     _flask_compress_1_24_deps = [
-        ":brotli@1.2.0",
+        ":brotli@1.2.1",
         ":flask@3.0.3",
     ] + select({
         ":_env_python_3.10_aarch64-apple-darwin": [
@@ -5569,7 +5569,7 @@ def targets():
     )
 
     _fonttools_4_63_0_deps = [
-        ":brotli@1.2.0",
+        ":brotli@1.2.1",
         ":zopfli@0.4.3",
     ]
 
@@ -5718,7 +5718,7 @@ def targets():
     )
 
     _geventhttpclient_2_3_4_deps = [
-        ":brotli@1.2.0",
+        ":brotli@1.2.1",
         ":certifi@2026.10.19",
         ":gevent@24.10.1",
         ":urllib3@1.26.19",
@@ -15996,72 +15996,72 @@ def targets():
     _starlette_compress_1_8_0_deps = [
     ] + select({
         ":_env_python_3.11_aarch64-apple-darwin": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
             ":zstandard@0.25.0",
         ],
         ":_env_python_3.11_aarch64-unknown-linux-gnu": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
             ":zstandard@0.25.0",
         ],
         ":_env_python_3.11_x86_64-unknown-linux-gnu": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
             ":zstandard@0.25.0",
         ],
         ":_env_python_3.12_aarch64-apple-darwin": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
             ":zstandard@0.25.0",
         ],
         ":_env_python_3.12_aarch64-unknown-linux-gnu": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
             ":zstandard@0.25.0",
         ],
         ":_env_python_3.12_x86_64-unknown-linux-gnu": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
             ":zstandard@0.25.0",
         ],
         ":_env_python_3.13_aarch64-apple-darwin": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
             ":zstandard@0.25.0",
         ],
         ":_env_python_3.13_aarch64-unknown-linux-gnu": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
             ":zstandard@0.25.0",
         ],
         ":_env_python_3.13_x86_64-unknown-linux-gnu": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
             ":zstandard@0.25.0",
         ],
         ":_env_python_3.14_aarch64-apple-darwin": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
         ],
         ":_env_python_3.14_aarch64-apple-darwin-freethreaded": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
         ],
         ":_env_python_3.14_aarch64-unknown-linux-gnu": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
         ],
         ":_env_python_3.14_aarch64-unknown-linux-gnu-freethreaded": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
         ],
         ":_env_python_3.14_x86_64-unknown-linux-gnu": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
         ],
         ":_env_python_3.14_x86_64-unknown-linux-gnu-freethreaded": [
-            ":brotli@1.2.0",
+            ":brotli@1.2.1",
             ":starlette@1.3.1",
         ],
         "//conditions:default": [],
@@ -20107,12 +20107,12 @@ def repositories():
 
     maybe(
         http_file,
-        name = "pycross_lock_file_sdist_brotli_1.2.0",
+        name = "pycross_lock_file_sdist_brotli_1.2.1",
         urls = [
-            "https://files.pythonhosted.org/packages/f7/16/c92ca344d646e71a43b8bb353f0a6490d7f6e06210f8554c8f874e454285/brotli-1.2.0.tar.gz",
+            "https://files.pythonhosted.org/packages/cf/81/1546c983678a9b4e77cb4718eaedd1b2caf24a6cdbf1eb8775938d22aff7/brotli-1.2.1.tar.gz",
         ],
-        sha256 = "e310f77e41941c13340a95976fe66a8a95b01e783d430eeaf7a2f87e0a57dd0a",
-        downloaded_file_path = "brotli-1.2.0.tar.gz",
+        sha256 = "02b2f7b5a83485efe448a44ddf7983def05c3bb1dcf917d4f7154070260e13de",
+        downloaded_file_path = "brotli-1.2.1.tar.gz",
     )
 
     maybe(
@@ -21777,212 +21777,212 @@ def repositories():
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp310_cp310_macosx_10_9_universal2",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp310_cp310_macosx_10_9_universal2",
         urls = [
-            "https://files.pythonhosted.org/packages/64/10/a090475284fc4a71aed40a96f32e44a7fe5bda39687353dd977720b211b6/brotli-1.2.0-cp310-cp310-macosx_10_9_universal2.whl",
+            "https://files.pythonhosted.org/packages/b6/71/ef20f95e1138d5faadbf0064af9e7a6f615ff406a662cd782054f052cf80/brotli-1.2.1-cp310-cp310-macosx_10_9_universal2.whl",
         ],
-        sha256 = "3b90b767916ac44e93a8e28ce6adf8d551e43affb512f2377c732d486ac6514e",
-        downloaded_file_path = "brotli-1.2.0-cp310-cp310-macosx_10_9_universal2.whl",
+        sha256 = "103b4762941760ae245d8d0d50e3ee4a7e034fcd786f122d177f76d6afc90c63",
+        downloaded_file_path = "brotli-1.2.1-cp310-cp310-macosx_10_9_universal2.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp310_cp310_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp310_cp310_manylinux2014_aarch64.manylinux_2_17_aarch64",
         urls = [
-            "https://files.pythonhosted.org/packages/24/31/90cc06584deb5d4fcafc0985e37741fc6b9717926a78674bbb3ce018957e/brotli-1.2.0-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+            "https://files.pythonhosted.org/packages/ec/2c/39ad000c7920efd4e1ceeacb7c9342a89f703cf68cbb85755c0dde812cd7/brotli-1.2.1-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
         ],
-        sha256 = "0bbd5b5ccd157ae7913750476d48099aaf507a79841c0d04a9db4415b14842de",
-        downloaded_file_path = "brotli-1.2.0-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+        sha256 = "a26384540c88b7c157899c2a08ff34c180a83ec1de97064d80c68bf8141af2f4",
+        downloaded_file_path = "brotli-1.2.1-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp310_cp310_manylinux2014_x86_64.manylinux_2_17_x86_64",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp310_cp310_manylinux2014_x86_64.manylinux_2_17_x86_64",
         urls = [
-            "https://files.pythonhosted.org/packages/48/10/f47854a1917b62efe29bc98ac18e5d4f71df03f629184575b862ef2e743b/brotli-1.2.0-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            "https://files.pythonhosted.org/packages/aa/f6/8965fda7552aaa285804b9e07c6eac7c475d25fd1de8696103bf8e192bfb/brotli-1.2.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
         ],
-        sha256 = "1b557b29782a643420e08d75aea889462a4a8796e9a6cf5621ab05a3f7da8ef2",
-        downloaded_file_path = "brotli-1.2.0-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        sha256 = "f760d9a9c441bfc87eee720ddb0946d3e19995b20983ae14038e033f1664efcb",
+        downloaded_file_path = "brotli-1.2.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp311_cp311_macosx_10_9_universal2",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp311_cp311_macosx_10_9_universal2",
         urls = [
-            "https://files.pythonhosted.org/packages/7a/ef/f285668811a9e1ddb47a18cb0b437d5fc2760d537a2fe8a57875ad6f8448/brotli-1.2.0-cp311-cp311-macosx_10_9_universal2.whl",
+            "https://files.pythonhosted.org/packages/63/f5/213512faee9562f069cc0d228a8dce8097d5517e15fdf48b8f05d53e6b55/brotli-1.2.1-cp311-cp311-macosx_10_9_universal2.whl",
         ],
-        sha256 = "15b33fe93cedc4caaff8a0bd1eb7e3dab1c61bb22a0bf5bdfdfd97cd7da79744",
-        downloaded_file_path = "brotli-1.2.0-cp311-cp311-macosx_10_9_universal2.whl",
+        sha256 = "970a3dbce807a3f5c2b8232036052bade01e4bc92ade37d73ea3750418307fa1",
+        downloaded_file_path = "brotli-1.2.1-cp311-cp311-macosx_10_9_universal2.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp311_cp311_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp311_cp311_manylinux2014_aarch64.manylinux_2_17_aarch64",
         urls = [
-            "https://files.pythonhosted.org/packages/cd/e1/7fadd47f40ce5549dc44493877db40292277db373da5053aff181656e16e/brotli-1.2.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+            "https://files.pythonhosted.org/packages/3b/f7/d98bcbc94b10c17bfc109157612b58481a383003e7df90925ff4d7534aaa/brotli-1.2.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
         ],
-        sha256 = "350c8348f0e76fff0a0fd6c26755d2653863279d086d3aa2c290a6a7251135dd",
-        downloaded_file_path = "brotli-1.2.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+        sha256 = "b0faa0b9af9367748388345d5b12f6add2a9cf896481e72910e88fbfe14ecd54",
+        downloaded_file_path = "brotli-1.2.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp311_cp311_manylinux2014_x86_64.manylinux_2_17_x86_64",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp311_cp311_manylinux2014_x86_64.manylinux_2_17_x86_64",
         urls = [
-            "https://files.pythonhosted.org/packages/89/5a/7071a621eb2d052d64efd5da2ef55ecdac7c3b0c6e4f9d519e9c66d987ef/brotli-1.2.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            "https://files.pythonhosted.org/packages/71/7e/c1d314406ce47a39180fc66114681d9ac10c2c667e14e4dc1a5e5089f4fb/brotli-1.2.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
         ],
-        sha256 = "40d918bce2b427a0c4ba189df7a006ac0c7277c180aee4617d99e9ccaaf59e6a",
-        downloaded_file_path = "brotli-1.2.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        sha256 = "6b3c3d5794212a54434b4856f808f7bdf7ad48eacadaadb5b2346fc9a639365a",
+        downloaded_file_path = "brotli-1.2.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp312_cp312_macosx_10_13_universal2",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp312_cp312_macosx_10_13_universal2",
         urls = [
-            "https://files.pythonhosted.org/packages/11/ee/b0a11ab2315c69bb9b45a2aaed022499c9c24a205c3a49c3513b541a7967/brotli-1.2.0-cp312-cp312-macosx_10_13_universal2.whl",
+            "https://files.pythonhosted.org/packages/34/5d/dcf82117cbb506cfe0b75a00c34f2f7e850e5d933d80c0e50e2a191f1fee/brotli-1.2.1-cp312-cp312-macosx_10_13_universal2.whl",
         ],
-        sha256 = "35d382625778834a7f3061b15423919aa03e4f5da34ac8e02c074e4b75ab4f84",
-        downloaded_file_path = "brotli-1.2.0-cp312-cp312-macosx_10_13_universal2.whl",
+        sha256 = "3975fb11f63e212b87a087e4a910187b522c6969a4989ca362d6f85f9dc36acd",
+        downloaded_file_path = "brotli-1.2.1-cp312-cp312-macosx_10_13_universal2.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp312_cp312_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp312_cp312_manylinux2014_aarch64.manylinux_2_17_aarch64",
         urls = [
-            "https://files.pythonhosted.org/packages/3d/6f/feba03130d5fceadfa3a1bb102cb14650798c848b1df2a808356f939bb16/brotli-1.2.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+            "https://files.pythonhosted.org/packages/7a/75/d8f2a81748b60733e8b03afd4bc1b70d3fb74a235b3b13dff0b2978e7f87/brotli-1.2.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
         ],
-        sha256 = "acec55bb7c90f1dfc476126f9711a8e81c9af7fb617409a9ee2953115343f08d",
-        downloaded_file_path = "brotli-1.2.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+        sha256 = "875975f91870682cca4371260522ad3f22d636e845b5c5355c52bc045c0f75c8",
+        downloaded_file_path = "brotli-1.2.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp312_cp312_manylinux2014_x86_64.manylinux_2_17_x86_64",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp312_cp312_manylinux2014_x86_64.manylinux_2_17_x86_64",
         urls = [
-            "https://files.pythonhosted.org/packages/03/a7/03aa61fbc3c5cbf99b44d158665f9b0dd3d8059be16c460208d9e385c837/brotli-1.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            "https://files.pythonhosted.org/packages/b6/cc/b0b5b6b1ff4544bec3a702d5ad2e0badf22db296d16277a6ee59dabaffdc/brotli-1.2.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
         ],
-        sha256 = "072e7624b1fc4d601036ab3f4f27942ef772887e876beff0301d261210bca97f",
-        downloaded_file_path = "brotli-1.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        sha256 = "4b9dd0173ca5e01d1eb307d3c184fe8c09bdc168ede560889b1018d216d38c61",
+        downloaded_file_path = "brotli-1.2.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp313_cp313_macosx_10_13_universal2",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp313_cp313_macosx_10_13_universal2",
         urls = [
-            "https://files.pythonhosted.org/packages/6c/d4/4ad5432ac98c73096159d9ce7ffeb82d151c2ac84adcc6168e476bb54674/brotli-1.2.0-cp313-cp313-macosx_10_13_universal2.whl",
+            "https://files.pythonhosted.org/packages/f0/85/d74a573b92ba449960eb088ce87dcb61a9dc6a0c5a7ba8d104ae180e64c3/brotli-1.2.1-cp313-cp313-macosx_10_13_universal2.whl",
         ],
-        sha256 = "9e5825ba2c9998375530504578fd4d5d1059d09621a02065d1b6bfc41a8e05ab",
-        downloaded_file_path = "brotli-1.2.0-cp313-cp313-macosx_10_13_universal2.whl",
+        sha256 = "a84e0ae14d1efe782a9f143021c4e01d5ed986a140fe5070505cc5978eaf0592",
+        downloaded_file_path = "brotli-1.2.1-cp313-cp313-macosx_10_13_universal2.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp313_cp313_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp313_cp313_manylinux2014_aarch64.manylinux_2_17_aarch64",
         urls = [
-            "https://files.pythonhosted.org/packages/2e/b6/fe84227c56a865d16a6614e2c4722864b380cb14b13f3e6bef441e73a85a/brotli-1.2.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+            "https://files.pythonhosted.org/packages/8b/ad/0942abad71d8b2aabd21472efa5be31ab0be31f98271d58767b9797eec82/brotli-1.2.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
         ],
-        sha256 = "c8565e3cdc1808b1a34714b553b262c5de5fbda202285782173ec137fd13709f",
-        downloaded_file_path = "brotli-1.2.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+        sha256 = "b5b458950312830913f837e179ce9221000ab7a20b4e42d7b48c1fcd79140de1",
+        downloaded_file_path = "brotli-1.2.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp313_cp313_manylinux2014_x86_64.manylinux_2_17_x86_64",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp313_cp313_manylinux2014_x86_64.manylinux_2_17_x86_64",
         urls = [
-            "https://files.pythonhosted.org/packages/5f/16/a1b22cbea436642e071adcaf8d4b350a2ad02f5e0ad0da879a1be16188a0/brotli-1.2.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            "https://files.pythonhosted.org/packages/65/85/4c57c3cd2eee42878677b4943086e6b36cefc50214a5447028268045ce63/brotli-1.2.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
         ],
-        sha256 = "67a91c5187e1eec76a61625c77a6c8c785650f5b576ca732bd33ef58b0dff49c",
-        downloaded_file_path = "brotli-1.2.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        sha256 = "264fd5b200f6f6170cb551a4b9fcaabf8aa846ddaefe72db4d5f49f9d3743df9",
+        downloaded_file_path = "brotli-1.2.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp314_cp314_macosx_10_15_universal2",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp314_cp314_macosx_10_15_universal2",
         urls = [
-            "https://files.pythonhosted.org/packages/17/e1/298c2ddf786bb7347a1cd71d63a347a79e5712a7c0cba9e3c3458ebd976f/brotli-1.2.0-cp314-cp314-macosx_10_15_universal2.whl",
+            "https://files.pythonhosted.org/packages/af/dd/641dd6072ea8c5e0ef7d1f8dc02149b4b0b77ef68fe12fc08b08320980d5/brotli-1.2.1-cp314-cp314-macosx_10_15_universal2.whl",
         ],
-        sha256 = "6c12dad5cd04530323e723787ff762bac749a7b256a5bece32b2243dd5c27b21",
-        downloaded_file_path = "brotli-1.2.0-cp314-cp314-macosx_10_15_universal2.whl",
+        sha256 = "b8b2fc7901b31d5885f26521cf2d74feccdc126a272ba1d879b7545bb25468bc",
+        downloaded_file_path = "brotli-1.2.1-cp314-cp314-macosx_10_15_universal2.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp314_cp314_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp314_cp314_manylinux2014_aarch64.manylinux_2_17_aarch64",
         urls = [
-            "https://files.pythonhosted.org/packages/ec/f1/0ca1f3f99ae300372635ab3fe2f7a79fa335fee3d874fa7f9e68575e0e62/brotli-1.2.0-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+            "https://files.pythonhosted.org/packages/11/95/54e7278ee3fc589a6ac3a9bc191b5412542949411f0b38c56614d0f51282/brotli-1.2.1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
         ],
-        sha256 = "963a08f3bebd8b75ac57661045402da15991468a621f014be54e50f53a58d19e",
-        downloaded_file_path = "brotli-1.2.0-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+        sha256 = "a3942e2d365f009e5e7839114fa315e1a2bcfea12b52064a28f1a7281862a2a7",
+        downloaded_file_path = "brotli-1.2.1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotli_1.2.0_cp314_cp314_manylinux2014_x86_64.manylinux_2_17_x86_64",
+        name = "pycross_lock_file_wheel_brotli_1.2.1_cp314_cp314_manylinux2014_x86_64.manylinux_2_17_x86_64",
         urls = [
-            "https://files.pythonhosted.org/packages/f3/2f/0976d5b097ff8a22163b10617f76b2557f15f0f39d6a0fe1f02b1a53e92b/brotli-1.2.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            "https://files.pythonhosted.org/packages/c4/07/8948582ce173e8e43cea9fadb8c3c3ea94800fb9814119c9239c1ae6c797/brotli-1.2.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
         ],
-        sha256 = "cf9cba6f5b78a2071ec6fb1e7bd39acf35071d90a81231d67e92d637776a6a63",
-        downloaded_file_path = "brotli-1.2.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        sha256 = "a998857af4fcd19920bdf5f30f0f1a23f38472a703d33e49168cd4fd32438377",
+        downloaded_file_path = "brotli-1.2.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp314_cp314t_macosx_11_0_arm64",
+        name = "pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp314_cp314t_macosx_11_0_arm64",
         urls = [
-            "https://files.pythonhosted.org/packages/ef/f9/dfa56316837fa798eac19358351e974de8e1e2ca9475af4cb90293cd6576/brotlicffi-1.2.0.1-cp314-cp314t-macosx_11_0_arm64.whl",
+            "https://files.pythonhosted.org/packages/69/c2/970af780f5e72bec6beb0d1c63d5799d52d2008f5660925c57a313999785/brotlicffi-1.2.1.0-cp314-cp314t-macosx_11_0_arm64.whl",
         ],
-        sha256 = "2c85e65913cf2b79c57a3fdd05b98d9731d9255dc0cb696b09376cc091b9cddd",
-        downloaded_file_path = "brotlicffi-1.2.0.1-cp314-cp314t-macosx_11_0_arm64.whl",
+        sha256 = "fea6f5450a6bd73ec222e92282d4db25030943946190697c1f2cd41087c59bc6",
+        downloaded_file_path = "brotlicffi-1.2.1.0-cp314-cp314t-macosx_11_0_arm64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp314_cp314t_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64",
+        name = "pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp314_cp314t_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64",
         urls = [
-            "https://files.pythonhosted.org/packages/4a/f5/f8f492158c76b0d940388801f04f747028971ad5774287bded5f1e53f08d/brotlicffi-1.2.0.1-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+            "https://files.pythonhosted.org/packages/72/7a/72586e3eaba1e90b6ff5525db4171bcb0011d0fce23feb1a33ebdb89a060/brotlicffi-1.2.1.0-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
         ],
-        sha256 = "535f2d05d0273408abc13fc0eebb467afac17b0ad85090c8913690d40207dac5",
-        downloaded_file_path = "brotlicffi-1.2.0.1-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+        sha256 = "b77704eb33e345e00d0a2854abf7966b86e1709a1f89bcc143b6c8437256d7c7",
+        downloaded_file_path = "brotlicffi-1.2.1.0-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp314_cp314t_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64",
+        name = "pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp314_cp314t_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64",
         urls = [
-            "https://files.pythonhosted.org/packages/3b/e1/ff87af10ac419600c63e9287a0649c673673ae6b4f2bcf48e96cb2f89f60/brotlicffi-1.2.0.1-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "https://files.pythonhosted.org/packages/0c/37/54900777a94c65386e414eb74aa01f5cf871763f95a1e7288105d2f3e5e7/brotlicffi-1.2.1.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
         ],
-        sha256 = "ce17eb798ca59ecec67a9bb3fd7a4304e120d1cd02953ce522d959b9a84d58ac",
-        downloaded_file_path = "brotlicffi-1.2.0.1-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        sha256 = "0cb591da62db91dddd701a28def82f39e0f7943321ac7d0814a1d2a1625095d1",
+        downloaded_file_path = "brotlicffi-1.2.1.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_macosx_11_0_arm64",
+        name = "pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_macosx_11_0_arm64",
         urls = [
-            "https://files.pythonhosted.org/packages/9a/9f/b98dcd4af47994cee97aebac866996a006a2e5fc1fd1e2b82a8ad95cf09c/brotlicffi-1.2.0.1-cp38-abi3-macosx_11_0_arm64.whl",
+            "https://files.pythonhosted.org/packages/6d/74/0149c52fef86523faf9768191e6b428a8aab2e60ef1ffeb6e6641d6d6bcd/brotlicffi-1.2.1.0-cp39-abi3-macosx_11_0_arm64.whl",
         ],
-        sha256 = "91ba5f0ccc040f6ff8f7efaf839f797723d03ed46acb8ae9408f99ffd2572cf4",
-        downloaded_file_path = "brotlicffi-1.2.0.1-cp38-abi3-macosx_11_0_arm64.whl",
+        sha256 = "cc882e1ab3f81d262cc002132476dab7667f8f41ead3de8609b163cb64409f8a",
+        downloaded_file_path = "brotlicffi-1.2.1.0-cp39-abi3-macosx_11_0_arm64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64",
+        name = "pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64",
         urls = [
-            "https://files.pythonhosted.org/packages/b1/7a/ac4ee56595a061e3718a6d1ea7e921f4df156894acffb28ed88a1fd52022/brotlicffi-1.2.0.1-cp38-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+            "https://files.pythonhosted.org/packages/23/3a/6ef07f52eb6ddef242eee7e3634ce21fa8467e7de9c4f4d288ef069375cb/brotlicffi-1.2.1.0-cp39-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
         ],
-        sha256 = "be9a670c6811af30a4bd42d7116dc5895d3b41beaa8ed8a89050447a0181f5ce",
-        downloaded_file_path = "brotlicffi-1.2.0.1-cp38-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+        sha256 = "ed7c8311209853c9d78e2f6cff1f57e4df2541e4d67e3677dc1f4c88539db907",
+        downloaded_file_path = "brotlicffi-1.2.1.0-cp39-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
     )
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_brotlicffi_1.2.0.1_cp38_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64",
+        name = "pycross_lock_file_wheel_brotlicffi_1.2.1.0_cp39_abi3_manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64",
         urls = [
-            "https://files.pythonhosted.org/packages/99/39/e7410db7f6f56de57744ea52a115084ceb2735f4d44973f349bb92136586/brotlicffi-1.2.0.1-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "https://files.pythonhosted.org/packages/f1/93/e2735a441a0f071b8094a2b9baadad5fb9811708c088b294ccb0e90aeb46/brotlicffi-1.2.1.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
         ],
-        sha256 = "6f3314a3476f59e5443f9f72a6dff16edc0c3463c9b318feaef04ae3e4683f5a",
-        downloaded_file_path = "brotlicffi-1.2.0.1-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        sha256 = "0a7281a39de91432e90c27ab9c4f9feb3a9cf33fda3873534c2a88270d9f60a2",
+        downloaded_file_path = "brotlicffi-1.2.1.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
     )
 
     maybe(
