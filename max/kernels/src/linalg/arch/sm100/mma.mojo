@@ -17,7 +17,7 @@ from std.math import align_up
 
 from max.gpu.primitives.cluster import cluster_mask_base
 from max.gpu import block_id_in_cluster
-from max.gpu.host._legacy._tensormap import SwizzleMode
+from max.gpu.host import SwizzleMode
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu.compute.arch.mma_nvidia_sm100 import *
 from max.gpu.compute.arch.tcgen05 import *

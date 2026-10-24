@@ -42,7 +42,7 @@ from max.gpu.host import (
     DeviceGraphInputKind,
     StableAddr,
 )
-from max.gpu.host._legacy.device_context import _DeviceContextPtr
+from max.gpu.host import _DeviceContextPtr
 from max.gpu.host.info import is_accelerator, is_cpu, is_gpu
 from std.memory import OwnedPointer, MaybeUninit, alloc
 from std.os import abort

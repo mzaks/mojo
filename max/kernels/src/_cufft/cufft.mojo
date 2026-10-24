@@ -15,7 +15,7 @@
 import std.ffi as ffi
 
 from std.complex import ComplexFloat32, ComplexFloat64
-from max.gpu.host._legacy._nvidia_cuda import CUstream
+from max.gpu.host import CUstream
 
 from .types import LibraryProperty, Property, Status, Type
 from .utils import _get_dylib_function

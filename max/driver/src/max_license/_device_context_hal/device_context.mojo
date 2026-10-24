@@ -85,14 +85,14 @@ from max.gpu.host import (
     LaunchAttribute,
     default_accelerator,
 )
-from max.gpu.host._legacy.device_attribute import DeviceAttribute
+from max.gpu.host import DeviceAttribute
 from max.gpu.host.info import (
     GPUInfo,
     get_gpu_info,
     is_cpu,
     _device_type_encoder_target,
 )
-from max.gpu.host._legacy.func_attribute import Attribute, FuncAttribute
+from max.gpu.host import Attribute, FuncAttribute
 from max.gpu.host import _launch_args
 from max.gpu.host._launch_args import DeviceFunctionWrapper, _IdentityWrapper
 

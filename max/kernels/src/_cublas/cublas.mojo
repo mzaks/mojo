@@ -29,7 +29,7 @@ from std.ffi import _find_dylib
 from std.ffi import _get_dylib_function as _ffi_get_dylib_function
 from std.ffi import _Global, OwnedDLHandle
 
-from max.gpu.host._legacy._nvidia_cuda import CUstream
+from max.gpu.host import CUstream
 
 from .dtype import DataType, Property
 from .result import Result

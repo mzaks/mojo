@@ -27,7 +27,7 @@ from std.sys import size_of
 
 from comm import Signal
 from max.gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
-from max.gpu.host._legacy.device_attribute import DeviceAttribute
+from max.gpu.host import DeviceAttribute
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu.host.info import B200
 from max.gpu.primitives.grid_controls import pdl_launch_attributes, PDLLevel

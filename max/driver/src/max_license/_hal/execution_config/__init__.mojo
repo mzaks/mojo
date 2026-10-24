@@ -13,7 +13,7 @@
 
 from std.collections import BitSet
 from max.gpu.host import ConstantMemoryMapping, Dim, LaunchAttribute
-from max.gpu.host._legacy.device_context import _DumpPath
+from max.gpu.host import _DumpPath
 from .gpu_execution_config import GPUExecutionConfiguration
 
 

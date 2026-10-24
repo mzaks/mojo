@@ -26,7 +26,7 @@ from std.sys import (
 
 from max.gpu.primitives.grid_controls import PDLLevel, pdl_launch_attributes
 from max.gpu.host import DeviceContext
-from max.gpu.host._legacy.device_attribute import DeviceAttribute
+from max.gpu.host import DeviceAttribute
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from layout import (
     DefaultEngine,
