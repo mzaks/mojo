@@ -452,6 +452,18 @@ Parameters:
 """
 
 
+trait MutabilityKnown:
+    """Exposes whether a value can write the storage it refers to.
+
+    Accelerator backends read `mutable` off kernel argument types to tell a
+    kernel's outputs from its inputs. They match the trait and the member by
+    name, so renaming either reports every argument as immutable.
+    """
+
+    comptime mutable: Bool
+    """True if the value can write the storage it refers to."""
+
+
 struct TileTensor[
     mut: Bool,
     //,
@@ -462,7 +474,13 @@ struct TileTensor[
     Engine: TensorEngine = DefaultEngine[element_width=1],
     address_space: AddressSpace = .GENERIC,
     linear_idx_type: DType = _get_index_type[LayoutType](address_space),
-](DevicePassable, ImplicitlyCopyable, TrivialRegisterPassable, Writable):
+](
+    DevicePassable,
+    ImplicitlyCopyable,
+    MutabilityKnown,
+    TrivialRegisterPassable,
+    Writable,
+):
     """A tensor type with trait-based layouts supporting nested and hierarchical
     indexing.
 
@@ -609,6 +627,9 @@ struct TileTensor[
 
     comptime device_type = Self
     """Device-side type for GPU kernel parameter passing."""
+
+    comptime mutable = Self.mut
+    """Whether the tensor can write its storage, per `origin`."""
 
     def _to_device_type(
         self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
