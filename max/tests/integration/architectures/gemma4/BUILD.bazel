@@ -55,6 +55,7 @@ modular_py_test(
             "test_batch_vision_inputs.py",
             "test_config_init.py",
             "test_image_processor.py",
+            "test_logprobs.py",
             "test_reasoning.py",
             "test_tokenizer.py",
             "test_tool_parser.py",
@@ -125,6 +126,16 @@ modular_py_test(
         requirement("pillow"),
         requirement("pytest-asyncio"),
         requirement("pytest-mock"),
+    ],
+)
+
+modular_py_test(
+    name = "test_logprobs",
+    srcs = ["test_logprobs.py"],
+    deps = [
+        "//max/python/max/pipelines/architectures/diffusion_gemma",
+        "//max/python/max/pipelines/architectures/gemma4",
+        "//max/python/max/pipelines/lib",
     ],
 )
 
