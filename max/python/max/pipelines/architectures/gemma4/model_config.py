@@ -77,6 +77,44 @@ def _resolve_num_global_kv_heads(text_config: PretrainedConfig) -> int:
     return num_global_kv_heads
 
 
+def _resolve_head_dims(huggingface_config: PretrainedConfig) -> tuple[int, int]:
+    """Resolves the (sliding, full-attention) head widths of a Gemma 4 config.
+
+    transformers >= 5.20 makes ``head_dim`` a per-layer attribute: the global
+    read raises and ``global_head_dim`` is folded into the per-layer
+    overrides. The HF modeling code reads the width off the layer's own
+    config, so read it the same way. Older transformers keep the config
+    homogeneous and expose both widths as plain attributes.
+    """
+    layer_types = getattr(huggingface_config, "layer_types", None) or []
+    per_layer = getattr(huggingface_config, "per_layer_config", None)
+    if per_layer is None or not layer_types:
+        return (
+            int(huggingface_config.head_dim),
+            int(huggingface_config.global_head_dim),
+        )
+
+    widths: dict[str, int] = {}
+    for idx, layer_type in enumerate(layer_types):
+        try:
+            width = int(per_layer[idx].head_dim)
+        except (AttributeError, IndexError, KeyError, TypeError) as exc:
+            raise ValueError(
+                "cannot resolve the head width of the Gemma 4 config "
+                f"(layer {idx}, type {layer_type!r})"
+            ) from exc
+        kind = "full" if "full" in str(layer_type) else "local"
+        widths.setdefault(kind, width)
+
+    local = widths.get("local")
+    if local is None:
+        raise ValueError(
+            "cannot resolve the sliding-window head width of the Gemma 4 "
+            "config: no sliding-attention layer"
+        )
+    return local, widths.get("full", local)
+
+
 @dataclass(kw_only=True)
 class Gemma4TextConfig(Gemma3Config):
     """Text configuration for Gemma 4 models.
@@ -222,6 +260,7 @@ class Gemma4TextConfig(Gemma3Config):
                 f"Gemma4 layers {layers.start} to {layers.stop - 1} need both"
                 " sliding and full attention to run as a pipeline stage."
             )
+        local_head_dim, full_head_dim = _resolve_head_dims(huggingface_config)
         return hybrid_swa_full_kv_params(
             layer_types=layer_types,
             sliding_window=huggingface_config.sliding_window,
@@ -230,10 +269,10 @@ class Gemma4TextConfig(Gemma3Config):
             kv_cache_config=kv_cache_config,
             cache_dtype=cache_dtype,
             n_kv_heads=huggingface_config.num_key_value_heads,
-            head_dim=huggingface_config.head_dim,
+            head_dim=local_head_dim,
             allow_kv_head_replication=allow_kv_head_replication,
             full_n_kv_heads=_resolve_num_global_kv_heads(huggingface_config),
-            full_head_dim=huggingface_config.global_head_dim,
+            full_head_dim=full_head_dim,
         )
 
     @classmethod
@@ -266,6 +305,7 @@ class Gemma4TextConfig(Gemma3Config):
         interleaved_rope_weights = _interleaved_rope_weights(
             pipeline_config.model
         )
+        local_head_dim, full_head_dim = _resolve_head_dims(huggingface_config)
         device_refs = [
             DeviceRef(spec.device_type, spec.id)
             for spec in pipeline_config.model.device_specs
@@ -310,7 +350,7 @@ class Gemma4TextConfig(Gemma3Config):
             num_hidden_layers=huggingface_config.num_hidden_layers,
             num_attention_heads=huggingface_config.num_attention_heads,
             num_key_value_heads=huggingface_config.num_key_value_heads,
-            head_dim=huggingface_config.head_dim,
+            head_dim=local_head_dim,
             hidden_activation=hidden_activation,
             max_position_embeddings=huggingface_config.max_position_embeddings,
             max_seq_len=max_seq_len,
@@ -339,7 +379,7 @@ class Gemma4TextConfig(Gemma3Config):
             num_global_key_value_heads=_resolve_num_global_kv_heads(
                 huggingface_config
             ),
-            global_head_dim=huggingface_config.global_head_dim,
+            global_head_dim=full_head_dim,
             attention_k_eq_v=huggingface_config.attention_k_eq_v,
             num_kv_shared_layers=huggingface_config.num_kv_shared_layers,
             enable_moe_block=huggingface_config.enable_moe_block,
