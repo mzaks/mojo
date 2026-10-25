@@ -95,14 +95,16 @@ class DeepseekV41Query(Module):
         )
 
     def __call__(
-        self, x: TensorValue, freqs_cis: TensorValue
+        self, x: TensorValue, freqs_cis: TensorValue, rope: bool = True
     ) -> QueryProjectionOutput:
-        """Returns the shared normalized ``qr`` and rotated local-head ``q``.
+        """Returns the shared normalized ``qr`` and local-head ``q``.
 
         Args:
             x: ``[1, T, hidden_size]`` hidden states.
             freqs_cis: ``[T, rope_head_dim // 2, 2]``, already gathered at
                 these tokens' positions.
+            rope: Whether to rotate ``q``'s RoPE tails. Off when the
+                attention rotates them itself.
 
         Returns:
             ``qr`` ``[1, T, q_lora_rank]``, ``q``
@@ -119,7 +121,9 @@ class DeepseekV41Query(Module):
         )
         qr = self.q_norm(qr_raw)
         q = ops.reshape(
-            mxfp8_linear_rope_tail(self.wq_b, qr, freqs_cis, self.head_dim),
+            mxfp8_linear_rope_tail(self.wq_b, qr, freqs_cis, self.head_dim)
+            if rope
+            else mxfp8_linear(self.wq_b, qr),
             [1, t, self.local_num_heads, self.head_dim],
         )
         return QueryProjectionOutput(qr=qr, q=q, kv_raw=kv_raw)
@@ -153,6 +157,7 @@ class DeepseekV41Query(Module):
         freqs_cis: TensorValue,
         kv_norm: RMSNorm,
         x_mxfp8: Mxfp8Rows | None = None,
+        rope: bool = True,
     ) -> FusedQueryProjectionOutput:
         """Like :meth:`__call__`, with one kernel for both norms and the quantize.
 
@@ -167,6 +172,8 @@ class DeepseekV41Query(Module):
             kv_norm: The KV latent's norm.
             x_mxfp8: ``x`` already in MXFP8, ``[T, hidden_size]``, when its
                 producer wrote it; only valid when :meth:`reads_mxfp8`.
+            rope: Whether to rotate ``q``'s RoPE tails. Off when the
+                attention rotates them itself.
 
         Returns:
             ``qr`` ``[T, q_lora_rank]`` float8 with its block scales, ``q``
@@ -182,7 +189,7 @@ class DeepseekV41Query(Module):
         return FusedQueryProjectionOutput(
             qr=qr,
             qr_scales=qr_scales,
-            q=self._rope_heads(qr, qr_scales, freqs_cis),
+            q=self._heads(qr, qr_scales, freqs_cis, rope),
             kv=kv,
         )
 
@@ -193,6 +200,7 @@ class DeepseekV41Query(Module):
         kv_norm: RMSNorm,
         window: WindowStore,
         x_mxfp8: Mxfp8Rows | None = None,
+        rope: bool = True,
     ) -> tuple[TensorValue, TensorValue, TensorValue]:
         """Like :meth:`call_fused`, storing the KV as window records.
 
@@ -207,6 +215,7 @@ class DeepseekV41Query(Module):
             kv_norm: The KV latent's norm.
             window: Where the KV's records go.
             x_mxfp8: As in :meth:`call_fused`.
+            rope: As in :meth:`call_fused`.
 
         Returns:
             ``qr`` ``[T, q_lora_rank]`` float8 with its block scales, and
@@ -223,7 +232,7 @@ class DeepseekV41Query(Module):
             self.q_lora_rank,
             window,
         )
-        return qr, qr_scales, self._rope_heads(qr, qr_scales, freqs_cis)
+        return qr, qr_scales, self._heads(qr, qr_scales, freqs_cis, rope)
 
     def _fused_norm_inputs(
         self,
@@ -248,13 +257,20 @@ class DeepseekV41Query(Module):
             kv_norm.weight.cast(DType.bfloat16).to(x.device),
         )
 
-    def _rope_heads(
-        self, qr: TensorValue, qr_scales: TensorValue, freqs_cis: TensorValue
+    def _heads(
+        self,
+        qr: TensorValue,
+        qr_scales: TensorValue,
+        freqs_cis: TensorValue,
+        rope: bool,
     ) -> TensorValue:
-        """Returns the rotated local heads of the quantized ``[T, ...]`` ``qr``."""
+        """Returns the local heads of the quantized ``[T, ...]`` ``qr``,
+        rotated when ``rope``."""
         return ops.reshape(
             mxfp8_linear_rope_tail(
                 self.wq_b, qr, freqs_cis, self.head_dim, qr_scales
-            ),
+            )
+            if rope
+            else mxfp8_linear(self.wq_b, qr, x_scales=qr_scales),
             [1, qr.shape[0], self.local_num_heads, self.head_dim],
         )

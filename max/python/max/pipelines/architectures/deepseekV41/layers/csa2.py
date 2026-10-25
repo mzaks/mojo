@@ -69,6 +69,8 @@ MAX_COMPRESSED = 512
 PREFILL_ROWS = 1 << 18
 """Distinct named slots a model's prefill workspace holds: a forward whose
 lists may name more runs the decode attention instead."""
+ROPE_Q_HEADS = 64
+"""Query heads of the MXFP8 attention that takes Q before its RoPE."""
 DECODE_SPLIT_ROWS = 296
 """Partial rows (``splits * tokens``) a decode workspace holds by default,
 two waves of a B200's CTAs; a decode splits a token's work only while its
@@ -632,6 +634,7 @@ def csa2_attention_mxfp8(
     split_rows: int = DECODE_SPLIT_ROWS,
     max_distinct_rows: Dim | int | None = None,
     window_entries: int = WINDOW_ENTRIES,
+    rope_q: bool = False,
 ) -> tuple[TensorValue, TensorValue]:
     """Returns :func:`csa2_attention`'s output as the MXFP8 input of the
     grouped output projection.
@@ -660,14 +663,23 @@ def csa2_attention_mxfp8(
         split_rows: As in :func:`csa2_attention`.
         max_distinct_rows: As in :func:`csa2_attention`.
         window_entries: As in :func:`csa2_attention`.
+        rope_q: Whether ``q`` arrives before its RoPE. The attention then
+            rotates each head's last 64 channels by ``freqs`` itself. Takes
+            64 heads.
 
     Returns:
         The ``[T, n_heads * 512]`` ``float8_e4m3fn`` data and its
         ``float8_e8m0fnu`` scales in the 5D TCGEN layout.
 
     Raises:
-        ValueError: As :func:`csa2_attention` does.
+        ValueError: As :func:`csa2_attention` does, or if ``rope_q`` is
+            set and ``q`` does not have 64 heads.
     """
+    if rope_q and int(q.shape[1]) != ROPE_Q_HEADS:
+        raise ValueError(
+            f"Q before its RoPE takes {ROPE_Q_HEADS} heads, not"
+            f" {int(q.shape[1])}"
+        )
     freqs = ops.cast(freqs, DType.float32)
     freqs = ops.reshape(freqs, [freqs.shape[0], 64]).rebind([q.shape[0], 64])
     data, scales = _csa2_op(
@@ -685,6 +697,7 @@ def csa2_attention_mxfp8(
         split_rows=split_rows,
         max_distinct_rows=max_distinct_rows,
         window_entries=window_entries,
+        rope_q=rope_q,
     )[:2]
     return data, scales
 
@@ -705,9 +718,11 @@ def _csa2_op(
     split_rows: int,
     max_distinct_rows: Dim | int | None,
     window_entries: int,
+    rope_q: bool = False,
 ) -> list[TensorValue]:
     """Builds a CSA2 attention op; with ``mxfp8_freqs``, its MXFP8 form,
-    whose outputs lead with the data and scales."""
+    whose outputs lead with the data and scales, and with ``rope_q`` too,
+    the form that rotates Q."""
     if (
         window_entries <= 0
         or window_entries % 64
@@ -765,7 +780,7 @@ def _csa2_op(
     if mxfp8_freqs is not None:
         if flag is None:
             raise ValueError("the MXFP8 CSA2 op takes a host prefill flag")
-        name += ".mxfp8"
+        name += ".mxfp8" + (".rope_q" if rope_q else "")
         out_types = (
             _block_scaled_quantize_out_types(
                 t,

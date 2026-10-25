@@ -71,6 +71,7 @@ from .csa2 import (
     HEAD_DIM,
     MAX_COMPRESSED,
     PREFILL_ROWS,
+    ROPE_Q_HEADS,
     WINDOW_ENTRIES,
     WindowStore,
     csa2_attention,
@@ -777,6 +778,11 @@ class CSA2Attention(Module):
         )
         return self.query_proj.can_fuse_norm_quant() and indexer_mxfp8
 
+    def _attention_ropes_q(self) -> bool:
+        """Whether the attention rotates Q, so ``wq_b`` runs as a plain
+        MXFP8 matmul rather than one with a RoPE epilogue."""
+        return self.csa2_mxfp8 and self.num_heads == ROPE_Q_HEADS
+
     def begin(
         self,
         h: TensorValue,
@@ -814,17 +820,18 @@ class CSA2Attention(Module):
         )
         qr_scales = None
         kv: TensorValue | None = None
+        rope = not self._attention_ropes_q()
         if self._fuses_query():
             if fused_kv_store_enabled():
                 qr, qr_scales, q = self.query_proj.call_fused_store_kv(
-                    h_flat, freqs_cis, self.kv_norm, window, h_mxfp8
+                    h_flat, freqs_cis, self.kv_norm, window, h_mxfp8, rope
                 )
             else:
                 qr, qr_scales, q, kv = self.query_proj.call_fused(
-                    h_flat, freqs_cis, self.kv_norm, h_mxfp8
+                    h_flat, freqs_cis, self.kv_norm, h_mxfp8, rope
                 )
         else:
-            qr, q, kv_raw = self.query_proj(h_flat, freqs_cis)
+            qr, q, kv_raw = self.query_proj(h_flat, freqs_cis, rope)
             kv = ops.cast(self.kv_norm(kv_raw), DType.bfloat16)
         if kv is not None:
             window.store(ops.reshape(kv, [-1, self.head_dim]))
@@ -1093,6 +1100,7 @@ class CSA2Attention(Module):
                 comp_stride=comp_stride,
                 compressed_rows=self.num_comp,
                 max_distinct_rows=PREFILL_ROWS,
+                rope_q=self._attention_ropes_q(),
             )
             return mxfp8_linear(
                 self.wo_b,

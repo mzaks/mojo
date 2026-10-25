@@ -507,6 +507,7 @@ modular_py_test(
         "//max/python/max/engine",
         "//max/python/max/graph",
         "//max/python/max/nn",
+        "//max/python/max/pipelines/architectures/deepseekV4",
         "//max/python/max/pipelines/architectures/deepseekV41",
         requirement("numpy"),
         requirement("torch"),
