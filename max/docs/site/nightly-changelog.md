@@ -199,6 +199,17 @@ This version is still a work in progress.
   `AutoModel.generate(prompt=...)`, and `generate()` points to
   `generate_images()`.
 
+- `generate_images()`, `AutoPipeline` and the image path of
+  `AutoModel.generate()` take `images`, one list of input images per prompt as
+  for text `generate()`, each image encoded bytes or a PIL image. A list holds
+  one image, or none for a text-only prompt. FLUX.2 and Z-Image run image to
+  image this way. They also take `strength`, which Z-Image reads and FLUX.2
+  ignores. `ZImagePipeline` now lists image input.
+
+- `generate()` and `GenerateIterator` raise the same `TypeError` for a bare
+  image or bytes passed as `images` as for any other `images` that is not one
+  list of images per conversation, instead of a Python iteration error.
+
 - Removed the `blocking_sync`, `disable_timing` and `interprocess` parameters
   from the Mojo `DeviceContext.create_event()`, along with `EventFlags`. Events
   never record timing; use `DeviceContext.execution_time()` to time kernels.
