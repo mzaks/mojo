@@ -33,6 +33,23 @@ modular_py_test(
 )
 
 modular_py_test(
+    name = "test_per_layer_embeddings",
+    srcs = ["test_per_layer_embeddings.py"],
+    gpu_constraints = ["//:has_gpu"],
+    tags = ["gpu"],
+    target_compatible_with = select({
+        "@platforms//os:macos": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//max/python/max/dtype",
+        "//max/python/max/graph",
+        "//max/python/max/nn",
+        "//max/python/max/pipelines/architectures/gemma4",
+    ],
+)
+
+modular_py_test(
     name = "test_batch_vision_inputs_cpu",
     srcs = ["test_batch_vision_inputs.py"],
     deps = [
@@ -56,6 +73,7 @@ modular_py_test(
             "test_config_init.py",
             "test_image_processor.py",
             "test_logprobs.py",
+            "test_per_layer_embeddings.py",
             "test_reasoning.py",
             "test_tokenizer.py",
             "test_tool_parser.py",

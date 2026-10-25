@@ -133,6 +133,10 @@ class Gemma4TextConfig(Gemma3Config):
     """Hidden size output of the per-layer input embedding. When this is 0, the
     per-layer input embedding is not used."""
 
+    pad_token_id: int = 0
+    """The pad token id. The per-layer embedding looks up this id in place of
+    every image, video, and audio placeholder token."""
+
     num_global_key_value_heads: int = 4
     """Number of key value heads used in full attention layers."""
 
@@ -376,6 +380,7 @@ class Gemma4TextConfig(Gemma3Config):
             # Gemma4-specific fields
             vocab_size_per_layer_input=huggingface_config.vocab_size_per_layer_input,
             hidden_size_per_layer_input=huggingface_config.hidden_size_per_layer_input,
+            pad_token_id=getattr(huggingface_config, "pad_token_id", None) or 0,
             num_global_key_value_heads=_resolve_num_global_kv_heads(
                 huggingface_config
             ),
@@ -553,6 +558,10 @@ class Gemma4ForConditionalGenerationConfig(
 
     video_token_index: int = 262_144
     """The video token index to encode the video prompt."""
+
+    audio_token_index: int | None = None
+    """The audio token index to encode the audio prompt, or ``None`` for
+    checkpoints that declare no audio token (the text-only line)."""
 
     text_config: Gemma4TextConfig
     """The config object of the text backbone."""
@@ -750,6 +759,14 @@ class Gemma4ForConditionalGenerationConfig(
             video_token_index=getattr(
                 huggingface_config, "video_token_id", 262_144
             ),
+            # Checkpoints name the audio placeholder ``audio_token_id`` (the
+            # processor's spelling) or ``audio_token_index``; a checkpoint
+            # without an audio tower declares neither, which leaves the field
+            # ``None`` and the placeholder mask unchanged.
+            audio_token_index=getattr(
+                huggingface_config, "audio_token_id", None
+            )
+            or getattr(huggingface_config, "audio_token_index", None),
             quantization_encoding=quantization_encoding,
             layer_ids=stage_layers(
                 pipeline_config, int(hf_text_config.num_hidden_layers)

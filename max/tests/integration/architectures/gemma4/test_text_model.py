@@ -640,10 +640,14 @@ _EXEC_GLOBAL_HEAD_DIM = 64
 _EXEC_N_HEADS = 2
 _EXEC_N_KV_HEADS = 2
 _EXEC_N_GLOBAL_KV_HEADS = 1
+# Width of the per-layer embedding (PLE) table's per-layer slice.
+_EXEC_PLE_DIM = 16
 
 
 def _make_small_model_config(
     devices: list[DeviceRef],
+    hidden_size_per_layer_input: int = 0,
+    vocab_size_per_layer_input: int = 262144,
 ) -> Gemma4ForConditionalGenerationConfig:
     """Build a small Gemma4 config suitable for execution tests.
 
@@ -718,6 +722,8 @@ def _make_small_model_config(
         global_rope_theta=TEXT_GLOBAL_ROPE_THETA,
         sliding_window_rope_theta=TEXT_SLIDING_WINDOW_ROPE_THETA,
         layer_types=_EXEC_LAYER_TYPES,
+        hidden_size_per_layer_input=hidden_size_per_layer_input,
+        vocab_size_per_layer_input=vocab_size_per_layer_input,
     )
     text_config.return_logits = ReturnLogits.LAST_TOKEN
 
@@ -772,6 +778,91 @@ def _build_shared_weights(
             w[key] = torch.tensor([2.0], dtype=TORCH_DTYPE)
 
     return w
+
+
+def _run_max_text_model_logits(
+    max_model: Gemma4TextModel,
+    tokens: torch.Tensor,
+    device: Accelerator,
+    device_ref: DeviceRef,
+    graph_name: str,
+    image_embeddings: torch.Tensor | None = None,
+    image_token_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Runs the MAX text model graph over ``tokens`` and returns the logits.
+
+    The graph takes the tokens, the row offsets, the returned-logits count
+    and the signal buffers, exactly as the language graph does at serve time.
+    ``image_embeddings`` are merged at ``image_token_indices`` when given.
+    """
+    if image_embeddings is None:
+        image_embeddings_buf = create_empty_embeddings(
+            [device], _EXEC_HIDDEN, DType.bfloat16
+        )[0]
+        image_token_indices_buf = create_empty_indices([device])[0]
+    else:
+        assert image_token_indices is not None
+        image_embeddings_buf = Buffer.from_dlpack(image_embeddings).to(device)
+        image_token_indices_buf = Buffer.from_dlpack(
+            image_token_indices.to(torch.int32)
+        ).to(device)
+    seq_len = tokens.shape[0]
+    signals = Signals([device_ref])
+    session = InferenceSession(devices=[device])
+    with Graph(
+        graph_name,
+        input_types=[
+            TensorType(DType.int64, [seq_len], device=device_ref),
+            TensorType(DType.uint32, [2], device=device_ref),
+            TensorType(DType.uint32, [1], device=DeviceRef.CPU()),
+            *signals.input_types(),
+        ],
+    ) as graph:
+        tokens_in, row_offsets_in, return_n_logits_in, signal_buf = graph.inputs
+        assert isinstance(tokens_in, TensorValue)
+        assert isinstance(row_offsets_in, TensorValue)
+        assert isinstance(return_n_logits_in, TensorValue)
+        assert isinstance(signal_buf, BufferValue)
+
+        results = max_model(
+            tokens_in,
+            signal_buffers=[signal_buf],
+            sliding_kv_collections=[None],  # type: ignore[list-item]
+            global_kv_collections=[None],  # type: ignore[list-item]
+            return_n_logits=return_n_logits_in,
+            input_row_offsets=[row_offsets_in],
+            image_embeddings=[ops.constant(image_embeddings_buf)],
+            image_token_indices=[ops.constant(image_token_indices_buf)],
+        )
+        graph.output(results.logits["logits"])
+
+    compiled = session.load(graph, weights_registry=max_model.state_dict())
+
+    tokens_gpu = Buffer.from_dlpack(tokens).to(device)
+    row_offsets = torch.tensor([0, seq_len], dtype=torch.uint32)
+    row_offsets_gpu = Buffer.from_dlpack(row_offsets).to(device)
+    # Unused by ReturnLogits.ALL but required as a graph input.
+    return_n_logits = torch.tensor([0], dtype=torch.uint32)
+    (result_buf,) = compiled.execute(
+        tokens_gpu, row_offsets_gpu, return_n_logits, *signals.buffers()
+    )
+    assert isinstance(result_buf, Buffer)
+    return torch.from_dlpack(result_buf).cpu().float()
+
+
+def test_text_model_refuses_kv_shared_layers() -> None:
+    """An E-series config must fail loudly until KV sharing is implemented.
+
+    E4B shares the K/V of its trailing 18 layers with an earlier one. Built
+    without that, the model loads and then diverges from the reference at
+    every shared layer, so the constructor refuses the config instead of
+    producing a silently different model.
+    """
+    config = _make_small_model_config(devices=[DeviceRef.CPU()])
+    config.text_config.num_kv_shared_layers = _EXEC_NUM_LAYERS - 1
+
+    with pytest.raises(NotImplementedError, match="num_kv_shared_layers"):
+        Gemma4TextModel(config)
 
 
 @pytest.mark.parametrize(
@@ -832,55 +923,100 @@ def test_text_model_execution_matches_torch(seq_len: int) -> None:
     torch_logits = (torch.tanh(torch_logits / cap) * cap).float()
 
     # -- Build and run MAX graph --
-    signals = Signals([device_ref])
-    session = InferenceSession(devices=[device])
-    with Graph(
-        "test_text_model_exec",
-        input_types=[
-            TensorType(DType.int64, [seq_len], device=device_ref),
-            TensorType(DType.uint32, [2], device=device_ref),
-            TensorType(DType.uint32, [1], device=DeviceRef.CPU()),
-            *signals.input_types(),
-        ],
-    ) as graph:
-        tokens_in, row_offsets_in, return_n_logits_in, signal_buf = graph.inputs
-        assert isinstance(tokens_in, TensorValue)
-        assert isinstance(row_offsets_in, TensorValue)
-        assert isinstance(return_n_logits_in, TensorValue)
-        assert isinstance(signal_buf, BufferValue)
-
-        results = max_model(
-            tokens_in,
-            signal_buffers=[signal_buf],
-            sliding_kv_collections=[None],  # type: ignore[list-item]
-            global_kv_collections=[None],  # type: ignore[list-item]
-            return_n_logits=return_n_logits_in,
-            input_row_offsets=[row_offsets_in],
-            image_embeddings=[
-                ops.constant(
-                    create_empty_embeddings(
-                        [device], _EXEC_HIDDEN, DType.bfloat16
-                    )[0]
-                )
-            ],
-            image_token_indices=[
-                ops.constant(create_empty_indices([device])[0])
-            ],
-        )
-        graph.output(results.logits["logits"])
-
-    compiled = session.load(graph, weights_registry=max_model.state_dict())
-
-    tokens_gpu = Buffer.from_dlpack(tokens).to(device)
-    row_offsets = torch.tensor([0, seq_len], dtype=torch.uint32)
-    row_offsets_gpu = Buffer.from_dlpack(row_offsets).to(device)
-    # Unused by ReturnLogits.ALL but required as a graph input.
-    return_n_logits = torch.tensor([0], dtype=torch.uint32)
-    (result_buf,) = compiled.execute(
-        tokens_gpu, row_offsets_gpu, return_n_logits, *signals.buffers()
+    max_logits = _run_max_text_model_logits(
+        max_model, tokens, device, device_ref, "test_text_model_exec"
     )
-    assert isinstance(result_buf, Buffer)
-    max_logits = torch.from_dlpack(result_buf).cpu().float()
+
+    # Compare all token logits.
+    torch.testing.assert_close(
+        torch_logits,
+        max_logits,
+        rtol=0.02,
+        atol=0.07,
+    )
+
+
+@pytest.mark.parametrize("with_image", [False, True])
+def test_text_model_per_layer_embeddings_match_torch(with_image: bool) -> None:
+    """Execute the text model with per-layer embeddings and compare to torch.
+
+    This exercises the whole path: the scaled per-layer embedding lookup,
+    the context projection and its norm, and the per-layer gate, projection
+    and norm inside each decoder layer. With an image, the placeholder
+    positions take the image embeddings and look up the pad token's
+    per-layer row, as the reference does.
+    """
+    device = Accelerator(0)
+    device_ref = DeviceRef.GPU()
+    seq_len = 4
+    # A placeholder id inside the small vocab, distinct from the pad id 0.
+    image_token_id = _EXEC_VOCAB - 1
+
+    # Build MAX model with identity attention.
+    config = _make_small_model_config(
+        [device_ref],
+        hidden_size_per_layer_input=_EXEC_PLE_DIM,
+        vocab_size_per_layer_input=_EXEC_VOCAB,
+    )
+    config.text_config.return_logits = ReturnLogits.ALL
+    config.image_token_index = image_token_id
+    max_model = Gemma4TextModel(config)
+    _stub_attention_shards(max_model)
+
+    # Build torch reference with identity attention.
+    torch_model = TorchGemma4TextModel(
+        vocab_size=_EXEC_VOCAB,
+        hidden_size=_EXEC_HIDDEN,
+        num_hidden_layers=_EXEC_NUM_LAYERS,
+        intermediate_size=_EXEC_INTERMEDIATE,
+        hidden_activation=TEXT_HIDDEN_ACTIVATION,
+        rms_norm_eps=TEXT_RMS_NORM_EPS,
+        layer_types=_EXEC_LAYER_TYPES,
+        attn_factory=_torch_identity_attn_factory,
+        hidden_size_per_layer_input=_EXEC_PLE_DIM,
+        vocab_size_per_layer_input=_EXEC_VOCAB,
+    )
+
+    shared_weights = _build_shared_weights(max_model)
+    max_model.load_state_dict(shared_weights)
+    torch_model.load_state_dict(shared_weights, strict=False)
+
+    # Input tokens (valid indices into the small vocab, never the
+    # placeholder id unless an image is placed).
+    torch.manual_seed(99)
+    tokens = torch.randint(1, image_token_id, (seq_len,), dtype=torch.int64)
+    image_embeddings = None
+    image_token_indices = None
+    if with_image:
+        image_token_indices = torch.tensor([1, 2], dtype=torch.int64)
+        tokens[image_token_indices] = image_token_id
+        image_embeddings = torch.randn(
+            len(image_token_indices), _EXEC_HIDDEN, dtype=TORCH_DTYPE
+        )
+
+    # -- Run torch reference (embed → layers → norm → lm_head) --
+    torch_model = torch_model.to(TORCH_DTYPE)
+    with torch.no_grad():
+        torch_hidden = torch_model(
+            tokens,
+            image_token_id=image_token_id if with_image else None,
+            image_features=image_embeddings,
+        )
+    embed_w = shared_weights["embed_tokens.weight"].to(TORCH_DTYPE)
+    torch_logits = torch_hidden @ embed_w.T
+    cap = TEXT_FINAL_LOGIT_SOFTCAPPING
+    torch_logits = (torch.tanh(torch_logits / cap) * cap).float()
+
+    # -- Build and run MAX graph --
+    max_logits = _run_max_text_model_logits(
+        max_model,
+        tokens,
+        device,
+        device_ref,
+        "test_text_model_ple_exec",
+        image_embeddings=image_embeddings,
+        image_token_indices=image_token_indices,
+    )
 
     # Compare all token logits.
     torch.testing.assert_close(
