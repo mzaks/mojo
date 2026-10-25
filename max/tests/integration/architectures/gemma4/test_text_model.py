@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -53,12 +53,19 @@ from max.graph import (
 )
 from max.nn.comm.allreduce import Signals
 from max.nn.kv_cache import MHAKVCacheParams, MultiKVCacheParams
+from max.nn.linear import MLP
 from max.nn.transformer import ReturnHiddenStates, ReturnLogits
 from max.pipelines.architectures.gemma4.batch_vision_inputs import (
     create_empty_embeddings,
     create_empty_indices,
 )
-from max.pipelines.architectures.gemma4.gemma4 import Gemma4TextModel
+from max.pipelines.architectures.gemma4.gemma4 import (
+    Gemma4TextModel,
+    _kv_share_source_slot,
+)
+from max.pipelines.architectures.gemma4.layers.decoder_layer import (
+    Gemma4TextDecoderLayer,
+)
 from max.pipelines.architectures.gemma4.layers.rotary_embedding import (
     ProportionalScalingParams,
 )
@@ -79,12 +86,13 @@ MAX_DTYPE = DType.bfloat16
 
 def _make_kv_params(
     devices: list[DeviceRef],
+    layer_types: list[str] | None = None,
 ) -> MultiKVCacheParams:
     """Build MultiKVCacheParams matching the gemma-4-31B-it config."""
-    sliding_layers = sum(
-        1 for t in TEXT_LAYER_TYPES if t == "sliding_attention"
-    )
-    global_layers = sum(1 for t in TEXT_LAYER_TYPES if t == "full_attention")
+    if layer_types is None:
+        layer_types = TEXT_LAYER_TYPES
+    sliding_layers = sum(1 for t in layer_types if t == "sliding_attention")
+    global_layers = sum(1 for t in layer_types if t == "full_attention")
 
     sliding_kv = MHAKVCacheParams(
         dtype=DType.bfloat16,
@@ -111,6 +119,8 @@ def _make_text_config(
     devices: list[DeviceRef],
     num_hidden_layers: int = TEXT_NUM_HIDDEN_LAYERS,
     layer_types: list[str] | None = None,
+    num_kv_shared_layers: int = 0,
+    use_double_wide_mlp: bool = False,
 ) -> Gemma4TextConfig:
     """Build a Gemma4TextConfig matching the canonical config.
 
@@ -165,6 +175,8 @@ def _make_text_config(
         global_rope_theta=TEXT_GLOBAL_ROPE_THETA,
         sliding_window_rope_theta=TEXT_SLIDING_WINDOW_ROPE_THETA,
         layer_types=layer_types,
+        num_kv_shared_layers=num_kv_shared_layers,
+        use_double_wide_mlp=use_double_wide_mlp,
     )
 
 
@@ -190,10 +202,18 @@ def _make_model_config(
     devices: list[DeviceRef],
     num_hidden_layers: int = TEXT_NUM_HIDDEN_LAYERS,
     layer_types: list[str] | None = None,
+    num_kv_shared_layers: int = 0,
+    use_double_wide_mlp: bool = False,
 ) -> Gemma4ForConditionalGenerationConfig:
     """Build a Gemma4ForConditionalGenerationConfig for model construction."""
-    kv_params = _make_kv_params(devices)
-    text_config = _make_text_config(devices, num_hidden_layers, layer_types)
+    kv_params = _make_kv_params(devices, layer_types)
+    text_config = _make_text_config(
+        devices,
+        num_hidden_layers,
+        layer_types,
+        num_kv_shared_layers,
+        use_double_wide_mlp,
+    )
     # Finalize requires return_logits to be set.
     text_config.return_logits = ReturnLogits.LAST_TOKEN
     return Gemma4ForConditionalGenerationConfig(
@@ -377,6 +397,87 @@ def test_kv_index_counts_match_layer_type_counts() -> None:
 
     assert sliding_count == expected_sliding
     assert global_count == expected_global
+
+
+# ---------------------------------------------------------------------------
+# Tests: Gemma 4's shared keys and values
+# ---------------------------------------------------------------------------
+
+# Five sliding layers, then a full attention layer, then one layer of each
+# kind: the last two share the keys and values of the last layer of their
+# own kind that comes before them.
+_SHARING_LAYER_TYPES = [
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+]
+_SHARING_NUM_KV_SHARED_LAYERS = 2
+
+
+def test_kv_sharing_layers_read_the_source_layer() -> None:
+    """The sharing layers read the source layer's KV cache slot."""
+    config = _make_model_config(
+        [DeviceRef.GPU()],
+        num_hidden_layers=len(_SHARING_LAYER_TYPES),
+        layer_types=_SHARING_LAYER_TYPES,
+        num_kv_shared_layers=_SHARING_NUM_KV_SHARED_LAYERS,
+    )
+    model = Gemma4TextModel(config)
+
+    # The source of a sharing layer, and the slot it holds in its own
+    # attention type's cache.
+    expected_source_slot = {6: 4, 7: 0}
+    for layer_idx in range(len(_SHARING_LAYER_TYPES)):
+        # The list is typed as the base Layer, which carries no attention.
+        layer = cast(Gemma4TextDecoderLayer, model.layers[layer_idx])
+        source_slot = layer.self_attn.kv_share_source_layer_idx_in_cache
+        if layer_idx in expected_source_slot:
+            assert source_slot == expected_source_slot[layer_idx], (
+                f"Layer {layer_idx}: expected the source layer's cache slot "
+                f"{expected_source_slot[layer_idx]}, got {source_slot}"
+            )
+        else:
+            assert source_slot is None, (
+                f"Layer {layer_idx}: expected no shared keys and values, got "
+                f"source slot {source_slot}"
+            )
+
+
+def test_kv_sharing_layers_get_a_double_wide_mlp() -> None:
+    """The sharing layers get the double wide MLP the config asks for."""
+    config = _make_model_config(
+        [DeviceRef.GPU()],
+        num_hidden_layers=len(_SHARING_LAYER_TYPES),
+        layer_types=_SHARING_LAYER_TYPES,
+        num_kv_shared_layers=_SHARING_NUM_KV_SHARED_LAYERS,
+        use_double_wide_mlp=True,
+    )
+    model = Gemma4TextModel(config)
+
+    intermediate_size = config.text_config.intermediate_size
+    for layer_idx in range(len(_SHARING_LAYER_TYPES)):
+        # The list is typed as the base Layer and the MLP as a protocol, so
+        # neither carries the width the config set.
+        layer = cast(Gemma4TextDecoderLayer, model.layers[layer_idx])
+        feed_forward_length = cast(MLP, layer.mlp).feed_forward_length
+        if (
+            layer_idx
+            >= len(_SHARING_LAYER_TYPES) - _SHARING_NUM_KV_SHARED_LAYERS
+        ):
+            assert feed_forward_length == 2 * intermediate_size, (
+                f"Layer {layer_idx}: expected a double wide MLP, got "
+                f"{feed_forward_length}"
+            )
+        else:
+            assert feed_forward_length == intermediate_size, (
+                f"Layer {layer_idx}: expected an MLP of width "
+                f"{intermediate_size}, got {feed_forward_length}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -907,3 +1008,38 @@ def test_text_model_selected_layer_hidden_states() -> None:
         tap_tensors.append(tap)
     max_taps = torch.cat(tap_tensors, dim=-1)
     torch.testing.assert_close(torch_taps, max_taps, rtol=0.02, atol=0.5)
+
+
+def test_kv_share_source_slot_all_layers_sharing_shares_nothing() -> None:
+    """Every layer sharing leaves nothing to share with.
+
+    The reference treats that config as sharing nothing rather than as an
+    error, and configs of that shape loaded before KV sharing was read at all,
+    so the mapping must stay empty instead of rejecting them.
+    """
+    layer_types = ["sliding_attention"] * 4
+
+    assert _kv_share_source_slot(layer_types, 4, 4) == {}
+    assert _kv_share_source_slot(layer_types, 4, 5) == {}
+
+
+def test_kv_share_source_slot_maps_only_the_trailing_layers() -> None:
+    """Sharing layers read a slot owned by a layer that does not share."""
+    layer_types = [
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+    ]
+
+    slots = _kv_share_source_slot(layer_types, len(layer_types), 3)
+
+    assert set(slots) == {5, 6, 7}
+    # Every source is a layer before the sharing point, and of the same
+    # attention type as the layer that reads it.
+    for layer_idx, source_slot in slots.items():
+        assert source_slot < 5, layer_idx

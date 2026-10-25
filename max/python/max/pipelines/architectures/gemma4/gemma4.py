@@ -99,6 +99,67 @@ def language_input_tree(
     )
 
 
+def _kv_share_source_slot(
+    layer_types: Sequence[str],
+    num_hidden_layers: int,
+    num_kv_shared_layers: int,
+) -> dict[int, int]:
+    """Maps every sharing layer to the KV cache slot it reads its keys and values from.
+
+    A sharing layer projects no keys and values of its own: it reuses the
+    ones of the last layer of the same attention type before the sharing
+    point. That source layer's cache slot holds them.
+
+    Args:
+        layer_types: The attention type of every layer.
+        num_hidden_layers: The number of layers in the model.
+        num_kv_shared_layers: The number of trailing layers that share
+            their keys and values.
+
+    Returns:
+        The source layer's index within its own attention type's KV
+        cache, for every sharing layer. Empty when the model shares
+        nothing.
+
+    Raises:
+        ValueError: If a sharing layer has no layer of its own attention
+            type to share with.
+    """
+    if num_kv_shared_layers <= 0:
+        return {}
+
+    first_shared_layer = num_hidden_layers - num_kv_shared_layers
+    if first_shared_layer <= 0:
+        # Every layer shares, so there is nothing to share with. The reference
+        # treats that as sharing nothing rather than as an error, and configs
+        # of that shape loaded before this change, so match it instead of
+        # rejecting them.
+        return {}
+
+    # The index of every layer within its own attention type's KV cache.
+    slot_by_layer: dict[int, int] = {}
+    slots_by_type: dict[str, int] = {}
+    for layer_idx, layer_type in enumerate(layer_types):
+        slot_by_layer[layer_idx] = slots_by_type.get(layer_type, 0)
+        slots_by_type[layer_type] = slot_by_layer[layer_idx] + 1
+
+    # The last layer of each attention type before the sharing point.
+    source_by_type: dict[str, int] = {}
+    for layer_idx in range(first_shared_layer):
+        source_by_type[layer_types[layer_idx]] = layer_idx
+
+    source_slot_by_layer: dict[int, int] = {}
+    for layer_idx in range(first_shared_layer, num_hidden_layers):
+        layer_type = layer_types[layer_idx]
+        if (source := source_by_type.get(layer_type)) is None:
+            raise ValueError(
+                f"Gemma 4 layer {layer_idx} shares its keys and values, but "
+                f"no {layer_type} layer comes before it."
+            )
+        source_slot_by_layer[layer_idx] = slot_by_layer[source]
+    return source_slot_by_layer
+
+
 class Gemma4TextModel(DistributedLogitsPostprocessMixin, Module):
     """The Gemma 4 language model."""
 
@@ -189,6 +250,21 @@ class Gemma4TextModel(DistributedLogitsPostprocessMixin, Module):
             "sliding_attention": 0,
             "full_attention": 0,
         }
+        # The trailing `num_kv_shared_layers` layers read the source
+        # layer's cache slot instead of projecting their own keys and values.
+        kv_share_source_slot = _kv_share_source_slot(
+            text_config.layer_types,
+            text_config.num_hidden_layers,
+            text_config.num_kv_shared_layers,
+        )
+        if kv_share_source_slot and len(self.layer_ids) != (
+            text_config.num_hidden_layers
+        ):
+            raise ValueError(
+                "Gemma 4 KV sharing needs every layer of the model in one "
+                "stage, because a sharing layer reads the source layer's "
+                "KV cache."
+            )
         layers: dict[int, Gemma4TextDecoderLayer] = {}
         for i in self.layer_ids:
             layer_type = text_config.layer_types[i]
@@ -249,6 +325,14 @@ class Gemma4TextModel(DistributedLogitsPostprocessMixin, Module):
                         dtype=config.dtype,
                     )
 
+            # A sharing layer gets a double wide MLP when the config asks
+            # for one.
+            feed_forward_length = text_config.intermediate_size * (
+                2
+                if text_config.use_double_wide_mlp and i in kv_share_source_slot
+                else 1
+            )
+
             layers[i] = Gemma4TextDecoderLayer(
                 attention=Gemma4Attention(
                     rope_global=rope_global,
@@ -272,12 +356,15 @@ class Gemma4TextModel(DistributedLogitsPostprocessMixin, Module):
                     quant_config=None
                     if (is_nvfp4 and not attn_quantized)
                     else quant_config,
+                    kv_share_source_layer_idx_in_cache=kv_share_source_slot.get(
+                        i
+                    ),
                 ),
                 mlp=MLP(
                     dtype=unquantized_dtype if moe_nvfp4 else config.dtype,
                     quantization_encoding=None,
                     hidden_dim=text_config.hidden_size,
-                    feed_forward_length=text_config.intermediate_size,
+                    feed_forward_length=feed_forward_length,
                     devices=config.devices,
                     activation_function=text_config.hidden_activation,
                     quant_config=None if moe_nvfp4 else quant_config,
