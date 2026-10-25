@@ -850,18 +850,20 @@ def _run_max_text_model_logits(
     return torch.from_dlpack(result_buf).cpu().float()
 
 
-def test_text_model_refuses_kv_shared_layers() -> None:
-    """An E-series config must fail loudly until KV sharing is implemented.
+def test_text_model_rejects_a_shared_layer_with_no_source() -> None:
+    """A shared layer needs an earlier layer of its attention type to read.
 
-    E4B shares the K/V of its trailing 18 layers with an earlier one. Built
-    without that, the model loads and then diverges from the reference at
-    every shared layer, so the constructor refuses the config instead of
-    producing a silently different model.
+    Sharing every layer after the first leaves the one full attention layer
+    with no full attention layer before it, so the constructor refuses the
+    config instead of building a layer with no keys and values to read.
     """
     config = _make_small_model_config(devices=[DeviceRef.CPU()])
     config.text_config.num_kv_shared_layers = _EXEC_NUM_LAYERS - 1
 
-    with pytest.raises(NotImplementedError, match="num_kv_shared_layers"):
+    with pytest.raises(
+        ValueError,
+        match="layer 5 shares its keys and values, but no full_attention",
+    ):
         Gemma4TextModel(config)
 
 
