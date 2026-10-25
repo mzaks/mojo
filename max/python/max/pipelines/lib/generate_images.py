@@ -333,6 +333,52 @@ def generate_images(
         OSError: If an input image's bytes do not decode, before any prompt
             runs.
     """
+    requests = _prepare_requests(
+        pipeline.pipeline_config,
+        prompt,
+        images=images,
+        negative_prompt=negative_prompt,
+        height=height,
+        width=width,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        true_cfg_scale=true_cfg_scale,
+        strength=strength,
+        num_images_per_prompt=num_images_per_prompt,
+        seed=seed,
+        caller=caller,
+    )
+    return _run_requests(pipeline, tokenizer, requests)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ImageRequests:
+    """Checked requests, each with its decoded input image or None."""
+
+    requests: list[OpenResponsesRequest]
+    input_images: list[Image.Image | None]
+
+
+def _prepare_requests(
+    pipeline_config: PipelineConfig,
+    prompt: str | Sequence[str],
+    *,
+    images: Sequence[Sequence[bytes | Image.Image]] | None,
+    negative_prompt: str | Sequence[str] | None,
+    height: int | None,
+    width: int | None,
+    num_inference_steps: int | None,
+    guidance_scale: float | None,
+    true_cfg_scale: float | None,
+    strength: float | None,
+    num_images_per_prompt: int,
+    seed: int,
+    caller: str,
+) -> _ImageRequests:
+    """Runs every check :func:`generate_images` makes that needs no pipeline.
+
+    ``max generate`` calls it before the model loads.
+    """
     prompts = [prompt] if isinstance(prompt, str) else list(prompt)
     if not prompts:
         raise ValueError("prompt must hold at least one prompt.")
@@ -353,7 +399,6 @@ def generate_images(
         )
     if not 0 <= seed < _SEED_LIMIT:
         raise ValueError(f"seed must be in [0, 2**32), got {seed}.")
-    pipeline_config = pipeline.pipeline_config
     _check_image_model(pipeline_config, caller)
     input_images = _input_images(images, len(prompts), pipeline_config)
 
@@ -385,10 +430,17 @@ def generate_images(
             zip(prompts, negative_prompts, strict=True)
         )
     ]
+    return _ImageRequests(requests, input_images)
 
+
+def _run_requests(
+    pipeline: ImagePipeline, tokenizer: ImageTokenizer, prepared: _ImageRequests
+) -> GenerateImagesResult:
     # Every context is built first, so a prompt the tokenizer rejects fails
     # before any prompt runs.
-    contexts = _run_coroutine(_new_contexts(tokenizer, requests, input_images))
+    contexts = _run_coroutine(
+        _new_contexts(tokenizer, prepared.requests, prepared.input_images)
+    )
     generated: list[list[Image.Image]] = []
     for context in contexts:
         outputs = pipeline.execute(

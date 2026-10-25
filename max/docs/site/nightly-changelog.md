@@ -78,6 +78,16 @@ This version is still a work in progress.
 
 ## `max` CLI
 
+- `max generate` runs image generation models such as FLUX.2 and saves the
+  images to `--output`, which defaults to `image.png` and whose suffix picks
+  the format. A path without a suffix is a directory, created with its parents
+  if missing. It adds `--negative-prompt`, `--height`, `--width`,
+  `--num-inference-steps`, `--guidance-scale`, `--true-cfg-scale`,
+  `--strength` and `--num-images-per-prompt` for them, and takes the input
+  image from `--image_url`. A flag the user set for the other kind of model,
+  including `--max-batch-size` and `--device-graph-capture` on an image
+  model, raises an error before anything loads. Text models run as before.
+
 ## Python API
 
 - A custom op whose Mojo kernel is registered wrong, or doesn't match its
