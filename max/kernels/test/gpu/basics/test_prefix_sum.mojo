@@ -16,7 +16,6 @@ from std.math import ceildiv
 from max.gpu import global_idx
 from max.gpu.primitives import block
 from max.gpu.primitives import warp
-from max.gpu.globals import WARP_SIZE
 from max.gpu.host import DeviceContext
 from std.testing import assert_equal
 
@@ -35,12 +34,14 @@ def warp_prefix_sum_kernel[
     var tid = global_idx.x
     if tid >= size:
         return
-    output[tid] = warp.prefix_sum[exclusive=exclusive](input[tid])
+    output.unsafe_store(
+        tid, warp.prefix_sum[exclusive=exclusive](input.unsafe_load(tid))
+    )
 
 
 def test_warp_prefix_sum[exclusive: Bool](ctx: DeviceContext) raises:
-    comptime size = WARP_SIZE
-    comptime BLOCK_SIZE = WARP_SIZE
+    comptime size = ctx.default_device_info.warp_size
+    comptime BLOCK_SIZE = size
 
     # Allocate and initialize host memory
     var in_host = ctx.enqueue_create_host_buffer[dtype](size)
@@ -96,15 +97,18 @@ def block_prefix_sum_kernel[
     var tid = global_idx.x
     if tid >= size:
         return
-    output[tid] = block.prefix_sum[exclusive=exclusive, block_size=block_size](
-        input[tid]
+    output.unsafe_store(
+        tid,
+        block.prefix_sum[exclusive=exclusive, block_size=block_size](
+            input.unsafe_load(tid)
+        ),
     )
 
 
 def test_block_prefix_sum[exclusive: Bool](ctx: DeviceContext) raises:
     # Initialize a block with several warps. The prefix sum for each warp is
     # tested above.
-    comptime BLOCK_SIZE = WARP_SIZE * 13
+    comptime BLOCK_SIZE = ctx.default_device_info.warp_size * 13
     comptime size = BLOCK_SIZE
 
     # Allocate and initialize host memory

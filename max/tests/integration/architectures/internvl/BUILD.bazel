@@ -98,7 +98,7 @@ modular_py_test(
         "MODULAR_TORCH_MEMORY_PERCENT": "0.5",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "4",
+        "test.resources:gpu-memory": "3",
     },
     gpu_constraints = ["//:has_gpu"] + select({
         "//:apple_gpu": ["@platforms//:incompatible"],
@@ -107,6 +107,7 @@ modular_py_test(
     per_test_tags = {
         "tests/test_vision_model.py": ["manual"],  # MODELS-1422: Test timing out in CI
     },
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",

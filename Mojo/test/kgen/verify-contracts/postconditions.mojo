@@ -45,7 +45,7 @@ def ok_swap_front(mut xs: List[Int])
 
 def ok_push_keep(mut xs: List[Int])
     ensures len(xs) == old(len(xs)) + 1 and _same_elements(
-        xs._data, old(xs._data), old(len(xs))
+        xs._storage.unsafe_ptr(), old(xs._storage.unsafe_ptr()), old(len(xs))
     ):
     xs.append(9)  # `List.append` keeps the elements it had
 

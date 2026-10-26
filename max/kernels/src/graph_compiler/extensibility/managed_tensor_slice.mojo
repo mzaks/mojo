@@ -21,14 +21,19 @@ A custom kernel's entry-point signature uses these:
 - Fusion traits (`InputFusion`, `OutputFusion`, ...) and their `_NoFusion*`
   sentinels.
 
-The decorators that register a kernel (`register`, `register_internal`,
-`view_kernel`) live next to this file in `register.mojo`.
+The decorators that register a kernel (`register`, `register_internal`) live
+next to this file in `decorators.mojo`.
 """
 from max.algorithm.functional import elementwise
 
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.collections import Optional
-from max.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
+from max.gpu.host import (
+    DeviceBuffer,
+    DeviceContext,
+    get_gpu_target,
+    default_accelerator,
+)
 from max.gpu.host.info import is_cpu
 from max.gpu.host.info import is_gpu as _is_gpu
 from std.math import ceil, fma
@@ -47,7 +52,6 @@ from layout import (
     CoordLike,
     IntTuple,
     Layout,
-    LayoutTensor,
     TileTensor,
     coord_to_index_list,
 )
@@ -59,8 +63,6 @@ from layout.coord import (
 from layout.int_tuple import _IntTupleToCoordLike, coord_to_int_tuple
 from layout.tile_io import TileCopier
 from layout.tile_layout import Layout as TileLayout, TensorLayout, _RowMajor
-
-from .decorators import register_internal
 
 
 # ===----------------------------------------------------------------------=== #
@@ -270,8 +272,8 @@ trait InputFusion(DevicePassable, TrivialRegisterPassable):
 
     Conformers are `DevicePassable` so a GPU kernel callback can capture the
     functor. Encoding walks fields via `encode_fields`, translating host
-    `Pointer`s. `ManagedTensorSlice.device_type` is `LayoutTensor` and drops
-    `in_fusion`; capture the fusion value, not the slice.
+    `Pointer`s. `ManagedTensorSlice.device_type` is `TileTensor` and omits
+    fusion fields; capture the fusion value, not the slice.
     """
 
     # Default DevicePassable so graph-compiler FusionStruct types and
@@ -840,7 +842,6 @@ struct StaticTensorSpecInternal[dtype: DType, rank: Int](ImplicitlyCopyable):
 # ===----------------------------------------------------------------------=== #
 
 
-@__parameter
 @inline(.always)
 def _gcd_pow2[a: Int, b: Int]() -> Int:
     # alignments should always be powers of 2
@@ -861,7 +862,6 @@ def _gcd_pow2[a: Int, b: Int]() -> Int:
 #
 # They are set to be inlined further down graph compiler stack.
 @doc_hidden
-@register_internal("simd_store_into_managed_tensor_slice")
 @inline(.always)
 def simd_store_into_managed_tensor_slice[
     dtype: DType,
@@ -890,9 +890,8 @@ def simd_store_into_managed_tensor_slice[
     ].static_value
 
     # Stride = 1
-    @__parameter
     @inline(.always)
-    def store_stride1():
+    def store_stride1() {imm}:
         comptime if dtype == .bool:
             var v = value.cast[.uint8]()
             tensor._ptr.unsafe_bitcast[UInt8]().unsafe_store(flat_index, v)
@@ -900,9 +899,8 @@ def simd_store_into_managed_tensor_slice[
             tensor._ptr.unsafe_store[alignment=max_alignment](flat_index, value)
 
     # Stride > 1
-    @__parameter
     @inline(.always)
-    def store_strided(stride: Int):
+    def store_strided(stride: Int) {imm}:
         comptime if dtype == .bool:
             var v = value.cast[.uint8]()
             strided_store(
@@ -918,24 +916,25 @@ def simd_store_into_managed_tensor_slice[
     comptime if not _last_stride_is_static:
         var stride = tensor.stride_length[rank - 1]()
         # Dynamic stride
-        if stride == 0:
-            tensor._ptr.unsafe_store[alignment=max_alignment](0, value)
-        elif stride == 1:
-            store_stride1()
-        else:
-            store_strided(stride)
+        match stride:
+            case 0:
+                tensor._ptr.unsafe_store[alignment=max_alignment](0, value)
+            case 1:
+                store_stride1()
+            case _:
+                store_strided(stride)
     else:
         # static stride
-        comptime if _last_stride_value == 0:
-            tensor._ptr.unsafe_store[alignment=max_alignment](0, value)
-        elif _last_stride_value == 1:
-            store_stride1()
-        else:
-            store_strided(_last_stride_value)
+        comptime match _last_stride_value:
+            case 0:
+                tensor._ptr.unsafe_store[alignment=max_alignment](0, value)
+            case 1:
+                store_stride1()
+            case _:
+                store_strided(_last_stride_value)
 
 
 @doc_hidden
-@register_internal("simd_store_into_tensor_pointer")
 @inline(.always)
 def simd_store_into_tensor_pointer[
     dtype: DType,
@@ -984,7 +983,6 @@ def simd_store_into_tensor_pointer[
 # ManagedTensorSlice. This avoids capturing ManagedTensorSlice in GPU kernels,
 # which doesn't work correctly due to closure capture limitations.
 @doc_hidden
-@register_internal("simd_load_from_tensor_pointer")
 @inline(.always)
 def simd_load_from_tensor_pointer[
     dtype: DType,
@@ -1031,7 +1029,6 @@ def simd_load_from_tensor_pointer[
 
 
 @doc_hidden
-@register_internal("simd_load_from_managed_tensor_slice")
 @inline(.always)
 def simd_load_from_managed_tensor_slice[
     dtype: DType,
@@ -1059,9 +1056,8 @@ def simd_load_from_managed_tensor_slice[
     comptime invariant = not tensor.io_spec.mut
 
     # Stride = 1
-    @__parameter
     @inline(.always)
-    def load_stride1() -> SIMD[dtype, simd_width]:
+    def load_stride1() {imm} -> SIMD[dtype, simd_width]:
         comptime if dtype == .bool:
             var v = tensor._ptr.unsafe_bitcast[UInt8]().unsafe_load[
                 width=simd_width,
@@ -1074,9 +1070,8 @@ def simd_load_from_managed_tensor_slice[
             ](flat_index)
 
     # Stride > 1
-    @__parameter
     @inline(.always)
-    def load_strided(stride: Int) -> SIMD[dtype, simd_width]:
+    def load_strided(stride: Int) {imm} -> SIMD[dtype, simd_width]:
         comptime if dtype == .bool:
             var v = strided_load[simd_width, invariant=invariant](
                 tensor._ptr.unsafe_bitcast[UInt8]().unsafe_offset(flat_index),
@@ -1091,20 +1086,22 @@ def simd_load_from_managed_tensor_slice[
     comptime if not _last_stride_is_static:
         var stride = tensor.stride_length[rank - 1]()
         # Dynamic stride
-        if stride == 0:
-            return tensor._ptr.unsafe_load[invariant=invariant](flat_index)
-        elif stride == 1:
-            return load_stride1()
-        else:
-            return load_strided(stride)
+        match stride:
+            case 0:
+                return tensor._ptr.unsafe_load[invariant=invariant](flat_index)
+            case 1:
+                return load_stride1()
+            case _:
+                return load_strided(stride)
     else:
         # Static stride
-        comptime if _last_stride_value == 0:
-            return tensor._ptr.unsafe_load[invariant=invariant](flat_index)
-        elif _last_stride_value == 1:
-            return load_stride1()
-        else:
-            return load_strided(_last_stride_value)
+        comptime match _last_stride_value:
+            case 0:
+                return tensor._ptr.unsafe_load[invariant=invariant](flat_index)
+            case 1:
+                return load_stride1()
+            case _:
+                return load_strided(_last_stride_value)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1208,27 +1205,21 @@ struct ManagedTensorSlice[
     """
 
     # `trait DevicePassable` implementation
-    comptime device_type: AnyType = LayoutTensor[
-        Self.dtype, Self.static_spec.to_layout(), MutAnyOrigin
+    comptime device_type: AnyType = TileTensor[
+        Self.dtype, Self.RuntimeLayout, MutUntrackedOrigin
     ]
 
     def _to_device_type(
         self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
     ):
-        encoder.encode(self.to_layout_tensor(), target)
+        encoder.encode(self.to_tile_tensor(), target)
 
     @staticmethod
     def get_type_name() -> String:
-        return (
-            "ManagedTensorSlice[mut = "
-            + String(Self.mut)
-            + ", dtype = "
-            + String(Self.dtype)
-            + ", rank = "
-            + String(Self.rank)
-            + ", static_spec (as Layout) = "
-            + String(Self.static_spec.to_layout())
-            + "]"
+        return String(
+            t"ManagedTensorSlice[mut = {Self.mut}, dtype = {Self.dtype},"
+            t" rank = {Self.rank}, static_spec (as Layout) ="
+            t" {Self.static_spec.to_layout()}]"
         )
 
     comptime address_space = Self.static_spec.address_space
@@ -1500,7 +1491,7 @@ struct ManagedTensorSlice[
         var result = IndexList[Self.rank]()
 
         comptime for i in range(Self.rank):
-            result[i] = Int(self._runtime_layout.shape[i]().value())
+            result[i] = Int(self._runtime_layout.shape[i]())
 
         return result
 
@@ -1580,7 +1571,7 @@ struct ManagedTensorSlice[
             t" {Self.rank}]"
         )
 
-        return Int(self._runtime_layout.shape[index]().value())
+        return Int(self._runtime_layout.shape[index]())
 
     @inline(.always)
     def strides(self) -> IndexList[Self.rank]:
@@ -1592,7 +1583,7 @@ struct ManagedTensorSlice[
         var result = IndexList[Self.rank]()
 
         comptime for i in range(Self.rank):
-            result[i] = Int(self._runtime_layout.stride[i]().value())
+            result[i] = Int(self._runtime_layout.stride[i]())
 
         return result
 
@@ -1626,7 +1617,7 @@ struct ManagedTensorSlice[
             t" [0, {Self.rank}]"
         )
 
-        return Int(self._runtime_layout.stride[index]().value())
+        return Int(self._runtime_layout.stride[index]())
 
     @inline(.always)
     def size(self) -> Int:
@@ -1832,9 +1823,9 @@ struct ManagedTensorSlice[
             AddressSpace.LOCAL,
             AddressSpace.CONSTANT,
         ):
-            return Int(crd2idx[out_type=DType.int32](index, shape, strides))
+            return Int(crd2idx[out_type=.int32](index, shape, strides))
 
-        return Int(crd2idx[out_type=DType.int](index, shape, strides))
+        return Int(crd2idx[out_type=.int](index, shape, strides))
 
     @__allow_legacy_custom_self_type
     @inline(.always)
@@ -2269,22 +2260,6 @@ struct ManagedTensorSlice[
         }
 
     @inline(.always)
-    def to_layout_tensor(
-        self,
-        out result: LayoutTensor[
-            Self.dtype, Self.static_spec.to_layout(), MutAnyOrigin
-        ],
-    ):
-        comptime layout = Self.static_spec.to_layout()
-        return type_of(result)(
-            self.unsafe_ptr(),
-            type_of(result.runtime_layout)(
-                self.shape().cast[result.layout_int_type](),
-                self.strides().cast[result.linear_idx_type](),
-            ),
-        )
-
-    @inline(.always)
     def to_tile_tensor[
         coord_dtype: DType = .int64
     ](
@@ -2309,8 +2284,7 @@ struct ManagedTensorSlice[
         """
         writer.write("ManagedTensorSlice(")
 
-        @__parameter
-        def serialize[T: Writable](val: T):
+        def serialize[T: Writable](val: T) {mut writer}:
             writer.write(val)
 
         var shape = List[Int]()
@@ -2323,9 +2297,7 @@ struct ManagedTensorSlice[
             self._ptr.as_imm().unsafe_origin_cast[ImmutAnyOrigin]()
         )
         # TODO(1937): make this work with all valid strides
-        _serialize[serialize_fn=serialize, serialize_end_line=False](
-            serialize_ptr, shape
-        )
+        _serialize[serialize_end_line=False](serialize_ptr, shape, serialize)
 
         writer.write("){")
         writer.write("static_shape = ", self._static_shape_tuple)
@@ -2708,9 +2680,7 @@ def get_kernel_simd_width[dtype: DType, target: StaticString]() -> Int:
     comptime if _is_gpu[target]():
         # We hardcode simd width to 16B for Nvidia GPUs but >= sm_100
         # arch support 32B load/store to global memory, see KERN-2037.
-        comptime if CompilationTarget.current_accelerator()._is_arch[
-            "sm_100a"
-        ]():
+        comptime if default_accelerator()._is_arch["sm_100a"]():
             return 32 // size_of[dtype]()
 
         return simd_width_of[dtype, target=get_gpu_target()]()
@@ -2736,53 +2706,6 @@ def get_kernel_tile_shape[dtype: DType, target: StaticString]() -> IndexList[2]:
         return IndexList[2](16, 16)
 
     return IndexList[2](8, 8)
-
-
-def foreach[
-    dtype: DType,
-    rank: Int,
-    //,
-    func: def[width: Int](Coord) capturing -> SIMD[dtype, width],
-    *,
-    target: StaticString = "cpu",
-    simd_width: Int = get_kernel_simd_width[dtype, target](),
-    _trace_name: StaticString = "mogg.for_each",
-](
-    tensor: ManagedTensorSlice[mut=True, dtype=dtype, rank=rank, ...],
-    ctx: DeviceContext,
-) raises:
-    """Apply the function `func` to each element of the tensor slice.
-
-    The `func` body receives the element index as a `Coord`. Use
-    `coord_to_index_list` to convert it to an `IndexList` if integer index
-    arithmetic is needed.
-
-    Parameters:
-        dtype: The data type of the elements in the tensor slice.
-        rank: The rank of the tensor slice.
-        func: The function to apply to each element of the tensor slice.
-        target: Indicates the type of the target device (e.g. "cpu", "gpu").
-        simd_width: The SIMD width for the target (usually leave this as its default value).
-        _trace_name: Name of the executed operation displayed in the trace_description.
-
-    Args:
-        tensor: The output tensor slice which receives the return values from `func`.
-        ctx: The call context (forward this from the custom operation).
-    """
-
-    @inline(.always)
-    def elementwise_fn_wrapper[
-        width: Int,
-        alignment: Int = 1,
-    ](index: Coord) {var}:
-        var val = func[width](index)
-        tensor._fused_store[element_alignment=alignment](index, val)
-
-    elementwise[
-        simd_width,
-        target=target,
-        _trace_description=_trace_name,
-    ](elementwise_fn_wrapper, tensor.shape_coord(), ctx)
 
 
 def foreach[

@@ -29,7 +29,7 @@
 * `ExplicitDestroy`
 """
 
-from std.hashlib import Hasher
+from std.hash import Hasher
 from std.memory import MaybeUninit
 from std.os import abort
 from std.reflection import call_location
@@ -40,9 +40,10 @@ from std.utils._nicheable import UnsafeNicheable, NicheIndex
 # ===----------------------------------------------------------------------=== #
 
 
-@explicit_destroy("Use .destroy() to consume `ExplicitDestroy`")
 @fieldwise_init
-struct ExplicitDestroy(not Deinitable, Movable):
+struct ExplicitDestroy(
+    not Deinitable else "Use .destroy() to consume `ExplicitDestroy`", Movable
+):
     """Test type that is explicitly-destroyed."""
 
     var value: Int
@@ -58,9 +59,13 @@ struct ExplicitDestroy(not Deinitable, Movable):
 # ===----------------------------------------------------------------------=== #
 
 
-@explicit_destroy("Use .destroy() to consume `ExplicitDestroyKey`")
 @fieldwise_init
-struct ExplicitDestroyKey(not Deinitable, Equatable, Hashable, Movable):
+struct ExplicitDestroyKey(
+    not Deinitable else "Use .destroy() to consume `ExplicitDestroyKey`",
+    Equatable,
+    Hashable,
+    Movable,
+):
     """Linear key type for testing linear-keyed containers: `Movable`,
     `Hashable`, and `Equatable`, but explicitly-destroyed (not
     `Deinitable`)."""
@@ -100,10 +105,12 @@ struct ExplicitDestroyKey(not Deinitable, Equatable, Hashable, Movable):
 # ===----------------------------------------------------------------------=== #
 
 
-@explicit_destroy("Use .destroy() to consume `CopyableExplicitDestroyKey`")
 @fieldwise_init
 struct CopyableExplicitDestroyKey(
-    Copyable, not Deinitable, Equatable, Hashable
+    Copyable,
+    not Deinitable else "Use .destroy() to consume `CopyableExplicitDestroyKey`",
+    Equatable,
+    Hashable,
 ):
     """Linear key type that is nonetheless `Copyable`: `Copyable`, `Hashable`,
     and `Equatable`, but explicitly-destroyed (not `Deinitable`).
@@ -580,7 +587,7 @@ struct PinnedExplicitDelOnly(not Deinitable, not Movable):
 
 
 @fieldwise_init
-struct Pinned(not Movable):
+struct Pinned(Defaultable, not Movable):
     """Utility testing container which is non-movable."""
 
     var data: Int
@@ -750,8 +757,8 @@ struct Observable[
         self._copies = copy._copies.copy()
         self._moves = copy._moves.copy()
         self._dels = copy._dels.copy()
-        if self._copies:
-            self._copies.value()[] += 1
+        if case .Some(copies) = self._copies:
+            copies[] += 1
 
     def __init__(out self, *, deinit move: Self):
         """Move initialize the Observable and increment the move count.
@@ -763,13 +770,13 @@ struct Observable[
         self._copies = move._copies^
         self._moves = move._moves^
         self._dels = move._dels^
-        if self._moves:
-            self._moves.value()[] += 1
+        if case .Some(moves) = self._moves:
+            moves[] += 1
 
     def __deinit__(deinit self):
         """Destroy the Observable and increment the deinit count."""
-        if self._dels:
-            self._dels.value()[] += 1
+        if case .Some(dels) = self._dels:
+            dels[] += 1
 
     @staticmethod
     def niche_count() -> Int where Self.opt_into_unsafe_niche:

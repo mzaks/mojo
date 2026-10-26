@@ -32,7 +32,7 @@ from max.benchmark import (
     bench_multicontext,
     bencher_iter_custom,
 )
-from layout import Idx, TileTensor, row_major
+from layout import TileTensor, row_major
 from comm.sync import enable_p2p, init_signal_buffer
 from comm.allreduce import allreduce
 from comm import Signal
@@ -41,6 +41,7 @@ from max.gpu.host import (
     DeviceBuffer,
     DeviceContext,
     DeviceMulticastBuffer,
+    default_accelerator,
     get_gpu_target,
 )
 from internal_utils import (
@@ -56,7 +57,6 @@ from std.utils.index import StaticTuple
 
 
 @inline(.always)
-@__parameter
 def _per_gpu_value[
     dtype: DType,
 ](gpu_rank: Int, j: Int) -> Scalar[dtype]:
@@ -244,8 +244,9 @@ def bench_reduce[
                 # multi_ptr is set when use_multimem == True
                 in_tensors[0] = TileTensor(
                     rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
-                        multi_ptr.unsafe_value()
-                        + cb_template.offset(cache_iter)
+                        multi_ptr.unsafe_value().unsafe_offset(
+                            cb_template.offset(cache_iter)
+                        )
                     ),
                     row_major(length),
                 )
@@ -404,10 +405,14 @@ def main() raises:
         print("P2P not enabled, skipping benchmark.")
         return
 
-    bench_reduce[
-        dtype=dtype,
-        ngpus=num_gpus,
-        use_multimem=use_multimem,
-        cache_busting=cache_busting,
-        use_vendor_ccl=use_vendor_ccl,
-    ](m, ctx, num_bytes, max_num_blocks, ragged)
+    # multimem is NVLink multicast (SM90+); AMD has no equivalent.
+    comptime if use_multimem and default_accelerator().is_amd_gpu():
+        print("multimem is not supported on AMD GPUs, skipping benchmark.")
+    else:
+        bench_reduce[
+            dtype=dtype,
+            ngpus=num_gpus,
+            use_multimem=use_multimem,
+            cache_busting=cache_busting,
+            use_vendor_ccl=use_vendor_ccl,
+        ](m, ctx, num_bytes, max_num_blocks, ragged)

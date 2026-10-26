@@ -6,9 +6,9 @@ modular_py_library(
     name = "base_print_hook",
     srcs = [
         "base_print_hook.py",
-        "identity.py",
     ],
     deps = [
+        "//max/python/max:tree",
         "//max/python/max/nn",
     ],
 )

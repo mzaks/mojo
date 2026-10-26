@@ -49,6 +49,8 @@ from max.benchmark.benchmark_shared.request import (
     RequestFuncOutput,
     mark_cancelled_if_past_deadline,
     progressbar_request_driver,
+    tag_lora_route,
+    tag_response_format_outcome,
 )
 from max.benchmark.benchmark_shared.utils import (
     deadline_passed,
@@ -75,6 +77,12 @@ def _poisson_interval(request_rate: float, burstiness: float) -> float:
     return float(np.random.gamma(shape=burstiness, scale=theta))
 
 
+def _cap_output_len(output_len: int, max_output_len: int | None) -> int:
+    if max_output_len is None:
+        return output_len
+    return min(output_len, max_output_len)
+
+
 async def chat_session_driver(
     model_id: str,
     api_url: str,
@@ -90,6 +98,9 @@ async def chat_session_driver(
     est_ttft_ms: float = 0.0,
     est_tpot_ms: float = 0.0,
     use_session_id_as_cache_salt: bool = False,
+    lora_id: str | None = None,
+    disable_ignore_eos: bool = False,
+    max_output_len: int | None = None,
 ) -> list[RequestFuncOutput]:
     request_func_input = RequestFuncInput(
         model=model_id,
@@ -104,6 +115,7 @@ async def chat_session_driver(
         prompt_len=0,
         max_tokens=0,
         ignore_eos=True,
+        lora_id=lora_id,
     )
     content_idx = 0  # Assume user initiates the conversation
 
@@ -158,7 +170,11 @@ async def chat_session_driver(
         chat_len += messages[content_idx].num_tokens
         if content_idx == 0 and run_prefix:
             chat_len += run_prefix_len
-        output_len = messages[content_idx + 1].num_tokens
+        # A fitted workload is already capped, before its context budgeting;
+        # this catches datasets whose lengths come from their own messages.
+        output_len = _cap_output_len(
+            messages[content_idx + 1].num_tokens, max_output_len
+        )
         if chat_len + output_len > max_chat_len:
             logger.warning(
                 f"Ending conversation: hitting max chat length {max_chat_len}"
@@ -196,7 +212,10 @@ async def chat_session_driver(
         # mostly unconstrained. A schema-shaped response ends when the schema is
         # satisfied anyway, so its length is the schema's to decide rather than
         # the workload's output-length distribution. Ref DISTINF-499.
-        request_func_input.ignore_eos = turn_response_format is None
+        request_func_input.ignore_eos = (
+            turn_response_format is None and not disable_ignore_eos
+        )
+        request_func_input.tools = messages[content_idx].tools
 
         if not applied_initial_sleep:
             applied_initial_sleep = True
@@ -250,9 +269,8 @@ async def chat_session_driver(
             # compare each measured turn against the previous one in-session.
             response.session_id = str(chat_session.id)
             response.turn_index = len(session_outputs)
-            response.response_format_constrained = (
-                turn_response_format is not None
-            )
+            tag_response_format_outcome(response, request_func_input)
+            tag_lora_route(response, request_func_input)
             session_outputs.append(response)
 
         if not response.success:
@@ -297,6 +315,7 @@ async def prerun_warmup_turns(
     max_concurrency: int,
     disable_tqdm: bool = False,
     use_session_id_as_cache_salt: bool = False,
+    max_output_len: int | None = None,
 ) -> None:
     """Send one warmup request per session with prefix_turns > 0.
 
@@ -350,8 +369,11 @@ async def prerun_warmup_turns(
                 images=[],
                 api_url=api_url,
                 prompt_len=chat_len,
-                max_tokens=output_len,
+                # The reply is discarded; history takes the dataset's text.
+                max_tokens=_cap_output_len(output_len, max_output_len),
                 ignore_eos=True,
+                tools=messages[content_idx].tools,
+                is_cache_warmup=True,
             )
             assistant_content = messages[content_idx + 1].content
             if not assistant_content:
@@ -432,6 +454,8 @@ async def run_multiturn_benchmark(
     est_ttft_ms: float = 0.0,
     est_tpot_ms: float = 0.0,
     use_session_id_as_cache_salt: bool = False,
+    disable_ignore_eos: bool = False,
+    max_output_len: int | None = None,
 ) -> dict[str, list[RequestFuncOutput]]:
     """Run multi-turn chat benchmark scenario.
 
@@ -473,6 +497,9 @@ async def run_multiturn_benchmark(
                 est_ttft_ms=est_ttft_ms,
                 est_tpot_ms=est_tpot_ms,
                 use_session_id_as_cache_salt=use_session_id_as_cache_salt,
+                lora_id=lora_id,
+                disable_ignore_eos=disable_ignore_eos,
+                max_output_len=max_output_len,
             )
         session_id = (
             str(chat_session.id)
@@ -537,7 +564,7 @@ class ConcurrentTurnsRequestDriver(RequestDriver):
     """Wraps a RequestDriver to cap the number of concurrent in-flight turns.
 
     Acquires a semaphore slot before issuing each turn request and releases it
-    as soon as the response returns. Inter-turn delays (e.g. delay_until_next_message)
+    as soon as the response returns. Inter-turn delays (such as delay_until_next_message)
     fall outside the slot's hold window, so idle user-think-time does not consume
     concurrency capacity.
 
@@ -601,6 +628,7 @@ async def run_kv_cache_stress_benchmark(
     est_ttft_ms: float = 0.0,
     est_tpot_ms: float = 0.0,
     use_session_id_as_cache_salt: bool = False,
+    disable_ignore_eos: bool = False,
 ) -> dict[str, list[RequestFuncOutput]]:
     """Run a KV-cache stress benchmark with independent conversation and turn concurrency.
 
@@ -715,6 +743,8 @@ async def run_kv_cache_stress_benchmark(
                 est_ttft_ms=est_ttft_ms,
                 est_tpot_ms=est_tpot_ms,
                 use_session_id_as_cache_salt=use_session_id_as_cache_salt,
+                lora_id=lora_id,
+                disable_ignore_eos=disable_ignore_eos,
             )
             session_id = (
                 str(chat_session.id)

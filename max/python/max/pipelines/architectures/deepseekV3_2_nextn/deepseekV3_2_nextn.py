@@ -35,6 +35,7 @@ from max.nn.comm import Signals
 from max.nn.comm.ep import EPBatchManager
 from max.nn.data_parallelism import split_batch_replicated
 from max.nn.embedding import VocabParallelEmbedding
+from max.nn.graph_groups import SparseIndices
 from max.nn.kernels import mtp_eh_norm
 from max.nn.kv_cache import (
     KVCacheParamInterface,
@@ -48,6 +49,7 @@ from max.nn.rotary_embedding import (
     DeepseekYarnRotaryEmbedding,
     RotaryEmbedding,
 )
+from max.nn.transformer import DecoderOutputs
 from max.nn.transformer.distributed_transformer import forward_sharded_layers
 
 from ..deepseekV3.deepseekV3 import deepseek_logits_postprocess
@@ -214,8 +216,9 @@ class DeepseekV3_2NextN(Module):
         ep_inputs: list[Value[Any]] | None = None,
         prev_topk_indices: list[TensorValue] | None = None,
         reuse_prev_topk: bool = False,
+        selection_lag: int = 0,
         split_prefix: str = "draft",
-    ) -> tuple[TensorValue, ...]:
+    ) -> DecoderOutputs:
         if not host_input_row_offsets.device == DeviceRef.CPU():
             raise ValueError("host_input_row_offsets must be located on CPU")
         if not data_parallel_splits.device == DeviceRef.CPU():
@@ -327,6 +330,7 @@ class DeepseekV3_2NextN(Module):
 
         layer_outs = self.decoder_layer(
             ops.constant(0, DType.uint32, device=DeviceRef.CPU()),
+            ops.constant(0, DType.uint32, device=DeviceRef.CPU()),
             h,
             h_norm,
             signal_buffers,
@@ -338,14 +342,17 @@ class DeepseekV3_2NextN(Module):
             prev_topk_indices if prev_topk_indices is not None else [],
             ep_inputs=ep_inputs,
             reuse_prev_topk=reuse_prev_topk,
+            selection_lag=selection_lag,
         )
 
         # The decoder layer returns ``hidden_states + topk_indices`` (both
-        # per-device lists concatenated).
+        # per-device lists concatenated). The selection is carried as physical
+        # rows in the draft's MLA cache, whose page table later draft steps
+        # share, so they reuse it without a page-table lookup.
         h = layer_outs[:n_devs]
-        topk_indices = layer_outs[n_devs:]
+        topk_indices = layer_outs[n_devs : 2 * n_devs]
 
-        postprocess = deepseek_logits_postprocess(
+        outputs = deepseek_logits_postprocess(
             h=h,
             input_row_offsets=input_row_offsets_,
             all_logits_input_row_offsets=all_logits_input_row_offsets,
@@ -363,9 +370,10 @@ class DeepseekV3_2NextN(Module):
             vocab_size=self.config.vocab_size,
         )
 
-        # Append the per-device top-k selection so the unified MTP module can
-        # gather and reuse it across subsequent draft steps.
-        return (*postprocess, *topk_indices)
+        # The per-device physical rows, so the unified MTP module can gather
+        # and reuse them across subsequent draft steps.
+        outputs["topk_indices"] = SparseIndices(rows=tuple(topk_indices))
+        return outputs
 
     def input_types(
         self, kv_params: KVCacheParamInterface

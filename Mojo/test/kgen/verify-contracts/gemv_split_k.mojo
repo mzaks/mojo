@@ -94,14 +94,13 @@ def ok_fp32_router[
         return
 
     # The launch of `gemv_gpu_dispatch`, for a static N.
-    @__parameter
     def launch[
         static_N: Int,
         num_threads: Int,
         tile_n: Int,
         unroll_factor: Int,
         tile_m: Int,
-    ]() raises:
+    ]() raises {imm}:
         if n != static_N:
             return
         comptime kernel = gemv_split_k[
@@ -175,14 +174,13 @@ def ok_bf16[
         return
 
     # The launch of `gemv_gpu_dispatch`, for a static N.
-    @__parameter
     def launch[
         static_N: Int,
         num_threads: Int,
         tile_n: Int,
         unroll_factor: Int,
         tile_m: Int,
-    ]() raises:
+    ]() raises {imm}:
         if n != static_N:
             return
         comptime kernel = gemv_split_k[
@@ -255,14 +253,13 @@ def ok_fp8[
         return
 
     # The launch of `gemv_gpu_dispatch`, for a static N.
-    @__parameter
     def launch[
         static_N: Int,
         num_threads: Int,
         tile_n: Int,
         unroll_factor: Int,
         tile_m: Int,
-    ]() raises:
+    ]() raises {imm}:
         if n != static_N:
             return
         comptime kernel = gemv_split_k[

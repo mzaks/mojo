@@ -52,8 +52,6 @@ _EXTRA_CONSTRAINTS = {
     "test_semaphore.mojo": ["//:nvidia_gpu"],
     "test_constant_memory.mojo": ["//:nvidia_gpu"],  # FIXME: KERN-1377
     "test_grid_dependence_control.mojo": ["//:h100_gpu"],
-    "test_has_amd_gpu.mojo": ["//:amd_gpu"],
-    "test_has_nvidia_gpu.mojo": ["//:nvidia_gpu"],
     "test_kernel_with_list.mojo": ["//:nvidia_gpu"],  # FIXME: KERN-1377 remove this
     "test_producer_consumer.mojo": ["//:h100_gpu"],
     "test_tbc_launch_config.mojo": ["//:h100_gpu"],
@@ -61,6 +59,9 @@ _EXTRA_CONSTRAINTS = {
     "test_wmma.mojo": ["//:nvidia_gpu"],
     "test_wmma_amd.mojo": ["//:amd_gpu"],
     "test_tcgen05.mojo": ["//:b200_gpu"],
+    "test_metal_math.mojo": ["//:apple_gpu"],  # Metal math lowering and subnormal handling (Apple only)
+    "test_metal_memory.mojo": ["//:apple_gpu"],  # Metal address-space handling (Apple only)
+    "test_metal_simd.mojo": ["//:apple_gpu"],  # Metal SIMD subvector operations (Apple only)
     "test_metal_print.mojo": ["//:apple_gpu"],  # Metal GPU print tests (Apple only)
     "test_debug_assert_gpu_error.mojo": _APPLE_GPU_INCOMPATIBLE,  # FIXME: MOCO-2405
     "test_print_elementwise.mojo": _APPLE_GPU_INCOMPATIBLE,  # FIXME: MOCO-2366
@@ -81,7 +82,6 @@ _GPU_MEMORY = {
     "test_dim.mojo": "1",
     "test_fast_div.mojo": "1",
     "test_fast_div_ptx.mojo": "1",
-    "test_has_nvidia_gpu.mojo": "1",
     "test_info.mojo": "1",
     "test_invariant_load.mojo": "1",
     "test_is_sm90.mojo": "1",

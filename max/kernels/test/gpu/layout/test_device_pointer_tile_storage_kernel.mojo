@@ -37,12 +37,12 @@ through that storage. Together those two accesses close the loop on the
   compile-time constants, so the kernel could "read" them without ever touching
   the `layout` field.)
 - The kernel reads the extents with `tile.dim[i]()` (a load from the `layout`
-  field) and writes through `tile.raw_store(...)` (the device pointer).
-  `DevicePointerEngine.store` reinterprets the handle's first bytes as a bare
-  device pointer — the cast pattern the lower-level probe validated in
+  field) and writes through a flat `reshape` view (the device pointer).
+  `DevicePointerEngine.unsafe_ptr` reinterprets the handle's first bytes as a
+  bare device pointer — the cast pattern the lower-level probe validated in
   isolation. The two together prove the `layout` field decoded at the right
   device offset and the encoded pointer is the real device address. (We store
-  at linear indices via `raw_store` rather than via `tile[r, c]`: the variadic
+  at linear indices of a flat view rather than via `tile[r, c]`: the variadic
   indexer's `IndexTypes.length == flat_rank` constraint can't be proven while
   `LayoutType` is an abstract kernel parameter.)
 
@@ -53,7 +53,8 @@ which walks the struct and encodes each field at its device-layout offset: a
 `DevicePassable` field runs its own `_to_device_type` (so the `_storage`
 handle's `DevicePointer` substitutes its device-side leaf — a real device
 address written via `encode_device_ptr` — rather than being byte-copied as the
-host `DeviceBuffer` reference), while the plain `layout` field is bit-copied.
+host `DeviceBuffer` reference), while the `layout` field's `Coord`s are
+bit-copied.
 A flat `encoder.encode(self, target)` would instead byte-copy the whole host
 struct — correct only for a plain `DefaultEngine`-backed tile, but for a
 `DevicePointer` handle it would copy the host reference verbatim and the kernel
@@ -101,8 +102,9 @@ def write_layout_dims_through_device_pointer_kernel[
     """
     if global_idx.x != 0:
         return
-    tile.raw_store[width=1](0, Float32(Int(tile.dim[0]())))
-    tile.raw_store[width=1](1, Float32(Int(tile.dim[1]())))
+    var flat = tile.reshape(row_major[_NUM_ELEMENTS]())
+    flat[0] = Float32(Int(tile.dim[0]()))
+    flat[1] = Float32(Int(tile.dim[1]()))
 
 
 def fill_tile_via_layout_and_device_pointer_kernel[
@@ -118,8 +120,9 @@ def fill_tile_via_layout_and_device_pointer_kernel[
     if global_idx.x != 0:
         return
     var count = Int(tile.dim[0]()) * Int(tile.dim[1]())
+    var flat = tile.reshape(row_major(count))
     for i in range(count):
-        tile.raw_store[width=1](i, Float32(i))
+        flat[i] = Float32(i)
 
 
 def test_kernel_reads_dynamic_layout_dims_after_device_pointer(

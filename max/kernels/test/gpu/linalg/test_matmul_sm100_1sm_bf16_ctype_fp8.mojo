@@ -12,14 +12,12 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.sys import argv, size_of
-import std.itertools
 import linalg.matmul.vendor.blas as vendor_blas
 from max.gpu.host import DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.random import rand
 from layout import (
     TileTensor,
-    Coord,
     CoordLike,
     row_major,
     Idx,
@@ -30,6 +28,7 @@ from linalg.matmul.gpu.sm100_structured.default.matmul import (
 from linalg.matmul.gpu.sm100_structured.structured_kernels.config import (
     MatmulConfig,
 )
+from std.utils.coord import DynamicCoord
 from std.testing import assert_equal
 
 from std.utils.index import Index, IndexList
@@ -52,7 +51,7 @@ def test_blackwell_matmul_tma_umma_warp_specialized[
     b_type: DType,
     c_type: DType,
     block_tile_shape: IndexList[3],
-    mma_shape: IndexList[3],
+    mma_shape: DynamicCoord[.int, 3],
     cluster_shape: StaticTuple[Int32, 3],
     cta_group: Int,
     transpose_b: Bool = True,
@@ -66,27 +65,21 @@ def test_blackwell_matmul_tma_umma_warp_specialized[
 ](ctx: DeviceContext, m: MType, n: NType, k: KType) raises:
     print(
         t"in/out dtypes=({a_type}, {b_type}, {c_type})  problem"
-        t" shape=({Int(m.value())}, {Int(n.value())}, {Int(k.value())})"
+        t" shape=({Int(m)}, {Int(n)}, {Int(k)})"
         t" mma_shape={mma_shape} block_tile_shape={block_tile_shape} cta_group={cta_group} cluster_shape=({cluster_shape[0]},"
         t" {cluster_shape[1]}, {cluster_shape[2]})"
         t" swapAB={swapAB} k_group_size={k_group_size}"
     )
 
-    var a_shape = row_major(Coord(m, Idx[KType.static_value]))
+    var a_shape = row_major(m, Idx[KType.static_value])
     var b_shape = row_major(
-        Coord(
-            Idx[NType.static_value if transpose_b else KType.static_value],
-            Idx[KType.static_value if transpose_b else NType.static_value],
-        )
+        Idx[NType.static_value if transpose_b else KType.static_value],
+        Idx[KType.static_value if transpose_b else NType.static_value],
     )
-    var c_shape = row_major(Coord(m, Idx[NType.static_value]))
-    var a_size = Int(m.value()) * Int(k.value())
-    var b_size = (
-        Int(n.value())
-        * Int(k.value()) if transpose_b else Int(k.value())
-        * Int(n.value())
-    )
-    var c_size = Int(m.value()) * Int(n.value())
+    var c_shape = row_major(m, Idx[NType.static_value])
+    var a_size = Int(m) * Int(k)
+    var b_size = Int(n) * Int(k) if transpose_b else Int(k) * Int(n)
+    var c_size = Int(m) * Int(n)
 
     var a_host_ptr = ctx.enqueue_create_host_buffer[a_type](a_size)
     var a_host = TileTensor(a_host_ptr, a_shape)
@@ -108,12 +101,12 @@ def test_blackwell_matmul_tma_umma_warp_specialized[
 
     # Initialize matmul operands
     if simple_init():
-        for m_idx in range(Int(m.value())):
-            for k_idx in range(Int(k.value())):
+        for m_idx in range(Int(m)):
+            for k_idx in range(Int(k)):
                 comptime assert a_host.flat_rank == 2
                 a_host[m_idx, k_idx] = Float32(m_idx + k_idx).cast[a_type]()
-        for n_idx in range(Int(n.value())):
-            for k_idx in range(Int(k.value())):
+        for n_idx in range(Int(n)):
+            for k_idx in range(Int(k)):
                 b_host[n_idx, k_idx] = Float32(n_idx + k_idx).cast[b_type]()
     else:
         rand(a_host.as_span(), min=-1.0, max=1.0)
@@ -198,8 +191,8 @@ def main() raises:
             # we support all range of mma_n_scales in range(1, 33) but the test will time out so we only test a subset
             comptime for mma_m in [64, 128]:
                 comptime for mma_n in range(16, 256 + 1, 16):
-                    comptime block_tile_shape = Index(mma_m, mma_n, BK)
-                    comptime umma_shape = Index(mma_m, mma_n, MMA_K)
+                    comptime block_tile_shape = (mma_m, mma_n, BK)
+                    comptime umma_shape = (mma_m, mma_n, MMA_K)
 
                     # Output TMA expects mma_n to be divisible by 16 for FP8 output
                     comptime if mma_n % 16 != 0:

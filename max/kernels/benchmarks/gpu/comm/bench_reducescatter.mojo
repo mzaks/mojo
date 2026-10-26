@@ -34,7 +34,7 @@ from max.benchmark import (
 )
 from comm.sync import enable_p2p
 from comm.reducescatter import reducescatter, ReduceScatterConfig
-from layout import Idx, TileTensor, row_major
+from layout import TileTensor, row_major
 from comm import Signal
 from max.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
 from internal_utils import (
@@ -48,7 +48,6 @@ from std.testing import assert_almost_equal, assert_true
 
 
 @inline(.always)
-@__parameter
 def _per_gpu_value[
     dtype: DType,
 ](gpu_rank: Int, j: Int) -> Scalar[dtype]:

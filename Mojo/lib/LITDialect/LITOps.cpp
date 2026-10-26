@@ -188,7 +188,8 @@ ArrayRef<ParamDeclAttr> FileModuleOp::getInputParams() { return {}; }
 void PackageOp::build(OpBuilder &builder, OperationState &state,
                       StringAttr name) {
   build(builder, state, name, /*sym_visibility=*/nullptr, /*docString=*/{},
-        /*dependencies=*/{}, /*externLLVMBitcodeModules=*/{});
+        /*dependencies=*/{}, /*externLLVMBitcodeModules=*/{},
+        /*isNamespace=*/nullptr);
   assert(state.regions.size() == 1);
   state.regions.back()->push_back(new Block());
 }
@@ -205,11 +206,9 @@ ArrayRef<ParamDeclAttr> PackageOp::getInputParams() { return {}; }
 
 LogicalResult PackageOp::verify() {
   for (Operation &op : *getBody()) {
-    if (!isa<FileModuleOp, PackageOp, ImportOp, UnresolvedImportOp,
-             UnresolvedWildcardImportOp>(op)) {
-      return emitOpError("expected only `lit.file_module`, `lit.package`, "
-                         "`lit.unresolved_import`, or "
-                         "`lit.unresolved_wildcard_import` in its body")
+    if (!isa<FileModuleOp, PackageOp>(op)) {
+      return emitOpError(
+                 "expected only `lit.file_module` or `lit.package` in its body")
           .attachNote(op.getLoc())
           .append("see operation defined here");
     }
@@ -383,7 +382,7 @@ static LogicalResult verifyCallOp(OpT op, FuncType sig, ValueRange operands,
              << expected.size() << " " << kind << "s but got " << types.size();
     }
     for (auto [i, type, exp] : llvm::enumerate(types, expected)) {
-      if (type == exp)
+      if (isEqualCanon(type, exp))
         continue;
       return op.emitOpError("callee expected call ")
              << kind << " #" << i << " to be " << exp << " but got " << type;
@@ -683,26 +682,6 @@ TypedAttr FnOp::getBoundReference(ParameterEvaluationContext &evalContext,
   if (!bindings) // We allow null for convenience.
     bindings = ParameterExprArrayAttr::get(getContext(), {});
 
-  if (ParamDeclAttr decl = getParamDeclAttr()) {
-    // KGEN expects different binding types than Lit can provide.
-    SmallVector<TypedAttr> reboundBindings;
-    ParameterEvaluator evaluator;
-    evaluator.setEvaluationContext(&evalContext);
-    for (auto [binding, type] :
-         llvm::zip(bindings, getFullSignature().getInputParamTypes())) {
-      TypedAttr value = binding;
-      Type unboundType = evaluator.getReboundType(type);
-      if (unboundType != value.getType())
-        value = ParamOperatorAttr::getRebind(value, unboundType);
-      evaluator.appendIndexBinding(value);
-      reboundBindings.push_back(value);
-    }
-
-    TypedAttr generator = ParamDeclRefAttr::get(decl);
-    return BindParamsAttr::get(generator.getContext(), generator,
-                               reboundBindings, &evalContext);
-  }
-
   SymbolRefAttr symbol = getFullyResolvedSymbolRef(*this);
   auto unboundSymbol = SymbolConstantAttr::get(symbol, getFullSignature());
   auto resultType = cast<FuncTypeGeneratorType>(
@@ -720,10 +699,6 @@ FnOp::getBoundSymbolRef(ParameterEvaluationContext &evalContext,
 TypedAttr FnOp::getFuncLiteralGenerator(
     ParameterEvaluationContext &evalContext, ParameterExprArrayAttr bindings,
     const llvm::BitVector &dischargedBodyConstraints) {
-  // legacy @__parameter closure is not a function literal.
-  if (getParamDeclAttr())
-    return getBoundReference(evalContext, bindings);
-
   SmallVector<TypedAttr> paramValues;
   FnTypeGeneratorType fullSig = getFullSignature();
   SymbolRefAttr symbol = getFullyResolvedSymbolRef(*this);
@@ -737,13 +712,11 @@ TypedAttr FnOp::getFuncLiteralGenerator(
 
   auto unboundGen = GeneratorAttr::get(fullSig.getInputParamTypes(), fnLiteral,
                                        fullSig.getParamListAttrs());
-  if (!bindings || llvm::all_of(bindings, [](TypedAttr binding) {
-        return isa<UnboundAttr>(binding);
-      })) {
+  if (!bindings || llvm::all_of(bindings, llvm::IsaPred<UnboundAttr>)) {
     // If all the provided bindings are unbound, return the original generator.
-    // FIXME: this is a hack to avoid the bug when UnboundAttr erased type
-    // dependencies, which results in BindParamsAttr being folded in a wrong
-    // way.
+    // FIXME(MOCO-3542): this is a hack to avoid the bug when UnboundAttr erased
+    // type dependencies, which results in BindParamsAttr being folded in a
+    // wrong way.
     //
     // E.g.,
     //
@@ -792,10 +765,11 @@ static void printImplicitOriginMutability(AsmPrinter &p, OriginType type) {
 // These FuncOp attributes are disallowed while parsing since they can
 // be inferred. Likewise while printing we ignore them.
 static StringRef disallowedAttrNames[] = {
-    "sym_name",          "exportKind",   "constraints", "implements",
-    "funcTypeGenerator", "functionType", "sym_name",    "argNames",
-    "paramNames",        "evaluator",    "defaultImpl", "inlineLevel",
-    "paramDecl",         "params",       "decorators",  "argPassingKinds"};
+    "sym_name",   "exportKind",        "constraints",
+    "implements", "funcTypeGenerator", "functionType",
+    "sym_name",   "argNames",          "paramNames",
+    "evaluator",  "defaultImpl",       "inlineLevel",
+    "params",     "decorators",        "argPassingKinds"};
 
 static ParseResult parseLITFunctionSignature(
     OpAsmParser &p, SmallVectorImpl<OpAsmParser::Argument> &args,
@@ -1019,16 +993,10 @@ ParseResult FnOp::parse(OpAsmParser &parser, OperationState &result) {
     return failure();
   result.addAttribute(getExportKindAttrName(result.name), exportKind);
 
-  // Parse the name as a symbol or a parameter declaration.
   StringAttr nameAttr;
-  bool isParamDecl = false;
-  if (parser.parseOptionalSymbolName(nameAttr)) {
-    if (parseParamName(parser, nameAttr))
-      return failure();
-    isParamDecl = true;
-  }
-  if (!isParamDecl)
-    result.addAttribute(getSymNameAttrName(result.name), nameAttr);
+  if (parser.parseSymbolName(nameAttr))
+    return failure();
+  result.addAttribute(getSymNameAttrName(result.name), nameAttr);
 
   // Parse the function signature.
   SmallVector<OpAsmParser::Argument> entryArgs;
@@ -1050,9 +1018,6 @@ ParseResult FnOp::parse(OpAsmParser &parser, OperationState &result) {
   result.addAttribute(getParamsAttrName(result.name), params);
   result.addAttribute(getFunctionTypeAttrName(result.name),
                       TypeAttr::get(functionType));
-  if (isParamDecl)
-    result.addAttribute(getParamDeclAttrName(result.name),
-                        ParamDeclAttr::get(nameAttr, signature));
 
   // If function attributes are present, parse them.
   NamedAttrList parsedAttributes;
@@ -1089,10 +1054,7 @@ void FnOp::print(OpAsmPrinter &p) {
   // Print the operation and the function name.
   printSymbolExport(p, *this, getExportKindAttr());
   p << ' ';
-  if (ParamDeclAttr decl = getParamDeclAttr())
-    printParamName(p, decl.getName());
-  else
-    p.printSymbolName(*getSymName());
+  p.printSymbolName(*getSymName());
 
   // Print the function arguments. Here we need all the use defined names.
   printLITFunctionSignature(p, &getBodyRegion(), getParams(), getFunctionType(),
@@ -1162,24 +1124,13 @@ LogicalResult FnOp::verify() {
   return success();
 }
 
-void FnOp::walkDeclarations(function_ref<void(ParamDeclAttr)> walkDecl) {
-  if (auto decl = getParamDeclAttr())
-    walkDecl(decl);
-}
+void FnOp::walkDeclarations(function_ref<void(ParamDeclAttr)> walkDecl) {}
 
 void FnOp::walkDefinitions(
-    function_ref<void(ParamDeclAttr, const ParamDefValue &)> walkDef) {
-  if (auto decl = getParamDeclAttr())
-    walkDef(decl, &getBodyRegion());
-}
+    function_ref<void(ParamDeclAttr, const ParamDefValue &)> walkDef) {}
 
 void FnOp::renameDeclarations(ArrayRef<ParamDeclAttr> decls) {
-  if (getParamDecl()) {
-    assert(decls.size() == 1);
-    setParamDeclAttr(decls.front());
-  } else {
-    assert(decls.empty());
-  }
+  assert(decls.empty());
 }
 
 /// This operation has no uses to collect in its current scope.
@@ -1204,6 +1155,8 @@ SmallVector<ParamDeclAttr> FnOp::collectAllParams(bool includeImplOrigins) {
 }
 
 FnTypeGeneratorType FnOp::getFullSignature() {
+  if (TypeAttr resolved = getResolvedFullSignatureAttr())
+    return cast<FnTypeGeneratorType>(resolved.getValue());
   return LIT::getFullSignature((*this)->getParentOp(), getFuncTypeGenerator());
 }
 
@@ -1212,7 +1165,7 @@ void FnOp::build(OpBuilder &builder, OperationState &result, StringAttr name,
                  StringAttr sourceName, FuncTypeGeneratorType signature) {
   MLIRContext *ctx = builder.getContext();
   UnitAttr none;
-  build(builder, result, name, /*sym_visibility=*/nullptr, ParamDeclAttr(),
+  build(builder, result, name, /*sym_visibility=*/nullptr,
         TypeAttr::get(signature),
         TypeAttr::get(signature.getBody().getValues()),
         ParamDeclArrayAttr::get(ctx, {}), DecoratorsAttr::get(ctx, {}),
@@ -1228,7 +1181,8 @@ void FnOp::build(OpBuilder &builder, OperationState &result, StringAttr name,
         /*defaultFnRef=*/{}, StringAttr(), DocStringAttr(),
         /*deprecationInfo=*/{}, /*unavailableInfo=*/{},
         /*hasStableDecorator=*/none, /*stableSinceVersion=*/{},
-        ArrayAttr::get(ctx, {}), ArrayAttr::get(ctx, {}), Attribute());
+        ArrayAttr::get(ctx, {}), ArrayAttr::get(ctx, {}), Attribute(),
+        /*noDocRequired=*/none, /*resolvedFullSignature=*/TypeAttr());
   result.regions[0]->push_back(new Block());
 }
 
@@ -1336,7 +1290,8 @@ LIT::StructType StructDeclOp::bindReference(ArrayRef<TypedAttr> paramValues) {
     SmallVector<TypedAttr> unbound;
     ParameterEvaluator evaluator;
     for (Type type : sig.getParamTypes()) {
-      unbound.push_back(UnboundAttr::get(evaluator.getReboundType(type)));
+      auto canonical = getCanonicalType(type);
+      unbound.push_back(UnboundAttr::get(evaluator.getReboundType(canonical)));
       evaluator.appendIndexBinding(unbound.back());
     }
     return LIT::StructType::get(symbol, unbound, sig);
@@ -1376,32 +1331,14 @@ void StructDeclOp::getFieldTypes(SmallVectorImpl<TypedAttr> &types,
     types.push_back(TypeParamAttr::get(field.getType(), metaType));
 }
 
-/// The annotations selected by `fieldIndex`: the struct's own when negative,
-/// otherwise those on the field at that index.
-ParameterExprArrayAttr
-StructDeclOp::getSelectedAnnotations(int64_t fieldIndex) {
-  if (fieldIndex < 0)
+FailureOr<ArrayAttr> StructDeclOp::getAnnotations(std::optional<int> fieldIdx) {
+  if (!fieldIdx.has_value())
     return getAnnotationsAttr();
-  int64_t index = 0;
-  for (StructFieldOp field : getFieldDecls())
-    if (index++ == fieldIndex)
+
+  for (auto [idx, field] : llvm::enumerate(getFieldDecls()))
+    if (static_cast<int>(idx) == *fieldIdx)
       return field.getAnnotationsAttr();
-  return {};
-}
-
-void StructDeclOp::getAnnotationValues(SmallVectorImpl<TypedAttr> &values,
-                                       int64_t fieldIndex) {
-  if (ParameterExprArrayAttr annotations = getSelectedAnnotations(fieldIndex))
-    llvm::append_range(values, annotations.getValue());
-}
-
-void StructDeclOp::getAnnotationTypes(SmallVectorImpl<TypedAttr> &types,
-                                      Type metaType, int64_t fieldIndex) {
-  // Nothing has been lowered yet here, so each value still carries its
-  // nominal type.
-  if (ParameterExprArrayAttr annotations = getSelectedAnnotations(fieldIndex))
-    for (TypedAttr value : annotations.getValue())
-      types.push_back(TypeParamAttr::get(value.getType(), metaType));
+  return failure();
 }
 
 /// Verify the debuginfo scope of an op that must be a top-level declaration.
@@ -1438,10 +1375,22 @@ DebugInfo::DIScopeAttr StructDeclOp::getLocScope() {
   return getTopLevelScope(*this);
 }
 
-/// Verify that there are no duplicate field names.
+/// Verify that there are no duplicate field or enum case names.
 LogicalResult StructDeclOp::verifyRegions() {
   SmallDenseMap<StringAttr, StructFieldOp, 8> seenFields;
+  SmallDenseMap<StringAttr, EnumCaseOp, 8> seenCases;
   for (Operation &op : getFields().front()) {
+    if (auto enumCase = dyn_cast<EnumCaseOp>(&op)) {
+      auto [it, inserted] =
+          seenCases.try_emplace(enumCase.getNameAttr(), enumCase);
+      if (!inserted) {
+        auto diag = enumCase.emitError("duplicate enum case ")
+                    << enumCase.getNameAttr();
+        diag.attachNote(it->second.getLoc()) << "see previous declaration here";
+        return failure();
+      }
+      continue;
+    }
     auto field = dyn_cast<StructFieldOp>(&op);
     if (!field)
       continue;
@@ -1464,12 +1413,25 @@ void StructDeclOp::build(OpBuilder &builder, OperationState &result,
         TypeAttr::get(TraitType::get(ctx, {})),
         /*isSynthetic=*/{},
         /*nonmaterializableTarget=*/{}, /*moveInit=*/{},
-        /*copyInit=*/{}, /*linearTypeErrorMsg*/ {}, /*closureSignature=*/{},
+        /*copyInit=*/{}, /*linearTypeErrorMsg*/ {}, /*closureThunkKey=*/{},
         /*docString=*/{}, /*deprecationInfo=*/{}, /*unavailableInfo=*/{},
         /*hasStableDecorator=*/{}, /*stableSinceVersion=*/{}, /*sourceName=*/{},
-        /*minAlignment=*/{}, /*convention=*/{}, /*definesClosure=*/{},
-        /*registerPassableConstraint=*/{}, /*annotations=*/{});
+        /*minAlignment=*/{}, /*convention=*/{},
+        /*registerPassableConstraint=*/{}, /*annotations=*/{},
+        /*isEnum=*/{});
   result.regions[0]->push_back(new Block());
+}
+
+//===----------------------------------------------------------------------===//
+// EnumCaseOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult EnumCaseOp::verify() {
+  if (!cast<StructDeclOp>((*this)->getParentOp()).isEnum())
+    return emitOpError("expected to be in the body of an enum");
+  if (getName().empty())
+    return emitOpError("expected a non-empty case name");
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -2015,12 +1977,12 @@ LogicalResult RefUpcastOp::verify() {
 //===----------------------------------------------------------------------===//
 
 void RefFromPointerOp::build(OpBuilder &builder, OperationState &result,
-                             Value pointer, TypedAttr origin, bool startsUninit,
-                             bool endsUninit) {
+                             Value pointer, TypedAttr origin, StringAttr name,
+                             bool startsUninit, bool endsUninit) {
   auto ptr = cast<PointerType>(pointer.getType());
   auto refType =
       RefType::get(ptr.getElementType(), origin, ptr.getAddressSpace());
-  build(builder, result, refType, pointer, startsUninit, endsUninit);
+  build(builder, result, refType, pointer, name, startsUninit, endsUninit);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2069,6 +2031,19 @@ LogicalResult RefFromKgenPtrOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// MemcpyOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult MemcpyOp::verify() {
+  Type srcElementType = getSrc().getType().getElementType();
+  Type dstElementType = getDst().getType().getElementType();
+  if (!isEqualCanon(srcElementType, dstElementType))
+    return emitOpError("source and destination element types must match, got ")
+           << srcElementType << " and " << dstElementType;
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // TraitDeclOp
 //===----------------------------------------------------------------------===//
 
@@ -2079,19 +2054,16 @@ DebugInfo::DIScopeAttr TraitDeclOp::getLocScope() {
 void TraitDeclOp::build(OpBuilder &builder, OperationState &result,
                         StringAttr name) {
   MLIRContext *ctx = builder.getContext();
-  UnitAttr none;
   build(builder, result, name, /*sym_visibility=*/nullptr,
         TypeAttr::get(TypeSignatureType::get(ctx)),
         ParamDeclArrayAttr::get(ctx, {}),
         TypeAttr::get(TraitType::get(ctx, {})),
         TraitSymbolArrayAttr::get(ctx, {}),
         /*convention=*/TypeConvention::Unspecified,
-        /*definesClosure=*/none,
         /*docString=*/{},
         /*deprecationInfo=*/{}, /*unavailableInfo=*/{},
         /*hasStableDecorator=*/{}, /*stableSinceVersion=*/{},
-        /*linearTypeErrorMsg*/ {}, /*closureSignature*/ {},
-        /*sourceName=*/{});
+        /*linearTypeErrorMsg*/ {}, /*sourceName=*/{});
   result.regions[0]->push_back(new Block());
 }
 

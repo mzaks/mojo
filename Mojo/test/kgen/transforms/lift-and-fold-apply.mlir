@@ -4,8 +4,11 @@ kgen.generator @pass(%arg0: index) -> index {
   hlcf.return %arg0 : index
 }
 
+// The lifted signature no longer rebuilds the self-contained one, so that is
+// printed too.
 // CHECK-LABEL: kgen.generator @take_and_pass
-// CHECK-SAME: !pop.array<*[[L0:.*]], index>
+// CHECK-SAME: !pop.array<*[[L0:"[^"]*"]], index>
+// CHECK-SAME: attributes {funcTypeGenerator = !kgen.generator<<index>() -> !pop.array<apply(:(index) -> index @pass, *(0,0)), index>>}
 kgen.generator @take_and_pass<N>() -> !pop.array<apply(:(index) -> index @pass, N), index> {
   // CHECK-NEXT: apply *[[L0]] = [(index) -> index: @pass](N)
   hlcf.unreachable
@@ -28,14 +31,6 @@ kgen.generator @lift_apply() {
   // CHECK: call @take_and_pass<*[[L2]]>() : () -> !pop.array<*[[L3]], index>
   %0 = kgen.call @take_and_pass<apply(:(index) -> index @pass, p1)>() : ()
     -> !pop.array<apply(:(index) -> index @pass, apply(:(index) -> index @pass, p1)), index>
-
-  // CHECK: region F = <p2>
-  kgen.param.declare.region F = <p2>() {
-    // CHECK: apply *[[L4:.*]] = [(index) -> index: @pass](p2)
-    // CHECK: constant = <*[[L4]]>
-    kgen.param.constant = <apply(:(index) -> index @pass, p2)>
-    hlcf.return
-  }
 
   hlcf.return
 }
@@ -93,6 +88,32 @@ kgen.generator @nohoist_cond() {
   kgen.param.declare cond: !kgen.scalar<bool> = <false>
   // CHECK-NOT: kgen.param.apply
   kgen.param.declare value = <cond(cond, apply(:() -> index @bad), 1)>
+  hlcf.return
+}
+
+kgen.generator @first_cond() -> !kgen.scalar<bool> {
+  hlcf.unreachable
+}
+
+kgen.generator @later_cond() -> !kgen.scalar<bool> {
+  hlcf.unreachable
+}
+
+// CHECK-LABEL: kgen.generator @comptime_if_lifts_only_first_cond
+kgen.generator @comptime_if_lifts_only_first_cond() {
+  // COM: A later comptime.if condition is only evaluated when the earlier
+  // COM: ones are false, so hoisting it would evaluate it unconditionally.
+  // CHECK-NEXT: apply *[[L0:.*]] = [{{.*}}@first_cond]()
+  // CHECK-NOT: kgen.param.apply
+  // CHECK: hlcf.comptime.if *[[L0]] {
+  // CHECK: } elif apply({{.*}}@later_cond) {
+  hlcf.comptime.if apply(:() -> !kgen.scalar<bool> @first_cond) {
+    hlcf.comptime.yield
+  } elif apply(:() -> !kgen.scalar<bool> @later_cond) {
+    hlcf.comptime.yield
+  } else {
+    hlcf.comptime.yield
+  }
   hlcf.return
 }
 

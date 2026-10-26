@@ -13,18 +13,14 @@
 
 
 from std.math.uutils import ualign_down
-from std.sys import size_of, has_amd_gpu_accelerator
+from std.sys import size_of
 
 from comm.allgather import allgather
 from comm import Signal
 from comm.sync import enable_p2p, init_signal_buffer
 import comm.vendor.ccl as vendor_ccl
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
-from layout import (
-    Idx,
-    TileTensor,
-    row_major,
-)
+from layout import TileTensor, row_major
 from std.testing import assert_equal, assert_true
 
 
@@ -119,8 +115,7 @@ def all_gather_test[
     )
 
     def tt_out_bufs_at(i: Int) {mut out_bufs_list, imm} -> OutTileType:
-        var device_idx = i // ngpus
-        var input_idx = i % ngpus
+        var device_idx, input_idx = divmod(i, ngpus)
         return TileTensor(
             out_bufs_list[device_idx][input_idx],
             row_major(lengths[input_idx]),
@@ -135,7 +130,7 @@ def all_gather_test[
             uniform = False
             break
 
-    if uniform and has_amd_gpu_accelerator():
+    if uniform and list_of_ctx.T.target.is_amd_gpu():
         # Reset outputs for vendor test
         for device_idx in range(ngpus):
             for input_idx in range(ngpus):
@@ -288,8 +283,7 @@ def grouped_all_gather_test[
     )
 
     def tt_out_bufs_at(i: Int) {mut out_bufs_list, imm} -> OutTileType:
-        var device_idx = i // group_size
-        var local_idx = i % group_size
+        var device_idx, local_idx = divmod(i, group_size)
         var group_start = ualign_down(device_idx, group_size)
         var input_idx = group_start + local_idx
         return TileTensor(
@@ -429,8 +423,7 @@ def relay_all_gather_test[
     )
 
     def tt_out_bufs_at(i: Int) {mut out_bufs_list, imm} -> OutTileType:
-        var device_idx = i // group_size
-        var local_idx = i % group_size
+        var device_idx, local_idx = divmod(i, group_size)
         var group_start = ualign_down(device_idx, group_size)
         return TileTensor(
             out_bufs_list[device_idx][local_idx],

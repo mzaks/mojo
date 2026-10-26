@@ -27,14 +27,16 @@ These primitives are essential for implementing complex GPU execution pipelines 
 multiple kernels need to execute in a specific order with minimal overhead. They
 eliminate the need for host-side synchronization when orchestrating dependent GPU work.
 """
-from max.gpu.host.launch_attribute import (
+from max.gpu.host import (
     LaunchAttribute,
     LaunchAttributeID,
     LaunchAttributeValue,
 )
-from std.sys import has_nvidia_gpu_accelerator
+from std._gpu.host.info import TargetAccelerator
 
-from ..host.info import H100, GPUInfo
+from max._plugin._overlay import TARGETS
+
+from ..host.info import H100
 
 comptime _SUPPORT_PDL_LAUNCH = _support_pdl_launch()
 
@@ -51,9 +53,11 @@ def _support_pdl_launch() -> Bool:
         True if PDL is supported and enabled, False otherwise.
     """
 
+    comptime default = TargetAccelerator.default_accelerator[TARGETS]()
+
     comptime if (
-        has_nvidia_gpu_accelerator()
-        and GPUInfo.current_accelerator().compute >= H100.compute
+        default.target.is_nvidia_gpu()
+        and default.gpu_info.compute >= H100.compute
     ):
         return True
     else:

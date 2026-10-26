@@ -12,10 +12,9 @@
 # ===----------------------------------------------------------------------=== #
 """Provides general test utility functions for the Mojo standard library tests."""
 
-from std.ffi import external_call
-
-from std.simd import _simd_apply
+from std.memory import MaybeUninit
 from std.testing import assert_equal, assert_true
+from std.utils._nicheable import NicheIndex, UnsafeNicheable
 
 
 def check_write_to(
@@ -61,47 +60,26 @@ def check_write_to(
     assert_true(contains in string)
 
 
-@inline(.always)
-def libm_call[
-    dtype: DType,
-    width: SIMDLength,
-    //,
-    fn_fp32: StaticString,
-    fn_fp64: StaticString,
-](arg: SIMD[dtype, width]) -> SIMD[dtype, width]:
-    """Calls a libm function with the appropriate float32 or float64 version.
+def check_niches[T: UnsafeNicheable]() raises:
+    """Check that `T` classifies its first, second, and last niches as the
+    niche that was written.
 
     Parameters:
-        dtype: The data type (must be float32 or float64).
-        width: The SIMD width.
-        fn_fp32: Name of the float32 version of the libm function.
-        fn_fp64: Name of the float64 version of the libm function.
+        T: The nicheable type to check.
 
-    Args:
-        arg: The input SIMD vector.
-
-    Returns:
-        The result of calling the libm function.
+    Raises:
+        Error: if `T.classify_niche` disagrees with `T.write_niche`.
     """
+    comptime count = T.niche_count()
+    _check_niche[T, 0]()
+    comptime if count > 1:
+        _check_niche[T, 1]()
+        _check_niche[T, count - 1]()
 
-    @inline(.nodebug)
-    def _float32_dispatch[
-        input_type: DType, result_type: DType
-    ](arg: Scalar[input_type]) -> Scalar[result_type]:
-        return external_call[fn_fp32, Scalar[result_type]](arg)
 
-    @inline(.nodebug)
-    def _float64_dispatch[
-        input_type: DType, result_type: DType
-    ](arg: Scalar[input_type]) -> Scalar[result_type]:
-        return external_call[fn_fp64, Scalar[result_type]](arg)
-
-    comptime assert dtype in [
-        DType.float32,
-        DType.float64,
-    ], "input dtype must be float32 or float64"
-
-    comptime if dtype == .float32:
-        return _simd_apply[_float32_dispatch, result_dtype=dtype](arg)
-    else:
-        return _simd_apply[_float64_dispatch, result_dtype=dtype](arg)
+def _check_niche[T: UnsafeNicheable, index: Int]() raises:
+    var storage = MaybeUninit[T]()
+    T.write_niche[index](Pointer(to=storage))
+    var classified = T.classify_niche(Pointer(to=storage))
+    storage^.unsafe_forget()
+    assert_true(classified == NicheIndex(index))

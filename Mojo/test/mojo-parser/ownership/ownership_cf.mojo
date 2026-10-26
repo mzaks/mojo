@@ -732,3 +732,88 @@ def nested_for_reassign_nontrivial():
         # CHECK-NEXT: lifetime.end %mem
         # CHECK-NEXT: hlcf.continue "_loop_0"
         use(mem)
+
+
+# MOCO-4908: a value whose only use is on a path ending in a no-return call
+# must stay alive for that use and be destroyed on the other path.
+# CHECK-LABEL: lit.fn @"use_before_noreturn_in_if
+def use_before_noreturn_in_if(cond: Bool):
+    # CHECK: %mem = lit.var.decl
+    # CHECK-NEXT: lifetime.start %mem
+    # CHECK-NEXT: lit.call {{.*}}MemExample::@"__init__{{.*}}(%mem)
+    # CHECK-NOT: __deinit__
+    # CHECK: hlcf.if
+    var mem = MemExample()
+    if cond:
+        # CHECK-NOT: __deinit__
+        # CHECK: lit.call {{.*}}@"use(
+        # CHECK-NOT: __deinit__
+        # CHECK: hlcf.unreachable
+        use(mem)
+        abort()
+    # CHECK-NEXT: } else {
+    # CHECK-NEXT: lit.call {{.*}}MemExample::@"__deinit__{{.*}}(%mem)
+    # CHECK-NEXT: lifetime.end %mem
+
+
+def make_mem() raises -> MemExample:
+    return MemExample()
+
+
+# A temporary from an earlier 'try' is still fully live at a later no-return
+# call but out of scope there, so it must not be destroyed on the other path.
+# CHECK-LABEL: lit.fn @"noreturn_except_after_try
+def noreturn_except_after_try() raises:
+    # CHECK: %__call_result_tmp__ = lit.var.decl
+    # CHECK: lit.call {{.*}}MemExample::@"__deinit__{{.*}}(%__call_result_tmp__)
+    try:
+        _ = make_mem()
+    except e:
+        raise e^
+    # CHECK-NOT: __deinit__{{.*}}(%__call_result_tmp__)
+    # CHECK: hlcf.unreachable
+    # CHECK-NOT: __deinit__{{.*}}(%__call_result_tmp__)
+    # CHECK: hlcf.return
+    var mem: MemExample
+    try:
+        mem = make_mem()
+    except e:
+        abort()
+    use(mem)
+
+
+def make_optional_string() -> Optional[String]:
+    return String("payload")
+
+def make_optional_int() -> Optional[Int]:
+    return Optional[Int](None)
+
+
+def make_optional_movable() -> Optional[MyStringReturningCtx]:
+    return MyStringReturningCtx()
+
+
+# The rvalue `Optional` must transfer its payload into `x` rather than borrow
+# the payload and require a copy.
+def extract_temporary_optional_payload() -> MyStringReturningCtx:
+    match make_optional_movable():
+        case .Some(var x):
+            return x^
+        case .None:
+            abort()
+
+
+# The enum payload reference is tied to the temporary returned by
+# `make_optional_string()`.
+def match_temporary_optional_payload():
+    match make_optional_string():
+    case .Some(payload):
+        use(payload)
+    case .None:
+        pass
+
+    match make_optional_string():
+    case .Some(payload):
+        _ = payload
+    case .None:
+        pass

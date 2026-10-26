@@ -31,16 +31,17 @@ class Qwen3_5MemoryPlanner(PagedMemoryPlanner):
 
     _always_signal_buffers = True
 
-    def shadow_state_bytes(self) -> int:
-        """Per-request bytes in a *second* copy of the state pools, or 0.
+    def spec_state_bytes(self, pipeline_config: PipelineConfig) -> int:
+        """Returns the bytes a request holds beyond its live state, or 0.
 
-        An unspeculated arch allocates one pool set, so nothing here. A
-        speculative one verifies on a shadow set and must price it: the bytes
-        are per request like the live pools, and they are invisible to the
-        reconciliation assert in ``load_model`` because the shadow is
-        allocated after it runs.
+        An unspeculated model allocates one pool set, so nothing here. A
+        speculative one holds its verify's ring per request. Counted only
+        when a batch size is inferred.
         """
-        return 0
+        assert isinstance(self._config, Qwen3_5Config)
+        return self._config._per_request_ring_bytes(
+            self._config._verify_ring_len(pipeline_config)
+        )
 
     def infer_max_batch_size(
         self,
@@ -60,6 +61,6 @@ class Qwen3_5MemoryPlanner(PagedMemoryPlanner):
             device_memory_utilization=(
                 pipeline_config.model.kv_cache.device_memory_utilization
             ),
-            extra_per_request_bytes=self.shadow_state_bytes(),
+            extra_per_request_bytes=self.spec_state_bytes(pipeline_config),
         )
         return inferred

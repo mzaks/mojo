@@ -36,15 +36,18 @@ NVFP4 routing (B200-tuned via ablation):
     Large prefill (avg_m > 64):    AB_swapped=True, mma_bn=128, cta_group=2
 
   Tuned stages live in `NVFP4_TUNED_STAGES`, one row per (N, K, regime).
-  A (shape, regime) pair with no row there falls through to stages=auto.
+  A decode (shape, regime) pair with no row there groups two k-tiles per
+  stage at `DECODE_K_GROUP_STAGES` when its k-tile count is even, else
+  uses `DECODE_DEFAULT_STAGES`; the other regimes fall through to
+  stages=auto.
 """
 
 from std.collections import Optional
+from std.math import ceildiv
 
 from max.gpu.host import DeviceContext
 from max.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
 from max.gpu.primitives.grid_controls import PDLLevel
-from std.utils.index import Index
 from layout import TileTensor
 
 from linalg.fp4_utils import (
@@ -60,6 +63,7 @@ from .grouped_1d1d_matmul_kernel import (
     NullSwiGLUOutput,
     SwiGLUOutput,
 )
+from ..structured_kernels.row_scales import NullRowScales, RowScales
 
 
 # Regime thresholds on avg_m = estimated_total_m / num_active_experts. Rows
@@ -69,37 +73,56 @@ from .grouped_1d1d_matmul_kernel import (
 comptime DECODE_AVG_M = 8
 comptime SMALL_PREFILL_AVG_M = 64
 
+# Decode depth for shapes without an `NVFP4_TUNED_STAGES` row. On B200 the
+# auto depth (10 stages) was 3-6% slower than 6 at 8-64 tokens.
+comptime DECODE_DEFAULT_STAGES = 6
+
+# Decode stages hold two 128-byte k-tiles of each weight row when the
+# k-tile count is even. A stage's barrier and scale handoff then cover twice
+# the bytes, which bounds one CTA's rate in a partial wave. On B200, eight
+# k-tiles in four stages beat one tile per stage and the other (group,
+# depth) pairs tried.
+comptime DECODE_K_GROUP = 2
+comptime DECODE_K_GROUP_STAGES = 8
+
+# NVFP4 values in one 128-byte k-tile.
+comptime _NVFP4_K_TILE = 256
+
 # Tuned NVFP4 pipeline depths as (N, K, regime, stages), where `regime` is
 # the regime row's `upper_avg_m` bound (-1 = large prefill). A (shape,
-# regime) pair absent from this table uses stages=auto, which maximizes
-# depth against the SMEM budget. Every row is a B200 ablation result
-# (bench_grouped_matmul); don't add one without a measurement.
-#
-# (N=7168, K=2048) DeepSeek-V3 down-proj decode: stages 4->6 is a
-# no-regret win that grows with the active expert count -- ~0% at 8
-# active experts (grid too small to benefit), +11% at 12, +5% at 16.
-# The down-proj has only 8 K-iters, so the deeper pipeline overlaps
-# cold-weight loads under more concurrent CTAs as the grid widens; the
-# up-proj (N=4096, K=7168) is already optimal at 6.
-#
-# (N=2048, K=4096) Inkling-Small TP=2 gate+up decode: the K-loop runs
-# only 16 iterations (BK=128 over the packed byte count), too few to fill
-# the 10 stages the auto-maximizer picks, so the extra stages only add
-# prologue latency. A stage sweep puts the minimum at 6.
+# regime) pair absent from this table uses stages=auto (maximum depth
+# against the SMEM budget), except decode, which uses
+# `DECODE_K_GROUP_STAGES` or `DECODE_DEFAULT_STAGES`. Every row is a B200
+# ablation result (bench_grouped_matmul); don't add one without a
+# measurement.
 comptime NVFP4_TUNED_STAGES = [
     # DeepSeek-V3 up-proj.
-    (4096, 7168, DECODE_AVG_M, 6),
     (4096, 7168, SMALL_PREFILL_AVG_M, 6),
     (4096, 7168, -1, 7),
     # DeepSeek-V3 down-proj.
-    (7168, 2048, DECODE_AVG_M, 6),
     (7168, 2048, SMALL_PREFILL_AVG_M, 6),
     (7168, 2048, -1, 6),
     # Kimi K2.5 TP=8 down-proj.
     (7168, 256, -1, 6),
-    # Inkling-Small TP=2 gate+up.
-    (2048, 4096, DECODE_AVG_M, 6),
 ]
+
+
+def _k_group[K: Int, regime: Int]() -> Int:
+    """Returns the k-tiles per pipeline stage for one (K, regime).
+
+    Parameters:
+        K: Reduction dimension (unpacked element count).
+        regime: The regime row's `upper_avg_m` bound (-1 = large prefill).
+
+    Returns:
+        `DECODE_K_GROUP` for decode when it divides the k-tile count, else 1.
+    """
+    comptime if (
+        regime == DECODE_AVG_M
+        and ceildiv(K, _NVFP4_K_TILE) % DECODE_K_GROUP == 0
+    ):
+        return DECODE_K_GROUP
+    return 1
 
 
 def _tuned_stages[N: Int, K: Int, regime: Int]() -> Optional[Int]:
@@ -111,12 +134,17 @@ def _tuned_stages[N: Int, K: Int, regime: Int]() -> Optional[Int]:
         regime: The regime row's `upper_avg_m` bound (-1 = large prefill).
 
     Returns:
-        The tuned stage count, or None for stages=auto when the table has
-        no row for this (shape, regime).
+        The tuned stage count in k-tiles. Without a table row, the decode
+        regime gets `DECODE_K_GROUP_STAGES` when it groups k-tiles, else
+        `DECODE_DEFAULT_STAGES`, and the other regimes None (stages=auto).
     """
     comptime for row in NVFP4_TUNED_STAGES:
         comptime if row[0] == N and row[1] == K and row[2] == regime:
             return Optional[Int](row[3])
+    comptime if regime == DECODE_AVG_M:
+        comptime if _k_group[K, regime]() > 1:
+            return Optional[Int](DECODE_K_GROUP_STAGES)
+        return Optional[Int](DECODE_DEFAULT_STAGES)
     return Optional[Int](None)
 
 
@@ -126,6 +154,7 @@ def _launch_grouped_block_scaled[
     mma_bn: Int,
     cta_group: Int,
     num_pipeline_stages: Optional[Int] = None,
+    k_group_size: Int = 1,
     scaling_kind: UMMAKind = UMMAKind.KIND_MXF4NVF4,
     pdl_level: PDLLevel = PDLLevel.ON,
     fuse_swiglu: Bool = False,
@@ -135,6 +164,7 @@ def _launch_grouped_block_scaled[
     swiglu_enable_trace: Bool = False,
     TraceBufT: TraceBuf = NullTrace,
     swiglu_use_inplace: Bool = False,
+    RowScalesT: RowScales = NullRowScales,
 ](
     c: TileTensor,
     a: TileTensor,
@@ -149,6 +179,7 @@ def _launch_grouped_block_scaled[
     ctx: DeviceContext,
     swiglu_out: SwiGLUOutputT = NullSwiGLUOutput[](),
     trace_buf: TraceBufT = NullTrace(),
+    a_row_scales: RowScalesT = NullRowScales(),
 ) raises:
     """Build config and launch grouped block-scaled matmul kernel.
 
@@ -158,6 +189,7 @@ def _launch_grouped_block_scaled[
         mma_bn: MMA tile N dimension.
         cta_group: CTA group size.
         num_pipeline_stages: Pipeline depth override. None = auto-compute.
+        k_group_size: K-tiles per pipeline stage.
         scaling_kind: Block-scaling format (NVFP4, MXFP4, or MXFP8).
         pdl_level: Programmatic dependent launch level.
         fuse_swiglu: When True, the kernel fuses SwiGLU + block-scaled
@@ -179,6 +211,8 @@ def _launch_grouped_block_scaled[
         swiglu_use_inplace: When True, the fused epilogue uses the
             in-place register path (no SMEM scratch) on decode shapes.
             Default False keeps the cooperative path.
+        RowScalesT: Per-row output scales type. Defaults to the no-op
+            `NullRowScales`.
     """
     # `grouped_matmul_block_scaled` feeds the weights into the kernel's A slot
     # when `AB_swapped`, so the config's per-operand dtypes have to follow the
@@ -188,18 +222,18 @@ def _launch_grouped_block_scaled[
     comptime c_type = c.dtype
     comptime sfa_dtype = a_scales.dtype
     comptime sfb_dtype = b_scales.dtype
-    comptime umma_shape = Index(128 * cta_group, mma_bn, 32)
+    comptime umma_shape = (128 * cta_group, mma_bn, 32)
 
     comptime config = BlockScaledMatmulConfig[
         a_type, b_type, c_type, sfa_dtype, sfb_dtype, transpose_b
     ](
         scaling_kind=scaling_kind,
-        cluster_shape=Index(cta_group, 1, 1),
+        cluster_shape=(cta_group, 1, 1),
         mma_shape=umma_shape,
         block_swizzle_size=8,
         cta_group=cta_group,
         AB_swapped=AB_swapped,
-        k_group_size=1,
+        k_group_size=k_group_size,
         num_pipeline_stages=num_pipeline_stages,
         num_accum_pipeline_stages=1 if mma_bn > 128 else 2,
         is_gmm=True,
@@ -226,6 +260,7 @@ def _launch_grouped_block_scaled[
         swiglu_enable_trace=swiglu_enable_trace,
         TraceBufT=TraceBufT,
         swiglu_use_inplace=_swiglu_use_inplace,
+        RowScalesT=RowScalesT,
     ](
         c,
         a,
@@ -240,6 +275,7 @@ def _launch_grouped_block_scaled[
         ctx,
         swiglu_out,
         trace_buf,
+        a_row_scales,
     )
 
 
@@ -259,6 +295,7 @@ def grouped_matmul_nvfp4_dispatch[
     swiglu_enable_trace: Bool = False,
     TraceBufT: TraceBuf = NullTrace,
     swiglu_use_inplace: Bool = False,
+    RowScalesT: RowScales = NullRowScales,
 ](
     c: TileTensor,
     a: TileTensor,
@@ -274,6 +311,7 @@ def grouped_matmul_nvfp4_dispatch[
     ctx: DeviceContext,
     swiglu_out: SwiGLUOutputT = NullSwiGLUOutput[](),
     trace_buf: TraceBufT = NullTrace(),
+    a_row_scales: RowScalesT = NullRowScales(),
 ) raises:
     """Dispatch grouped NVFP4 matmul with shape-tuned configuration.
 
@@ -312,6 +350,8 @@ def grouped_matmul_nvfp4_dispatch[
         swiglu_use_inplace: When True, the fused SwiGLU+NVFP4 epilogue
             uses the in-place register-only path (no SMEM scratch).
             Default False keeps the original scatter+cooperative path.
+        RowScalesT: Per-row output scales type. Defaults to the no-op
+            `NullRowScales`.
 
     Args:
         c: Output tensor (total_tokens, N).
@@ -330,6 +370,9 @@ def grouped_matmul_nvfp4_dispatch[
             NVFP4 + E4M3 SF tile). `NullSwiGLUOutput()` otherwise.
         trace_buf: Per-CTA timestamp buffer when `swiglu_enable_trace=True`.
             `NullTrace()` otherwise.
+        a_row_scales: Per-row output scales: output row `m` is scaled by
+            `expert_scales[e] * a_row_scales[m]`, before SwiGLU when
+            `fuse_swiglu`. `NullRowScales()` for none.
     """
     comptime if override:
         # Ablation/benchmarking: use caller's explicit parameters.
@@ -350,6 +393,7 @@ def grouped_matmul_nvfp4_dispatch[
             swiglu_enable_trace=swiglu_enable_trace,
             TraceBufT=TraceBufT,
             swiglu_use_inplace=swiglu_use_inplace,
+            RowScalesT=RowScalesT,
         ](
             c,
             a,
@@ -364,6 +408,7 @@ def grouped_matmul_nvfp4_dispatch[
             ctx,
             swiglu_out,
             trace_buf,
+            a_row_scales,
         )
     else:
         # Production: tuning table keyed on (N, K).
@@ -377,18 +422,19 @@ def grouped_matmul_nvfp4_dispatch[
         # (mma_bn, cta_group, stages) vary. Factoring the call here keeps
         # the regime selection below a one-liner per regime.
         @inline(.always)
-        @__parameter
         def _regime[
             mma_bn: Int,
             cta_group: Int,
             stages: Optional[Int],
-        ]() raises:
+            k_group: Int,
+        ]() raises {imm}:
             _launch_grouped_block_scaled[
                 transpose_b,
                 True,
                 mma_bn=mma_bn,
                 cta_group=cta_group,
                 num_pipeline_stages=stages,
+                k_group_size=k_group,
                 pdl_level=pdl_level,
                 fuse_swiglu=fuse_swiglu,
                 SwiGLUOutputT=SwiGLUOutputT,
@@ -397,6 +443,7 @@ def grouped_matmul_nvfp4_dispatch[
                 swiglu_enable_trace=swiglu_enable_trace,
                 TraceBufT=TraceBufT,
                 swiglu_use_inplace=swiglu_use_inplace,
+                RowScalesT=RowScalesT,
             ](
                 c,
                 a,
@@ -411,6 +458,7 @@ def grouped_matmul_nvfp4_dispatch[
                 ctx,
                 swiglu_out,
                 trace_buf,
+                a_row_scales,
             )
 
         # Kimi K2.5 TP=8 up-proj: (N=512, K=7168) has an unusually small N
@@ -422,8 +470,7 @@ def grouped_matmul_nvfp4_dispatch[
         # the two-way split it needs doesn't fit the three-regime rows
         # `_regime` iterates.
         @inline(.always)
-        @__parameter
-        def _launch512[mma_bn: Int, cta_group: Int]() raises:
+        def _launch512[mma_bn: Int, cta_group: Int]() raises {imm}:
             _launch_grouped_block_scaled[
                 transpose_b,
                 True,
@@ -438,6 +485,7 @@ def grouped_matmul_nvfp4_dispatch[
                 swiglu_enable_trace=swiglu_enable_trace,
                 TraceBufT=TraceBufT,
                 swiglu_use_inplace=swiglu_use_inplace,
+                RowScalesT=RowScalesT,
             ](
                 c,
                 a,
@@ -452,6 +500,7 @@ def grouped_matmul_nvfp4_dispatch[
                 ctx,
                 swiglu_out,
                 trace_buf,
+                a_row_scales,
             )
 
         comptime if N == 512 and K == 7168:
@@ -479,7 +528,7 @@ def grouped_matmul_nvfp4_dispatch[
             comptime for r in regimes:
                 comptime _stages = _tuned_stages[N, K, r[0]]()
                 if r[0] < 0 or estimated_total_m <= num_active_experts * r[0]:
-                    _regime[r[1], r[2], _stages]()
+                    _regime[r[1], r[2], _stages, _k_group[K, r[0]]()]()
                     return
 
 
@@ -598,8 +647,7 @@ def grouped_matmul_mxfp8_dispatch[
     # config) table as the NVFP4 path. Stages travel per-row as an Int with
     # -1 = auto (the classifier's pick), mirroring the NVFP4 table sentinel.
     @inline(.always)
-    @__parameter
-    def _go[mma_bn: Int, cta_group: Int, stages: Optional[Int]]() raises:
+    def _go[mma_bn: Int, cta_group: Int, stages: Optional[Int]]() raises {imm}:
         _launch_grouped_block_scaled[
             transpose_b,
             AB_swapped=True,
@@ -651,6 +699,7 @@ def grouped_matmul_block_scaled_sm100_dispatch[
     transpose_b: Bool = True,
     target: StaticString = "cpu",
     pdl_level: PDLLevel = PDLLevel.ON,
+    RowScalesT: RowScales = NullRowScales,
 ](
     c: TileTensor,
     a: TileTensor,
@@ -664,6 +713,7 @@ def grouped_matmul_block_scaled_sm100_dispatch[
     num_active_experts: Int,
     estimated_total_m: Int,
     ctx: DeviceContext,
+    a_row_scales: RowScalesT = NullRowScales(),
 ) raises:
     """Dispatch grouped block-scaled matmul based on input dtypes.
 
@@ -674,6 +724,8 @@ def grouped_matmul_block_scaled_sm100_dispatch[
         transpose_b: Whether B is transposed (must be True).
         target: Target device (unused, for MOGG interface compatibility).
         pdl_level: Programmatic dependent launch level.
+        RowScalesT: Per-row output scales type. Defaults to the no-op
+            `NullRowScales`; only NVFP4 supports others.
 
     Args:
         c: Output tensor (total_tokens, N).
@@ -688,10 +740,15 @@ def grouped_matmul_block_scaled_sm100_dispatch[
         num_active_experts: Number of active experts.
         estimated_total_m: Estimated number of total non-padded tokens.
         ctx: Device context.
+        a_row_scales: Per-row output scales, one per `a` row (NVFP4 only).
     """
     comptime scaling_kind = block_scaled_umma_kind[
         a.dtype, b.dtype, a_scales.dtype
     ]()
+    comptime assert not RowScalesT.Enabled or (
+        scaling_kind == UMMAKind.KIND_MXF4NVF4
+        and not is_w4a8_operand_pair[a.dtype, b.dtype]()
+    ), "per-row input scales are only supported for NVFP4"
 
     # W4A8 lands in shared memory with the same byte geometry as MXFP8 -- the
     # FP4 TMA copy pads the weights on the way in -- so it takes the same
@@ -712,7 +769,9 @@ def grouped_matmul_block_scaled_sm100_dispatch[
             ctx,
         )
     elif scaling_kind == UMMAKind.KIND_MXF4NVF4:
-        grouped_matmul_nvfp4_dispatch[transpose_b, target, pdl_level=pdl_level](
+        grouped_matmul_nvfp4_dispatch[
+            transpose_b, target, pdl_level=pdl_level, RowScalesT=RowScalesT
+        ](
             c,
             a,
             b,
@@ -725,6 +784,7 @@ def grouped_matmul_block_scaled_sm100_dispatch[
             num_active_experts,
             estimated_total_m,
             ctx,
+            a_row_scales=a_row_scales,
         )
     elif scaling_kind == UMMAKind.KIND_MXF4:
         _launch_grouped_block_scaled[

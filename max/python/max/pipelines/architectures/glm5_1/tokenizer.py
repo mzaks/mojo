@@ -20,18 +20,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from max.pipelines.lib.config import PipelineConfig
-from max.pipelines.lib.tokenizer import (
-    TextTokenizer,
-    resolve_single_special_token,
+from max.pipelines.architectures.glm5_1.chat_template import (
+    linearize_tool_results,
+    order_tool_results,
 )
+from max.pipelines.lib.config import PipelineConfig
+from max.pipelines.lib.tokenizer import ReasoningTextTokenizer
 from max.pipelines.modeling.types import (
     TextGenerationRequestMessage,
     TextGenerationRequestTool,
 )
-
-_THINK_START_TOKEN = "<think>"
-_THINK_END_TOKEN = "</think>"
 
 logger = logging.getLogger("max.serve")
 
@@ -153,13 +151,14 @@ def _asks_for_no_reasoning(options: Mapping[str, Any]) -> bool:
 def _apply_glm_clear_thinking_default(
     chat_template_options: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Sets the default for `clear_thinking`.
+    """Defaults ``clear_thinking`` to False, keeping earlier turns' reasoning.
 
-    GLM 5.3's template sets `clear_thinking` to False, but it should be enabled
-    for multi-turn conversations.
+    GLM-5.1's and 5.2's templates drop it when the kwarg is unset, and
+    GLM-5.3's keeps it. Z.ai's Coding Plan endpoint keeps it for every GLM,
+    as its thinking-mode guide recommends for coding and agent workloads.
     """
     options = dict(chat_template_options)
-    options.setdefault("clear_thinking", True)
+    options.setdefault("clear_thinking", False)
     return options
 
 
@@ -228,7 +227,7 @@ def normalize_glm_reasoning_effort(
     return options
 
 
-class GlmTokenizer(TextTokenizer):
+class GlmTokenizer(ReasoningTextTokenizer):
     """Text tokenizer for GLM-4.5+ (GLM-5.1 / GLM-5.2 / GLM-5.3).
 
     Overridden to apply reasoning parsing normalization to the chat template,
@@ -257,12 +256,7 @@ class GlmTokenizer(TextTokenizer):
             chat_template=chat_template,
             **unused_kwargs,
         )
-        self._reasoning_start_token_id: int = resolve_single_special_token(
-            self.delegate, _THINK_START_TOKEN
-        )
-        self._reasoning_end_token_id: int = resolve_single_special_token(
-            self.delegate, _THINK_END_TOKEN
-        )
+        self._orders_tool_results = self._linearize_tool_results()
         self._template_capabilities = _probe_template_rungs(self._render_probe)
         if not self._template_capabilities.honors_thinking_toggle:
             logger.info(
@@ -272,6 +266,43 @@ class GlmTokenizer(TextTokenizer):
                 "disabling reasoning.",
                 self._template_capabilities.floor_rung,
             )
+
+    def _linearize_tool_results(self) -> bool:
+        """Swaps GLM-5.3's quadratic tool-result ordering for a linear one.
+
+        Applies to whichever template requests render with, including an
+        operator's ``--chat-template``. A template without GLM-5.3's block
+        is left as is.
+
+        Returns:
+            Whether the template was patched, in which case requests must
+            pass through :func:`order_tool_results` before rendering.
+        """
+        source = (
+            self._chat_template
+            if self._custom_template_provided
+            else self.delegate.chat_template
+        )
+        if not isinstance(source, str):
+            return False
+        patched = linearize_tool_results(source)
+        if patched is None:
+            if "has_dup_tool_result_id" in source:
+                logger.warning(
+                    "This GLM chat template orders tool results with "
+                    "GLM-5.3's quadratic macros, but not in the form MAX "
+                    "rewrites, so a turn with thousands of tool calls can "
+                    "stall the server while it renders."
+                )
+            return False
+        if self._custom_template_provided:
+            self._chat_template = patched
+        self.delegate.chat_template = patched
+        logger.info(
+            "Ordering GLM tool results in Python: the chat template's "
+            "tool-result ordering is quadratic in the number of tool calls."
+        )
+        return True
 
     def _render_probe(self, **chat_template_options: Any) -> str:
         """Renders a one-message prompt, for template capability detection.
@@ -294,6 +325,8 @@ class GlmTokenizer(TextTokenizer):
     ) -> str:
         """Applies the GLM chat template, first settling GLM's own defaults."""
         options = _apply_glm_clear_thinking_default(chat_template_options)
+        if self._orders_tool_results:
+            messages = order_tool_results(messages)
         return super().apply_chat_template(
             messages,
             tools,
@@ -301,13 +334,3 @@ class GlmTokenizer(TextTokenizer):
                 options, self._template_capabilities
             ),
         )
-
-    @property
-    def reasoning_start_token_id(self) -> int:
-        """Token id of ``<think>`` (opens a GLM reasoning span)."""
-        return self._reasoning_start_token_id
-
-    @property
-    def reasoning_end_token_id(self) -> int:
-        """Token id of ``</think>`` (closes a GLM reasoning span)."""
-        return self._reasoning_end_token_id

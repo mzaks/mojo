@@ -26,9 +26,9 @@ from linalg.gemv import (
     gemm_mma_cpasync,
     gemm_mma_cpasync_kernel,
 )
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, default_accelerator
 from std.math import ceildiv
-from std.sys.info import has_nvidia_gpu_accelerator, size_of
+from std.sys.info import size_of
 
 
 def ok_launch_cpasync[
@@ -86,7 +86,7 @@ def ok_launch_cpasync[
         stage_cnt=2,
         swapAB=False,
     ]
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         ctx.enqueue_function[kernel](
             c,
             act,

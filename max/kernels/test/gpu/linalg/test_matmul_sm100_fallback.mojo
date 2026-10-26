@@ -11,13 +11,11 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.collections import Optional
-from std.sys import align_of, size_of
+from std.sys import size_of
 
 import linalg.matmul.vendor.blas as vendor_blas
 from max.gpu.host import DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.memory import alloc
 
 # Additional imports for testing
 from internal_utils import assert_almost_equal
@@ -32,8 +30,8 @@ from layout import (
 from linalg.matmul.gpu.sm100_structured.default.matmul import (
     matmul_sm100_fallback,
 )
-from linalg.utils import elementwise_epilogue_type
 
+from std.utils.coord import DynamicCoord
 from std.utils.index import Index, IndexList
 
 
@@ -45,24 +43,22 @@ def test_matmul_sm100_fallback[
     a_type: DType,
     b_type: DType,
     c_type: DType,
-    umma_shape: IndexList[3],
+    umma_shape: DynamicCoord[.int, 3],
     swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
     transpose_b: Bool = True,
     BK: Int = 64,
     use_epilogue: Bool = False,
 ](ctx: DeviceContext, m: MType, n: NType, k: KType,) raises:
-    var a_shape = row_major(Coord(m, Idx[KType.static_value]))
+    var a_shape = row_major(m, Idx[KType.static_value])
     var b_shape = row_major(
-        Coord(
-            Idx[NType.static_value if transpose_b else KType.static_value],
-            Idx[KType.static_value if transpose_b else NType.static_value],
-        )
+        Idx[NType.static_value if transpose_b else KType.static_value],
+        Idx[KType.static_value if transpose_b else NType.static_value],
     )
-    var c_shape = row_major(Coord(m, Idx[NType.static_value]))
+    var c_shape = row_major(m, Idx[NType.static_value])
 
-    var a_size = Int(m.value()) * Int(k.value())
-    var b_size = Int(n.value()) * Int(k.value())
-    var c_size = Int(m.value()) * Int(n.value())
+    var a_size = Int(m) * Int(k)
+    var b_size = Int(n) * Int(k)
+    var c_size = Int(m) * Int(n)
 
     var a_host_ptr = ctx.enqueue_create_host_buffer[a_type](a_size)
     var b_host_ptr = ctx.enqueue_create_host_buffer[b_type](b_size)
@@ -97,11 +93,11 @@ def test_matmul_sm100_fallback[
         "use_epilogue:",
         use_epilogue,
         " : PROBLEM SHAPE (M,N,K): (",
-        Int(m.value()),
+        Int(m),
         "x",
-        Int(n.value()),
+        Int(n),
         "x",
-        Int(k.value()),
+        Int(k),
         ") - ",
         "BLOCKS SHAPE (BM,BN,BK): (",
         umma_shape[0],
@@ -112,18 +108,12 @@ def test_matmul_sm100_fallback[
         ")",
     )
 
-    @__parameter
     @inline(.always)
-    @__copy_capture(c_tensor)
-    def epilogue_fn[
-        _dtype: DType,
-        width: SIMDLength,
-        *,
-        alignment: Int = align_of[SIMD[_dtype, width]](),
-    ](idx: IndexList[2], val: SIMD[_dtype, width]) capturing -> None:
-        c_tensor.store[alignment=alignment](
-            Coord(idx), rebind[SIMD[c_type, width]](val)
-        )
+    def compute_fn[
+        _dtype: DType, width: SIMDLength, *, alignment: Int
+    ](idx: Coord, val: SIMD[_dtype, width]) -> SIMD[_dtype, width]:
+        comptime assert idx.rank == 2, "the matmul epilogue contract is rank 2"
+        return val
 
     # Initialize matmul operands
     rand(a_host.as_span())
@@ -137,7 +127,7 @@ def test_matmul_sm100_fallback[
     ctx.enqueue_copy(c_device, c_host_ptr)
     ctx.enqueue_copy(c_device_ref, c_host_ref_ptr)
 
-    comptime block_tile_shape = Index(umma_shape[0], umma_shape[1], BK)
+    comptime block_tile_shape = (umma_shape[0], umma_shape[1], BK)
 
     matmul_sm100_fallback[
         c_type,
@@ -148,10 +138,8 @@ def test_matmul_sm100_fallback[
         block_tile_shape=block_tile_shape,
         a_swizzle=swizzle,
         b_swizzle=swizzle,
-        elementwise_lambda_fn=Optional[elementwise_epilogue_type](
-            epilogue_fn
-        ) if use_epilogue else None,
-    ](c_tensor, a_tensor, b_tensor, ctx)
+        has_compute_fn=use_epilogue,
+    ](c_tensor, a_tensor, b_tensor, ctx, compute_fn)
 
     ctx.synchronize()
 
@@ -204,7 +192,7 @@ def main() raises:
                     dtype,
                     dtype,
                     .bfloat16,
-                    umma_shape=Index(64, 128, MMA_K),
+                    umma_shape=(64, 128, MMA_K),
                     swizzle=swizzle,
                     transpose_b=True,
                     BK=BK,
@@ -218,7 +206,7 @@ def main() raises:
                     dtype,
                     dtype,
                     .bfloat16,
-                    umma_shape=Index(64, 128, MMA_K),
+                    umma_shape=(64, 128, MMA_K),
                     swizzle=swizzle,
                     transpose_b=True,
                     BK=BK,
@@ -234,7 +222,7 @@ def main() raises:
                     dtype,
                     dtype,
                     .bfloat16,
-                    umma_shape=Index(64, 128, MMA_K),
+                    umma_shape=(64, 128, MMA_K),
                     swizzle=swizzle,
                     transpose_b=True,
                     BK=BK,
@@ -249,7 +237,7 @@ def main() raises:
                     dtype,
                     dtype,
                     .bfloat16,
-                    umma_shape=Index(64, 128, MMA_K),
+                    umma_shape=(64, 128, MMA_K),
                     swizzle=swizzle,
                     transpose_b=True,
                     BK=BK,
@@ -267,7 +255,7 @@ def main() raises:
                         dtype,
                         dtype,
                         .bfloat16,
-                        umma_shape=Index(64, 128, MMA_K),
+                        umma_shape=(64, 128, MMA_K),
                         transpose_b=True,
                         BK=_BK,
                     ](
@@ -281,7 +269,7 @@ def main() raises:
                         dtype,
                         dtype,
                         .bfloat16,
-                        umma_shape=Index(64, 128, MMA_K),
+                        umma_shape=(64, 128, MMA_K),
                         transpose_b=True,
                         BK=_BK,
                     ](
@@ -295,7 +283,7 @@ def main() raises:
                         dtype,
                         dtype,
                         .bfloat16,
-                        umma_shape=Index(64, 128, MMA_K),
+                        umma_shape=(64, 128, MMA_K),
                         transpose_b=True,
                         BK=_BK,
                     ](
@@ -309,7 +297,7 @@ def main() raises:
                         dtype,
                         dtype,
                         .bfloat16,
-                        umma_shape=Index(64, 128, MMA_K),
+                        umma_shape=(64, 128, MMA_K),
                         transpose_b=True,
                         BK=_BK,
                     ](
@@ -323,7 +311,7 @@ def main() raises:
                         dtype,
                         dtype,
                         .bfloat16,
-                        umma_shape=Index(64, 128, MMA_K),
+                        umma_shape=(64, 128, MMA_K),
                         transpose_b=True,
                         BK=_BK,
                     ](

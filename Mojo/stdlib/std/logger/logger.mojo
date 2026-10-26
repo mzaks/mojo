@@ -172,20 +172,21 @@ struct Level(
         Args:
             writer: The writer to write to.
         """
-        if self == Self.NOTSET:
-            writer.write("NOTSET")
-        elif self == Self.TRACE:
-            writer.write("TRACE")
-        elif self == Self.DEBUG:
-            writer.write("DEBUG")
-        elif self == Self.INFO:
-            writer.write("INFO")
-        elif self == Self.WARNING:
-            writer.write("WARNING")
-        elif self == Self.ERROR:
-            writer.write("ERROR")
-        elif self == Self.CRITICAL:
-            writer.write("CRITICAL")
+        match self:
+            case .NOTSET:
+                writer.write("NOTSET")
+            case .TRACE:
+                writer.write("TRACE")
+            case .DEBUG:
+                writer.write("DEBUG")
+            case .INFO:
+                writer.write("INFO")
+            case .WARNING:
+                writer.write("WARNING")
+            case .ERROR:
+                writer.write("ERROR")
+            case .CRITICAL:
+                writer.write("CRITICAL")
 
 
 # ===-----------------------------------------------------------------------===#
@@ -200,13 +201,13 @@ struct Logger[level: Level = DEFAULT_LEVEL](ImplicitlyCopyable):
         level: The minimum severity level for messages to be logged.
     """
 
-    var _fd: FileDescriptor
+    var _fd: RawFileDescriptor
     var _prefix: String
     var _source_location: Bool
 
     def __init__(
         out self,
-        fd: FileDescriptor = std.sys.stdout,
+        fd: RawFileDescriptor = std.sys.stdout,
         *,
         prefix: String = "",
         source_location: Bool = False,

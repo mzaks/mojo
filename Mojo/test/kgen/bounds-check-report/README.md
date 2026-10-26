@@ -14,7 +14,7 @@ Build the tools and the stdlib with the in-tree compiler (the prebuilt
 toolchain does not know `kgen.obligation`):
 
 ```bash
-./bazelw build --config=build-mojo //Mojo/tools/kgen //Mojo/tools/kgen-opt //Mojo/stdlib/std
+./bazelw build //Mojo/tools/kgen //Mojo/tools/kgen-opt //Mojo/stdlib/std
 ```
 
 ### Building on Linux or a fresh checkout
@@ -48,9 +48,9 @@ The `#ifndef` makes it harmless where the header does exist.
 binary from <https://github.com/Z3Prover/z3/releases>. The results here were
 produced with z3 4.16 on macOS.
 
-Then build as above, always with `--config=build-mojo`: without it Bazel
-compiles the stdlib with the prebuilt toolchain, which does not know
-`kgen.obligation`, `kgen.assume` or `kgen.copy_marker`. A cold build takes
+Then build as above (the open-source build compiles the Mojo toolchain
+from source, so the stdlib is compiled by the `kgen` that knows
+`kgen.obligation`, `kgen.assume` and `kgen.copy_marker`). A cold build takes
 about 15 minutes, a rebuild of the pass alone under a minute. If
 `./bazelw run //:format` was run in between, rebuild `kgen` and `std` again
 before running the report: formatting can leave `bazel-bin` without the stdlib
@@ -63,7 +63,7 @@ function should stay unproven and every `ok_*` function be proven.
 tests should still pass:
 
 ```bash
-./bazelw test --config=build-mojo //Mojo/stdlib/test/collections/... //Mojo/stdlib/test/memory/...
+./bazelw test //Mojo/stdlib/test/collections/... //Mojo/stdlib/test/memory/...
 ```
 
 On macOS this build registers no GPU target (`--target-triple` rejects both

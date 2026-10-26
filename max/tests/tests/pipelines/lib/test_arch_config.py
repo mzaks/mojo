@@ -426,6 +426,13 @@ def test_kv_connector_config_disk_budget_bounds() -> None:
         KVConnectorConfig(disk_offload_max_gb=-1)
 
 
+def test_kv_connector_config_h2d_onload_lanes() -> None:
+    assert KVConnectorConfig().num_h2d_onload_lanes == 1
+    assert KVConnectorConfig(num_h2d_onload_lanes=2).num_h2d_onload_lanes == 2
+    with pytest.raises(ValidationError, match="num_h2d_onload_lanes"):
+        KVConnectorConfig(num_h2d_onload_lanes=0)
+
+
 def test_kv_cache_config_model_copy_update() -> None:
     kv_cache_config = KVCacheConfig()
     patched = kv_cache_config.model_copy(

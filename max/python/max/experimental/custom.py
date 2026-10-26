@@ -94,9 +94,9 @@ class TemplateType:
 
     ``dtype`` is a concrete :class:`~max.dtype.DType` or a :class:`DTypeVar`;
     entries sharing a variable must agree on the actual dtype at call time.
-    ``shape`` holds :class:`Symbol`s, :class:`Param`s, statics, or expressions
-    over them; its length is the entry's rank. There is no device: the op takes
-    its device from its operands at each call.
+    ``shape`` holds :class:`Symbol` and :class:`Param` values, statics, or
+    expressions over them; its length is the entry's rank. There is no
+    device: the op takes its device from its operands at each call.
 
     Instances are immutable: :class:`CustomOp` validates a signature once
     at declaration, so an entry must not change underneath it afterwards.
@@ -197,15 +197,16 @@ _ParamKey = tuple[tuple[str, str, object], ...]
 
 
 def _frozen_params(
-    params: Mapping[str, bool | int | str | DType | None],
+    params: Mapping[str, bool | int | float | str | DType | None],
 ) -> _ParamKey:
     """Canonicalizes a param dict into a hashable, order-independent key.
 
     Each entry carries its value's type name, because ``ops.custom`` lowers
-    ``bool``, ``int``, ``str`` and ``DType`` to four different MLIR
+    ``bool``, ``int``, ``float``, ``str`` and ``DType`` to different MLIR
     attributes (see ``_parameter_attribute``) while a key over the values
-    alone collapses two of those pairs: ``DType.float32`` and ``"float32"``
-    share a spelling, and ``True`` and ``1`` compare and hash equal.
+    alone collapses some of those pairs: ``DType.float32`` and ``"float32"``
+    share a spelling, ``True`` and ``1`` compare and hash equal, and so do
+    ``1`` and ``1.0``.
     """
     return tuple(
         sorted(
@@ -316,7 +317,7 @@ def _resolve_extension(path: Path) -> Path:
 def _resolve_parameters(
     inputs: Mapping[str, TemplateType],
     outputs: Sequence[TemplateType],
-    parameters: Mapping[str, bool | int | str | DType | None],
+    parameters: Mapping[str, bool | int | float | str | DType | None],
 ) -> tuple[
     dict[str, TemplateType],
     tuple[TemplateType, ...],
@@ -369,8 +370,8 @@ class CustomOp:
     compiles the kernel packages once. Instances are immutable and compare
     by declaration.
 
-    The same op accepts eager :class:`~max.experimental.tensor.Tensor`s,
-    running the kernel immediately, or :class:`~max.graph.TensorValue`s
+    The same op accepts an eager :class:`~max.experimental.tensor.Tensor`,
+    running the kernel immediately, or a :class:`~max.graph.TensorValue`
     inside a :class:`~max.graph.Graph` build, staging a ``mo.custom`` op.
     Output types come from the declared signature, so nothing is computed
     per call beyond binding the signature's symbols to the operands' dims.
@@ -414,7 +415,7 @@ class CustomOp:
     extensions: tuple[Path, ...]
     #: Compile-time parameters passed to the kernel. ``None`` declares one
     #: without giving it a value yet (see :attr:`is_complete`).
-    parameters: Mapping[str, bool | int | str | DType | None] = field(
+    parameters: Mapping[str, bool | int | float | str | DType | None] = field(
         hash=False
     )
     #: The signature as declared, before valued parameters were folded
@@ -480,8 +481,9 @@ class CustomOp:
     def _check_signature(self) -> None:
         """Rejects any dim a signature is not allowed to name.
 
-        Every dim must reduce to statics, :class:`Symbol`s, or :class:`Param`s.
-        Because dim arithmetic erases the Python subclass, the test is on the
+        Every dim must reduce to statics, :class:`Symbol` values, or
+        :class:`Param` values. Because dim arithmetic erases the Python
+        subclass, the test is on the
         namespaced name, which is exactly what a :class:`Symbol` or
         :class:`Param` contributes and nothing else can.
 
@@ -547,9 +549,8 @@ class CustomOp:
             "parameters can appear in a dim"
         )
 
-    def _check_unbound_outputs(self) -> None:
+    def _check_unbound_outputs(self, library: KernelLibrary) -> None:
         """Requires a shape function for any output dim no input binds."""
-        has_shape_function: bool | None = None
         first_seen: dict[str, tuple[int, int]] = {}
         for i, j, dim, symbol in self._unbound_output_symbols():
             if not isinstance(dim, Symbol):
@@ -560,9 +561,7 @@ class CustomOp:
                 )
             # GEX-2198: lift once the compiler shares one shape call.
             self._check_symbol_used_once(first_seen, i, j, dim)
-            if has_shape_function is None:
-                has_shape_function = self._has_shape_function()
-            if not has_shape_function:
+            if not library.has_shape_function(self.name):
                 raise ValueError(
                     f"kernel {self.name!r} declares data-dependent "
                     f"output {i} dim {symbol.name!r} but registers "
@@ -653,14 +652,34 @@ class CustomOp:
         return sorted(names)
 
     @in_default_mlir_context
-    def _has_shape_function(self) -> bool:
-        """Whether the kernel (overlay included) registers a shape function."""
+    def _resolve_kernel(self) -> KernelLibrary:
+        """Loads the declaration's own packages and requires the kernel in them.
+
+        Checking here rather than at the first call keeps a neighbor's
+        extensions, already imported into the shared staging graph, from
+        masking a declaration that omitted its own.
+
+        Returns:
+            The loaded library (``extensions`` plus the process-global
+            overlay).
+
+        Raises:
+            ValueError: If no loaded package defines the kernel.
+        """
         library = KernelLibrary()
         library.load_paths(_resolved_custom_extensions(self.extensions))
-        return library.has_shape_function(self.name)
+        if self.name in library:
+            return library
+        searched = ", ".join(str(p) for p in library.library_paths()) or "none"
+        raise ValueError(
+            f"custom op {self.name!r}: no kernel named {self.name!r} in the "
+            f"declared custom_extensions (searched: {searched}); pass the "
+            "Mojo package that registers it, since one op's extensions are "
+            "not visible to another's declaration"
+        )
 
     def __getitem__(
-        self, params: Mapping[str, bool | int | str | DType | None]
+        self, params: Mapping[str, bool | int | float | str | DType | None]
     ) -> CustomOp:
         """Returns a derived op specialized with per-call *params*.
 
@@ -920,13 +939,15 @@ def declare(
     *,
     inputs: Mapping[str, TemplateType],
     outputs: Sequence[TemplateType],
-    parameters: Mapping[str, bool | int | str | DType | None] | None = None,
+    parameters: Mapping[str, bool | int | float | str | DType | None]
+    | None = None,
     custom_extensions: Sequence[Path | str] = (),
 ) -> CustomOp:
     """Declares a custom op from its signature.
 
-    Validates the signature and compiles any Mojo source package once, here,
-    rather than on every call.
+    Validates the signature, compiles any Mojo source package, and resolves
+    the kernel against ``custom_extensions`` once, here, rather than on
+    every call.
 
     Args:
         name: The registered kernel symbol.
@@ -934,9 +955,9 @@ def declare(
             in diagnostics and accepted as a keyword at call time. Iteration
             order is operand order.
         outputs: One :class:`TemplateType` per result. Dims may only be
-            statics, :class:`Symbol`s, :class:`Param`s, or expressions over
-            them. A :class:`Symbol` no input binds is data-dependent: the
-            kernel must register a shape function with
+            statics, :class:`Symbol` and :class:`Param` values, or
+            expressions over them. A :class:`Symbol` no input binds is
+            data-dependent: the kernel must register a shape function with
             ``@extensibility.register_shape_function`` (see the "Declare the
             output shape" section of
             https://docs.modular.com/max/develop/build-custom-ops).
@@ -950,7 +971,9 @@ def declare(
         An immutable :class:`CustomOp`.
 
     Raises:
-        ValueError: If ``inputs`` or ``outputs`` is empty.
+        ValueError: If ``inputs`` or ``outputs`` is empty, or if neither
+            ``custom_extensions`` nor the process-global overlay registers
+            ``name``.
         TypeError: If a dim names a symbol that is neither a :class:`Symbol`
             nor a :class:`Param`.
         MojoCompilationError: If a source package fails to compile.
@@ -980,7 +1003,7 @@ def declare(
         pinned,
     )
     op._check_signature()
-    op._check_unbound_outputs()
+    op._check_unbound_outputs(op._resolve_kernel())
     # Anything sharing a content token declares the same kernel, parameters
     # and signature, so it is interchangeable with this op for every purpose
     # a resolved op is read for.

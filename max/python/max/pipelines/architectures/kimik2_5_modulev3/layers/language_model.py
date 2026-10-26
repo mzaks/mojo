@@ -29,13 +29,12 @@ from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.nn import Module, as_subgraph
 from max.experimental.nn.common_layers.kv_cache import PagedCacheValues
+from max.experimental.nn.common_layers.quant_moe import QuantizedMoE
 from max.experimental.sharding import (
     DeviceMapping,
-    NoReshard,
-    PlacementMapping,
     Replicated,
     Sharded,
-    mode,
+    auto_reshard,
 )
 from max.experimental.tensor import Tensor
 from max.graph import TensorValue
@@ -48,7 +47,6 @@ from ...deepseekV3_modulev3.deepseekV3 import (
     gather_last_tokens,
     split_replicated_batch,
 )
-from ...deepseekV3_modulev3.layers.quant_moe import QuantizedMoE
 from ...deepseekV3_modulev3.model_config import DeepseekV3Config
 
 
@@ -96,7 +94,7 @@ class KimiK2_5MoEDecoder(Module[..., tuple[Tensor, ...]]):
         if dp_degree > 1:
             batch_context_length = Tensor.from_shard_values(
                 [TensorValue(shard) for shard in batch_context_lengths],
-                PlacementMapping(mesh, (Replicated(),) * mesh.ndim),
+                DeviceMapping(mesh, (Replicated(),) * mesh.ndim),
             )
             data_parallel_splits, input_row_offsets_i64, *rest = variadic_args
             variadic_args = tuple(rest)
@@ -119,7 +117,7 @@ class KimiK2_5MoEDecoder(Module[..., tuple[Tensor, ...]]):
 
         kv_collection = PagedCacheValues.from_upstream(
             kv_collections,
-            PlacementMapping(mesh, (Replicated(),) * mesh.ndim),
+            DeviceMapping(mesh, (Replicated(),) * mesh.ndim),
         )
         return self._run_text_model(
             tokens,
@@ -133,7 +131,7 @@ class KimiK2_5MoEDecoder(Module[..., tuple[Tensor, ...]]):
             comm_buffers,
         )
 
-    @mode(NoReshard())
+    @auto_reshard(mode="raise")
     def _run_text_model(
         self,
         tokens: Tensor,

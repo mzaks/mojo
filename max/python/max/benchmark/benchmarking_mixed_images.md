@@ -40,13 +40,14 @@ remaining requests are unchanged.
 
 ## Flag reference
 
-| Flag                   | Description                                                                                                                                                                   | Default |
-|------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
-| `--image-fraction`     | Fraction (`0.0`-`1.0`) of requests (single-turn) or chat sessions (multi-turn) that get at least one image.                                                                   | `0.0`   |
-| `--image-count`        | Distribution for the number of images on a selected request or turn. Accepts a constant or a distribution string such as `DU(1,4)`.                                           | `1`     |
-| `--image-long-side`    | Distribution for each image's longer side, in pixels. Accepts a constant or a distribution string such as `U(224,1024)`.                                                      | `512`   |
-| `--image-aspect-ratio` | Distribution for each image's width divided by height. `1.0` produces square images; values above `1.0` produce landscape images; values below `1.0` produce portrait images. | `1.0`   |
-| `--image-turn`         | Which user turn(s) in a multi-turn chat session get images: `first`, `last`, or `every`. Ignored for single-turn requests.                                                    | `first` |
+| Flag                   | Description                                                                                                                                                                        | Default |
+|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| `--image-fraction`     | Fraction (`0.0`-`1.0`) of requests (single-turn) or chat sessions (multi-turn) that get at least one image.                                                                        | `0.0`   |
+| `--image-count`        | Distribution for the number of images on a selected request or turn. Accepts a constant or a distribution string such as `DU(1,4)`.                                                | `1`     |
+| `--image-long-side`    | Distribution for each image's longer side, in pixels. Accepts a constant or a distribution string such as `U(224,1024)`.                                                           | `512`   |
+| `--image-aspect-ratio` | Distribution for each image's width divided by height. `1.0` produces square images; values above `1.0` produce landscape images; values below `1.0` produce portrait images.      | `1.0`   |
+| `--image-turn`         | Which user turn(s) in a multi-turn chat session get images: `first`, `last`, or `every`. Ignored for single-turn requests.                                                         | `first` |
+| `--image-num-turns`    | Distribution for the number of user turns in a chat session that gets images. A longer session is cut to the drawn length; a shorter one is kept. Unset keeps sessions as sampled. | unset   |
 
 `--image-fraction` defaults to `0.0`, so none of these flags change behavior
 unless you set it above zero.
@@ -70,6 +71,63 @@ max benchmark \
 
 This attaches an image to the last user turn of every session. Use `every` to
 attach an image to every user turn instead of just one.
+
+### What the fraction counts
+
+In a multi-turn run `--image-fraction` selects *sessions*, not requests: exactly
+that share of them, rounded at random when it isn't whole, or fewer if too few
+sessions can carry images (no user turn, or over the max chat length). That
+matters when you
+are calibrating against a per-request production figure, because the chat driver
+resends a session's history: once a turn carries an image, every later turn of
+that session carries it again.
+
+With `--image-turn every` and `--image-count 1` the two coincide — newly encoded
+images per request and the share of requests carrying one are equal, and match
+`--image-fraction` on average, which is what makes that combination the one to
+reach for when matching production. In a single run they're weighted by how many
+turns the picked sessions have, so a run that picks long sessions lands above
+the fraction. With `first` or `last` one image is encoded per session, so the
+encoder rate falls by roughly the average turn count. The share of requests
+carrying an image then depends on where that image lands, because only the image
+turn and the turns after it resend it:
+
+- `first`: every turn of a selected session carries the image, so the share
+  matches `--image-fraction` on average.
+- `last`: only the final request of a selected session carries it, so the share
+  falls by the same factor as the encoder rate.
+
+The run reports the realized share as `image_request_rate`, in the "Request
+Mix" section of its results.
+
+This is deliberately unlike `--response-format-fraction`, which draws per
+request and per turn. A structured-output constraint applies only to the
+request that sets it, so a per-turn draw lands directly on the share of
+requests that set `response_format`. The rule for both: draw per session when
+the payload persists into later turns, per turn when it does not.
+
+### Image sessions shorter than the rest
+
+Under `--image-turn every`, an image-bearing request carries more image parts
+the longer its session runs, because history is resent. In production,
+image-bearing sessions are often shorter than text-only ones.
+`--image-num-turns` cuts sessions that get images to a drawn length, which
+lowers the parts per image-bearing request. Under `every` and `first` it also
+lowers the share of requests carrying an image, so raise `--image-fraction` to
+compensate. The run's log reports both, over the turns it sampled.
+
+### `--image-turn first` on a warmed session
+
+`first` is the default, and it is safe on sessions that start mid-conversation
+(`--warmup-to-steady-state`, on by default). Those sessions build their opening
+turns locally, but the driver splices the images into the history it sends, so
+an image on a replayed turn still reaches the server on the first measured
+request.
+
+This is where images and `--response-format-turn first` differ: a
+`response_format` is a per-request field the prefix loop never sets, so a
+constraint on a replayed turn is genuinely lost (CENG-1086). An image is part
+of the message history, so it is not.
 
 ## Matching a real image-size distribution
 
@@ -129,12 +187,12 @@ max benchmark \
   ...
 
   Image count (per request):
-    min       max       mean      std       p5        p25       p50       p75       p95       p99
-    0.00      1.00      0.48      0.50      0.00      0.00      0.00      1.00      1.00      1.00
+    count     min       mean      std       p5        p25       p50       p75       p90       p95       p99       max
+    100       0.00      0.48      0.50      0.00      0.00      0.00      1.00      1.00      1.00      1.00      1.00
 
   Image long side (px):
-    min       max       mean      std       p5        p25       p50       p75       p95       p99
-    512.00    512.00    512.00    0.00      512.00    512.00    512.00    512.00    512.00    512.00
+    count     min       mean      std       p5        p25       p50       p75       p90       p95       p99       max
+    48        512.00    512.00    0.00      512.00    512.00    512.00    512.00    512.00    512.00    512.00    512.00
 =======================================================
 ```
 

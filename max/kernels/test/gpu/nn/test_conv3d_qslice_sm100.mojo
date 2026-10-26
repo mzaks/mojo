@@ -24,17 +24,9 @@ time_conv 3x1x1, and the C_out F-padding paths (64/192/320).
 """
 
 from std.random import rand
-from std.sys import align_of
-
-from layout import (
-    LTToTTLayout,
-    Layout,
-    LayoutTensor,
-    TileTensor,
-)
+from layout import Coord, LTToTTLayout, Layout, TileTensor
 from max.gpu.host import DeviceContext
 from nn.conv.conv import Naive2dConvolution
-from nn.conv.conv_utils import elementwise_simd_epilogue_type
 from nn.conv.gpu.nvidia.sm100.qslice_conv3d import (
     dispatch_qslice_conv3d_sm100,
 )
@@ -132,7 +124,6 @@ def test_conv3d_qslice_direct[
     ctx.enqueue_copy(input_dev, input_host)
     ctx.enqueue_copy(filter_dev, filter_host)
 
-    var output_lt = LayoutTensor[dtype, output_layout_](output_dev.unsafe_ptr())
     var input_tt = TileTensor(
         input_dev.unsafe_ptr(), LTToTTLayout[input_layout]()
     )
@@ -145,25 +136,14 @@ def test_conv3d_qslice_direct[
 
     comptime if with_epilogue:
 
-        @__parameter
         @inline(.always)
-        @__copy_capture(output_lt)
-        def scale_epilogue[
-            _dtype: DType, _rank: Int, _width: SIMDLength, _alignment: Int = 1
-        ](coords: IndexList[_rank], val: SIMD[_dtype, _width]):
-            var scaled = (val.cast[.float32]() * 2.0).cast[dtype]()
-            output_lt.store[
-                width=_width, store_alignment=align_of[dtype]() * _alignment
-            ](
-                rebind[IndexList[5]](coords),
-                rebind[SIMD[dtype, _width]](scaled),
-            )
+        def scale_compute[
+            _dtype: DType, _width: SIMDLength, _alignment: Int = 1
+        ](coords: Coord, val: SIMD[_dtype, _width]) -> SIMD[_dtype, _width]:
+            comptime assert coords.rank == 5
+            return (val.cast[.float32]() * 2.0).cast[_dtype]()
 
-        var handled = dispatch_qslice_conv3d_sm100[
-            maybe_epilogue_func=Optional[elementwise_simd_epilogue_type](
-                scale_epilogue
-            ),
-        ](
+        var handled = dispatch_qslice_conv3d_sm100[has_compute_fn=True](
             input_tt,
             filter_tt,
             output_tt,
@@ -172,6 +152,7 @@ def test_conv3d_qslice_direct[
             pad,
             1,
             ctx,
+            compute_fn=scale_compute,
         )
         if not handled:
             print("SKIP: qslice dispatcher declined this shape")

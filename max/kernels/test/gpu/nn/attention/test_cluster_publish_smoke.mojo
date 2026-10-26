@@ -82,10 +82,10 @@ def publish_smoke_kernel[
     # The publish mbarrier (one SharedMemBarrier = one 8-byte slot).
     var mbar = unsafe_stack_allocation[
         1, DType.int64, address_space=.SHARED, alignment=8
-    ]().bitcast[SharedMemBarrier]()
+    ]().unsafe_bitcast[SharedMemBarrier]()
 
     var me = block_rank_in_cluster()
-    var tid = Int(thread_idx.x)
+    var tid = thread_idx.x
 
     # Init the publish barrier to expect `BM * P` arrivals: every WG0 row of
     # every CTA arrives on its own behalf (BM rows × P partitions), mirroring the

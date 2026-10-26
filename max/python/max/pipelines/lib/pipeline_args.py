@@ -123,7 +123,7 @@ class PipelineArgs(ConfigFileModel):
     ``profiling``) and a small number of cohesive sub-config objects
     (``kv_cache``, ``lora``, ``speculative``, ``draft_model``).
 
-    Multi-component pipelines (e.g. diffusion) that require a pre-built
+    Multi-component pipelines (such as diffusion) that require a pre-built
     :class:`~max.pipelines.lib.model_manifest.ModelManifest` may pass
     ``models=<manifest>`` to the constructor. That manifest is stored as a
     private override and used verbatim by :meth:`PipelineConfig.from_args`
@@ -170,10 +170,18 @@ class PipelineArgs(ConfigFileModel):
     tokenizer_impl: str | None = Field(
         default=None,
         description=(
-            "Cascade only: import path of the TokenizerWorker subclass to "
-            "construct for text-generation pipelines, as "
+            "Import path of an alternative tokenizer implementation, as "
             "``'module.path:ClassName'``. Left unset, uses the HuggingFace "
             "tokenizer."
+        ),
+    )
+
+    model_worker_impl: str | None = Field(
+        default=None,
+        description=(
+            "[--cascade] Import path of an alternative model worker "
+            "implementation, as ``'module.path:ClassName'``. Left unset, uses "
+            "the MAX Serve model worker."
         ),
     )
 
@@ -267,6 +275,18 @@ class PipelineArgs(ConfigFileModel):
         description=(
             "Whether to force download a given file if it's already present in "
             "the local cache."
+        ),
+    )
+
+    header_only_weights: bool = Field(
+        default=False,
+        description=(
+            "Stand in header-only, zero-filled sparse copies of the safetensors "
+            "checkpoint, built from the remote files' headers, instead of "
+            "downloading the weights. Compilation only needs tensor names, "
+            "shapes and dtypes, so this makes ``warm-cache --target`` "
+            "independent of checkpoint size. Only valid with ``--target`` "
+            "(compile-only mode); safetensors repos only."
         ),
     )
 
@@ -451,7 +471,7 @@ class PipelineArgs(ConfigFileModel):
 
         Owns the full flat-to-nested routing for CLI and legacy callers:
 
-        - Flat sub-config kwargs (e.g. ``max_batch_size``, ``enable_lora``,
+        - Flat sub-config kwargs (such as ``max_batch_size``, ``enable_lora``,
           ``num_speculative_tokens``) are nested under their sub-config
           section (``runtime``, ``lora``, ``speculative``, ...) before the
           ``--config-file`` merge, so CLI flags and config-file subtrees
@@ -460,14 +480,14 @@ class PipelineArgs(ConfigFileModel):
           schema shape) is folded into the flat model fields; explicit CLI
           kwargs win per field, ``--model-override`` entries win over both.
         - ``draft_``-prefixed kwargs build :attr:`draft_model`, inheriting
-          ``trust_remote_code``/``device_specs``/``data_parallel_degree``
-          from the target model when unset.
-        - Multi-component (e.g. diffusion) model paths are detected via
+          ``trust_remote_code``/``device_specs``/``data_parallel_degree``/
+          ``header_only_weights`` from the target model when unset.
+        - Multi-component (such as diffusion) model paths are detected via
           :meth:`ModelManifest.from_model_path` and carried as a manifest
           override.
 
         Args:
-            **kwargs: Flat keyword arguments, e.g. ``model_path``,
+            **kwargs: Flat keyword arguments, for example, ``model_path``,
                 ``kv_cache_size``, ``enable_lora``.
 
         Returns:
@@ -478,7 +498,7 @@ class PipelineArgs(ConfigFileModel):
         # Merge YAML config file values, then clear config_file so the
         # model_validator on ConfigFileModel doesn't reload it when the
         # instance is constructed below.
-        kwargs = cls.load_config_file(kwargs)  # type: ignore[operator]
+        kwargs = cls.load_config_file(kwargs)
         kwargs.pop("config_file", None)
 
         # The CLI generates a --models flag from PipelineConfig's field, so
@@ -692,3 +712,13 @@ class PipelineArgs(ConfigFileModel):
                     "for draft model"
                 )
             draft_kwargs["data_parallel_degree"] = data_parallel_degree
+
+        if "header_only_weights" not in draft_kwargs:
+            # A compile-only run stands in stubs for the whole pipeline, so
+            # the draft model cannot be the one model that downloads weights.
+            if target_kwargs.get("header_only_weights"):
+                _logger.info(
+                    "Inheriting header_only_weights=True from target model "
+                    "for draft model"
+                )
+                draft_kwargs["header_only_weights"] = True

@@ -30,7 +30,7 @@ from _cufft.types import Type
 from _cufft.utils import check_error
 from std.complex import ComplexFloat32
 from max.gpu.host import DeviceContext
-from max.gpu.host._nvidia_cuda import CUDA
+from max.gpu.host import CUDA
 from layout import TileTensor, coord_to_index_list
 
 
@@ -57,9 +57,9 @@ def _get_fft_workarea(
     )
 
     var lookup = _get_global_or_null(fft_buffer_key)
-    if lookup:
+    if case .Some(lookup) = lookup:
         # we found the allocated device buffer
-        return lookup.unsafe_value()
+        return lookup
 
     # manually allocate the memory on the device, and cache the pointer
     var work_space = ctx.enqueue_create_buffer[.uint8](buffer_size)
@@ -71,9 +71,7 @@ def _get_fft_workarea(
         device_ptr.unsafe_bitcast[NoneType](),
     )
 
-    return device_ptr.unsafe_bitcast[NoneType]().unsafe_origin_cast[
-        MutUntrackedOrigin
-    ]()
+    return device_ptr.unsafe_bitcast[NoneType]()
 
 
 def _get_fft_plan[
@@ -90,9 +88,9 @@ def _get_fft_plan[
     )
 
     var lookup = _get_global_or_null(cached_plan_key)
-    if lookup:
+    if case .Some(lookup) = lookup:
         # We found the plan in the cache, so just return it
-        return cufftHandle(Int(lookup.unsafe_value()))
+        return cufftHandle(Int(lookup))
 
     comptime if not create_if_not_found:
         # a valid cufft handle is always non-zero

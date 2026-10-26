@@ -18,7 +18,7 @@ Covers the same shapes as test_ping_pong_shapes.mojo but goes through
 the production dispatch path instead of calling ping_pong_matmul directly.
 """
 
-from std.sys import align_of, get_defined_bool
+from std.sys import get_defined_bool
 
 import linalg.matmul.vendor.blas as vendor_blas
 from max.gpu.host import DeviceContext
@@ -32,7 +32,6 @@ from layout._fillers import random
 from linalg.matmul.gpu import _matmul_gpu
 
 from std.testing import assert_true
-from std.utils.index import IndexList
 
 
 def test_dispatch_dynamic_m[
@@ -45,9 +44,9 @@ def test_dispatch_dynamic_m[
     """
     comptime b_type = a_type
 
-    var a_shape = row_major(Coord(m, Idx[K]))
-    var b_shape = row_major(Coord(Idx[N], Idx[K]))
-    var c_shape = row_major(Coord(Int(m), Idx[N]))
+    var a_shape = row_major(m, Idx[K])
+    var b_shape = row_major(Idx[N], Idx[K])
+    var c_shape = row_major(m, Idx[N])
 
     var a_size = m * K
     var b_size = N * K
@@ -58,7 +57,7 @@ def test_dispatch_dynamic_m[
     var c_host_ptr = ctx.enqueue_create_host_buffer[c_type](c_size)
     var c_ref_host_ptr = ctx.enqueue_create_host_buffer[c_type](c_size)
 
-    var a_host = TileTensor(a_host_ptr, row_major(Coord(m, Idx[K])))
+    var a_host = TileTensor(a_host_ptr, row_major(m, Idx[K]))
     random(a_host)
 
     var b_host = TileTensor(b_host_ptr, row_major[N, K]())
@@ -141,6 +140,80 @@ def test_dispatch_dynamic_m[
     ctx.synchronize()
 
 
+def test_dispatch_compute_fn[
+    a_type: DType,
+    c_type: DType,
+    N: Int,
+    K: Int,
+](ctx: DeviceContext, m: Int) raises:
+    """Checks that the compute-closure `_matmul_gpu` stores exactly the
+    closure applied to what the plain dispatch stores, at the closure's
+    index."""
+    comptime b_type = a_type
+    var c_size = m * N
+
+    var a_host_ptr = ctx.enqueue_create_host_buffer[a_type](m * K)
+    var b_host_ptr = ctx.enqueue_create_host_buffer[b_type](N * K)
+    var c_host_ptr = ctx.enqueue_create_host_buffer[c_type](c_size)
+    var c_ref_host_ptr = ctx.enqueue_create_host_buffer[c_type](c_size)
+    random(TileTensor(a_host_ptr, row_major(m, Idx[K])))
+    random(TileTensor(b_host_ptr, row_major[N, K]()))
+
+    var a_dev = ctx.enqueue_create_buffer[a_type](m * K)
+    var b_dev = ctx.enqueue_create_buffer[b_type](N * K)
+    var c_dev = ctx.enqueue_create_buffer[c_type](c_size)
+    var c_ref_dev = ctx.enqueue_create_buffer[c_type](c_size)
+    ctx.enqueue_copy(a_dev, a_host_ptr)
+    ctx.enqueue_copy(b_dev, b_host_ptr)
+    ctx.enqueue_memset(c_dev, 0)
+    ctx.enqueue_memset(c_ref_dev, 0)
+
+    var a_tensor = TileTensor(a_dev, row_major(m, Idx[K])).as_imm()
+    var b_tensor = TileTensor(b_dev, row_major(Idx[N], Idx[K])).as_imm()
+    var c_tensor = TileTensor(c_dev, row_major(m, Idx[N]))
+    var c_ref_tensor = TileTensor(c_ref_dev, row_major(m, Idx[N]))
+
+    var scale: Int = 2
+
+    def scale_odd_rows_negated[
+        dtype: DType, width: SIMDLength, *, alignment: Int
+    ](idx: Coord, val: SIMD[dtype, width]) {var scale} -> SIMD[dtype, width]:
+        comptime assert idx.rank == 2, "the matmul epilogue contract is rank 2"
+        var row_scale = -scale if Int(idx[0]) % 2 == 1 else scale
+        return val * SIMD[dtype, width](row_scale)
+
+    _matmul_gpu[use_tensor_core=True, transpose_b=True](
+        c_ref_tensor, a_tensor, b_tensor, ctx
+    )
+    _matmul_gpu[use_tensor_core=True, transpose_b=True](
+        c_tensor, a_tensor, b_tensor, scale_odd_rows_negated, ctx
+    )
+
+    ctx.enqueue_copy(c_host_ptr, c_dev)
+    ctx.enqueue_copy(c_ref_host_ptr, c_ref_dev)
+    ctx.synchronize()
+
+    var errors = 0
+    for i in range(c_size):
+        var row_scale = -2 if (i // N) % 2 == 1 else 2
+        var expected = c_ref_host_ptr[i] * Scalar[c_type](row_scale)
+        if c_host_ptr[i] != expected:
+            errors += 1
+            if errors <= 5:
+                print(
+                    "  MISMATCH [",
+                    i // N,
+                    ",",
+                    i % N,
+                    "]: got",
+                    c_host_ptr[i],
+                    "expected",
+                    expected,
+                )
+    print("  compute_fn M=", m, " N=", N, " K=", K, " errors=", errors)
+    assert_true(errors == 0, msg=String("COMPUTE_FN FAILED:", errors))
+
+
 def test_oob_diagnostic[
     a_type: DType,
     c_type: DType,
@@ -202,10 +275,10 @@ def test_oob_diagnostic[
     ctx.enqueue_copy(c_ref_dev, c_ref_host_ptr)
 
     # TileTensors: kernel sees [M, N/K] but backed by larger allocation
-    var a_tensor = TileTensor(a_dev, row_major(Coord(Idx[M], Idx[K])))
-    var b_tensor = TileTensor(b_dev, row_major(Coord(Idx[N], Idx[K])))
-    var c_tensor = TileTensor(c_dev, row_major(Coord(Idx[M], Idx[N])))
-    var c_ref_tensor = TileTensor(c_ref_dev, row_major(Coord(Idx[M], Idx[N])))
+    var a_tensor = TileTensor(a_dev, row_major(Idx[M], Idx[K]))
+    var b_tensor = TileTensor(b_dev, row_major(Idx[N], Idx[K]))
+    var c_tensor = TileTensor(c_dev, row_major(Idx[M], Idx[N]))
+    var c_ref_tensor = TileTensor(c_ref_dev, row_major(Idx[M], Idx[N]))
 
     # Run kernel under test
     _matmul_gpu[
@@ -237,8 +310,7 @@ def test_oob_diagnostic[
         if val != sentinel:
             oob_writes += 1
             if oob_writes <= 5:
-                var row = i // N
-                var col = i % N
+                var row, col = divmod(i, N)
                 print(
                     "  OOB WRITE [",
                     row,
@@ -274,8 +346,7 @@ def test_oob_diagnostic[
         if abs_err > atol and rel_err > rtol:
             accuracy_errors += 1
             if accuracy_errors <= 5:
-                var row = i // N
-                var col = i % N
+                var row, col = divmod(i, N)
                 print(
                     "  ACCURACY [",
                     row,
@@ -397,38 +468,34 @@ def test_oob_epilogue[
     ctx.enqueue_copy(c_ref_dev, c_ref_host_ptr)
 
     # TileTensors: kernel sees [M, N, K]
-    var a_tensor = TileTensor(a_dev, row_major(Coord(Idx[M], Idx[K])))
-    var b_tensor = TileTensor(b_dev, row_major(Coord(Idx[N], Idx[K])))
-    var c_tensor = TileTensor(c_dev, row_major(Coord(Idx[M], Idx[N])))
-    var c_ref_tensor = TileTensor(c_ref_dev, row_major(Coord(Idx[M], Idx[N])))
+    var a_tensor = TileTensor(a_dev, row_major(Idx[M], Idx[K]))
+    var b_tensor = TileTensor(b_dev, row_major(Idx[N], Idx[K]))
+    var c_tensor = TileTensor(c_dev, row_major(Idx[M], Idx[N]))
+    var c_ref_tensor = TileTensor(c_ref_dev, row_major(Idx[M], Idx[N]))
 
     # Output buffer: [alloc_M, alloc_N] so OOB writes in both dims are visible
     var out_tensor = TileTensor(
         out_dev.unsafe_ptr(),
-        row_major(Coord(Idx[alloc_M], Idx[alloc_N])),
+        row_major(Idx[alloc_M], Idx[alloc_N]),
     )
 
     # Epilogue writes to out_tensor using global (m, n) coordinates
-    @__parameter
     @inline(.always)
-    @__copy_capture(out_tensor)
     def epilogue_fn[
         _dtype: DType,
         width: SIMDLength,
         *,
-        alignment: Int = align_of[SIMD[_dtype, width]](),
-    ](idx: IndexList[2], val: SIMD[_dtype, width]) capturing -> None:
-        var coord = Coord(idx)
-        comptime assert coord.flat_rank == out_tensor.flat_rank
-        out_tensor.store[width=width, alignment=alignment](
-            coord, rebind[SIMD[c_type, width]](val)
+        alignment: Int,
+    ](idx: Coord, val: SIMD[_dtype, width]) {var out_tensor}:
+        comptime assert idx.rank == 2, "the matmul epilogue contract is rank 2"
+        comptime assert idx.flat_rank == out_tensor.flat_rank
+        out_tensor.store[alignment=alignment](
+            idx, rebind[SIMD[c_type, width]](val)
         )
 
-    _matmul_gpu[
-        use_tensor_core=True,
-        transpose_b=True,
-        elementwise_lambda_fn=epilogue_fn,
-    ](c_tensor, a_tensor, b_tensor, ctx)
+    _matmul_gpu[use_tensor_core=True, transpose_b=True](
+        c_tensor, a_tensor, b_tensor, epilogue_fn, ctx
+    )
 
     vendor_blas.matmul(
         ctx,
@@ -575,7 +642,7 @@ def test_oob_epilogue_dynamic_m[
     var c_ref_host_ptr = ctx.enqueue_create_host_buffer[c_type](c_size)
 
     # A: random for [0, M), poison for [M, alloc_m)
-    var a_host = TileTensor(a_host_ptr, row_major(Coord(alloc_m, Idx[K])))
+    var a_host = TileTensor(a_host_ptr, row_major(alloc_m, Idx[K]))
     random(a_host)
 
     for i in range(m * K, alloc_m * K):
@@ -598,35 +665,31 @@ def test_oob_epilogue_dynamic_m[
     ctx.enqueue_copy(c_ref_dev, c_ref_host_ptr)
 
     # Dynamic M: TileTensors with runtime M dimension
-    var a_tensor = TileTensor(a_dev, row_major(Coord(Int(m), Idx[K])))
-    var b_tensor = TileTensor(b_dev, row_major(Coord(Idx[N], Idx[K])))
-    var c_tensor = TileTensor(c_dev, row_major(Coord(Int(m), Idx[N])))
-    var c_ref_tensor = TileTensor(c_ref_dev, row_major(Coord(Int(m), Idx[N])))
+    var a_tensor = TileTensor(a_dev, row_major(m, Idx[K]))
+    var b_tensor = TileTensor(b_dev, row_major(Idx[N], Idx[K]))
+    var c_tensor = TileTensor(c_dev, row_major(m, Idx[N]))
+    var c_ref_tensor = TileTensor(c_ref_dev, row_major(m, Idx[N]))
 
     var out_tensor = TileTensor(
-        out_dev.unsafe_ptr(), row_major(Coord(Int(alloc_m), Idx[N]))
+        out_dev.unsafe_ptr(), row_major(alloc_m, Idx[N])
     )
 
-    @__parameter
     @inline(.always)
-    @__copy_capture(out_tensor)
     def epilogue_fn[
         _dtype: DType,
         width: SIMDLength,
         *,
-        alignment: Int = align_of[SIMD[_dtype, width]](),
-    ](idx: IndexList[2], val: SIMD[_dtype, width]) capturing -> None:
-        var coord = Coord(idx)
-        comptime assert coord.flat_rank == out_tensor.flat_rank
-        out_tensor.store[width=width, alignment=alignment](
-            coord, rebind[SIMD[c_type, width]](val)
+        alignment: Int,
+    ](idx: Coord, val: SIMD[_dtype, width]) {var out_tensor}:
+        comptime assert idx.rank == 2, "the matmul epilogue contract is rank 2"
+        comptime assert idx.flat_rank == out_tensor.flat_rank
+        out_tensor.store[alignment=alignment](
+            idx, rebind[SIMD[c_type, width]](val)
         )
 
-    _matmul_gpu[
-        use_tensor_core=True,
-        transpose_b=True,
-        elementwise_lambda_fn=epilogue_fn,
-    ](c_tensor, a_tensor, b_tensor, ctx)
+    _matmul_gpu[use_tensor_core=True, transpose_b=True](
+        c_tensor, a_tensor, b_tensor, epilogue_fn, ctx
+    )
 
     vendor_blas.matmul(
         ctx,
@@ -800,6 +863,17 @@ def main() raises:
         # ============================================================
         print("\nFP8 - Various M values (N=2048, K=2048):")
         test_dispatch_dynamic_m[.float8_e4m3fn, .float32, 2048, 2048](ctx, 2048)
+
+        # ============================================================
+        # FP8 N=7168 K=1024 (attention out proj, TP=8 shard)
+        # ============================================================
+        # M=17..32 picks a block_n=64 config whose BK=1024 exceeds K / 2.
+        print("\nFP8 - Various M values (N=7168, K=1024):")
+        var fp8_7168_m: List[Int] = [16, 17, 24, 32, 33]
+        for i in range(len(fp8_7168_m)):
+            test_dispatch_dynamic_m[.float8_e4m3fn, .float32, 7168, 1024](
+                ctx, fp8_7168_m[i]
+            )
 
         # ============================================================
         # OOB diagnostic: detect reads/writes past M
@@ -987,6 +1061,25 @@ def main() raises:
             alloc_N=4096,
         ](ctx)
         print(" PASSED")
+
+        # ============================================================
+        # Compute-closure dispatch: each kernel applies the closure
+        # before its own store into c.
+        # ============================================================
+        print("\nCompute closure through _matmul_gpu:")
+        test_dispatch_compute_fn[.bfloat16, .bfloat16, 4096, 4096](ctx, 100)
+        test_dispatch_compute_fn[.float8_e4m3fn, .float32, 256, 192](ctx, 256)
+        test_dispatch_compute_fn[.float8_e4m3fn, .float32, 3000, 16384](
+            ctx, 300
+        )
+        var compute_fp8_m: List[Int] = [1, 16, 64, 300, 2048]
+        for i in range(len(compute_fp8_m)):
+            test_dispatch_compute_fn[.float8_e4m3fn, .float32, 4096, 4096](
+                ctx, compute_fp8_m[i]
+            )
+        test_dispatch_compute_fn[.float8_e4m3fn, .bfloat16, 2304, 16384](
+            ctx, 75
+        )
 
         comptime run_llama3_sizes = get_defined_bool[
             "RUN_LLAMA3_SIZES", False

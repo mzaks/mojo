@@ -40,10 +40,6 @@ SCHEMA = '{"type": "object"}'
 def create_mock_kv_cache() -> Mock:
     cache = Mock()
     cache.chunk_alignment_tokens = 0
-    cache.max_seq_len = 2048
-    cache.page_size = 16
-    cache.get_total_num_pages = Mock(return_value=128)
-    cache.get_free_blocks_pct = Mock(return_value=0.5)
     cache.alloc = Mock(return_value=CompletedTransfer())
     cache.claim = Mock()
     cache.release = Mock()
@@ -66,17 +62,11 @@ class _StubMatcher:
     def is_stopped(self) -> bool:
         return False
 
-    def get_error(self) -> str | None:
-        return None
-
-    def get_grammar_warnings(self) -> Any:
-        return None
-
     def deep_copy(self) -> "_StubMatcher":
         return self
 
 
-class _ControlledBackend(GrammarBackend[Any]):
+class _ControlledBackend(GrammarBackend):
     """Backend stub whose build can block on ``release_build`` or fail."""
 
     name = "stub"
@@ -98,9 +88,6 @@ class _ControlledBackend(GrammarBackend[Any]):
         if self.fail_build:
             raise ValueError("stub backend refuses this grammar")
         return _StubMatcher()
-
-    def validate_grammar(self, grammar: Any) -> None:
-        pass
 
     def allocate_token_bitmask(
         self, batch_size: int, vocab_size: int

@@ -22,7 +22,7 @@ from std.math import exp
 from std.random import seed
 
 from internal_utils import assert_almost_equal, assert_equal
-from layout import Coord, Idx, TileTensor, row_major
+from layout import Idx, TileTensor, row_major
 from layout._fillers import random
 from max.gpu.host import DeviceContext
 from nn.moe import sink_gate_router
@@ -55,7 +55,7 @@ def test_sink_gate_router[
     # Continuous random values keep the selection order unambiguous: ties would
     # be broken by lower index in the kernel but are measure-zero here.
     random(
-        TileTensor(logits_host, row_major(Coord(num_tokens, Idx[n_stride]))),
+        TileTensor(logits_host, row_major(num_tokens, Idx[n_stride])),
         min=-4.0,
         max=4.0,
     )
@@ -77,12 +77,10 @@ def test_sink_gate_router[
     ctx.enqueue_copy(gscale_dev, gscale_host)
 
     sink_gate_router[n_routed, topk, n_shared, "gpu"](
-        TileTensor(idx_dev, row_major(Coord(num_tokens, Idx[topk]))),
-        TileTensor(w_dev, row_major(Coord(num_tokens, Idx[topk]))),
-        TileTensor(sink_dev, row_major(Coord(num_tokens, Idx[n_shared]))),
-        TileTensor(
-            logits_dev, row_major(Coord(num_tokens, Idx[n_stride]))
-        ).as_imm(),
+        TileTensor(idx_dev, row_major(num_tokens, Idx[topk])),
+        TileTensor(w_dev, row_major(num_tokens, Idx[topk])),
+        TileTensor(sink_dev, row_major(num_tokens, Idx[n_shared])),
+        TileTensor(logits_dev, row_major(num_tokens, Idx[n_stride])).as_imm(),
         TileTensor(bias_dev, row_major(Idx[n_routed])).as_imm(),
         TileTensor(gscale_dev, row_major(Idx[1])).as_imm(),
         route_scale,

@@ -16,14 +16,14 @@ from std.sys.info import simd_width_of
 
 from std.algorithm import vectorize
 from std.complex import ComplexSIMD
+from std.memory.alloc import unsafe_alloc
 from max.gpu import global_idx
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, default_accelerator
 from std.testing import assert_equal
 
-from std.sys import has_apple_gpu_accelerator
-from layout import TileTensor, Idx, row_major
+from layout import TileTensor, row_major
 
-comptime float_type = DType.float32 if has_apple_gpu_accelerator() else DType.float64
+comptime float_type = DType.float32 if default_accelerator().is_apple_gpu() else DType.float64
 comptime int_type = DType.int
 
 
@@ -82,9 +82,7 @@ def mandelbrot(out_ptr: MutPointer[Scalar[int_type], MutAnyOrigin]):
             float_type, simd_width
         ](scale_y)
         var c = ComplexSIMD[float_type, simd_width](cx, cy)
-        out.store[width=simd_width](
-            (row, col), mandelbrot_kernel[simd_width](c)
-        )
+        out.store((row, col), mandelbrot_kernel[simd_width](c))
 
     # We vectorize the call to compute_vector where call gets a chunk of
     # pixels.
@@ -92,7 +90,7 @@ def mandelbrot(out_ptr: MutPointer[Scalar[int_type], MutAnyOrigin]):
 
 
 def run_mandelbrot(ctx: DeviceContext) raises:
-    var out_host = alloc[Scalar[int_type]](width * height)
+    var out_host = unsafe_alloc[Scalar[int_type]](width * height)
 
     var out_device = ctx.enqueue_create_buffer[int_type](width * height)
 

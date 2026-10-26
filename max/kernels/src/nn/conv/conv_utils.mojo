@@ -34,15 +34,110 @@ from std.utils.index import Index, IndexList
 # ===----------------------------------------------------------------------=== #
 
 
-# Elementwise epilogue signature
-comptime elementwise_epilogue_type = def[rank: Int](
-    coords: IndexList[rank],
-    f_size: Int,
-) capturing -> None
+comptime _conv_epilogue_fn_signature = def(Coord, Int) -> None
 
-comptime elementwise_simd_epilogue_type = def[
-    dtype: DType, rank: Int, width: SIMDLength, alignment: Int = 1
-](IndexList[rank], SIMD[dtype, width]) capturing -> None
+comptime ConvEpilogueFn = (
+    ImplicitlyCopyable & RegisterPassable & _conv_epilogue_fn_signature
+)
+"""Fused epilogue applied over a whole `f_size`-long run at `coords`.
+
+Distinct from `ConvSimdEpilogueFn`, which receives the value; this one receives
+only the coordinate and the run length. Rank-N in the output's own space; the
+`Coord` carries its rank, so there is no `rank` parameter.
+"""
+
+
+@fieldwise_init
+struct NoConvEpilogue(
+    ImplicitlyCopyable,
+    RegisterPassable,
+    def(Coord, Int) -> None,
+):
+    """Stands in for a `ConvEpilogueFn` argument on code paths that apply no
+    epilogue."""
+
+    @inline(.always)
+    def __call__(self, coords: Coord, f_size: Int):
+        """Does nothing.
+
+        Args:
+            coords: Output coordinates of the run, unused.
+            f_size: Length of the run, unused.
+        """
+        pass
+
+
+comptime _conv_simd_epilogue_fn_signature = def[
+    dtype: DType, width: SIMDLength, alignment: Int = 1
+](Coord, SIMD[dtype, width]) -> None
+
+comptime ConvSimdEpilogueFn = (
+    ImplicitlyCopyable & RegisterPassable & _conv_simd_epilogue_fn_signature
+)
+"""Fused elementwise store epilogue for convolution: `(coord, value) -> None`.
+
+The coordinate is rank-N in the output's own space (NHWC / NDHWC), unlike
+`linalg.utils.ElementwiseEpilogueFn`, which is always rank 2. The `Coord`
+carries its own rank. The closure stores the value itself, so it must not
+capture the output tensor passed alongside it; use `ConvSimdComputeFn` there.
+"""
+
+
+@inline(.always)
+def _no_conv_simd_epilogue_body[
+    dtype: DType, width: SIMDLength, alignment: Int = 1
+](coords: Coord, val: SIMD[dtype, width]):
+    pass
+
+
+@inline(.always)
+def _as_conv_simd_epilogue_fn[
+    EpilogueFnType: ConvSimdEpilogueFn
+](epilogue_fn: EpilogueFnType) -> EpilogueFnType:
+    return epilogue_fn
+
+
+comptime no_conv_simd_epilogue_fn = _as_conv_simd_epilogue_fn(
+    _no_conv_simd_epilogue_body
+)
+"""Stands in for a `ConvSimdEpilogueFn` argument on code paths that store the
+output directly."""
+
+
+comptime _conv_simd_compute_fn_signature = def[
+    dtype: DType, width: SIMDLength, alignment: Int = 1
+](Coord, SIMD[dtype, width]) -> SIMD[dtype, width]
+
+comptime ConvSimdComputeFn = (
+    ImplicitlyCopyable & RegisterPassable & _conv_simd_compute_fn_signature
+)
+"""Fused convolution compute epilogue: `(coords, value) -> value`.
+
+The coordinates are rank-N in the output's own space (NHWC or NDHWC). The
+kernel stores the returned value into its output, so the closure never
+captures the output and can travel next to it.
+"""
+
+
+@inline(.always)
+def _identity_conv_simd_compute_body[
+    dtype: DType, width: SIMDLength, alignment: Int = 1
+](coords: Coord, val: SIMD[dtype, width]) -> SIMD[dtype, width]:
+    return val
+
+
+@inline(.always)
+def _as_conv_simd_compute_fn[
+    ComputeFnType: ConvSimdComputeFn
+](compute_fn: ComputeFnType) -> ComputeFnType:
+    return compute_fn
+
+
+comptime no_conv_simd_compute_fn = _as_conv_simd_compute_fn(
+    _identity_conv_simd_compute_body
+)
+"""Stands in for a `ConvSimdComputeFn` argument on code paths that apply no
+compute epilogue."""
 
 
 # ===----------------------------------------------------------------------=== #
@@ -115,7 +210,7 @@ struct ConvShape[rank: Int](TrivialRegisterPassable):
         """Input depth."""
 
         comptime if Self.rank >= 3:
-            return Int(self.input_dims[Self.rank - 3].value())
+            return Int(self.input_dims[Self.rank - 3])
         else:
             return 1
 
@@ -124,21 +219,21 @@ struct ConvShape[rank: Int](TrivialRegisterPassable):
         """Input height."""
 
         comptime if Self.rank >= 2:
-            return Int(self.input_dims[Self.rank - 2].value())
+            return Int(self.input_dims[Self.rank - 2])
         else:
             return 1
 
     @inline(.always)
     def w(self) -> Int:
         """Input width."""
-        return Int(self.input_dims[Self.rank - 1].value())
+        return Int(self.input_dims[Self.rank - 1])
 
     @inline(.always)
     def do(self) -> Int:
         """Output depth."""
 
         comptime if Self.rank >= 3:
-            return Int(self.output_dims[Self.rank - 3].value())
+            return Int(self.output_dims[Self.rank - 3])
         else:
             return 1
 
@@ -147,21 +242,21 @@ struct ConvShape[rank: Int](TrivialRegisterPassable):
         """Output height."""
 
         comptime if Self.rank >= 2:
-            return Int(self.output_dims[Self.rank - 2].value())
+            return Int(self.output_dims[Self.rank - 2])
         else:
             return 1
 
     @inline(.always)
     def wo(self) -> Int:
         """Output width."""
-        return Int(self.output_dims[Self.rank - 1].value())
+        return Int(self.output_dims[Self.rank - 1])
 
     @inline(.always)
     def q(self) -> Int:
         """Filter window depth."""
 
         comptime if Self.rank >= 3:
-            return Int(self.filter_dims[Self.rank - 3].value())
+            return Int(self.filter_dims[Self.rank - 3])
         else:
             return 1
 
@@ -170,14 +265,14 @@ struct ConvShape[rank: Int](TrivialRegisterPassable):
         """Filter window height."""
 
         comptime if Self.rank >= 2:
-            return Int(self.filter_dims[Self.rank - 2].value())
+            return Int(self.filter_dims[Self.rank - 2])
         else:
             return 1
 
     @inline(.always)
     def s(self) -> Int:
         """Filter window width."""
-        return Int(self.filter_dims[Self.rank - 1].value())
+        return Int(self.filter_dims[Self.rank - 1])
 
     @inline(.always)
     def stride_at[axis: Int](self) -> Int:
@@ -186,7 +281,7 @@ struct ConvShape[rank: Int](TrivialRegisterPassable):
         Parameters:
             axis: Spatial axis to read.
         """
-        return Int(self.stride[axis].value())
+        return Int(self.stride[axis])
 
     @inline(.always)
     def dilation_at[axis: Int](self) -> Int:
@@ -195,22 +290,22 @@ struct ConvShape[rank: Int](TrivialRegisterPassable):
         Parameters:
             axis: Spatial axis to read.
         """
-        return Int(self.dilation[axis].value())
+        return Int(self.dilation[axis])
 
     @inline(.always)
     def pad_d_lower(self) -> Int:
         """Depth padding before the first input point."""
-        return Int(self.pad_d[0].value())
+        return Int(self.pad_d[0])
 
     @inline(.always)
     def pad_h_lower(self) -> Int:
         """Height padding above the first input row."""
-        return Int(self.pad_h[0].value())
+        return Int(self.pad_h[0])
 
     @inline(.always)
     def pad_w_lower(self) -> Int:
         """Width padding left of the first input column."""
-        return Int(self.pad_w[0].value())
+        return Int(self.pad_w[0])
 
     @inline(.always)
     def filter_window_flat_size(self) -> Int:
@@ -240,38 +335,41 @@ struct ConvShape[rank: Int](TrivialRegisterPassable):
             Self.rank == 1 or Self.rank == 2 or Self.rank == 3
         ), "Only support 1d, 2d, and 3d convolution."
 
-        comptime if Self.rank == 1:
-            var w = output_flat_coord * self.stride_at[0]() - self.pad_w_lower()
+        comptime match Self.rank:
+            case 1:
+                var w = (
+                    output_flat_coord * self.stride_at[0]() - self.pad_w_lower()
+                )
 
-            return self.c * w
+                return self.c * w
 
-        elif Self.rank == 2:
-            # Unpack output coordinates
-            var ho, wo = divmod(output_flat_coord, self.wo())
+            case 2:
+                # Unpack output coordinates
+                var ho, wo = divmod(output_flat_coord, self.wo())
 
-            # Input coordinates
-            var h = ho * self.stride_at[0]() - self.pad_h_lower()
-            var w = wo * self.stride_at[1]() - self.pad_w_lower()
+                # Input coordinates
+                var h = ho * self.stride_at[0]() - self.pad_h_lower()
+                var w = wo * self.stride_at[1]() - self.pad_w_lower()
 
-            return self.c * (w + self.w() * (h + n * self.h()))
+                return self.c * (w + self.w() * (h + n * self.h()))
 
-        elif Self.rank == 3:
-            # Unpack output coordinates
-            var doho, wo = divmod(output_flat_coord, self.wo())
-            var do, ho = divmod(doho, self.ho())
+            case 3:
+                # Unpack output coordinates
+                var doho, wo = divmod(output_flat_coord, self.wo())
+                var do, ho = divmod(doho, self.ho())
 
-            # Input coordinates
-            var d = do * self.stride_at[0]() - self.pad_d_lower()
-            var h = ho * self.stride_at[1]() - self.pad_h_lower()
-            var w = wo * self.stride_at[2]() - self.pad_w_lower()
+                # Input coordinates
+                var d = do * self.stride_at[0]() - self.pad_d_lower()
+                var h = ho * self.stride_at[1]() - self.pad_h_lower()
+                var w = wo * self.stride_at[2]() - self.pad_w_lower()
 
-            return self.c * (
-                w + self.w() * (h + self.h() * (d + self.d() * self.n))
-            )
+                return self.c * (
+                    w + self.w() * (h + self.h() * (d + self.d() * self.n))
+                )
 
-        else:
-            # Pass compile.
-            return -1
+            case _:
+                # Pass compile.
+                return -1
 
     @inline(.always)
     def matmul_M(self) -> Int:
@@ -551,12 +649,13 @@ def reorder_padding[rank: Int](pad: IntTuple) -> IntTuple:
     Returns:
         Flattened padding tuple ordered as per-dimension `(lower, upper)` pairs.
     """
-    comptime if rank == 1:
-        return IntTuple(pad).flatten()
-    elif rank == 2:
-        return IntTuple(pad[0], pad[2], pad[1], pad[3])
-    else:
-        return IntTuple(pad[0], pad[2], pad[4], pad[1], pad[3], pad[5])
+    comptime match rank:
+        case 1:
+            return IntTuple(pad).flatten()
+        case 2:
+            return IntTuple(pad[0], pad[2], pad[1], pad[3])
+        case _:
+            return IntTuple(pad[0], pad[2], pad[4], pad[1], pad[3], pad[5])
 
 
 struct ConvInfoStatic[rank: Int](Defaultable):
@@ -866,12 +965,8 @@ def get_conv_num_partitions[
     )
     comptime min_c_per_task = min_c_per_task_avx512 if CompilationTarget.has_avx512f() else 1024
 
-    # alias min_rows_per_task = (196 // micro_kernel_w) * micro_kernel_w
-    # alias min_c_per_task = 64
-
     var matmul_M = conv_shape.matmul_M()
     var matmul_N = conv_shape.matmul_N()
-    # var matmul_K = conv_shape.matmul_K()
 
     # Accessing A is more expensive in im2col than accessing B.
     # Time a factor to M to var the heuristic bias on partitioning M.

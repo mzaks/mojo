@@ -32,7 +32,6 @@ from max.benchmark import bencher_iter_custom
 from max.gpu.host import DeviceContext
 from std.benchmark import (
     Bench,
-    BenchConfig,
     Bencher,
     BenchId,
     BenchMetric,
@@ -151,7 +150,7 @@ def bench_range(mut b: Bench, ctx: DeviceContext) raises:
 
     def run[
         LaunchFn: def(DeviceContext) raises -> None
-    ](launch: LaunchFn, name: StaticString, elems: Int) raises:
+    ](launch: LaunchFn, name: StaticString, elems: Int) raises {mut b, imm ctx}:
         def bench_func(mut bencher: Bencher) raises {imm launch, imm ctx}:
             bencher_iter_custom(bencher, launch, ctx)
 

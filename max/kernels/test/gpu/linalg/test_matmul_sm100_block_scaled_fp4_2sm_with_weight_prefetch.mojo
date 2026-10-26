@@ -22,13 +22,11 @@ from std.math import align_up, ceildiv
 from std.sys import size_of
 from max.gpu.host import DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.memory import alloc
 from std.random import rand
 
 from internal_utils import assert_almost_equal
 from layout import (
     TileTensor,
-    Coord,
     CoordLike,
     row_major,
     Idx,
@@ -37,6 +35,7 @@ from linalg.matmul.gpu.sm100.block_scaled_matmul import (
     blackwell_block_scaled_matmul_tma_umma_warp_specialized,
 )
 from linalg.matmul.gpu.sm100.config import BlockScaledMatmulConfig
+from std.utils.coord import DynamicCoord
 from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
 from linalg.fp4_utils import (
@@ -61,7 +60,7 @@ def _test_impl[
     c_type: DType,
     scales_dtype: DType,
     block_tile_shape: IndexList[3],
-    mma_shape: IndexList[3],
+    mma_shape: DynamicCoord[.int, 3],
     cluster_shape: StaticTuple[Int32, 3],
     cta_group: Int,
     transpose_b: Bool = True,
@@ -86,7 +85,7 @@ def _test_impl[
     print(
         t"[prefetch-2sm] in/out dtypes=({a_type}, {b_type}, {c_type},"
         t" {scales_dtype})"
-        t" shape=({Int(m.value())}, {Int(n.value())}, {Int(k.value())})"
+        t" shape=({Int(m)}, {Int(n)}, {Int(k)})"
         t" mma_shape={mma_shape} block_tile_shape={block_tile_shape}"
         t" cta_group={cta_group}"
         t" cluster_shape=({cluster_shape[0]}, {cluster_shape[1]},"
@@ -96,15 +95,15 @@ def _test_impl[
         t" prefetch_tiles_n={prefetch_tiles_n}"
     )
 
-    var a_shape = row_major(Coord(m, Idx[KType.static_value // 2]))
+    var a_shape = row_major(m, Idx[KType.static_value // 2])
     var b_shape = row_major(
-        Coord(Idx[NType.static_value], Idx[KType.static_value // 2])
+        Idx[NType.static_value], Idx[KType.static_value // 2]
     )
-    var c_shape = row_major(Coord(m, Idx[NType.static_value]))
+    var c_shape = row_major(m, Idx[NType.static_value])
 
-    var a_size = Int(m.value()) * (KType.static_value // 2)
-    var b_size = Int(n.value()) * (KType.static_value // 2)
-    var c_size = Int(m.value()) * Int(n.value())
+    var a_size = Int(m) * (KType.static_value // 2)
+    var b_size = Int(n) * (KType.static_value // 2)
+    var c_size = Int(m) * Int(n)
 
     var a_host_ptr = ctx.enqueue_create_host_buffer[a_type](a_size)
     var a_host = TileTensor(a_host_ptr, a_shape)
@@ -125,22 +124,18 @@ def _test_impl[
     var c_ref_tensor = TileTensor(c_device_ref, c_shape)
 
     var a_scales_shape = row_major(
-        Coord(
-            ceildiv(Int(m.value()), SF_MN_GROUP_SIZE),
-            Idx[ceildiv(KType.static_value, SF_VECTOR_SIZE * SF_ATOM_K)],
-            Idx[SF_ATOM_M[0]],
-            Idx[SF_ATOM_M[1]],
-            Idx[SF_ATOM_K],
-        )
+        ceildiv(Int(m), SF_MN_GROUP_SIZE),
+        Idx[ceildiv(KType.static_value, SF_VECTOR_SIZE * SF_ATOM_K)],
+        Idx[SF_ATOM_M[0]],
+        Idx[SF_ATOM_M[1]],
+        Idx[SF_ATOM_K],
     )
     var b_scales_shape = row_major(
-        Coord(
-            Idx[ceildiv(NType.static_value, SF_MN_GROUP_SIZE)],
-            Idx[ceildiv(KType.static_value, SF_VECTOR_SIZE * SF_ATOM_K)],
-            Idx[SF_ATOM_M[0]],
-            Idx[SF_ATOM_M[1]],
-            Idx[SF_ATOM_K],
-        )
+        Idx[ceildiv(NType.static_value, SF_MN_GROUP_SIZE)],
+        Idx[ceildiv(KType.static_value, SF_VECTOR_SIZE * SF_ATOM_K)],
+        Idx[SF_ATOM_M[0]],
+        Idx[SF_ATOM_M[1]],
+        Idx[SF_ATOM_K],
     )
 
     var a_scales_total = a_scales_shape.product()
@@ -169,24 +164,24 @@ def _test_impl[
     rand(a_scales_host.as_span())
     rand(b_scales_host.as_span())
 
-    for idx0 in range(align_up(Int(m.value()), SF_MN_GROUP_SIZE)):
+    for idx0 in range(align_up(Int(m), SF_MN_GROUP_SIZE)):
         for idx1 in range(
             0,
-            align_up(Int(k.value()), SF_VECTOR_SIZE * SF_ATOM_K),
+            align_up(Int(k), SF_VECTOR_SIZE * SF_ATOM_K),
             SF_VECTOR_SIZE,
         ):
-            if idx0 >= Int(m.value()) or idx1 >= Int(k.value()):
+            if idx0 >= Int(m) or idx1 >= Int(k):
                 set_scale_factor[SF_VECTOR_SIZE=SF_VECTOR_SIZE](
                     a_scales_host, idx0, idx1, Scalar[scales_dtype](0.0)
                 )
 
-    for idx0 in range(align_up(Int(n.value()), SF_MN_GROUP_SIZE)):
+    for idx0 in range(align_up(Int(n), SF_MN_GROUP_SIZE)):
         for idx1 in range(
             0,
-            align_up(Int(k.value()), SF_VECTOR_SIZE * SF_ATOM_K),
+            align_up(Int(k), SF_VECTOR_SIZE * SF_ATOM_K),
             SF_VECTOR_SIZE,
         ):
-            if idx0 >= Int(n.value()) or idx1 >= Int(k.value()):
+            if idx0 >= Int(n) or idx1 >= Int(k):
                 set_scale_factor[SF_VECTOR_SIZE=SF_VECTOR_SIZE](
                     b_scales_host, idx0, idx1, Scalar[scales_dtype](0.0)
                 )
@@ -278,7 +273,6 @@ def run_matmul_sm100_block_scaled_fp4_2sm_prefetch_suite[
         comptime BK = (swizzle.bytes() // size_of[dtype]())
         comptime MMA_K = 32
 
-        @__parameter
         @inline(.always)
         def run[
             MType: CoordLike,
@@ -290,7 +284,7 @@ def run_matmul_sm100_block_scaled_fp4_2sm_prefetch_suite[
             c_type: DType,
             _scales_dtype: DType,
             block_tile_shape: IndexList[3],
-            mma_shape: IndexList[3],
+            mma_shape: DynamicCoord[.int, 3],
             cluster_shape: StaticTuple[Int32, 3],
             cta_group: Int,
             transpose_b: Bool = True,
@@ -335,12 +329,12 @@ def run_matmul_sm100_block_scaled_fp4_2sm_prefetch_suite[
 
         # ------------------------------------------------------------------
         # 2SM tile sweep: cta_group=2, bm=128, bn in [64, 128]
-        # umma_shape = Index(2*bm, 2*bn, MMA_K) — reflects 2SM layout
+        # umma_shape = (2*bm, 2*bn, MMA_K) — reflects 2SM layout
         # ------------------------------------------------------------------
         comptime for bm in [128]:
             comptime for bn in [64, 128]:
-                comptime block_tile_shape = Index(bm, bn, BK)
-                comptime umma_shape = Index(2 * bm, 2 * bn, MMA_K)
+                comptime block_tile_shape = (bm, bn, BK)
+                comptime umma_shape = (2 * bm, 2 * bn, MMA_K)
 
                 run[
                     dtype,

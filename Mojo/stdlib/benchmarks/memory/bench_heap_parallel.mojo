@@ -30,12 +30,11 @@ from std.benchmark import (
     BenchConfig,
     Bencher,
     BenchId,
-    Unit,
     black_box,
     keep,
 )
 from std.math import ceildiv
-from std.memory import Allocation, alloc, dealloc
+from std.memory import alloc
 from std.atomic import Atomic
 from std.sys.info import num_physical_cores
 
@@ -66,7 +65,7 @@ def bench_heap_alloc_parallel(mut b: Bencher) raises:
                 if n_elems < 1:
                     n_elems = 1
 
-                var allocation = alloc[Int]({count = n_elems}).into_managed()
+                var allocation = alloc[Int]({length = n_elems}).into_managed()
                 var p = allocation.unsafe_ptr()
                 var seed = Int(black_box(task_id + j))
 

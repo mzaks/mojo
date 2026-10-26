@@ -33,20 +33,27 @@ from __future__ import annotations
 import functools
 import math
 from collections.abc import Iterable, Sequence
+from pathlib import Path
+from typing import Any
 
+from max import tree
 from max.driver import accelerator_api
 from max.dtype import DType
 from max.graph import (
     BufferType,
     BufferValue,
     DeviceRef,
+    Graph,
     ShardingStrategy,
     TensorType,
     TensorValue,
     TensorValueLike,
+    Type,
+    Value,
     Weight,
     ops,
 )
+from max.graph import Module as GraphModule
 from max.graph.quantization import QuantizationEncoding
 from max.nn.attention import MHAMaskVariant
 from max.nn.embedding import Embedding
@@ -54,17 +61,19 @@ from max.nn.kernels import (
     flash_attention_ragged,
     grouped_matmul_ragged,
     moe_create_indices,
+    moe_finalize,
     store_k_cache_ragged,
     store_v_cache_ragged,
 )
 from max.nn.kv_cache import (
+    KVCacheInputsPerDevice,
     KVCacheParamInterface,
     KVCacheParams,
     PagedCacheValues,
 )
 from max.nn.layer import LayerList, Module
 from max.nn.linear import MLP, Linear
-from max.nn.moe import MoE, MoEGate
+from max.nn.moe import GatedActivation, MoE, MoEGate
 from max.nn.norm import RMSNorm
 from max.nn.quant_config import QuantConfig
 from max.nn.state_space import (
@@ -72,7 +81,7 @@ from max.nn.state_space import (
     gated_group_rmsnorm,
     mamba2_ssd_chunk_scan_varlen_fwd_inplace,
 )
-from max.nn.transformer import ReturnLogits, logits_postprocess
+from max.nn.transformer import DecoderOutputs, ReturnLogits, logits_postprocess
 
 from .model_config import NemotronHConfig
 
@@ -358,14 +367,12 @@ class NemotronHMoE(MoE):
     ``[num_experts, moe_intermediate_size, hidden]``.
 
     bf16 (no ``quant_config``) reuses the base :class:`~max.nn.moe.MoE`
-    grouped-matmul routing verbatim, which on Apple resolves to MAX's own
-    ``naive_grouped_matmul`` (the else-branch of ``grouped_matmul_ragged``).
+    grouped-matmul routing verbatim.
 
     FP8 (per-tensor static ``quant_config``, the 30B-A3B) keeps the routed
     expert weights as ``float8_e4m3fn`` and feeds them to the SAME grouped
-    matmul: the op is dtype-generic, so the naive kernel widens each E4M3 weight
-    to fp32 on load (bf16 activation x fp8 weight -> fp32 accumulate -> bf16),
-    i.e. weight-only W8A16 — the grouped analog of the dense Apple FP8 Linear.
+    matmul (bf16 activation x fp8 weight -> fp32 accumulate -> bf16), i.e.
+    weight-only W8A16 — the grouped analog of the dense Apple FP8 Linear.
     The per-tensor scalar ``weight_scale`` (one per expert) factors out of the
     matmul sum, so it is folded EXACTLY as a post-matmul per-row multiply
     (gathered by each permuted row's expert). The shared expert runs the dense
@@ -405,12 +412,9 @@ class NemotronHMoE(MoE):
             return super().__call__(x)
 
         # FP8 weight-only (W8A16): mirrors the base routing, but the routed
-        # expert grouped matmuls consume FP8-E4M3 weight stacks (widened to
-        # fp32 on load by the dtype-generic naive grouped-matmul kernel) and the
+        # expert grouped matmuls consume FP8-E4M3 weight stacks and the
         # per-expert scalar ``weight_scale`` is folded post-matmul. A per-tensor
-        # scalar factors out of the sum, so the fold is exact (not merely within
-        # tolerance) -- the grouped analog of the dense Apple FP8 Linear.
-        seq_len = x.shape[0]
+        # scalar factors out of the sum, so the fold is exact.
         router_idx, router_weight = self.gate(x)
         router_idx = ops.reshape(router_idx, [-1])
 
@@ -427,7 +431,7 @@ class NemotronHMoE(MoE):
         permutated_states = ops.gather(
             x,
             ops.cast(
-                ops.floor_div(token_expert_order, self.num_experts_per_token),
+                token_expert_order // self.num_experts_per_token,
                 DType.int32,
             ),
             axis=0,
@@ -482,11 +486,9 @@ class NemotronHMoE(MoE):
         )
         down = (down.cast(DType.float32) * down_scale).cast(x.dtype)
 
-        down = ops.gather(down, restore_token_order, axis=0).reshape(
-            [seq_len, self.num_experts_per_token, self.hidden_dim]
+        routed_expert_out = moe_finalize(
+            down, restore_token_order, router_weight, x.dtype
         )
-        routed_expert_out = ops.unsqueeze(router_weight, axis=1) @ down
-        routed_expert_out = ops.squeeze(routed_expert_out, axis=1).cast(x.dtype)
 
         if self.has_shared_experts:
             routed_expert_out += self.shared_experts(x)
@@ -506,6 +508,8 @@ class NemotronHAttention(Module):
         self,
         config: NemotronHConfig,
         kv_layer_idx: int,
+        *,
+        quant_config: QuantConfig | None = None,
     ) -> None:
         super().__init__()
         dev = config.devices[0]
@@ -520,11 +524,32 @@ class NemotronHAttention(Module):
 
         self.q_dim = self.n_heads * self.head_dim
         self.kv_dim = self.n_kv_heads * self.head_dim
-        # Attention projections are bf16 here: the 4B FP8 checkpoint excludes
-        # them from quantization, and the 8B Reasoning checkpoint's per-tensor
-        # FP8 q/k/v/o are dequantized to bf16 at load by the weight adapter. So
-        # no quantization config is wired here.
-        #
+        # ``quant_config`` is set when this layer's q/k/v/o are per-tensor
+        # static FP8 (the 8B Reasoning checkpoint). Each projection has its own
+        # weight and input scale, so they run as separate FP8 Linears.
+        self.qkv_proj: Linear | None = None
+        if quant_config is not None:
+            fp8_linear = functools.partial(
+                Linear,
+                in_dim=config.hidden_size,
+                dtype=DType.float8_e4m3fn,
+                device=dev,
+                has_bias=config.attention_bias,
+                quant_config=quant_config,
+            )
+            self.q_proj = fp8_linear(out_dim=self.q_dim)
+            self.k_proj = fp8_linear(out_dim=self.kv_dim)
+            self.v_proj = fp8_linear(out_dim=self.kv_dim)
+            self.o_proj = Linear(
+                in_dim=self.q_dim,
+                out_dim=config.hidden_size,
+                dtype=DType.float8_e4m3fn,
+                device=dev,
+                has_bias=config.attention_bias,
+                quant_config=quant_config,
+            )
+            return
+        # bf16 (the 4B checkpoint, which leaves attention unquantized).
         # Fused QKV: one matmul over the concatenated [q | k | v] out-dim, then
         # ``ops.split``. The HF checkpoint ships q/k/v as separate weights; the
         # adapter concatenates them (q, then k, then v) into ``qkv_proj.weight``.
@@ -557,10 +582,15 @@ class NemotronHAttention(Module):
         input_row_offsets: TensorValue,
     ) -> TensorValue:
         total_seq_len = x.shape[0]
-        # One fused QKV matmul, then split into q | k | v (sizes q_dim, kv_dim,
-        # kv_dim along the feature axis).
-        qkv = self.qkv_proj(x)
-        q, k, v = ops.split(qkv, [self.q_dim, self.kv_dim, self.kv_dim], axis=1)
+        if self.qkv_proj is None:
+            q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        else:
+            # One fused QKV matmul, then split into q | k | v (sizes q_dim,
+            # kv_dim, kv_dim along the feature axis).
+            qkv = self.qkv_proj(x)
+            q, k, v = ops.split(
+                qkv, [self.q_dim, self.kv_dim, self.kv_dim], axis=1
+            )
         query = ops.reshape(q, [-1, self.n_heads, self.head_dim])
         key = ops.reshape(k, [-1, self.n_kv_heads, self.head_dim])
         value = ops.reshape(v, [-1, self.n_kv_heads, self.head_dim])
@@ -866,7 +896,9 @@ class NemotronHBlock(Module):
         if self.kind == "mamba":
             self.mixer = NemotronHMamba2Mixer(config, quant_config=quant_config)
         elif self.kind == "attention":
-            self.mixer = NemotronHAttention(config, kv_layer_idx)
+            self.mixer = NemotronHAttention(
+                config, kv_layer_idx, quant_config=quant_config
+            )
         elif self.kind == "moe":
             # Non-gated relu2 MoE. ``quant_config`` is set only when this MoE
             # layer is FP8 (the 30B-A3B FP8 checkpoint); it makes the routed +
@@ -888,11 +920,12 @@ class NemotronHBlock(Module):
                 has_shared_experts=True,
                 shared_experts_dim=config.moe_shared_expert_intermediate_size,
                 dtype=config.dtype,
-                apply_router_weight_first=False,
                 quant_config=quant_config,
                 # Non-gated: relu2 over the whole up-projection (the moe_dim
                 # split arg from the base MoE is ignored).
-                gated_activation_fn=lambda gate_up, moe_dim: _relu2(gate_up),
+                activation=GatedActivation(
+                    gated_activation_fn=lambda gate_up, moe_dim: _relu2(gate_up)
+                ),
             )
         else:  # mlp
             self.mixer = NemotronHMLP(config, quant_config=quant_config)
@@ -944,6 +977,8 @@ class NemotronH(Module):
                 qc = quant_config
             elif kind == "moe" and li in config.fp8_moe_layers:
                 qc = quant_config
+            elif kind == "attention" and li in config.fp8_attention_layers:
+                qc = quant_config
             blocks.append(NemotronHBlock(config, li, kv_layer, quant_config=qc))
             if kind == "attention":
                 kv_idx += 1
@@ -985,7 +1020,7 @@ class NemotronH(Module):
         conv_pools: list[BufferValue],
         ssm_pools: list[BufferValue],
         has_initial_state: TensorValue,
-    ) -> tuple[TensorValue, ...]:
+    ) -> DecoderOutputs:
         """Run the hybrid stack.
 
         Returns the logits tuple from :func:`logits_postprocess`. The conv and
@@ -1106,4 +1141,74 @@ class NemotronH(Module):
             + conv_pool_types
             + ssm_pool_types
             + [has_initial_state_type]
+        )
+
+    def trace(
+        self,
+        *input_types: Type[Any],
+        name: str | None = None,
+        module: GraphModule | None = None,
+        custom_extensions: Iterable[Path] = (),
+        is_device_graph: bool = False,
+    ) -> Graph:
+        """Traces the graph, whose inputs are :meth:`input_types`.
+
+        Adapts the flat graph inputs to :meth:`__call__`: splits them into
+        the batch, the KV cache, the slot indices, the conv and SSM state
+        pools and ``has_initial_state``.
+
+        Args:
+            *input_types: The graph's input types, as :meth:`input_types`
+                returns them.
+            name: The name of the graph. Defaults to the class's qualified
+                name.
+            module: The MLIR module to add the graph to. Defaults to a new
+                module.
+            custom_extensions: Paths to custom kernel libraries the graph
+                uses.
+            is_device_graph: Whether to build a device graph.
+
+        Returns:
+            The traced :class:`~max.graph.Graph`.
+        """
+        num_mamba = self.num_mamba_layers
+
+        def forward(
+            tokens: Value[Any],
+            input_row_offsets: Value[Any],
+            return_n_logits: Value[Any],
+            *variadic: Value[Any],
+        ) -> DecoderOutputs:
+            # The KV inputs come first, then slot_idx, the conv pools, the
+            # SSM pools and has_initial_state.
+            kv_count = len(variadic) - 1 - num_mamba * 2 - 1
+            kv_collections = tree.leaves(
+                self.kv_params.unflatten_kv_inputs(iter(variadic[:kv_count])),
+                leaf=KVCacheInputsPerDevice,
+            )
+            idx = kv_count
+            slot_idx = variadic[idx].tensor
+            idx += 1
+            conv_pools = [variadic[idx + i].buffer for i in range(num_mamba)]
+            idx += num_mamba
+            ssm_pools = [variadic[idx + i].buffer for i in range(num_mamba)]
+            idx += num_mamba
+            return self(
+                tokens.tensor,
+                input_row_offsets.tensor,
+                return_n_logits.tensor,
+                kv_collections,
+                slot_idx,
+                conv_pools,
+                ssm_pools,
+                variadic[idx].tensor,
+            )
+
+        return Graph(
+            type(self).__qualname__ if name is None else name,
+            forward,
+            input_types=input_types,
+            custom_extensions=list(custom_extensions),
+            module=module,
+            is_device_graph=is_device_graph,
         )

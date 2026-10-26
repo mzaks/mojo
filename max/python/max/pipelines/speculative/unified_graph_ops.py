@@ -17,12 +17,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from max.dtype import DType
-from max.graph import BufferValue, DeviceRef, Dim, TensorValue, ops
+from max.graph import BufferValue, DeviceRef, Dim, DimLike, TensorValue, ops
 from max.nn.kernels import (
     eagle_prefill_shift_tokens,
     inplace_memcpy,
     wait_host_value_with_dep,
 )
+from max.nn.sampling.penalties import LogitPenalties
 from max.nn.sampling.rejection_sampler import AcceptanceSampler
 
 from .ragged_token_merger import (
@@ -36,6 +37,8 @@ __all__ = [
     "apply_overlap_bitmask",
     "broadcast_per_device",
     "gather_accepted_hidden_states",
+    "gather_rows_per_device",
+    "mask_padded_tail",
     "merge_tokens_and_host_offsets",
     "shift_corrected_tokens",
 ]
@@ -54,6 +57,47 @@ def broadcast_per_device(
     if n_devs == 1:
         return [value]
     return ops.distributed_broadcast(value, list(signal_buffers))
+
+
+def mask_padded_tail(
+    logits: TensorValue, vocab_size: int, unpadded_vocab_size: int | None
+) -> TensorValue:
+    """Sends the padding rows of a padded vocabulary to negative infinity.
+
+    A head padded past its tokenizer has live weights in those rows, so a
+    sampler could pick a token id no tokenizer decodes.
+    """
+    if unpadded_vocab_size is None or unpadded_vocab_size >= vocab_size:
+        return logits
+    device = logits.device
+    # Two broadcast scalars rather than a materialized row: keeps a
+    # vocab-sized fp32 constant out of the graph.
+    keep = ops.broadcast_to(
+        ops.constant(0.0, DType.float32, device=device), [unpadded_vocab_size]
+    )
+    drop = ops.broadcast_to(
+        ops.constant(float("-inf"), DType.float32, device=device),
+        [vocab_size - unpadded_vocab_size],
+    )
+    return logits + ops.cast(ops.concat([keep, drop]), logits.dtype)
+
+
+def gather_rows_per_device(
+    values: Sequence[TensorValue],
+    row_ids_per_device: Sequence[TensorValue],
+    rows: Dim,
+    trailing_dim: DimLike,
+) -> list[TensorValue]:
+    """Gathers rows out of each device's copy of a ``[B, D]`` tensor.
+
+    ``row_ids_per_device`` holds each device's own copy of the row indices,
+    from :func:`broadcast_per_device`, so no gather reads its indices from
+    another device. Each result is rebound to ``[rows, trailing_dim]``.
+    """
+    return [
+        ops.gather(value, ids, axis=0).rebind([rows, trailing_dim])
+        for value, ids in zip(values, row_ids_per_device, strict=True)
+    ]
 
 
 def gather_accepted_hidden_states(
@@ -193,6 +237,7 @@ def accept_and_pick_next_tokens(
     in_thinking_phase: TensorValue | None = None,
     token_bitmasks: TensorValue | None = None,
     draft_probs_full: TensorValue | None = None,
+    penalties: LogitPenalties | None = None,
 ) -> tuple[TensorValue, TensorValue, TensorValue, TensorValue]:
     """Run acceptance sampling and pick the next token at the first reject."""
     # AcceptanceSampler defaults in_thinking_phase to None, so passing it
@@ -209,6 +254,7 @@ def accept_and_pick_next_tokens(
         in_thinking_phase=in_thinking_phase,
         token_bitmasks=token_bitmasks,
         draft_probs_full=draft_probs_full,
+        penalties=penalties,
     )
     # concat([recovered, bonus]) -> [batch, K+1]; gather_nd picks the token at
     # index num_accepted[b] per batch element (target argmax at first reject).

@@ -19,12 +19,10 @@ from std.sys import bit_width_of
 from std.builtin.dtype import _uint_type_of_width
 from max.gpu import WARP_SIZE, block_idx, thread_idx
 from max.gpu.sync import barrier
-import max.gpu.primitives.warp as warp
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu.host import Dim
-from std.sys.info import has_apple_gpu_accelerator
 from std.random import Random
-from layout import Coord, Idx, TileTensor, row_major
+from layout import Coord, TileTensor, row_major
 from std.memory import bitcast, unsafe_stack_allocation
 from nn.softmax import _softmax_gpu
 from nn.topk import (
@@ -52,15 +50,15 @@ def topk_wrapper[
     K: Int32,
     num_elements: Int32,
     num_blocks_per_input: Int32,
-    in_buffer: UnsafePointer[Scalar[input_type], ImmUntrackedOrigin],
-    local_topk_vals: UnsafePointer[
+    in_buffer: ImmPointer[Scalar[input_type], ImmUntrackedOrigin],
+    local_topk_vals: MutPointer[
         Scalar[input_type], MutUntrackedOrigin
     ],  # Output buffer of size num_blocks_per_input * K
-    local_topk_idxs: UnsafePointer[
+    local_topk_idxs: MutPointer[
         Scalar[index_type], MutUntrackedOrigin
     ],  # Output buffer of size num_blocks_per_input * K
-    p_threshold: UnsafePointer[Scalar[input_type], MutUntrackedOrigin],
-    skip_sort: UnsafePointer[Scalar[.bool], MutUntrackedOrigin],
+    p_threshold: MutPointer[Scalar[input_type], MutUntrackedOrigin],
+    skip_sort: MutPointer[Scalar[.bool], MutUntrackedOrigin],
 ):
     """
     Copy of `Kernels/mojo/nn/topk.mojo:_topk_stage1` with the addition of
@@ -93,7 +91,7 @@ def topk_wrapper[
 
     var batch_id, block_lane = divmod(bid, _num_blocks_per_input)
 
-    var _in_buffer = in_buffer + batch_id * _num_elements
+    var _in_buffer = in_buffer.unsafe_offset(batch_id * _num_elements)
 
     # # Allocate shared memory for the values and indices
     var topk_sram = unsafe_stack_allocation[
@@ -247,21 +245,22 @@ def normalize(
     """
     comptime dtype = value.dtype
 
-    comptime if dtype == .int32:
-        return normalize(rebind[Int32](value)).cast[result.dtype]()
-    elif dtype == .uint32:
-        return normalize(rebind[UInt32](value)).cast[result.dtype]()
-    elif dtype == .float32:
-        return normalize(rebind[Float32](value)).cast[result.dtype]()
-    # TODO: These below don't return uint32 so must generalize and fix
-    elif dtype == .uint16:
-        return normalize(rebind[UInt16](value)).cast[result.dtype]()
-    elif dtype == .float16:
-        return normalize(rebind[Float16](value)).cast[result.dtype]()
-    elif dtype == .bfloat16:
-        return normalize(rebind[BFloat16](value)).cast[result.dtype]()
-    else:
-        comptime assert False, "unhandled normalize type"
+    comptime match dtype:
+        case .int32:
+            return normalize(rebind[Int32](value)).cast[result.dtype]()
+        case .uint32:
+            return normalize(rebind[UInt32](value)).cast[result.dtype]()
+        case .float32:
+            return normalize(rebind[Float32](value)).cast[result.dtype]()
+        # TODO: These below don't return uint32 so must generalize and fix
+        case .uint16:
+            return normalize(rebind[UInt16](value)).cast[result.dtype]()
+        case .float16:
+            return normalize(rebind[Float16](value)).cast[result.dtype]()
+        case .bfloat16:
+            return normalize(rebind[BFloat16](value)).cast[result.dtype]()
+        case _:
+            comptime assert False, "unhandled normalize type"
 
 
 @inline(.always)
@@ -274,16 +273,16 @@ def radix_sort_pairs_kernel[
     BLOCK_SIZE: Int = 256,  # found empirically
     NUM_BITS_PER_PASS: Int = 4,
 ](
-    input_keys_: UnsafePointer[
+    input_keys_: MutPointer[
         Scalar[dtype], MutUntrackedOrigin
     ],  # modifies input
-    output_keys_: UnsafePointer[mut=True, Scalar[dtype], MutUntrackedOrigin],
-    input_key_ids_: UnsafePointer[
+    output_keys_: MutPointer[Scalar[dtype], MutUntrackedOrigin],
+    input_key_ids_: MutPointer[
         Scalar[out_idx_type], MutUntrackedOrigin
     ],  # modifies input
-    output_key_ids_: UnsafePointer[Scalar[out_idx_type], MutUntrackedOrigin],
+    output_key_ids_: MutPointer[Scalar[out_idx_type], MutUntrackedOrigin],
     num_keys: Int32,
-    skip_sort: UnsafePointer[Scalar[.bool], MutUntrackedOrigin],
+    skip_sort: MutPointer[Scalar[.bool], MutUntrackedOrigin],
 ):
     """
     Radix pair sort kernel for (default) descending order.
@@ -315,10 +314,10 @@ def radix_sort_pairs_kernel[
     var elems_per_thread = ceildiv(_num_keys, BLOCK_SIZE)
     comptime NUM_BUCKETS = 2**NUM_BITS_PER_PASS
 
-    var input_keys = input_keys_ + batch_id * _num_keys
-    var output_keys = output_keys_ + batch_id * _num_keys
-    var input_key_ids = input_key_ids_ + batch_id * _num_keys
-    var output_key_ids = output_key_ids_ + batch_id * _num_keys
+    var input_keys = input_keys_.unsafe_offset(batch_id * _num_keys)
+    var output_keys = output_keys_.unsafe_offset(batch_id * _num_keys)
+    var input_key_ids = input_key_ids_.unsafe_offset(batch_id * _num_keys)
+    var output_key_ids = output_key_ids_.unsafe_offset(batch_id * _num_keys)
 
     if skip_sort[batch_id]:
         return
@@ -353,7 +352,6 @@ def radix_sort_pairs_kernel[
     # Initialize counts[NUM_BUCKETS]
     var counts_stack = Array[Int32, NUM_BUCKETS](fill=0)
     var counts_buf = TileTensor(counts_stack, row_major[NUM_BUCKETS]())
-    var counts = counts_buf.ptr
 
     # Process elements and compute counts for each thread
     for index in range(tid * elems_per_thread, (tid + 1) * elems_per_thread):
@@ -364,11 +362,11 @@ def radix_sort_pairs_kernel[
             var radix = (normalized_key >> KeyType(current_bit)) & KeyType(
                 NUM_BUCKETS - 1
             )
-            counts[radix] += 1
+            counts_buf[radix] += 1
 
     # Store counts[NUM_BUCKETS] per thread into shared memory s_counts
     comptime for i in range(NUM_BUCKETS):
-        s_counts[tid * NUM_BUCKETS + i] = counts[i]
+        s_counts[tid * NUM_BUCKETS + i] = counts_buf[i]
     barrier()
 
     # Compute total_counts[NUM_BUCKETS] by summing counts[NUM_BUCKETS] across threads
@@ -417,14 +415,9 @@ def radix_sort_pairs_kernel[
             # Double the offset for the next iteration to fetch values from farther threads.
             offset <<= 1
 
-        # After the loop, set the first thread's offset to 0.
-        if tid == 0:
-            s_thread_offsets[tid * NUM_BUCKETS + radix] = 0
-        else:
-            # For all other threads, set the offset to the value of the previous thread.
-            s_thread_offsets[tid * NUM_BUCKETS + radix] = s_thread_offsets[
-                (tid - 1) * NUM_BUCKETS + radix
-            ]
+        # Make the scan exclusive with the thread's own count. Reading slot
+        # `tid - 1` instead races with thread `tid - 1` writing it.
+        s_thread_offsets[tid * NUM_BUCKETS + radix] -= counts_buf[radix]
         # Synchronize all threads to ensure that the final offset values are set.
         barrier()
 
@@ -441,7 +434,6 @@ def radix_sort_pairs_kernel[
     var local_offsets_buf = TileTensor(
         local_offsets_stack, row_major[NUM_BUCKETS]()
     )
-    var local_offsets = local_offsets_buf.ptr
 
     # Now, each thread processes its elements, computes destination index, write to output
     for index in range(tid * elems_per_thread, (tid + 1) * elems_per_thread):
@@ -461,13 +453,13 @@ def radix_sort_pairs_kernel[
                 global_offset = Int(
                     total_offsets[radix]
                     + s_thread_offsets[tid * NUM_BUCKETS + radix]
-                    + local_offsets[radix]
+                    + local_offsets_buf[radix]
                 )
             else:
                 global_offset = Int(
                     total_offsets_descending[radix]
                     + s_thread_offsets[tid * NUM_BUCKETS + radix]
-                    + local_offsets[radix]
+                    + local_offsets_buf[radix]
                 )
 
             output_keys[global_offset] = key
@@ -477,7 +469,7 @@ def radix_sort_pairs_kernel[
             else:
                 output_key_ids[global_offset] = input_key_ids[index]
 
-            local_offsets[radix] += 1
+            local_offsets_buf[radix] += 1
 
 
 struct DoubleBuffer[dtype: DType](ImplicitlyCopyable):
@@ -491,7 +483,7 @@ struct DoubleBuffer[dtype: DType](ImplicitlyCopyable):
     """
 
     var _d_buffers: Array[
-        Optional[UnsafePointer[Scalar[Self.dtype], MutUntrackedOrigin]], 2
+        Optional[MutPointer[Scalar[Self.dtype], MutUntrackedOrigin]], 2
     ]
     var _selection: Int32
     var _size: Int
@@ -503,8 +495,8 @@ struct DoubleBuffer[dtype: DType](ImplicitlyCopyable):
 
     def __init__(
         out self,
-        current: UnsafePointer[Scalar[Self.dtype], MutUntrackedOrigin],
-        alternate: UnsafePointer[Scalar[Self.dtype], MutUntrackedOrigin],
+        current: MutPointer[Scalar[Self.dtype], MutUntrackedOrigin],
+        alternate: MutPointer[Scalar[Self.dtype], MutUntrackedOrigin],
         size: Int,
     ):
         self._d_buffers = [current, alternate]
@@ -518,10 +510,10 @@ struct DoubleBuffer[dtype: DType](ImplicitlyCopyable):
 
     @inline(.always)
     def current(self, ctx: DeviceContext) -> DeviceBuffer[Self.dtype]:
-        if self._d_buffers[self._selection]:
+        if case .Some(ptr) = self._d_buffers[self._selection]:
             return DeviceBuffer[Self.dtype](
                 ctx,
-                self._d_buffers[self._selection].unsafe_value(),
+                ptr,
                 self._size,
                 owning=False,
             )
@@ -530,10 +522,10 @@ struct DoubleBuffer[dtype: DType](ImplicitlyCopyable):
 
     @inline(.always)
     def alternate(self, ctx: DeviceContext) -> DeviceBuffer[Self.dtype]:
-        if self._d_buffers[self._selection ^ 1]:
+        if case .Some(ptr) = self._d_buffers[self._selection ^ 1]:
             return DeviceBuffer[Self.dtype](
                 ctx,
-                self._d_buffers[self._selection ^ 1].unsafe_value(),
+                ptr,
                 self._size,
                 owning=False,
             )
@@ -556,7 +548,7 @@ def run_radix_sort_pairs_gpu[
     ctx: DeviceContext,
     mut keys: DoubleBuffer[dtype, ...],
     mut key_ids: DoubleBuffer[out_idx_type, ...],
-    skip_sort: UnsafePointer[mut=True, Scalar[.bool], _],
+    skip_sort: MutPointer[Scalar[.bool], _],
     in_shape: IndexList,
 ) raises:
     """
@@ -615,11 +607,11 @@ def topp_minp_sampling_kernel[
     out_idx_type: DType,
     is_top_p: Bool,
 ](
-    p_thresholds_: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    sorted_probs_: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    sorted_ids_: UnsafePointer[Scalar[out_idx_type], MutUntrackedOrigin],
-    out_token_ids: UnsafePointer[Scalar[out_idx_type], MutUntrackedOrigin],
-    skip_sort: UnsafePointer[Scalar[.bool], MutUntrackedOrigin],
+    p_thresholds_: MutPointer[Scalar[dtype], MutUntrackedOrigin],
+    sorted_probs_: MutPointer[Scalar[dtype], MutUntrackedOrigin],
+    sorted_ids_: MutPointer[Scalar[out_idx_type], MutUntrackedOrigin],
+    out_token_ids: MutPointer[Scalar[out_idx_type], MutUntrackedOrigin],
+    skip_sort: MutPointer[Scalar[.bool], MutUntrackedOrigin],
     vocab_size: Int32,
 ):
     """
@@ -647,8 +639,8 @@ def topp_minp_sampling_kernel[
         return
 
     var p_threshold = p_thresholds_[batch_id]
-    var sorted_probs = sorted_probs_ + batch_id * _vocab_size
-    var sorted_ids = sorted_ids_ + batch_id * _vocab_size
+    var sorted_probs = sorted_probs_.unsafe_offset(batch_id * _vocab_size)
+    var sorted_ids = sorted_ids_.unsafe_offset(batch_id * _vocab_size)
 
     comptime if is_top_p:
         if tid == 0:
@@ -779,7 +771,7 @@ def _topp_minp_sampling_gpu[
         "Unsupported dtype: ", dtype
     )
 
-    comptime BLOCK_SIZE = WARP_SIZE if has_apple_gpu_accelerator() else 256
+    comptime BLOCK_SIZE = WARP_SIZE if ctx.target.is_apple_gpu() else 256
 
     # Step 1; Apply temperature scaling to the logits and apply
     # softmax to get probabilities
@@ -789,11 +781,11 @@ def _topp_minp_sampling_gpu[
     var batch_size = input_shape[0]
     var vocab_size = input_shape[1]
 
-    @__parameter
-    @__copy_capture(input_logits)
     def apply_temperature[
         _simd_width: Int
-    ](coords: Coord) -> SIMD[dtype, _simd_width]:
+    ](coords: Coord) {var input_logits, var temperature} -> SIMD[
+        dtype, _simd_width
+    ]:
         var val = input_logits.load[width=_simd_width](coords)
         return val / temperature
 
@@ -805,12 +797,13 @@ def _topp_minp_sampling_gpu[
         row_major(batch_size, vocab_size),
     )
 
-    _softmax_gpu[
-        dtype,
-        1,
-        input_logits.rank,
+    _softmax_gpu[dtype, 1, input_logits.rank](
         apply_temperature,
-    ](Coord(input_shape), input_probs, input_logits.rank - 1, ctx)
+        Coord(input_shape),
+        input_probs,
+        input_logits.rank - 1,
+        ctx,
+    )
 
     # Step 2: Do a Top K=1 search on each vocab_size row of the
     #   probabilities tensor. This is to check if the most probable
@@ -848,14 +841,16 @@ def _topp_minp_sampling_gpu[
     var ids_buf = ctx.enqueue_create_buffer[out_idx_type](input_size * 2)
     var probs_double_buffer = DoubleBuffer(
         probs_buf.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
-        probs_buf.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
-        + input_size,
+        probs_buf.unsafe_ptr()
+        .unsafe_origin_cast[MutUntrackedOrigin]()
+        .unsafe_offset(input_size),
         input_size,
     )
     var keys_double_buffer = DoubleBuffer(
         ids_buf.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
-        ids_buf.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
-        + input_size,
+        ids_buf.unsafe_ptr()
+        .unsafe_origin_cast[MutUntrackedOrigin]()
+        .unsafe_offset(input_size),
         input_size,
     )
 

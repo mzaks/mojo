@@ -36,18 +36,21 @@ page ``j // slots_per_page``, slot ``j % slots_per_page``, which is the same
 page the token page table already names.
 
 Attention reads the window leaf and the zone leaf through the fused
-``mo.latent_sparse_attention.ragged.paged`` kernel. The remaining graph-side
-reads -- the compressor's open state and the indexer's candidate table --
-gather rows out of the block buffer by ``(lookup_table[b, slot //
-slots_per_page], slot % slots_per_page)``; each copies the leaf
-(``buffer_load``), which is fine at bringup sizes and nowhere else.
+``mo.latent_sparse_attention.ragged.paged`` kernel, and the indexer scores its
+zone leaf through ``mo.indexer_score.ragged.paged``. The remaining graph-side
+read -- the compressor's open state -- gathers rows out of the block buffer by
+``(lookup_table[b, slot // slots_per_page], slot % slots_per_page)``; it
+copies the leaf (``buffer_load``), which is fine at bringup sizes and nowhere
+else.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from typing import Any
 
+from max import tree
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, ops
 from max.nn.kernels import store_k_cache_ragged, store_v_cache_ragged
@@ -68,16 +71,6 @@ def scalar(value: int, device: DeviceRef) -> TensorValue:
     return ops.constant(value, DType.int32, device)
 
 
-def idiv(x: TensorValue, divisor: int) -> TensorValue:
-    """Exact integer floor division of a non-negative integer tensor.
-
-    ``TensorValue.__floordiv__`` is ``floor(div)`` and ``div`` promotes
-    integers to float, so its result is not an index dtype. The values here
-    (positions, slots) are far below 2**24, so the round trip is exact.
-    """
-    return ops.cast(ops.floor(ops.div(x, divisor)), x.dtype)
-
-
 def row_offsets(
     batch: int, rows_per_seq: int, device: DeviceRef
 ) -> TensorValue:
@@ -95,6 +88,33 @@ def row_offsets(
     )
 
 
+@tree.dataclass
+class LayerIndex:
+    """Where one block's rows live in the leaves, as graph values.
+
+    The kernels take a layer as a uint32 host scalar. A block called directly
+    builds these as constants. A subgraph shared by several blocks takes them
+    as inputs instead, so one body serves every layer of its group.
+    """
+
+    swa: TensorValue
+    """The window leaf's layer, host uint32."""
+    zone: TensorValue | None = None
+    """The compressed and state leaves' layer, host uint32; ``None`` on a
+    window-only layer."""
+
+    @classmethod
+    def constant(cls, swa: int, zone: int | None) -> LayerIndex:
+        """The index of a block whose layers are fixed at graph build."""
+
+        def host(layer: int) -> TensorValue:
+            return ops.constant(layer, DType.uint32, DeviceRef.CPU())
+
+        if zone is None:
+            return cls(swa=host(swa))
+        return cls(swa=host(swa), zone=host(zone))
+
+
 @dataclass
 class CacheLeaf:
     """One leaf's graph inputs plus the slot geometry the kernels infer."""
@@ -102,37 +122,39 @@ class CacheLeaf:
     values: PagedCacheValues
     slots_per_page: int
 
+    def __tree_flatten__(self) -> tuple[tuple[PagedCacheValues], int]:
+        return (self.values,), self.slots_per_page
+
+    @classmethod
+    def __tree_unflatten__(
+        cls, slots_per_page: int, children: Sequence[Any]
+    ) -> CacheLeaf:
+        (values,) = children
+        return cls(values=values, slots_per_page=slots_per_page)
+
     @property
     def cache_lengths(self) -> TensorValue:
         """``[batch]`` int32 tokens already in the cache."""
         return ops.cast(self.values.cache_lengths, DType.int32)
 
     def gather(
-        self,
-        layer: int,
-        kv_idx: int,
-        slots: TensorValue,
-        lut_rows: TensorValue | None = None,
+        self, layer: int, kv_idx: int, slots: TensorValue
     ) -> TensorValue:
-        """Rows at ``slots`` (``[rows, n]`` int32) -> ``[rows, n, head_dim]``.
+        """Rows at ``slots`` (``[batch, n]`` int32) -> ``[batch, n, head_dim]``.
 
-        ``lut_rows`` (``[rows]`` int32) names the request each row of
-        ``slots`` addresses; without it the rows are the batch itself. Every
-        slot must be non-negative and inside that request's allocated pages;
-        callers clamp dead slots onto a live one and mask them out afterwards.
-        Heads are always 1 on these leaves.
+        Row ``i`` of ``slots`` addresses request ``i``. Every slot must be
+        non-negative and inside that request's allocated pages; callers clamp
+        dead slots onto a live one and mask them out afterwards. Heads are
+        always 1 on these leaves.
         """
         blocks = ops.buffer_load(self.values.kv_blocks)
         b, n = slots.shape[0], slots.shape[1]
-        page_col = idiv(slots, self.slots_per_page)
+        page_col = slots // self.slots_per_page
         in_page = slots - page_col * self.slots_per_page
         lut = ops.cast(self.values.lookup_table, DType.int32)
-        if lut_rows is not None:
-            lut = ops.gather(lut, lut_rows, axis=0)
-        else:
-            # ``gather_nd`` wants the batch dims to match exactly, and the
-            # table's is symbolic.
-            lut = ops.rebind(lut, [b, lut.shape[1]])
+        # ``gather_nd`` wants the batch dims to match exactly, and the
+        # table's is symbolic.
+        lut = ops.rebind(lut, [b, lut.shape[1]])
         pages = ops.gather_nd(lut, ops.unsqueeze(page_col, -1), batch_dims=1)
 
         def const(v: int) -> TensorValue:
@@ -145,7 +167,7 @@ class CacheLeaf:
 
     def store(
         self,
-        layer: int,
+        layer: TensorValue,
         kv_idx: int,
         rows: TensorValue,
         offsets: TensorValue,
@@ -160,7 +182,8 @@ class CacheLeaf:
         A compressed leaf passes its own ``cache_lengths`` (the token count
         divided by ``ratio``) so the slots count entries, not tokens; the
         bound inputs are rescaled the same way, ``rows_per_seq`` being an
-        upper bound on the rows any one request stores.
+        upper bound on the rows any one request stores. ``layer`` is a
+        uint32 host scalar (:class:`LayerIndex`).
         """
         values = self.values
         if cache_lengths is not None:
@@ -176,19 +199,18 @@ class CacheLeaf:
                 values,
                 cache_lengths=ops.cast(cache_lengths, DType.uint32),
                 max_prompt_length=bound(rows_per_seq),
-                max_cache_length=idiv(
-                    values.max_cache_length + bound(ratio - 1), ratio
+                max_cache_length=(
+                    (values.max_cache_length + bound(ratio - 1)) // ratio
                 ),
             )
         x = ops.unsqueeze(rows, 1)
-        layer_idx = ops.constant(layer, DType.uint32, DeviceRef.CPU())
         if kv_idx == KEY:
-            store_k_cache_ragged(values, x, offsets, layer_idx)
+            store_k_cache_ragged(values, x, offsets, layer)
         else:
-            store_v_cache_ragged(values, x, offsets, layer_idx)
+            store_v_cache_ragged(values, x, offsets, layer)
 
 
-@dataclass
+@tree.dataclass
 class DeepseekV4Cache:
     """Every leaf one device's forward reads and writes.
 
@@ -247,4 +269,18 @@ class DeepseekV4Cache:
             },
             idx_comp=leaves.get("idx_c4a"),
             idx_state=leaves.get("idx_c4a_state"),
+        )
+
+    @classmethod
+    def from_leaves(
+        cls,
+        config: DeepseekV4Config,
+        leaves: Mapping[str, Sequence[PagedCacheValues]],
+        device_idx: int = 0,
+    ) -> DeepseekV4Cache:
+        """Bundles the leaves by key, each one entry per device."""
+        return cls.from_groups(
+            config,
+            [leaves[spec.key] for spec in config.kv_leaf_specs()],
+            device_idx,
         )

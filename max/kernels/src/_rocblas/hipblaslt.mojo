@@ -18,7 +18,7 @@ from std.ffi import _get_dylib_function as _ffi_get_dylib_function
 from std.ffi import _Global, OwnedDLHandle
 from std.utils import StaticTuple
 
-from max.gpu.host._amdgpu_hip import hipStream_t
+from max.gpu.host import hipStream_t
 
 comptime hipblasLtHandle_t = Optional[OpaquePointer[MutAnyOrigin]]
 comptime hipblasLtMatmulDesc_t = Optional[OpaquePointer[MutAnyOrigin]]
@@ -271,7 +271,7 @@ def _get_dylib_function[
 
 
 def hipblasLtCreate(
-    light_handle: UnsafePointer[hipblasLtHandle_t, _],
+    light_handle: Pointer[hipblasLtHandle_t, _],
 ) raises -> Status:
     return _get_dylib_function[
         "hipblasLtCreate",
@@ -286,7 +286,7 @@ def hipblasLtDestroy(light_handle: hipblasLtHandle_t) raises -> Status:
 
 
 def hipblasLtMatmulDescCreate(
-    matmul_desc: UnsafePointer[hipblasLtMatmulDesc_t, _],
+    matmul_desc: Pointer[hipblasLtMatmulDesc_t, _],
     compute_type: hipblasComputeType_t,
     scale_type: hipDataType_t,
 ) raises -> Status:
@@ -326,7 +326,7 @@ def hipblasLtMatmulDescDestroy(
 
 
 def hipblasLtMatrixLayoutCreate(
-    mat_layout: UnsafePointer[hipblasLtMatrixLayout_t, _],
+    mat_layout: Pointer[hipblasLtMatrixLayout_t, _],
     type: hipDataType_t,
     rows: UInt64,
     cols: UInt64,
@@ -371,7 +371,7 @@ def hipblasLtMatrixLayoutDestroy(
 
 
 def hipblasLtMatmulPreferenceCreate(
-    pref: UnsafePointer[hipblasLtMatmulPreference_t, _],
+    pref: Pointer[hipblasLtMatmulPreference_t, _],
 ) raises -> Status:
     return _get_dylib_function[
         "hipblasLtMatmulPreferenceCreate",
@@ -388,8 +388,8 @@ def hipblasLtMatmulAlgoGetHeuristic(
     _ddesc: hipblasLtMatrixLayout_t,
     preference: hipblasLtMatmulPreference_t,
     requested_algo_count: Int,
-    heuristic_results_array: UnsafePointer[hipblasLtMatmulHeuristicResult_t, _],
-    return_algo_count: UnsafePointer[Int, _],
+    heuristic_results_array: Pointer[hipblasLtMatmulHeuristicResult_t, _],
+    return_algo_count: Pointer[Int, _],
 ) raises -> Status:
     return _get_dylib_function[
         "hipblasLtMatmulAlgoGetHeuristic",
@@ -441,7 +441,7 @@ def hipblasLtMatmul(
     _cdesc: hipblasLtMatrixLayout_t,
     _d: OptionalPointer[NoneType, _],
     _ddesc: hipblasLtMatrixLayout_t,
-    algo: UnsafePointer[hipblasLtMatmulAlgo_t, _],
+    algo: Pointer[hipblasLtMatmulAlgo_t, _],
     workspace: OpaquePointer[_],
     workspace_size_in_bytes: Int,
     stream: hipStream_t,
@@ -499,25 +499,27 @@ def _check_hipblas_error(status: Status) raises:
 
 @inline(.always)
 def _convert_to_hip_datatype[dtype: DType]() -> hipDataType_t:
-    comptime if dtype == .float32:
-        return hipDataType_t.R_32F
-    elif dtype == .float16:
-        return hipDataType_t.R_16F
-    elif dtype == .float8_e4m3fn:
-        return hipDataType_t.R_8F_E4M3
-    elif dtype == .float8_e5m2:
-        return hipDataType_t.R_8F_E5M2
-    elif dtype == .float8_e4m3fnuz:
-        return hipDataType_t.R_8F_E4M3_FNUZ
-    elif dtype == .float8_e5m2fnuz:
-        return hipDataType_t.R_8F_E5M2_FNUZ
-    # TODO (KERN-2238): uint8 is a proxy data type for two Float4-E2M1 values for now.
-    # Replace this with float4-e2m1fn when GENAI-337 is fixed.
-    elif dtype == .uint8:
-        return hipDataType_t.R_4F_E2M1
-    else:
-        comptime assert dtype == .bfloat16, (
-            "Only support FP32, FP16, BF16, E4M3(FNUZ), E5M2(FNUZ), and E2M1x2"
-            " (UInt8). Please extend it if more dtypes are needed."
-        )
-        return hipDataType_t.R_16BF
+    comptime match dtype:
+        case .float32:
+            return hipDataType_t.R_32F
+        case .float16:
+            return hipDataType_t.R_16F
+        case .float8_e4m3fn:
+            return hipDataType_t.R_8F_E4M3
+        case .float8_e5m2:
+            return hipDataType_t.R_8F_E5M2
+        case .float8_e4m3fnuz:
+            return hipDataType_t.R_8F_E4M3_FNUZ
+        case .float8_e5m2fnuz:
+            return hipDataType_t.R_8F_E5M2_FNUZ
+        # TODO (KERN-2238): uint8 is a proxy data type for two Float4-E2M1 values for now.
+        # Replace this with float4-e2m1fn when GENAI-337 is fixed.
+        case .uint8:
+            return hipDataType_t.R_4F_E2M1
+        case .bfloat16:
+            return hipDataType_t.R_16BF
+        case _:
+            comptime assert False, (
+                "Only support FP32, FP16, BF16, E4M3(FNUZ), E5M2(FNUZ), and"
+                " E2M1x2 (UInt8). Please extend it if more dtypes are needed."
+            )

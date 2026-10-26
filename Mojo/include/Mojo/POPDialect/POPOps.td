@@ -1020,6 +1020,14 @@ def POP_LoadOp : POPOp<"load", [
         return boolAttr.getValue();
       return true;
     }
+    /// Return true if this has an atomic ordering.
+    bool isAtomic() {
+      return getOrdering() != AtomicOrdering::NOT_ATOMIC;
+    }
+    /// Return true if this is atomic, or is known or might be volatile.
+    bool isAtomicOrMightBeVolatile() {
+      return isAtomic() || mightBeVolatile();
+    }
   }];
 }
 
@@ -1097,6 +1105,14 @@ def POP_StoreOp : POPOp<"store", [PointerElementType<"ptr", "arg">,
       if (auto boolAttr = llvm::dyn_cast<BoolAttr>(getIsVolatileAttr()))
         return boolAttr.getValue();
       return true;
+    }
+    /// Return true if this has an atomic ordering.
+    bool isAtomic() {
+      return getOrdering() != AtomicOrdering::NOT_ATOMIC;
+    }
+    /// Return true if this is atomic, or is known or might be volatile.
+    bool isAtomicOrMightBeVolatile() {
+      return isAtomic() || mightBeVolatile();
     }
   }];
 }
@@ -1901,56 +1917,6 @@ def POP_GlobalConstantOp : POPOp<"global_constant",
   let builders = [
     OpBuilder<(ins "TypedAttr":$value)>
   ];
-}
-
-//===----------------------------------------------------------------------===//
-// CompilerGlobalLoadOp
-//===----------------------------------------------------------------------===//
-
-def POP_CompilerGlobalLoadOp : POPOp<"compiler.global_load", [Pure,
-    DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
-  let summary = "load the value of a global variable";
-  let description = [{
-    The `pop.compiler.global_load` operation loads a global variable by
-    name so it can be used by SSA value. This op is a compile time only
-    operation and expects to be folded away.
-
-    Example:
-
-    ```mlir
-    %0 = pop.compiler.global_load "foo" : !kgen.scalar<ui32>
-    ```
-  }];
-
-  let arguments = (ins StrAttr:$name);
-  let results = (outs AnyType:$result);
-
-  let assemblyFormat = "$name attr-dict `:` qualified(type($result))";
-}
-
-//===----------------------------------------------------------------------===//
-// CompilerGlobalStoreOp
-//===----------------------------------------------------------------------===//
-
-def POP_CompilerGlobalStoreOp : POPOp<"compiler.global_store", [
-    DeclareOpInterfaceMethods<InterpreterOpInterface>]> {
-  let summary = "store a value into a global variable";
-  let description = [{
-    The `pop.compiler.global_store` operation stores a value into a global
-    variable by symbol name. It is a compile error if this op exists by the
-    time POP is lowered to LLVM.
-
-    Example:
-
-    ```mlir
-    %0 = pop.constant(0) : !kgen.scalar<ui32>
-    pop.compiler.global_store "foo", %0 : !kgen.scalar<ui32>
-    ```
-  }];
-
-  let arguments = (ins StrAttr:$name, AnyType:$value);
-
-  let assemblyFormat = "$name `,` $value `:` type($value) attr-dict";
 }
 
 

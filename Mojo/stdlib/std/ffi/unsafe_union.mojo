@@ -25,7 +25,6 @@ type results in undefined behavior, just like in C. Prefer `Variant` for safe,
 type-checked sum types.
 """
 
-from std.builtin.rebind import downcast
 from std.format._utils import FormatStruct, Named, TypeNames
 from std.traits import (
     IsTriviallyCopyable,
@@ -159,7 +158,7 @@ struct UnsafeUnion[*Ts: AnyType](ImplicitlyCopyable, Movable, Writable):
     # Life cycle methods
     # ===-------------------------------------------------------------------===#
 
-    def __init__(out self, *, unsafe_uninitialized: ()):
+    def __init__(out self, *, unsafe_uninitialized: Tuple[]):
         """Unsafely create an uninitialized `UnsafeUnion`.
 
         The storage contains garbage data. You must call `unsafe_set` before

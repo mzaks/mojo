@@ -18,6 +18,7 @@ import dataclasses
 import json
 import logging
 from abc import abstractmethod
+from collections.abc import Mapping, Sequence
 from os import environ
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic
@@ -28,13 +29,13 @@ from max.driver import (
     CPU,
     Buffer,
     Device,
-    DevicePinnedBuffer,
     Usage,
     is_virtual_device_mode,
     load_devices,
 )
 from max.dtype import DType
 from max.engine import InferenceSession, Model
+from max.experimental.compilation import CompiledCallable
 from max.graph import DeviceRef
 from max.graph.weights import (
     WeightsAdapter,
@@ -74,6 +75,7 @@ from max.pipelines.modeling.types import (
 from max.profiler import Tracer, traced
 from max.support.algorithm import flatten2d
 
+from ._label_scoring import BatchLabelScorer
 from .utils import StructuredOutputHelper, update_context_and_prepare_responses
 
 if TYPE_CHECKING:
@@ -81,22 +83,68 @@ if TYPE_CHECKING:
 
 from max.pipelines.sampling import (
     FusedSamplingProcessor,
+    TopKSampler,
     apply_logits_processors,
-    token_sampler,
 )
 
+from ..graph_specs import GraphRole, GraphSpec, compile_and_init_graphs
 from ..interfaces import (
     ModelInputs,
     ModelOutputs,
     PipelineModel,
     PipelineModelWithKVCache,
 )
-from ..interfaces.generate import GenerateMixin
 from ..memory_estimation import MemoryPlan
 from ..utils import CompilationTimer
 from ..vision_encoder_cache import VideoEncoderMetrics, VisionEncoderMetrics
 
 logger = logging.getLogger("max.pipelines")
+
+
+def load_sampler_graphs(
+    session: InferenceSession,
+    pipeline_config: PipelineConfig,
+    device: DeviceRef,
+    vocab_size: int | None,
+    custom_extensions: Sequence[Path] = (),
+) -> dict[str, CompiledCallable[..., Any]]:
+    """Compiles the sampler, and the bitmask sampler if constraints may fire.
+
+    The bitmask sampler compiles when ``needs_bitmask_constraints`` is set.
+
+    Args:
+        session: The session that compiles and initializes the samplers.
+        pipeline_config: The pipeline's configuration.
+        device: The device the samplers run on.
+        vocab_size: The tokenizer's token count, which bounds the ids the
+            samplers produce, or ``None`` for no bound.
+        custom_extensions: Paths to custom kernel libraries the samplers use.
+
+    Returns:
+        The compiled, initialized samplers keyed by role: the
+        :attr:`GraphRole.SAMPLER` role, and the
+        :attr:`GraphRole.SAMPLER_BITMASK` role if compiled.
+    """
+    specs: dict[str, GraphSpec] = {}
+    with CompilationTimer("sampler") as sampler_timer:
+        variants = [(GraphRole.SAMPLER, False)]
+        if pipeline_config.needs_bitmask_constraints:
+            variants.insert(0, (GraphRole.SAMPLER_BITMASK, True))
+        for role, needs_bitmask in variants:
+            sampler = TopKSampler(
+                pipeline_config.sampling,
+                device=device,
+                needs_bitmask_input=needs_bitmask,
+                unpadded_vocab_size=vocab_size,
+            )
+            specs[role] = GraphSpec(
+                sampler,
+                TopKSampler.GRAPH_NAME,
+                sampler.input_types,
+                custom_extensions=custom_extensions,
+            )
+        sampler_timer.mark_build_complete()
+        return compile_and_init_graphs(session, specs)
 
 
 @dataclasses.dataclass
@@ -114,7 +162,6 @@ class TextGenerationPipelineInterface(
     Pipeline[
         TextGenerationInputs[TextGenerationContextType], TextGenerationOutput
     ],
-    GenerateMixin[TextGenerationContextType, TextGenerationRequest],
     Generic[TextGenerationContextType],
 ):
     """Interface for text generation pipelines."""
@@ -123,10 +170,32 @@ class TextGenerationPipelineInterface(
     _devices: list[Device]
     _pipeline_model: PipelineModelWithKVCache[TextGenerationContextType]
 
+    compiled_modules: Mapping[str, CompiledCallable[..., Any]]
+    """The graphs this pipeline compiled, by role, for export: the model's,
+    then the sampler's."""
+
     @property
     @abstractmethod
     def kv_manager(self) -> PagedKVCacheManagerInterface:
         """Returns the KV cache managers for this pipeline."""
+        ...
+
+    @property
+    @abstractmethod
+    def pipeline_config(self) -> PipelineConfig:
+        """Returns the pipeline configuration."""
+        ...
+
+    @property
+    @abstractmethod
+    def tokenizer(
+        self,
+    ) -> PipelineTokenizer[
+        TextGenerationContextType,
+        npt.NDArray[np.integer[Any]],
+        TextGenerationRequest,
+    ]:
+        """Returns the tokenizer for this pipeline."""
         ...
 
 
@@ -209,6 +278,12 @@ class TextGenerationPipeline(
             export_mefs=pipeline_config.runtime.export_mefs,
         )
         self.session = session
+        self._label_scorer = BatchLabelScorer(
+            session,
+            self._devices[0],
+            pipeline_config.sampling.in_dtype,
+            self.vocab_size,
+        )
 
         # Configure session with pipeline settings.
         self._pipeline_config.configure_session(session)
@@ -272,27 +347,20 @@ class TextGenerationPipeline(
         )
         sampler_device_ref = DeviceRef.from_device(self._sampler_device)
 
-        # Load sampler. The bitmask-aware sampler is loaded when constrained
-        # decoding could fire (see ``needs_bitmask_constraints``).
-        self._sampler_with_bitmask: Model | None = None
-        self._sampler_without_bitmask: Model | None = None
-        with_bitmask_graph = None
-        with CompilationTimer("sampler") as sampler_timer:
-            if pipeline_config.needs_bitmask_constraints:
-                with_bitmask_graph = token_sampler(
-                    pipeline_config.sampling,
-                    device=sampler_device_ref,
-                    needs_bitmask_input=True,
-                )
-            without_bitmask_graph = token_sampler(
-                pipeline_config.sampling,
-                device=sampler_device_ref,
-                needs_bitmask_input=False,
-            )
-            sampler_timer.mark_build_complete()
-            if with_bitmask_graph is not None:
-                self._sampler_with_bitmask = session.load(with_bitmask_graph)
-            self._sampler_without_bitmask = session.load(without_bitmask_graph)
+        samplers = load_sampler_graphs(
+            session, pipeline_config, sampler_device_ref, self.vocab_size
+        )
+        bitmask_sampler = samplers.get(GraphRole.SAMPLER_BITMASK)
+        self._sampler_with_bitmask: Model | None = (
+            bitmask_sampler.engine_model if bitmask_sampler else None
+        )
+        self._sampler_without_bitmask: Model | None = samplers[
+            GraphRole.SAMPLER
+        ].engine_model
+        self.compiled_modules = {
+            **self._pipeline_model.compiled_modules,
+            **samplers,
+        }
 
         # Pre-allocate pinned buffer for D2H token copies only when the
         # bitmask path is wired in. This buffer is used for async token
@@ -305,10 +373,11 @@ class TextGenerationPipeline(
             and not self._sampler_device.is_host
             and not is_virtual_device_mode()
         ):
-            self._pinned_new_tokens = DevicePinnedBuffer(
+            self._pinned_new_tokens = Buffer(
                 shape=(max_batch_size,),
                 dtype=DType.int64,
                 device=self._sampler_device,
+                usage=Usage.STAGING | Usage.UNTRACKED,
             )
 
         self._identity_logit_offsets = (
@@ -574,7 +643,13 @@ class TextGenerationPipeline(
             )
 
         # Execute the single step if the batch is not empty.
+        label_log_probabilities: dict[RequestID, list[float]] = {}
         if len(flat_batch) > 0:
+            # Scoring precedes sampling: the sampler's penalty and min-token
+            # processors edit the logits buffer in place.
+            label_log_probabilities = self._label_scorer.score(
+                model_outputs, flat_batch
+            )
             # Sample next token.
             with Tracer("sample_next_token"):
                 sample_logits, sample_offsets = (
@@ -626,7 +701,7 @@ class TextGenerationPipeline(
         with Tracer("d2h_generated_tokens"):
             generated_tokens_device = sampling_processor.generated_tokens
             # Staging memory keeps the d2h transfer async on accelerators.
-            # Note that we do not want to use `DevicePinnedBuffer` here.
+            # Left tracked (no UNTRACKED) so to_numpy() waits for the copy.
             generated_tokens_host = Buffer(
                 shape=generated_tokens_device.shape,
                 dtype=generated_tokens_device.dtype,
@@ -634,9 +709,6 @@ class TextGenerationPipeline(
                 usage=Usage.STAGING,
             )
             generated_tokens_host.inplace_copy_from(generated_tokens_device)
-            # Staging buffers do not synchronize on host reads, so the copy
-            # above is still in flight here.
-            sampler_device.synchronize()
             generated_tokens_np = generated_tokens_host.to_numpy()
 
         res = update_context_and_prepare_responses(
@@ -645,6 +717,11 @@ class TextGenerationPipeline(
             batch_log_probabilities=batch_log_probabilities,
             enable_log_probs=inputs.enable_log_probs,
         )
+        # A chunked-prefill step emits no output for its request, so its
+        # scores wait for the step that finishes the prompt.
+        for request_id, scores in label_log_probabilities.items():
+            if request_id in res:
+                res[request_id].label_log_probabilities = scores
 
         # Update the cache lengths in our kv_cache manager.
         # This should be done after the contexts are updated.
@@ -700,7 +777,7 @@ class TextGenerationPipeline(
         """Returns vision encoder metrics for the most recent batch.
 
         Returns ``None`` for text-only models and for batches that did no
-        vision encoding (e.g. decode steps). The metrics come from the
+        vision encoding (such as decode steps). The metrics come from the
         pipeline-owned :class:`VisionEncoderCache`, if this pipeline has one;
         otherwise, for a model that owns its encoder cache internally, from
         :class:`SupportsPooledVisionMetrics`.

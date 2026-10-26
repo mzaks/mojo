@@ -4,8 +4,8 @@ load("//max/python/max/pipelines/architectures:all_arches.bzl", "ALL_ARCHITECTUR
 
 ALL_MAX_PYTHON_DEPS = ALL_ARCHITECTURES + [
     "//max/python/max:_core",
+    "//max/python/max:_kv_core",
     "//max/python/max:tensor",
-    "//max/python/max/_core_mojo",
     "//max/python/max/_entrypoints",
     "//max/python/max/_entrypoints:_pipelines",
     "//max/python/max/_entrypoints:gpu-query",
@@ -28,7 +28,6 @@ ALL_MAX_PYTHON_DEPS = ALL_ARCHITECTURES + [
     "//max/python/max/experimental/testing",
     "//max/python/max/experimental/torch",
     "//max/python/max/graph",
-    "//max/python/max/kv_cache",
     "//max/python/max/mlir",
     "//max/python/max/nn",
     "//max/python/max/nn/hooks",
@@ -37,7 +36,6 @@ ALL_MAX_PYTHON_DEPS = ALL_ARCHITECTURES + [
     "//max/python/max/pipelines/modeling",
     "//max/python/max/profiler",
     "//max/python/max/serve",
-    "//max/python/max/serve:debug",
     "//max/python/max/serve/mocks",
     "//max/python/max/support",
 ]

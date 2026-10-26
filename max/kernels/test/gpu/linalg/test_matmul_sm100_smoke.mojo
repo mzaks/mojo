@@ -36,10 +36,14 @@ from std.sys import size_of
 import linalg.matmul.vendor.blas as vendor_blas
 from max.gpu.host import DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.memory import alloc
 from internal_utils import assert_almost_equal
 from std.random import rand
-from layout import TileTensor, Coord, CoordLike, row_major, Idx
+from layout import (
+    TileTensor,
+    CoordLike,
+    row_major,
+    Idx,
+)
 from linalg.matmul.gpu.sm100_structured.default.matmul import (
     blackwell_matmul_tma_umma_warp_specialized,
 )
@@ -47,6 +51,7 @@ from linalg.matmul.gpu.sm100_structured.structured_kernels.config import (
     MatmulConfig,
 )
 
+from std.utils.coord import DynamicCoord
 from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
 
@@ -60,7 +65,7 @@ def test_blackwell_matmul[
     b_type: DType,
     c_type: DType,
     block_tile_shape: IndexList[3],
-    mma_shape: IndexList[3],
+    mma_shape: DynamicCoord[.int, 3],
     cluster_shape: StaticTuple[Int32, 3],
     cta_group: Int,
     transpose_b: Bool = True,
@@ -70,9 +75,9 @@ def test_blackwell_matmul[
     num_split_k: Int = 1,
 ](ctx: DeviceContext, m: MType, n: NType, k: KType) raises:
     """Generic test function for SM100 matmul kernel variants."""
-    var M = Int(m.value())
-    var N = Int(n.value())
-    var K = Int(k.value())
+    var M = Int(m)
+    var N = Int(n)
+    var K = Int(k)
 
     print(
         "[SMOKE] dtypes=(",
@@ -104,22 +109,16 @@ def test_blackwell_matmul[
         sep="",
     )
 
-    var a_shape = row_major(Coord(m, Idx[KType.static_value]))
+    var a_shape = row_major(m, Idx[KType.static_value])
     var b_shape = row_major(
-        Coord(
-            Idx[NType.static_value if transpose_b else KType.static_value],
-            Idx[KType.static_value if transpose_b else NType.static_value],
-        )
+        Idx[NType.static_value if transpose_b else KType.static_value],
+        Idx[KType.static_value if transpose_b else NType.static_value],
     )
-    var c_shape = row_major(Coord(m, Idx[NType.static_value]))
+    var c_shape = row_major(m, Idx[NType.static_value])
 
-    var a_size = Int(m.value()) * Int(k.value())
-    var b_size = (
-        Int(n.value())
-        * Int(k.value()) if transpose_b else Int(k.value())
-        * Int(n.value())
-    )
-    var c_size = Int(m.value()) * Int(n.value())
+    var a_size = Int(m) * Int(k)
+    var b_size = Int(n) * Int(k) if transpose_b else Int(k) * Int(n)
+    var c_size = Int(m) * Int(n)
 
     # Host allocations
     var a_host_ptr = ctx.enqueue_create_host_buffer[a_type](a_size)
@@ -222,8 +221,8 @@ def main() raises:
             dtype,
             dtype,
             .bfloat16,
-            block_tile_shape=Index(64, 32, BK),
-            mma_shape=Index(64, 32, MMA_K),
+            block_tile_shape=(64, 32, BK),
+            mma_shape=(64, 32, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](1, 1, 1),
             cta_group=1,
         ](ctx, Int(256), Idx[256], Idx[256])
@@ -236,8 +235,8 @@ def main() raises:
             dtype,
             dtype,
             .bfloat16,
-            block_tile_shape=Index(128, 64, BK),
-            mma_shape=Index(128, 64, MMA_K),
+            block_tile_shape=(128, 64, BK),
+            mma_shape=(128, 64, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
             cta_group=1,
             block_swizzle_size=4,
@@ -251,8 +250,8 @@ def main() raises:
             dtype,
             dtype,
             .bfloat16,
-            block_tile_shape=Index(128, 64, BK),
-            mma_shape=Index(256, 128, MMA_K),
+            block_tile_shape=(128, 64, BK),
+            mma_shape=(256, 128, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
             cta_group=2,
             block_swizzle_size=4,
@@ -266,8 +265,8 @@ def main() raises:
             dtype,
             dtype,
             .bfloat16,
-            block_tile_shape=Index(128, 64, BK),
-            mma_shape=Index(128, 64, MMA_K),
+            block_tile_shape=(128, 64, BK),
+            mma_shape=(128, 64, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
             cta_group=1,
             swapAB=True,
@@ -281,8 +280,8 @@ def main() raises:
             dtype,
             dtype,
             .bfloat16,
-            block_tile_shape=Index(64, 32, BK),
-            mma_shape=Index(64, 32, MMA_K),
+            block_tile_shape=(64, 32, BK),
+            mma_shape=(64, 32, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](4, 2, 1),
             cta_group=1,
             k_group_size=2,
@@ -296,8 +295,8 @@ def main() raises:
             dtype,
             dtype,
             .bfloat16,
-            block_tile_shape=Index(64, 32, BK),
-            mma_shape=Index(128, 64, MMA_K),
+            block_tile_shape=(64, 32, BK),
+            mma_shape=(128, 64, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
             cta_group=2,
             num_split_k=2,
@@ -311,8 +310,8 @@ def main() raises:
             dtype,
             dtype,
             .bfloat16,
-            block_tile_shape=Index(128, 128, BK),
-            mma_shape=Index(128, 128, MMA_K),
+            block_tile_shape=(128, 128, BK),
+            mma_shape=(128, 128, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](1, 1, 1),
             cta_group=1,
         ](ctx, Int(512), Idx[512], Idx[512])
@@ -325,8 +324,8 @@ def main() raises:
             dtype,
             dtype,
             .bfloat16,
-            block_tile_shape=Index(64, 64, BK),
-            mma_shape=Index(64, 64, MMA_K),
+            block_tile_shape=(64, 64, BK),
+            mma_shape=(64, 64, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](1, 1, 1),
             cta_group=1,
         ](ctx, Int(317), Idx[512], Idx[256])
@@ -339,8 +338,8 @@ def main() raises:
             dtype,
             dtype,
             .bfloat16,
-            block_tile_shape=Index(64, 32, BK),
-            mma_shape=Index(64, 32, MMA_K),
+            block_tile_shape=(64, 32, BK),
+            mma_shape=(64, 32, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](8, 2, 1),
             cta_group=1,
             block_swizzle_size=2,
@@ -354,8 +353,8 @@ def main() raises:
             dtype,
             dtype,
             .bfloat16,
-            block_tile_shape=Index(128, 64, BK),
-            mma_shape=Index(256, 128, MMA_K),
+            block_tile_shape=(128, 64, BK),
+            mma_shape=(256, 128, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
             cta_group=2,
             swapAB=True,

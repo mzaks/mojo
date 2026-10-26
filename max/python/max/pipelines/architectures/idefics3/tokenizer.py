@@ -20,21 +20,26 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import numpy.typing as npt
 from max.pipelines.context import (
     ImageMetadata,
     TextAndVisionContext,
     TokenBuffer,
 )
 from max.pipelines.context.exceptions import PromptTooLongError
-from max.pipelines.lib import TextAndVisionTokenizer
-from max.pipelines.lib.tokenizer import encode_dkv_cache_hint, open_image
+from max.pipelines.lib import TextAndVisionTokenizer, resolve_eos_token_ids
+from max.pipelines.lib.tokenizer import (
+    checked_token_ids,
+    encode_dkv_cache_hint,
+    open_image,
+    resolve_token_id_bound,
+)
 from max.pipelines.modeling.types import (
     ImageContentPart,
     TextContentPart,
     TextGenerationRequest,
     TextGenerationRequestMessage,
     TextGenerationRequestTool,
+    TokenIds,
 )
 from max.support.image import find_contiguous_ranges, hash_image
 from PIL.Image import Image as ImageType
@@ -91,17 +96,14 @@ class Idefics3Tokenizer(TextAndVisionTokenizer):
             model_path, revision=revision
         )
 
-        # Initialize default EOS token IDs (required by parent class new_context method)
-        eos_token_id = self.delegate.eos_token_id
-        self._eos_token_ids = (
-            {eos_token_id} if eos_token_id is not None else set()
+        self._eos_token_ids = resolve_eos_token_ids(
+            self.delegate.eos_token_id, pipeline_config
+        )
+        self._token_id_bound = resolve_token_id_bound(
+            self.delegate, pipeline_config
         )
 
-    async def decode(
-        self,
-        encoded: npt.NDArray[np.integer[Any]] | Sequence[int] | int,
-        **kwargs,
-    ) -> str:
+    async def decode(self, encoded: TokenIds, **kwargs) -> str:
         """Decode token array back into readable text, filtering out special tokens."""
         # Log-probability responses decode one token id (a plain int) and the
         # CLI passes a token list; normalize both to a rank-1 array.
@@ -214,12 +216,24 @@ class Idefics3Tokenizer(TextAndVisionTokenizer):
         else:
             images = None
 
-        processed_inputs = self.processor(
-            text=prompt,
-            images=images,
-            add_special_tokens=add_special_tokens,
-            return_tensors="np",
-        )
+        if isinstance(prompt, str):
+            processed_inputs = self.processor(
+                text=prompt,
+                images=images,
+                add_special_tokens=add_special_tokens,
+                return_tensors="np",
+            )
+        elif images is not None:
+            raise ValueError(
+                "A prompt given as token ids can't carry images. Send the "
+                "images with messages instead."
+            )
+        else:
+            # Hugging Face processors take only text, so token ids skip the
+            # processor.
+            processed_inputs = {
+                "input_ids": [checked_token_ids(prompt, self._token_id_bound)]
+            }
 
         if "input_ids" not in processed_inputs:
             raise ValueError(

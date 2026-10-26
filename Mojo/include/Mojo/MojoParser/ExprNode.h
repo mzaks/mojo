@@ -109,6 +109,7 @@ public:
     kTransfer, // x^
     kVarPat,   // var x
     kRefPat,   // ref x
+    kPrefixEQ, // ==x
     kComptime, // comptime (x)
     kFirstUnaryOp = kNeg,
     kLastUnaryOp = kComptime,
@@ -200,9 +201,6 @@ public:
   const ExprNode *getWithoutParens() const {
     return const_cast<ExprNode *>(this)->getWithoutParens();
   }
-
-  /// Return true if this is a TupleNode with no subexpressions.
-  bool isEmptyTuple() const;
 
   /// To support destructuring patterns in comptime expressions, this value
   /// binds the RHS of the comptime declaration to the pattern being declared,

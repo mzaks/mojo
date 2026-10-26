@@ -14,11 +14,16 @@ max.pipelines.kv_cache
 Submodules
 ----------
 
+.. autosummary::
+   :nosignatures:
+
+   max.pipelines.kv_cache.paged_kv_cache
+
 .. toctree::
    :maxdepth: 1
+   :hidden:
 
-   pipelines.kv_cache.paged_kv_cache.kv_group_coordinator
-   pipelines.kv_cache.paged_kv_cache.recurrent_coordinator
+   pipelines.kv_cache.paged_kv_cache
 
 Memory planning
 ---------------
@@ -52,10 +57,32 @@ Cache manager
    :toctree: generated
    :template: autosummary/class.rst
 
+   BlockCount
    ByteCount
    DummyKVCache
    InsufficientBlocksError
+   JengaKVCacheManager
    PagedKVCacheManager
+   PagedKVCacheManagerInterface
+
+Connectors
+----------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: generated
+   :template: autosummary/class.rst
+
+   ~max.pipelines.kv_cache.connectors.KVConnector
+   ~max.pipelines.kv_cache.connectors.NullConnector
+   ~max.pipelines.kv_cache.connectors.dkv.DKVConnector
+
+.. autosummary::
+   :nosignatures:
+   :toctree: generated
+   :template: autosummary/function.rst
+
+   ~max.pipelines.kv_cache.connectors.create_connector
 
 Transfer engine
 ---------------
@@ -78,6 +105,7 @@ Factory functions
    :template: autosummary/function.rst
 
    available_port
+   kv_cache_memory_size
    load_kv_manager
    max_seq_len_fitting_in_cache
 
@@ -90,3 +118,4 @@ Utilities
    :template: autosummary/function.rst
 
    cache_dtype_for_encoding
+   is_fp4_kv_cache_format

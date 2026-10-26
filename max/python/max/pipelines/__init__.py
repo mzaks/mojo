@@ -11,13 +11,25 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-"""Types to interface with ML pipelines such as text/token/pixel generation."""
+"""Interfaces for running models end to end: registry, configuration, and
+pipeline classes for text, embeddings, and pixel generation.
+
+A pipeline wires a model family into an executable workflow. A
+:class:`~max.pipelines.lib.registry.SupportedArchitecture` registers the model in the
+pipeline registry, :class:`~max.pipelines.lib.config.PipelineConfig` sets how it runs, and
+pipeline classes such as :class:`TextGenerationPipeline`,
+:class:`EmbeddingsPipeline`, and :class:`PixelGenerationPipeline` drive
+tokenization, weight loading, and generation.
+"""
 
 from max.experimental.validation import EagerUsageValidator
 from max.pipelines.weights.hf_utils import download_weight_files
 
 from .architectures import register_all_models
 from .diffusion.pipeline import PixelGenerationPipeline
+from .lib.auto_model import AutoModel, AutoTokenizer
+from .lib.auto_pipeline import AutoPipeline
+from .lib.auto_processor import AutoProcessor
 from .lib.config import (
     KVCacheConfig,
     LoRAConfig,
@@ -40,7 +52,6 @@ from .lib.config import (
 )
 from .lib.embeddings_pipeline import EmbeddingsPipeline, EmbeddingsPipelineType
 from .lib.interfaces import (
-    GenerateMixin,
     ModelInputs,
     ModelOutputs,
     PipelineModel,
@@ -63,7 +74,7 @@ from .lib.tokenizer import (
 from .lib.utils import upper_bounded_default
 from .lora import ADAPTER_CONFIG_FILE
 from .modeling.eager_validation import eager_validator
-from .sampling.sampling_config import SamplingConfig
+from .sampling import SamplingConfig
 
 # Hydrate the registry.
 register_all_models()
@@ -71,11 +82,14 @@ register_all_models()
 __all__ = [
     "ADAPTER_CONFIG_FILE",
     "PIPELINE_REGISTRY",
+    "AutoModel",
+    "AutoPipeline",
+    "AutoProcessor",
+    "AutoTokenizer",
     "EagerUsageValidator",
     "EagerValidatorMode",
     "EmbeddingsPipeline",
     "EmbeddingsPipelineType",
-    "GenerateMixin",
     "IdentityPipelineTokenizer",
     "KVCacheConfig",
     "LoRAConfig",

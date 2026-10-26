@@ -41,6 +41,16 @@ from max.nn.rotary_embedding import RotaryEmbedding
 from max.nn.stacked_linear import StackedLinear
 from max.pipelines.architectures.gemma4.layers.rms_norm import Gemma4RMSNorm
 
+KV_SHARING_SUPPORTED = True
+"""Whether this attention layer implements KV sharing.
+
+Read by ``Gemma4TextModel``, which refuses a ``num_kv_shared_layers > 0``
+checkpoint when the attention module does not implement sharing: the layers
+would otherwise load without complaint and diverge from the reference at every
+shared layer. The check stops firing on its own, which is why it keys on this
+flag rather than on a version comparison.
+"""
+
 
 class Gemma4Attention(Module, Shardable):
     """Implementation of the attention layer for the Gemma3 text model."""
@@ -72,7 +82,7 @@ class Gemma4Attention(Module, Shardable):
         qk_norm_eps: float = 1e-6,
         local_window_size: int = 1024,
         quant_config: QuantConfig | None = None,
-        fused_qkv: bool = False,
+        kv_share_source_layer_idx_in_cache: int | None = None,
     ) -> None:
         """Initializes the attention layer.
 
@@ -99,10 +109,10 @@ class Gemma4Attention(Module, Shardable):
             has_bias: Whether to use an attention bias. Defaults to False.
             qk_norm_eps: Value to use for numerical stability. Defaults to 1e-6.
             quant_config: Scaled quantization configuration. Defaults to None.
-            fused_qkv: When True, the qkv/qk projection uses a single stacked
-                weight (``StackedLinear(stacked=True)``) loaded pre-fused from
-                the checkpoint instead of concatenating per-projection weights
-                in-graph (DISTINF-194). Defaults to False.
+            kv_share_source_layer_idx_in_cache: The index, within this layer
+                type's KV cache, of the layer whose keys and values this
+                layer reuses. Defaults to None, meaning the layer projects
+                and caches its own.
         """
 
         super().__init__()
@@ -126,6 +136,9 @@ class Gemma4Attention(Module, Shardable):
 
         self.use_local = is_sliding
         self.layer_idx_in_cache = layer_idx_in_cache
+        self.kv_share_source_layer_idx_in_cache = (
+            kv_share_source_layer_idx_in_cache
+        )
 
         self.head_dim = (
             self.kv_params.head_dim
@@ -162,7 +175,6 @@ class Gemma4Attention(Module, Shardable):
                 names=["q_proj", "k_proj", "v_proj"],
                 dtype=dtype,
                 device=devices[0],
-                stacked=fused_qkv,
                 has_bias=has_bias,
                 linear_cls=linear_cls,
                 quant_config=quant_config,
@@ -174,7 +186,6 @@ class Gemma4Attention(Module, Shardable):
                 names=["q_proj", "k_proj"],
                 dtype=dtype,
                 device=devices[0],
-                stacked=fused_qkv,
                 has_bias=has_bias,
                 linear_cls=linear_cls,
                 quant_config=quant_config,
@@ -199,6 +210,21 @@ class Gemma4Attention(Module, Shardable):
 
         layer_idx = ops.constant(
             self.layer_idx_in_cache, DType.uint32, device=DeviceRef.CPU()
+        )
+
+        # A sharing layer reads the source layer's cached keys and values.
+        # The reference keeps the shared keys and values outside its cache,
+        # so a sharing layer there sees the source layer's whole history,
+        # while the slot bounds it by the sliding window. The sharing layer
+        # still caches its own keys and values, which nothing reads.
+        kv_read_layer_idx = (
+            ops.constant(
+                self.kv_share_source_layer_idx_in_cache,
+                DType.uint32,
+                device=DeviceRef.CPU(),
+            )
+            if self.kv_share_source_layer_idx_in_cache is not None
+            else layer_idx
         )
 
         head_dim = self.head_dim
@@ -257,7 +283,7 @@ class Gemma4Attention(Module, Shardable):
             self.kv_params,
             input=xq,
             kv_collection=kv_collection,
-            layer_idx=layer_idx,
+            layer_idx=kv_read_layer_idx,
             input_row_offsets=kwargs["input_row_offsets"],
             mask_variant=mask_variant,
             scale=self.scale,
@@ -386,6 +412,9 @@ class Gemma4Attention(Module, Shardable):
                 qk_norm_eps=self.qk_norm_eps,
                 local_window_size=self.local_window_size,
                 quant_config=self.quant_config,
+                kv_share_source_layer_idx_in_cache=(
+                    self.kv_share_source_layer_idx_in_cache
+                ),
             )
 
             # Assign sharded weights

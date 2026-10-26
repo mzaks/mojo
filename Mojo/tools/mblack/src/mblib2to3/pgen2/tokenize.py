@@ -662,6 +662,9 @@ def generate_tokens(
         "ref": REF,
         "where": WHERE,
         "__extension": EXTENSION,
+        "__enum": ENUM,
+        "__async": ASYNC,
+        "__await": AWAIT,
     }
 
     strstart: tuple[int, int]
@@ -971,6 +974,8 @@ def generate_tokens(
                         yield (tok_type, token, spos, epos, line)
                         continue
 
+                    # Bare `async` / `await` are warned-on Mojo spellings of
+                    # `__async` / `__await` but still format as keywords.
                     if token in ("async", "await"):
                         if async_keywords or async_def:
                             yield (

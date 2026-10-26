@@ -225,7 +225,11 @@ struct BlockwiseFP8_1D2DMatmulKernel[
         Self.a_type,
         Self.b_type,
         Self.config.block_tile_shape,
-        Self.config.mma_shape,
+        (
+            Self.config.mma_shape[0],
+            Self.config.mma_shape[1],
+            Self.config.mma_shape[2],
+        ),
         accum_type=Self.accum_type,
         cta_group=Self.cta_group,
         cluster_shape=Self.config.cluster_shape,
@@ -339,7 +343,11 @@ struct BlockwiseFP8_1D2DMatmulKernel[
     comptime accum_dims = get_accumulator_dims[
         c_smem_dim1=Self.OutputN,
         block_tile_shape=Self.config.block_tile_shape,
-        mma_shape=Self.config.mma_shape,
+        mma_shape=(
+            Self.config.mma_shape[0],
+            Self.config.mma_shape[1],
+            Self.config.mma_shape[2],
+        ),
         cta_group=Self.cta_group,
     ]()
 
@@ -349,7 +357,11 @@ struct BlockwiseFP8_1D2DMatmulKernel[
         Self.accum_dims[1],
         Self.is_lower_required,
         Self.config.block_tile_shape,
-        Self.config.mma_shape,
+        (
+            Self.config.mma_shape[0],
+            Self.config.mma_shape[1],
+            Self.config.mma_shape[2],
+        ),
         Self.CLUSTER_SIZE,
     ]
 
@@ -362,7 +374,11 @@ struct BlockwiseFP8_1D2DMatmulKernel[
         Self.accum_dims[0],
         Self.accum_dims[1],
         block_tile_shape=Self.config.block_tile_shape,
-        mma_shape=Self.config.mma_shape,
+        mma_shape=(
+            Self.config.mma_shape[0],
+            Self.config.mma_shape[1],
+            Self.config.mma_shape[2],
+        ),
         is_lower_frag_required=Self.is_lower_required,
         cta_group=Self.cta_group,
         num_output_stages=Self.num_output_stages,
@@ -541,7 +557,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
             UInt8,
             address_space=.SHARED,
             alignment=128,
-        ]().bitcast[Self.SmemType]()[]
+        ]().unsafe_bitcast[Self.SmemType]()[]
 
         # Get typed tile arrays from SMEM
         var a_tiles = smem.a_tiles()
@@ -785,9 +801,7 @@ struct BlockwiseFP8_1D2DMatmulKernel[
             elect_one_cta: True if this CTA is the elected CTA in a two-CTA
                 cluster; gates `expect_bytes` setup.
         """
-        var peer_rank_n = peer_cta_coord[0]
-        var peer_rank_m = peer_cta_coord[1]
-        var peer_m_rank = peer_cta_coord[2]
+        var peer_rank_n, peer_rank_m, peer_m_rank = peer_cta_coord
 
         # M coordinate in contiguous token space
         var m_coord = work_ctx.m()
@@ -817,11 +831,15 @@ struct BlockwiseFP8_1D2DMatmulKernel[
 
             # Peer CTA slicing using TileTensor pattern (ptr + layout)
             var a_peer_tile = type_of(a_tile)(
-                a_tile._storage + peer_m_rank * Self.a_tma_load_size,
+                a_tile._storage.unsafe_offset(
+                    peer_m_rank * Self.a_tma_load_size
+                ),
                 a_tile.layout,
             )
             var b_peer_tile = type_of(b_tile)(
-                b_tile._storage + peer_rank_m * Self.b_tma_load_size,
+                b_tile._storage.unsafe_offset(
+                    peer_rank_m * Self.b_tma_load_size
+                ),
                 b_tile.layout,
             )
 

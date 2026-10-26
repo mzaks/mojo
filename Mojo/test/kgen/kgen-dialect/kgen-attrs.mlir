@@ -141,8 +141,6 @@ kgen.generator @"LinkedList::__bool__(::LinkedList)"<T: type, x: !kgen.param<T>>
   c = #kgen.get_linkage_name<#kgen.target<triple = "unknown", arch = "", simd_bit_width = 128>, #kgen.symbol.constant<@return_one> : !kgen.generator<() -> index>> : !kgen.string,
   // CHECK-SAME: d = #kgen.get_type_name<#kgen.genref<@LinkedList<:type index, 3>>, true> : !kgen.string,
   d = #kgen.get_type_name<#kgen.genref<@LinkedList<:type index, 3>>, true> : !kgen.string,
-  // CHECK-SAME: e = #kgen.compile_offload_closure<#kgen.target<triple = "unknown", arch = "", simd_bit_width = 128>, #kgen.symbol.constant<@return_one> : !kgen.generator<() -> index>> : !kgen.string
-  e = #kgen.compile_offload_closure<#kgen.target<triple = "unknown", arch = "", simd_bit_width = 128>, #kgen.symbol.constant<@return_one> : !kgen.generator<() -> index>> : !kgen.string,
   // CHECK-SAME: f = #kgen.compile_assembly<#kgen.target<triple = "unknown", arch = "", simd_bit_width = 128>, =llvm, "", false, :() -> index @return_one> : !kgen.string,
   f = #kgen.compile_assembly<#kgen.target<triple = "unknown", arch = "", simd_bit_width = 128>, =llvm, "", false, :() -> index @return_one> : !kgen.string,
   // CHECK-SAME: g = #kgen.get_source_name<#kgen.symbol.constant<@return_one> : !kgen.generator<() -> index>> : !kgen.string,
@@ -662,66 +660,34 @@ kgen.param.assert <rebind(:i73 rebind(:i53 42))>, "rebind must fold"
   b = #kgen.target<triple = "unknown", arch = "", simd_bit_width = 128, opaque_plugin = #kgen.param_list<index, !kgen.struct<(index)>> : !kgen.param_list<!kgen.type>> : !kgen.target
 } : () -> ()
 
-// CHECK-LABEL: kgen.generator @get_target_plugin_unfolded
-kgen.generator @get_target_plugin_unfolded<t0: target>() {
-  // A target parameter has no payload to read yet, so the expression is kept.
-  // CHECK-NEXT: = kgen.param.constant: param_list<type> = <#kgen.get_target_plugin<t0>>
-  kgen.param.constant: !kgen.param_list<!kgen.type> =
-    <#kgen.get_target_plugin<t0> : !kgen.param_list<!kgen.type>>
-  hlcf.return
-}
-
 // CHECK-LABEL: kgen.generator @get_target_plugin_folds
-kgen.generator @get_target_plugin_folds() {
-  // Literal target, payload type matches the requested type: folds to the
-  // payload itself, so no `get_target_plugin` is left behind.
+kgen.generator @get_target_plugin_folds<t0: target>() {
+  // Matching concrete payload folds to the opaque_plugin payload.
   // CHECK-NEXT: = kgen.param.constant: param_list<type> = <[index, f32]>
   kgen.param.constant: !kgen.param_list<!kgen.type> =
-    <#kgen.get_target_plugin<#kgen.target<triple = "unknown", arch = "",
-      opaque_plugin = #kgen.param_list<index, f32> : !kgen.param_list<!kgen.type>>
-      : !kgen.target> : !kgen.param_list<!kgen.type>>
+    <#kgen.get_target_plugin<
+      #kgen.target<triple = "unknown", arch = "",
+        opaque_plugin = #kgen.param_list<index, f32> : !kgen.param_list<!kgen.type>
+      > : !kgen.target,
+      :!kgen.param_list<!kgen.type> #kgen.param_list<f16>
+    > : !kgen.param_list<!kgen.type>>
 
-  // Literal target carrying no payload at all: nothing to fold to.
-  // CHECK-NEXT: = kgen.param.constant: param_list<type> = <#kgen.get_target_plugin<#kgen.target<triple = "unknown", arch = "">>>
+  // A concrete target with no opaque_plugin payload folds to its fallback.
+  // CHECK-NEXT: = kgen.param.constant: param_list<type> = <[f16]>
   kgen.param.constant: !kgen.param_list<!kgen.type> =
-    <#kgen.get_target_plugin<#kgen.target<triple = "unknown", arch = ""> : !kgen.target>
+    <#kgen.get_target_plugin<
+      #kgen.target<triple = "unknown", arch = ""> : !kgen.target,
+      :!kgen.param_list<!kgen.type> #kgen.param_list<f16>
+    > : !kgen.param_list<!kgen.type>>
+
+  // A target parameter has no payload decision yet, so the get_target_plugin
+  // attribute remains unresolved.
+  // CHECK-NEXT: = kgen.param.constant: param_list<type> = <#kgen.get_target_plugin<t0, :param_list<type> [f16]>>
+  kgen.param.constant: !kgen.param_list<!kgen.type> =
+    <#kgen.get_target_plugin<t0, :!kgen.param_list<!kgen.type> #kgen.param_list<f16>>
       : !kgen.param_list<!kgen.type>>
 
-  // Literal target whose payload is a different type than the one requested:
-  // must not fold, or the constant would take on the wrong type.
-  // CHECK-NEXT: = kgen.param.constant: param_list<type> = <#kgen.get_target_plugin<#kgen.target<triple = "unknown", arch = "", opaque_plugin = #kgen.param_list<1, 2> : !kgen.param_list<index>>>>
-  kgen.param.constant: !kgen.param_list<!kgen.type> =
-    <#kgen.get_target_plugin<#kgen.target<triple = "unknown", arch = "",
-      opaque_plugin = #kgen.param_list<1, 2> : !kgen.param_list<index>>
-      : !kgen.target> : !kgen.param_list<!kgen.type>>
+  // A literal target whose opaque_plugin payload has a different type than
+  // expected is rejected at parse time; see kgen-errors.mlir.
   hlcf.return
 }
-
-// `@__annotation` values are attached to a struct generator and read back by
-// index. `struct_annotation`'s own type is the `index`th element of
-// `struct_annotation_types` for the same struct and field. It is computed from
-// the other operands rather than spelled, so it is absent from the syntax and
-// reappears on the way out.
-// CHECK: kgen.struct.generator @Annotated
-// CHECK-SAME: annotationTypes = #kgen<exprs[#kgen.type<index> : !kgen.type]>
-// CHECK-SAME: annotations = #kgen<exprs[7 : index]>
-kgen.struct.generator @Annotated = struct_inst<"Annotated"(value: index)> attributes {
-  annotationTypes = #kgen<exprs[#kgen.type<index> : !kgen.type]>,
-  annotations = #kgen<exprs[7 : index]>
-}
-
-"some.op"() {
-  // CHECK: a = #kgen.struct_annotation_types<[typevalue<#kgen.genref<@Annotated>>, struct<(index)>], -1> : !kgen.param_list<index>
-  a = #kgen.struct_annotation_types<
-        #kgen.type<typevalue<:type #kgen.genref<@Annotated>>, struct<(index)>> : !kgen.type,
-        -1> : !kgen.param_list<index>,
-  // CHECK-SAME: b = #kgen.struct_annotation<{{.*}}, -1, 0, <index>> : !kgen.param<:index #kgen.param_list.get<:param_list<index> #kgen.struct_annotation_types<{{.*}}, -1>, 0>>
-  b = #kgen.struct_annotation<
-        #kgen.type<typevalue<:type #kgen.genref<@Annotated>>, struct<(index)>> : !kgen.type,
-        -1, 0, !kgen.param_list<index>>,
-  // A non-negative field index selects that field's annotations instead.
-  // CHECK-SAME: c = #kgen.struct_annotation_types<{{.*}}, 0> : !kgen.param_list<index>
-  c = #kgen.struct_annotation_types<
-        #kgen.type<typevalue<:type #kgen.genref<@Annotated>>, struct<(index)>> : !kgen.type,
-        0> : !kgen.param_list<index>
-} : () -> ()

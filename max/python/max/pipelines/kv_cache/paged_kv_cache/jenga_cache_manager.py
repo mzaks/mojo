@@ -33,6 +33,7 @@ from max.nn.kv_cache.cache_params import (
     KVCacheBufferInterface,
     KVCacheMemory,
     KVConnectorType,
+    max_pages_per_request,
     spec_decode_cache_slack,
 )
 from max.nn.kv_cache.data_parallelism_utils import split_into_groups
@@ -56,7 +57,7 @@ from max.support import to_human_readable_bytes
 from max.support.math import ceildiv
 
 from ..connectors import create_connector
-from .cache_manager import (
+from ._common import (
     KV_CACHE_LENGTHS,
     cache_valid_length_for_context,
     prompt_tokens_for_context,
@@ -72,6 +73,8 @@ from .jenga_block_manager import (
 from .jenga_block_pool import (
     JengaBlockPool,
     JengaGeometry,
+    _pristine_pool_can_satisfy,
+    _stranding_warning,
     plan_jenga_geometry,
 )
 from .kv_group_coordinator import KVGroupCoordinatorInterface
@@ -97,15 +100,14 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
         bytes_per_page = {
             leaf_id: leaf.bytes_per_page for leaf_id, leaf in leaves.items()
         }
-        # A row-addressed leaf reports 1 and so constrains nothing.
-        row_bytes = {
-            leaf_id: leaf.row_bytes for leaf_id, leaf in leaves.items()
+        stride_alignments = {
+            leaf_id: leaf.stride_alignment for leaf_id, leaf in leaves.items()
         }
         n_devices = len(params.devices)
         if n_devices < 1:
             raise ValueError("Jenga KV cache requires at least one device")
         return plan_jenga_geometry(
-            available_bytes // n_devices, bytes_per_page, row_bytes
+            available_bytes // n_devices, bytes_per_page, stride_alignments
         )
 
     @classmethod
@@ -127,10 +129,86 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
             params.page_size,
             geometry.num_huge_blocks - 1,  # Huge block 0 is the null block.
             geometry.ratios,
+            enable_prefix_caching=params.enable_prefix_caching,
         )
         if longest is None:
             return None
         return max(1, longest - spec_decode_cache_slack(params))
+
+    @classmethod
+    def memory_size(
+        cls,
+        params: KVCacheParamInterface,
+        available_bytes: int,
+        max_batch_size: int,
+        max_seq_len: int,
+    ) -> int:
+        """Returns the slab bytes a full batch at ``max_seq_len`` needs.
+
+        Every leaf, a state or scratch leaf included, is priced in the whole
+        huge blocks an empty pool would carve for it, the same test the pool
+        admits a request by. The answer is checked against the geometry
+        :meth:`create` plans for it, since a smaller budget can choose a
+        different huge block, and is never more than ``available_bytes``.
+
+        Args:
+            params: The cache the slab holds.
+            available_bytes: The KV budget across all devices.
+            max_batch_size: Requests held at once.
+            max_seq_len: The longest request, before speculative slack.
+
+        Returns:
+            The bytes across all devices.
+
+        Raises:
+            RuntimeError: If ``available_bytes`` cannot hold a single block.
+        """
+        num_blocks = max_pages_per_request(params, max_seq_len)
+        demand = {
+            leaf_id: max_batch_size
+            * leaf.blocks_to_reserve(
+                num_blocks, enable_prefix_caching=params.enable_prefix_caching
+            )
+            for leaf_id, leaf in params.leaves().items()
+        }
+        n_devices = len(params.devices)
+
+        def geometry_for(size: int) -> JengaGeometry:
+            try:
+                geometry = cls._plan_geometry(params, size)
+            except ValueError as e:
+                raise RuntimeError(
+                    f"Insufficient cache memory to allocate even a single"
+                    f" page: {e}"
+                ) from None
+            if geometry.num_huge_blocks < 2:
+                raise RuntimeError(
+                    "Insufficient cache memory to allocate even a single"
+                    f" page: {to_human_readable_bytes(size)} holds"
+                    f" {geometry.num_huge_blocks} huge block of"
+                    f" {to_human_readable_bytes(geometry.huge_page_bytes)},"
+                    " and one is the null block."
+                )
+            return geometry
+
+        geometry = geometry_for(available_bytes)
+        needed = 1 + sum(  # Huge block 0 is the null block.
+            ceildiv(blocks, geometry.ratios[leaf_id])
+            for leaf_id, blocks in demand.items()
+        )
+        size = min(
+            available_bytes, needed * geometry.huge_page_bytes * n_devices
+        )
+        while size < available_bytes:
+            planned = geometry_for(size)
+            if _pristine_pool_can_satisfy(
+                planned.num_huge_blocks - 1, planned.ratios, demand
+            ):
+                return size
+            size = min(
+                available_bytes, size + planned.huge_page_bytes * n_devices
+            )
+        return available_bytes
 
     @classmethod
     def create(
@@ -139,8 +217,8 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
         params: KVCacheParamInterface,
         available_bytes: int,
         max_batch_size: int,
+        max_seq_len: int,
         max_num_input_tokens: int | None = None,
-        max_seq_len: int | None = None,
     ) -> JengaKVCacheManager:
         """Creates a JengaKVCacheManager.
 
@@ -152,17 +230,6 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
         bytes_per_page = {
             leaf_id: leaf.bytes_per_page for leaf_id, leaf in leaves.items()
         }
-        is_kv_connector_enabled = (
-            params.kv_connector_config.type.value != "null"
-        )
-        has_unservable_leaf = any(
-            leaf.group_id.is_recurrent() for leaf in leaves.values()
-        )
-        if is_kv_connector_enabled and has_unservable_leaf:
-            raise ValueError(
-                "Recurrent KV cache group is incompatible with KVConnector."
-                " Please disable KVConnector"
-            )
         geometry = cls._plan_geometry(params, available_bytes)
         num_huge_blocks = geometry.num_huge_blocks
         huge_page_bytes = geometry.huge_page_bytes
@@ -187,6 +254,12 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
                 )
             )
 
+        warning = _stranding_warning(
+            geometry, len(leaves), available_bytes // len(params.devices)
+        )
+        if warning is not None:
+            logger.warning(warning)
+
         devices = [d.to_device() for d in params.devices]
         slabs = [
             Buffer.zeros(
@@ -208,7 +281,12 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
             leaf_infos, num_huge_blocks, params.data_parallel_degree
         )
 
-        groups = create_groups(leaf_infos, pools, params.page_size)
+        groups = create_groups(
+            leaf_infos,
+            pools,
+            params.page_size,
+            enable_prefix_caching=params.enable_prefix_caching,
+        )
 
         # A single connector serves every replica; each load/offload passes
         # the replica_idx that selects the device endpoint.
@@ -234,30 +312,30 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
             replica_kv_memory=replica_kv_memory,
             max_batch_size=max_batch_size,
             max_num_input_tokens=max_num_input_tokens,
+            max_seq_len=max_seq_len,
             connector=connector,
             pools=pools,
             groups=groups,
             slabs=slabs,
         )
-        if max_seq_len is not None:
-            slack = spec_decode_cache_slack(params)
-            seq_len_with_slack = max_seq_len + slack
-            if not manager._fits_in_cache(seq_len_with_slack):
-                effective = manager.effective_max_seq_length
-                max_tokens = effective if effective is not None else 0
-                slack_str = (
-                    f" (plus {slack} speculative-decode slack tokens)"
-                    if slack > 0
-                    else ""
-                )
-                raise RuntimeError(
-                    "Insufficient cache memory to support a batch containing one"
-                    f" request at the max sequence length of {max_seq_len} tokens"
-                    f"{slack_str}. A request approaching the max sequence length would"
-                    " exhaust the KV cache and crash the model worker. Reduce"
-                    f" --max-length to at most {max_tokens} or increase the available"
-                    " KV cache memory (e.g. raise --device-memory-utilization)."
-                )
+        slack = spec_decode_cache_slack(params)
+        seq_len_with_slack = max_seq_len + slack
+        if not manager._fits_in_cache(seq_len_with_slack):
+            effective = manager.effective_max_seq_length
+            max_tokens = effective if effective is not None else 0
+            slack_str = (
+                f" (plus {slack} speculative-decode slack tokens)"
+                if slack > 0
+                else ""
+            )
+            raise RuntimeError(
+                "Insufficient cache memory to support a batch containing one"
+                f" request at the max sequence length of {max_seq_len} tokens"
+                f"{slack_str}. A request approaching the max sequence length would"
+                " exhaust the KV cache and crash the model worker. Reduce"
+                f" --max-length to at most {max_tokens} or increase the available"
+                " KV cache memory (e.g. raise --device-memory-utilization)."
+            )
         return manager
 
     def __init__(
@@ -269,6 +347,7 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
         kv_buffers: Sequence[KVCacheBufferInterface],
         replica_kv_memory: Sequence[Mapping[str, KVCacheMemory]],
         max_batch_size: int,
+        max_seq_len: int,
         max_num_input_tokens: int | None = None,
         connector: KVConnector | None = None,
         groups: Mapping[str, KVGroupCoordinatorInterface],
@@ -301,9 +380,12 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
         self._devices_per_replica = devices_per_replica
 
         leaves = params.leaves()
-        max_num_blocks = max(
-            leaf_info.ratio * self._num_huge_blocks
-            for leaf_info in leaf_infos.values()
+        # LUT columns index logical sequence pages, not physical page IDs.
+        # Tiny scale pages can give a slab millions of physical pages, but
+        # a request still only addresses its sequence length plus slack.
+        max_num_blocks = max_pages_per_request(params, max_seq_len)
+        self._max_seq_len_with_slack = max_seq_len + spec_decode_cache_slack(
+            params
         )
         # One instance across every leaf, shard and replica. Leaf ids are
         # already unique, a replica's shards are the destinations of one
@@ -398,15 +480,9 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
         if binds_rows and not any(batches):
             raise ValueError("runtime_inputs called with an empty batch")
 
-        if self._connector is not None:
-            # Pre-forward load barrier (dKV-only): dKV posts its READs in
-            # `load` and orders them here. Asynchronous connectors instead hold
-            # a request out of the batch until its onload polls complete, so
-            # this is a no-op for them.
-            self._connector.wait_for_loads()
-            for replica_idx in range(len(batches)):
-                # Initiate saves of everything committed since the last forward.
-                self.offload(replica_idx)
+        for replica_idx in range(len(batches)):
+            # Initiate saves of everything committed since the last forward.
+            self.offload(replica_idx)
 
         # One scope per forward: every replica stages into it, and leaving
         # it sends the lot.
@@ -490,7 +566,7 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
         cache_lengths_np = cache_lengths_host.to_numpy()
         cache_lengths_np.fill(0)
 
-        plans: dict[str, list[list[int]]] = {}
+        plans: dict[str, list[Sequence[int]]] = {}
         for group in self._groups.values():
             plans.update(group.forward_blocks(batch, num_blocks))
 
@@ -690,14 +766,40 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
         return self.huge_block_count(replica_idx)
 
     def pressure_pct(self, replica_idx: int = 0) -> float:
-        """Returns the fullest leaf's page occupancy, in ``[0, 100]``.
+        """Returns how much of the replica's headroom is gone, in ``[0, 100]``.
 
-        Reads 100 once no leaf can allocate another page.
+        Headroom is how many more pages of every full leaf at once, and how
+        many more requests' pages of every windowed, state or scratch leaf,
+        the pool can serve, each against a pristine pool; the larger share
+        gone wins. Committed pages no request holds count as free. Reads 100
+        once either runs out.
         """
+        pool = self.pools[replica_idx]
+        per_request = self._blocks_to_reserve(self._max_seq_len_with_slack)
+        units = [
+            {
+                leaf_id: 1
+                for leaf_id, group in self.groups.items()
+                if not group.demand_plateaus
+            },
+            {
+                leaf_id: per_request[leaf_id]
+                for leaf_id, group in self.groups.items()
+                if group.demand_plateaus
+            },
+        ]
         return max(
             (
-                count.used_pct
-                for count in self.little_block_count(replica_idx).values()
+                100.0
+                * (
+                    1
+                    - pool.max_satisfiable_multiple(unit)
+                    / max(
+                        1, pool.max_satisfiable_multiple(unit, at_capacity=True)
+                    )
+                )
+                for unit in units
+                if unit
             ),
             default=0.0,
         )
@@ -706,14 +808,14 @@ class JengaKVCacheManager(JengaBlockManager, PagedKVCacheManagerInterface):
     # KVConnector APIs (full-attention groups only -- see __init__)
     # ============================================================================
 
-    def host_byte_count(self, replica_idx: int = 0) -> ByteCount:
-        """Returns the host KV tier occupancy in bytes for the given replica."""
+    def host_byte_count(self) -> ByteCount:
+        """Returns the host KV tier occupancy in bytes, shared by every replica."""
         if self._connector is None:
             return ByteCount(free=0, total=0)
         return self._connector.host_byte_count
 
-    def disk_byte_count(self, replica_idx: int = 0) -> ByteCount:
-        """Returns the disk KV tier occupancy in bytes for the given replica."""
+    def disk_byte_count(self) -> ByteCount:
+        """Returns the disk KV tier occupancy in bytes, shared by every replica."""
         if self._connector is None:
             return ByteCount(free=0, total=0)
         return self._connector.disk_byte_count

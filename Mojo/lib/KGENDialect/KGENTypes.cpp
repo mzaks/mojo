@@ -516,9 +516,11 @@ Type FuncGeneratorTypeBuilderType::get(MLIRContext *ctx, TypedAttr paramDecls,
   auto cstArgTypes = dyn_cast<ParamListAttr>(argTypes);
   auto cstMetadata = dyn_cast<FnMetadataAttr>(metadata);
 
-  // Two optional pogs.
-  auto cstParamListAttrs = dyn_cast_or_null<PogListAttr>(paramListAttrs);
-  auto cstArgListAttrs = dyn_cast_or_null<PogListAttr>(argListAttrs);
+  // Two optional pogs; unquote them before we assemble a FnTypeGeneratorType.
+  auto cstParamListAttrs =
+      dyn_cast_or_null<PogListAttr>(QuoteAttr::unquote(paramListAttrs));
+  auto cstArgListAttrs =
+      dyn_cast_or_null<PogListAttr>(QuoteAttr::unquote(argListAttrs));
 
   // If any of the components are not constants, skip.
   if (!cstParamDecls || !cstArgTypes || !cstMetadata ||
@@ -529,27 +531,24 @@ Type FuncGeneratorTypeBuilderType::get(MLIRContext *ctx, TypedAttr paramDecls,
   assert(llvm::all_of(cstParamDecls.getValues(), llvm::IsaPred<QuoteAttr>) &&
          "malformed fn gen builder param decls");
 
-  // Unquote before we assemble a FnTypeGeneratorType.
-  auto unquote = [](TypedAttr value) -> TypedAttr {
-    return cast<QuoteAttr>(value).getQuotedParam();
-  };
-
   SmallVector<Type> inputParamTypes = llvm::map_to_vector(
-      cstParamDecls.getValues(),
-      [&](TypedAttr attr) -> Type { return ParamType::get(unquote(attr)); });
+      cstParamDecls.getValues(), [&](TypedAttr attr) -> Type {
+        return ParamType::get(QuoteAttr::unquote(attr));
+      });
 
   SmallVector<Type> inputArgTypes =
       llvm::map_to_vector(cstArgTypes.getValues(), [&](TypedAttr attr) -> Type {
-        return ParamType::get(unquote(attr));
+        return ParamType::get(QuoteAttr::unquote(attr));
       });
 
   // Fold to the generator type this builder describes.
   return KGEN::FuncTypeGeneratorType::get(
       inputParamTypes,
-      FuncType::get(FunctionType::get(ctx, inputArgTypes,
-                                      ParamType::get(unquote(resultType))),
-                    cstMetadata.getArgConventions(), cstMetadata.getFnEffects(),
-                    cstMetadata.getMetadata(), cstArgListAttrs),
+      FuncType::get(
+          FunctionType::get(ctx, inputArgTypes,
+                            ParamType::get(QuoteAttr::unquote(resultType))),
+          cstMetadata.getArgConventions(), cstMetadata.getFnEffects(),
+          cstMetadata.getMetadata(), cstArgListAttrs),
       cstParamListAttrs);
 }
 
@@ -698,9 +697,7 @@ std::optional<size_t> FuncType::findPackVarArgIndex() {
 bool FuncType::hasKwVarArgs() { return getArgListAttrs().hasKwVarArg(); }
 
 std::optional<int64_t> FuncType::getTypeSize(TargetInfoAttr target) const {
-  // Non-capturing closures are function pointers. Capturing closures contain
-  // a function pointer and a capture state pointer.
-  return (isCapturing() ? 2 : 1) * target.getDataLayout().getPointerSize();
+  return target.getDataLayout().getPointerSize();
 }
 
 std::optional<int64_t> FuncType::getTypeAlign(TargetInfoAttr target) const {
@@ -1035,18 +1032,35 @@ SymbolConstantAttr FuncLiteralTypeGeneratorType::getSymbolConstantAttr() {
   auto sig = GeneratorType::get(getInputParamTypes(), directSymbol.getType(),
                                 getParamListAttrs());
 
-  // The parameter values might have dependent type, erase the ref too in the
-  // create a evaluator to erase the dependencies too.
+  // An input parameter type may contain an expression dependent on an earlier
+  // parameter. Those dependencies are erased to `#kgen.unknown` rather than
+  // `#kgen.unbound` to appease the verifier which may fail compilation if the
+  // expression contains a symbol use that the verifier expects to be fully
+  // bound.
+  ParameterEvaluator typeEvaluator(ArrayRef<TypedAttr>{});
   ParameterEvaluator evaluator(ArrayRef<TypedAttr>{});
-  for (auto unboundType : getInputParamTypes()) {
-    // There could be a dependent input parameter type, erase the unknown ref.
-    auto unbound = UnboundAttr::get(evaluator.replace(unboundType));
-    evaluator.appendIndexBinding(unbound);
+  for (auto inputType : getInputParamTypes()) {
+    Type type = typeEvaluator.replace(inputType);
+    auto paramType = dyn_cast<ParameterTypeInterface>(type);
+    if (!paramType || paramType.supportsUnknownValue())
+      typeEvaluator.appendIndexBinding(UnknownAttr::get(type));
+    else
+      typeEvaluator.appendIndexBinding(UnboundAttr::get(type));
+    evaluator.appendIndexBinding(UnboundAttr::get(type));
   }
 
+  // A direct reference to a slot takes the slot's erased type from above.
+  // Replacing it through `evaluator` would also rewrite the reference's own
+  // type with `#kgen.unbound` bindings, which turns an applied subexpression
+  // such as `bind_params(*(0,2), *(0,0), *(0,1))` into an unapplied one.
   SmallVector<TypedAttr> paramValues;
-  for (auto paramValue : directSymbol.getParamValues())
-    paramValues.push_back(evaluator.replace(paramValue));
+  for (auto paramValue : directSymbol.getParamValues()) {
+    auto indexRef = dyn_cast<ParamIndexRefAttr>(paramValue);
+    if (indexRef && indexRef.getDepth() == 0)
+      paramValues.push_back(evaluator.getIndexBindings()[indexRef.getIndex()]);
+    else
+      paramValues.push_back(evaluator.replace(paramValue));
+  }
 
   return SymbolConstantAttr::get(directSymbol.getSymbol(),
                                  cast<FuncTypeGeneratorType>(sig), paramValues);
@@ -1517,8 +1531,10 @@ Type StructType::parse(AsmParser &p) {
 
   TypedAttr variadic;
 
-  // Check for `(` which indicates concrete types.
+  // `(...)` lists layouts, so it makes a layout struct.
+  StructDomain domain = StructDomain::Unset;
   if (succeeded(p.parseOptionalLParen())) {
+    domain = StructDomain::Layout;
     auto metatype = TypeType::get(p.getContext());
     auto variadicType = ParamListType::get(metatype);
     // Check for empty struct case.
@@ -1560,6 +1576,10 @@ Type StructType::parse(AsmParser &p) {
     return {};
 
   bool isParamPack = succeeded(p.parseOptionalKeyword("isParamPack"));
+  if (succeeded(p.parseOptionalKeyword("layout")))
+    domain = StructDomain::Layout;
+  else if (succeeded(p.parseOptionalKeyword("value")))
+    domain = StructDomain::Value;
 
   // Parse optional `align(N)` for minAlignment.
   TypedAttr minAlignment;
@@ -1573,7 +1593,7 @@ Type StructType::parse(AsmParser &p) {
     return {};
 
   return StructType::get(p.getContext(), variadic, isMemoryOnly, minAlignment,
-                         isParamPack);
+                         isParamPack, domain);
 }
 
 /// Print the StructType.
@@ -1582,7 +1602,11 @@ void StructType::print(AsmPrinter &p) const {
 
   TypedAttr variadic = getElementTypesVariadic();
   auto attr = dyn_cast<ParamListAttr>(variadic);
-  if (!attr || !isa<TypeType>(attr.getType().getElementType())) {
+  // A resolved layout prints as `(...)`, a list of types. Everything else
+  // prints as a parameter value, and an explicit domain is denoted.
+  bool printsAsTypes = isLayoutDomain() && attr &&
+                       isa<TypeType>(attr.getType().getElementType());
+  if (!printsAsTypes) {
     // Parametric expression or complex metatype - print without parens.  We
     // print :param_list<Movable> if the elements are not TypeType metatype.
     if (!isa<TypeType>(
@@ -1607,6 +1631,11 @@ void StructType::print(AsmPrinter &p) const {
   if (getIsParamPack())
     p << " isParamPack";
 
+  if (isLayoutDomain() && !printsAsTypes)
+    p << " layout";
+  else if (isValueDomain())
+    p << " value";
+
   // Print alignment if not the default (1).
   TypedAttr minAlign = getMinAlignment();
   if (auto intAttr = dyn_cast<IntegerAttr>(minAlign)) {
@@ -1628,7 +1657,8 @@ void StructType::print(AsmPrinter &p) const {
 /// expression.
 LogicalResult StructType::verify(function_ref<InFlightDiagnostic()> emitError,
                                  TypedAttr variadic, TypedAttr isMemoryOnly,
-                                 TypedAttr minAlignment, bool isParamPack) {
+                                 TypedAttr minAlignment, bool isParamPack,
+                                 StructDomain domain) {
   // isMemoryOnly must be an i1-typed attribute (BoolAttr or constraint
   // proposition).
   if (auto intTy = dyn_cast<IntegerType>(isMemoryOnly.getType());
@@ -1837,28 +1867,22 @@ static TypedAttr convertTypesToVariadicAttr(MLIRContext *context,
   return ParamListAttr::get(elements, variadicType);
 }
 
-/// Normalize a ParamListAttr to use canonicalized TypeParamAttrs.
-/// This ensures consistent uniquing regardless of how the ParamListAttr was
-/// created (e.g., from bytecode vs from ArrayRef<Type>).
-static TypedAttr normalizeVariadicForUniquing(MLIRContext *context,
-                                              TypedAttr variadic) {
-  // Only normalize concrete VariadicAttrs, not parametric expressions.
-  auto variadicAttr = dyn_cast<ParamListAttr>(variadic);
-  if (!variadicAttr)
-    return variadic;
+/// Reduces each type constant in a layout's element list to its layout half.
+/// Parametric expressions are kept as-is; they are reduced when they fold to
+/// type constants and the struct is rebuilt.
+static void projectToLayouts(TypedAttr &variadic) {
+  auto paramList = dyn_cast<ParamListAttr>(variadic);
+  if (!paramList)
+    return;
 
-  // Directly canonicalize TypeParamAttr values by rebuilding them through
-  // TypeParamAttr::get(), which ensures consistent representation.
-  // Non-TypeParamAttr values (parametric expressions) are kept as-is.
-  auto metatype = TypeType::get(context);
   SmallVector<TypedAttr> normalized;
-  normalized.reserve(variadicAttr.getValues().size());
+  normalized.reserve(paramList.getValues().size());
   bool changed = false;
-  for (TypedAttr value : variadicAttr.getValues()) {
+  for (TypedAttr value : paramList.getValues()) {
     if (auto typeParam = dyn_cast<TypeParamAttr>(value)) {
-      // Canonicalize by rebuilding through TypeParamAttr::get().
+      // Keep the element's metatype: a pack's list can be typed by a trait.
       TypedAttr canonical = cast<TypedAttr>(
-          TypeParamAttr::get(typeParam.getMlirType(), metatype));
+          TypeParamAttr::get(typeParam.getMlirType(), typeParam.getType()));
       normalized.push_back(canonical);
       if (canonical != value)
         changed = true;
@@ -1868,11 +1892,8 @@ static TypedAttr normalizeVariadicForUniquing(MLIRContext *context,
     }
   }
 
-  // Return original if nothing changed.
-  if (!changed)
-    return variadic;
-
-  return ParamListAttr::get(normalized, variadicAttr.getType());
+  if (changed)
+    variadic = ParamListAttr::get(normalized, paramList.getType());
 }
 
 /// Main builder for StructType with TypedAttr variadic.
@@ -1880,14 +1901,38 @@ static TypedAttr normalizeVariadicForUniquing(MLIRContext *context,
 /// If isMemoryOnly is null, uses BoolAttr(false).
 StructType StructType::get(MLIRContext *context, TypedAttr variadic,
                            TypedAttr isMemoryOnly, TypedAttr minAlignment,
-                           bool isParamPack) {
+                           bool isParamPack, StructDomain domain) {
   if (!isMemoryOnly)
     isMemoryOnly = BoolAttr::get(context, false);
   if (!minAlignment)
     minAlignment = IntegerAttr::get(IndexType::get(context), 1);
-  if (!isParamPack)
-    variadic = normalizeVariadicForUniquing(context, variadic);
-  return Base::get(context, variadic, isMemoryOnly, minAlignment, isParamPack);
+  if (domain == StructDomain::Layout)
+    projectToLayouts(variadic);
+  return Base::get(context, variadic, isMemoryOnly, minAlignment, isParamPack,
+                   domain);
+}
+
+StructType StructType::get(MLIRContext *context, TypedAttr variadic,
+                           TypedAttr isMemoryOnly, TypedAttr minAlignment,
+                           bool isParamPack) {
+  return get(context, variadic, isMemoryOnly, minAlignment, isParamPack,
+             StructDomain::Unset);
+}
+
+StructType StructType::getLayoutDomain(MLIRContext *context, TypedAttr variadic,
+                                       TypedAttr isMemoryOnly,
+                                       TypedAttr minAlignment,
+                                       bool isParamPack) {
+  return get(context, variadic, isMemoryOnly, minAlignment, isParamPack,
+             StructDomain::Layout);
+}
+
+StructType StructType::getValueDomain(MLIRContext *context, TypedAttr variadic,
+                                      TypedAttr isMemoryOnly,
+                                      TypedAttr minAlignment,
+                                      bool isParamPack) {
+  return get(context, variadic, isMemoryOnly, minAlignment, isParamPack,
+             StructDomain::Value);
 }
 
 StructType StructType::get(ArrayRef<Type> types, bool isMemoryOnly) {
@@ -1896,21 +1941,21 @@ StructType StructType::get(ArrayRef<Type> types, bool isMemoryOnly) {
          "use get(MLIRContext*, ArrayRef<Type>, bool) for empty structs");
   MLIRContext *context = types.front().getContext();
   TypedAttr variadic = convertTypesToVariadicAttr(context, types);
-  return StructType::get(context, variadic,
+  return getLayoutDomain(context, variadic,
                          BoolAttr::get(context, isMemoryOnly));
 }
 
 StructType StructType::get(MLIRContext *context, ArrayRef<Type> types,
                            bool isMemoryOnly, TypedAttr minAlignment) {
   TypedAttr variadic = convertTypesToVariadicAttr(context, types);
-  return StructType::get(context, variadic,
+  return getLayoutDomain(context, variadic,
                          BoolAttr::get(context, isMemoryOnly), minAlignment);
 }
 
 StructType StructType::get(MLIRContext *context, ArrayRef<Type> types,
                            TypedAttr isMemoryOnly, TypedAttr minAlignment) {
   TypedAttr variadic = convertTypesToVariadicAttr(context, types);
-  return StructType::get(context, variadic, isMemoryOnly, minAlignment);
+  return getLayoutDomain(context, variadic, isMemoryOnly, minAlignment);
 }
 
 StructType StructType::getChecked(function_ref<InFlightDiagnostic()> emitError,
@@ -1927,25 +1972,28 @@ StructType StructType::getChecked(function_ref<InFlightDiagnostic()> emitError,
   TypedAttr variadic = convertTypesToVariadicAttr(context, types);
   TypedAttr isMemOnlyAttr = BoolAttr::get(context, isMemoryOnly);
   TypedAttr minAlignment = IntegerAttr::get(IndexType::get(context), 1);
-  if (failed(verify(emitError, variadic, isMemOnlyAttr, minAlignment, false)))
+  if (failed(verify(emitError, variadic, isMemOnlyAttr, minAlignment, false,
+                    StructDomain::Layout)))
     return {};
-  return get(context, variadic, isMemOnlyAttr, minAlignment);
+  return getLayoutDomain(context, variadic, isMemOnlyAttr, minAlignment);
 }
 
 StructType StructType::getChecked(function_ref<InFlightDiagnostic()> emitError,
                                   MLIRContext *context, TypedAttr variadic,
                                   TypedAttr isMemoryOnly,
-                                  TypedAttr minAlignment, bool isParamPack) {
+                                  TypedAttr minAlignment, bool isParamPack,
+                                  StructDomain domain) {
   if (!isMemoryOnly)
     isMemoryOnly = BoolAttr::get(context, false);
   if (!minAlignment)
     minAlignment = IntegerAttr::get(IndexType::get(context), 1);
-  if (!isParamPack)
-    variadic = normalizeVariadicForUniquing(context, variadic);
-  if (failed(
-          verify(emitError, variadic, isMemoryOnly, minAlignment, isParamPack)))
+  if (domain == StructDomain::Layout)
+    projectToLayouts(variadic);
+  if (failed(verify(emitError, variadic, isMemoryOnly, minAlignment,
+                    isParamPack, domain)))
     return {};
-  return Base::get(context, variadic, isMemoryOnly, minAlignment, isParamPack);
+  return Base::get(context, variadic, isMemoryOnly, minAlignment, isParamPack,
+                   domain);
 }
 
 FailureOr<Type>

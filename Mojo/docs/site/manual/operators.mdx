@@ -7,6 +7,10 @@ description: >-
   operators in Mojo, with precedence and examples.
 ---
 
+<!-- Compiler verified: 2026-10-15, repo build at 8dd6016c251
+       (walrus loop example only)
+     Last updated: 2026-10-15 (fixes walrus loop example) -->
+
 <!--
 Removed:
 
@@ -203,6 +207,8 @@ print(16 >> 2)   # 4
 print(-16 >> 2)  # -4
 ```
 
+A shift at or above the bit width has no defined result.
+
 Among the bitwise operators, precedence runs: NOT (`~`) is tightest,
 then shift operators, then AND, then XOR, then OR. If the grouping isn't
 obvious, use parentheses.
@@ -393,7 +399,8 @@ Press Return without entering text to terminate the loop. Non-empty strings are
 truthy:
 
 ```mojo
-while (var name := input("Name or return: ")):
+var name: String
+while (name := input("Name or return: ")):
     print("Hello,", name)
 ```
 

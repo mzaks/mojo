@@ -39,18 +39,15 @@ from std.random import randn, seed
 from max.gpu.host import DeviceContext
 from std.testing import assert_almost_equal
 
-from layout import LayoutTensor, Layout, TileTensor, UNKNOWN_VALUE
-from layout.coord import Coord, Idx
-from layout.runtime_layout import RuntimeLayout
+from layout import TileTensor
+from layout.coord import Idx
 from layout.tile_layout import row_major
-
-from std.utils.index import Index
 
 from nn.attention.gpu.amd_structured.mha_mma_op import MhaConfigV2
 from nn.attention.gpu.amd_structured.mha_prefill_v2 import MhaPrefillV2
 from nn.attention.gpu.mha import mha_gpu_naive
 from nn.attention.mha_mask import CausalMask, MHAMask, NullMask
-from nn.attention.mha_operand import LayoutTensorMHAOperand, MHAOperand
+from nn.attention.mha_operand import TileTensorMHAOperand, MHAOperand
 
 
 # ---- Shape constants (MHA archetype at d=128).
@@ -250,51 +247,23 @@ def test_mha_vs_naive[
     # Q/K/V/O TileTensors at (BATCH, SEQ_LEN/NUM_KEYS, NUM_HEADS, DEPTH).
     var q_tt = TileTensor(
         dev_q,
-        row_major(
-            Coord(
-                Int32(BATCH),
-                Int32(SEQ_LEN),
-                Idx[NUM_HEADS],
-                Idx[DEPTH],
-            )
-        ),
+        row_major(Int32(BATCH), Int32(SEQ_LEN), Idx[NUM_HEADS], Idx[DEPTH]),
     )
     var k_tt = TileTensor(
         dev_k,
-        row_major(
-            Coord(
-                Int32(BATCH),
-                Int32(NUM_KEYS),
-                Idx[NUM_KV_HEADS],
-                Idx[DEPTH],
-            )
-        ),
+        row_major(Int32(BATCH), Int32(NUM_KEYS), Idx[NUM_KV_HEADS], Idx[DEPTH]),
     )
     var v_tt = TileTensor(
         dev_v,
-        row_major(
-            Coord(
-                Int32(BATCH),
-                Int32(NUM_KEYS),
-                Idx[NUM_KV_HEADS],
-                Idx[DEPTH],
-            )
-        ),
+        row_major(Int32(BATCH), Int32(NUM_KEYS), Idx[NUM_KV_HEADS], Idx[DEPTH]),
     )
     var o_tt = TileTensor(
         dev_out,
-        row_major(
-            Coord(
-                Int32(BATCH),
-                Int32(SEQ_LEN),
-                Idx[NUM_HEADS],
-                Idx[DEPTH],
-            )
-        ),
+        row_major(Int32(BATCH), Int32(SEQ_LEN), Idx[NUM_HEADS], Idx[DEPTH]),
     )
 
-    var k_op = LayoutTensorMHAOperand(k_tt)
-    var v_op = LayoutTensorMHAOperand(v_tt)
+    var k_op = TileTensorMHAOperand(k_tt)
+    var v_op = TileTensorMHAOperand(v_tt)
 
     _mha_prefill_v2_launch[config=CONFIG](
         q_tt,
@@ -312,57 +281,29 @@ def test_mha_vs_naive[
     # mha_gpu_naive takes K and V at d=DEPTH (same as the MHA kernel).
     var q_naive_tt = TileTensor(
         dev_q,
-        row_major(
-            Coord(
-                Int32(BATCH),
-                Int32(SEQ_LEN),
-                Idx[NUM_HEADS],
-                Idx[DEPTH],
-            )
-        ),
+        row_major(Int32(BATCH), Int32(SEQ_LEN), Idx[NUM_HEADS], Idx[DEPTH]),
     )
     var k_ref_tt = TileTensor(
         dev_k,
-        row_major(
-            Coord(
-                Int32(BATCH),
-                Int32(NUM_KEYS),
-                Idx[NUM_KV_HEADS],
-                Idx[DEPTH],
-            )
-        ),
+        row_major(Int32(BATCH), Int32(NUM_KEYS), Idx[NUM_KV_HEADS], Idx[DEPTH]),
     )
     var v_ref_tt = TileTensor(
         dev_v,
-        row_major(
-            Coord(
-                Int32(BATCH),
-                Int32(NUM_KEYS),
-                Idx[NUM_KV_HEADS],
-                Idx[DEPTH],
-            )
-        ),
+        row_major(Int32(BATCH), Int32(NUM_KEYS), Idx[NUM_KV_HEADS], Idx[DEPTH]),
     )
     var out_ref_tt = TileTensor(
         dev_out_ref,
-        row_major(
-            Coord(
-                Int32(BATCH),
-                Int32(SEQ_LEN),
-                Idx[NUM_HEADS],
-                Idx[DEPTH],
-            )
-        ),
+        row_major(Int32(BATCH), Int32(SEQ_LEN), Idx[NUM_HEADS], Idx[DEPTH]),
     )
-    var k_ref_operand = LayoutTensorMHAOperand(
+    var k_ref_operand = TileTensorMHAOperand(
         k_ref_tt.as_imm().as_unsafe_any_origin()
     )
-    var v_ref_operand = LayoutTensorMHAOperand(
+    var v_ref_operand = TileTensorMHAOperand(
         v_ref_tt.as_imm().as_unsafe_any_origin()
     )
     var null_valid_length = TileTensor(
         MutPointer[UInt32, MutAnyOrigin].unsafe_dangling(),
-        row_major(Coord(Idx[0])),
+        row_major(Idx[0]),
     )
 
     # MHA: group = num_q_heads / num_kv_heads = 1.
@@ -490,7 +431,7 @@ def test_mha_vs_naive[
 
     # FP8 gate: cosine similarity >= 0.99 (per MLA convention).
     # BF16 gate: zero mismatches per the per-element tolerance.
-    comptime is_fp8 = qkv_type == DType.float8_e4m3fn
+    comptime is_fp8 = qkv_type == .float8_e4m3fn
     var passed: Bool = False
     if mismatches == 0:
         passed = True

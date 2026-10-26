@@ -297,15 +297,15 @@ lit.fn @does_memcpy<l: !lit.origin<true>, l2: !lit.origin<true>>
 // CHECK-LABEL: kgen.generator @takes_pack<types: param_list<type>>
 lit.fn @takes_pack
 <life: !lit.origin<true>, types: !kgen.param_list<!kgen.type>>
-// CHECK-SAME: (%arg0: !kgen.struct<variadic_ptr_map(:param_list<type> types, 42) isParamPack>)
+// CHECK-SAME: (%arg0: !kgen.struct<variadic_ptr_map(:param_list<type> types, 42) isParamPack layout>)
 // CHECK-SAME: sourceParamList = #kgen.pog_list<[<"life", pos_or_kw, not_vararg>, <"types", pos_or_kw, not_vararg>]>
 (%args: !lit.ref.pack<:param_list<!kgen.type> types, mut life, 42>) {
 
-  // CHECK-NEXT: [[E:%.*]] = kgen.struct.extract %arg0[0] : <variadic_ptr_map(:param_list<type> types, 42) isParamPack>
+  // CHECK-NEXT: [[E:%.*]] = kgen.struct.extract %arg0[0] : <variadic_ptr_map(:param_list<type> types, 42) isParamPack layout>
   // CHECK-NEXT: kgen.rebind [[E]] : !kgen.param<{{.*}}> to !kgen.pointer
   %v1 = lit.ref.pack.extract %args[0]: !lit.ref.pack<:param_list<!kgen.type> types, mut life, 42>
 
-  // CHECK-NEXT: [[E:%.*]] = kgen.struct.extract %arg0[1] : <variadic_ptr_map(:param_list<type> types, 42) isParamPack>
+  // CHECK-NEXT: [[E:%.*]] = kgen.struct.extract %arg0[1] : <variadic_ptr_map(:param_list<type> types, 42) isParamPack layout>
   // CHECK-NEXT: kgen.rebind [[E]] : !kgen.param<{{.*}}> to !kgen.pointer
   %v2 = lit.ref.pack.extract %args[1]: !lit.ref.pack<:param_list<!kgen.type> types, mut life, 42>
 
@@ -619,4 +619,34 @@ kgen.generator @type_values() {
   kgen.param.declare gen_type: type = <#kgen.type<<index, !lit.struct<@Int>> !lit.struct<@StaticTuple<2, :type #kgen.type<@Int>>>>>
 
   hlcf.return
+}
+
+// -----
+
+//===----------------------------------------------------------------------===//
+// A struct instantiated at a type parameter, with no recursion anywhere. The
+// argument is a type constant, so it carries both halves, and the
+// instantiation reads a different half for each of its own: `@Box`'s value
+// half is built from `typevalue<ty>` and its layout half from `ty`. That is
+// why `@Inner`'s built layout shows up nested inside `@Use`'s value half - it
+// is the argument's layout half, which the instantiation needs in order to
+// substitute into `array<2, ty>`.
+//===----------------------------------------------------------------------===//
+
+lit.struct.decl @Inner {
+  lit.struct.field x : !kgen.scalar<index>
+}
+
+// CHECK-LABEL: kgen.struct.generator @Box
+// CHECK-SAME:    (v: [array<2, typevalue<ty>>, array<2, ty>])
+lit.struct.decl @Box<ty: type> {
+  lit.struct.field v : !kgen.array<2, ty>
+}
+
+// CHECK-LABEL: kgen.struct.generator @Use
+// CHECK-SAME:    (b: [typevalue<#kgen.genref<@Box<:type
+// CHECK-SAME:      [typevalue<#kgen.genref<@Inner>>, struct<(scalar<index>) memoryOnly>]
+// CHECK-SAME:      struct<(array<2, struct<(scalar<index>) memoryOnly>>) memoryOnly>])
+lit.struct.decl @Use {
+  lit.struct.field b : !lit.struct<@Box<:type !lit.struct<@Inner>>>
 }

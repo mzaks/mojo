@@ -12,30 +12,29 @@
 # ===----------------------------------------------------------------------=== #
 """`mxfp6_block_scaled_matmul_amd` fused-epilogue equivalence, preshuffled-B.
 
-The preshuffled-B struct gained its `elementwise_lambda_fn` with this test.
 The fused QKV ops reach their epilogue through the split-K and default
 launches instead -- nothing sets `preshuffled_b` for them yet -- so this test
 is currently the only exercise of the preshuffled-B epilogue.
 
 Two gates per case, because neither alone is sufficient:
 
-1. The lambda must receive exactly what the direct store would have written.
+1. The epilogue must receive exactly what the direct store would have written.
    Both paths take the same `c_reg` accumulator and the same cast, so the
    comparison is bit-exact, not tolerance-based. A wrong (m, n) mapping lands
    values in the wrong place and shows up here.
-2. With a lambda set, DRAM must be left untouched. The C buffer is filled with
+2. With an epilogue set, DRAM must be left untouched. The C buffer is filled with
    a sentinel beforehand and must still hold it afterwards. Gate 1 alone would
-   pass if the kernel wrote BOTH the lambda destination and C.
+   pass if the kernel wrote BOTH the epilogue destination and C.
+
+Each case runs the gates for the epilogue closure and the compute closure
+(whose output is `c` itself, so only gate 1 applies).
 
 Run:
   ./bazelw test //max/kernels/test/gpu/linalg:test_mxfp6_matmul_amd_preb_epilogue.mojo.test
 """
 
-from std.math import ceildiv
 from std.random import random_ui64, seed
-from std.sys import align_of
 from std.testing import assert_equal, assert_true
-from std.utils import IndexList
 
 from max.gpu.host import DeviceContext, HostBuffer
 from max.gpu.host.info import MI355X
@@ -46,6 +45,7 @@ from linalg.matmul.gpu.amd import Shuffler
 from linalg.matmul.gpu.amd.block_scaled_matmul_amd import (
     mxfp6_block_scaled_matmul_amd,
 )
+from linalg.utils import _as_compute_fn
 
 comptime FP6_LANE_BYTES = 24
 
@@ -82,7 +82,7 @@ def _run_case[
     _fill_random(sfb_h, N_static * scale_K, 125, 129)
 
     var sfb_h_tt = TileTensor[mut=True](
-        sfb_h, row_major(Coord(Idx[1], Idx[N_static], Idx[scale_K]))
+        sfb_h, row_major(Idx[1], Idx[N_static], Idx[scale_K])
     )
     _ = Shuffler[1].preshuffle_scale_4d[MN=N_static, K_SCALES=scale_K](
         sfb_h_tt, sfb_pre_h
@@ -115,30 +115,28 @@ def _run_case[
         N=N_static, K_BYTES=K_BYTES, lane_bytes=FP6_LANE_BYTES
     ](b_raw_tt, b_pre_dst_tt, ctx)
 
-    var a_tt = TileTensor[mut=False](
-        a_d, row_major(Coord(M_static, Idx[K_BYTES]))
-    )
+    var a_tt = TileTensor[mut=False](a_d, row_major(M_static, Idx[K_BYTES]))
     var b_pre_tt = TileTensor[mut=False](
-        b_pre_d, row_major(Coord(Idx[N_static], Idx[K_BYTES]))
+        b_pre_d, row_major(Idx[N_static], Idx[K_BYTES])
     )
     var sfa_tt = TileTensor[mut=False](
-        sfa_d.unsafe_ptr().bitcast[Float8_e8m0fnu](),
-        row_major(Coord(M_static, Idx[scale_K])),
+        sfa_d.unsafe_ptr().unsafe_bitcast[Float8_e8m0fnu](),
+        row_major(M_static, Idx[scale_K]),
     )
     var sfb_pre_tt = TileTensor[mut=False](
-        sfb_pre_d.unsafe_ptr().bitcast[Float8_e8m0fnu](),
-        row_major(Coord(Idx[N_static], Idx[scale_K])),
+        sfb_pre_d.unsafe_ptr().unsafe_bitcast[Float8_e8m0fnu](),
+        row_major(Idx[N_static], Idx[scale_K]),
     )
 
     var sfb_raw_tt = TileTensor[mut=False](
-        sfb_raw_d.unsafe_ptr().bitcast[Float8_e8m0fnu](),
-        row_major(Coord(Idx[N_static], Idx[scale_K])),
+        sfb_raw_d.unsafe_ptr().unsafe_bitcast[Float8_e8m0fnu](),
+        row_major(Idx[N_static], Idx[scale_K]),
     )
     var b_row_tt = TileTensor[mut=False](
-        b_d, row_major(Coord(Idx[N_static], Idx[K_BYTES]))
+        b_d, row_major(Idx[N_static], Idx[K_BYTES])
     )
     var c_direct_tt = TileTensor[mut=True](
-        c_direct_d, row_major(Coord(M_static, Idx[N_static]))
+        c_direct_d, row_major(M_static, Idx[N_static])
     )
     comptime if preshuffled_b:
         mxfp6_block_scaled_matmul_amd[preshuffled_b=True](
@@ -149,33 +147,17 @@ def _run_case[
             c_direct_tt, a_tt, b_row_tt, sfa_tt, sfb_raw_tt, ctx
         )
 
-    var out_tt = TileTensor[mut=True](
-        out_d, row_major(Coord(M_static, Idx[N_static]))
-    )
+    var out_tt = TileTensor[mut=True](out_d, row_major(M_static, Idx[N_static]))
     var c_sentinel_tt = TileTensor[mut=True](
-        c_sentinel_d, row_major(Coord(M_static, Idx[N_static]))
+        c_sentinel_d, row_major(M_static, Idx[N_static])
     )
 
     @inline(.always)
-    @__copy_capture(out_tt)
-    def epilogue_fn[
-        _dtype: DType,
-        width: SIMDLength,
-        *,
-        alignment: Int = align_of[SIMD[_dtype, width]](),
-    ](idx: IndexList[2], val: SIMD[_dtype, width]) capturing -> None:
-        out_tt.store[width=width, alignment=alignment](
-            Coord(idx), rebind[SIMD[DType.float32, width]](val)
-        )
-
-    comptime if preshuffled_b:
-        mxfp6_block_scaled_matmul_amd[
-            preshuffled_b=True, elementwise_lambda_fn=epilogue_fn
-        ](c_sentinel_tt, a_tt, b_pre_tt, sfa_tt, sfb_pre_tt, ctx)
-    else:
-        mxfp6_block_scaled_matmul_amd[
-            preshuffled_b=False, elementwise_lambda_fn=epilogue_fn
-        ](c_sentinel_tt, a_tt, b_row_tt, sfa_tt, sfb_raw_tt, ctx)
+    def store_fn[
+        _dtype: DType, width: SIMDLength, *, alignment: Int
+    ](idx: Coord, val: SIMD[_dtype, width]) {var out_tt}:
+        comptime assert idx.rank == 2, "the matmul epilogue contract is rank 2"
+        out_tt.store(idx, rebind[SIMD[DType.float32, width]](val))
 
     var direct_h = ctx.enqueue_create_host_buffer[.float32](M_static * N_static)
     var out_host = ctx.enqueue_create_host_buffer[.float32](M_static * N_static)
@@ -183,10 +165,75 @@ def _run_case[
         M_static * N_static
     )
     ctx.enqueue_copy(direct_h, c_direct_d)
+
+    out_d.enqueue_fill(Float32(0.0))
+    comptime if preshuffled_b:
+        mxfp6_block_scaled_matmul_amd[preshuffled_b=True](
+            c_sentinel_tt, a_tt, b_pre_tt, sfa_tt, sfb_pre_tt, store_fn, ctx
+        )
+    else:
+        mxfp6_block_scaled_matmul_amd[preshuffled_b=False](
+            c_sentinel_tt, a_tt, b_row_tt, sfa_tt, sfb_raw_tt, store_fn, ctx
+        )
     ctx.enqueue_copy(out_host, out_d)
     ctx.enqueue_copy(sentinel_h, c_sentinel_d)
     ctx.synchronize()
+    _assert_matches_direct[M_static, N_static](
+        direct_h, out_host, sentinel_h, SENTINEL
+    )
 
+    # The compute closure stores into `c` itself, so `out_d` is its `c`.
+    @inline(.always)
+    def identity_fn[
+        _dtype: DType, width: SIMDLength, *, alignment: Int
+    ](idx: Coord, val: SIMD[_dtype, width]) -> SIMD[_dtype, width]:
+        comptime assert idx.rank == 2, "the matmul epilogue contract is rank 2"
+        return val
+
+    var compute_fn = _as_compute_fn(identity_fn)
+    out_d.enqueue_fill(Float32(0.0))
+    comptime if preshuffled_b:
+        mxfp6_block_scaled_matmul_amd[preshuffled_b=True](
+            out_tt, a_tt, b_pre_tt, sfa_tt, sfb_pre_tt, compute_fn, ctx
+        )
+    else:
+        mxfp6_block_scaled_matmul_amd[preshuffled_b=False](
+            out_tt, a_tt, b_row_tt, sfa_tt, sfb_raw_tt, compute_fn, ctx
+        )
+    ctx.enqueue_copy(out_host, out_d)
+    ctx.enqueue_copy(sentinel_h, c_sentinel_d)
+    ctx.synchronize()
+    _assert_matches_direct[M_static, N_static](
+        direct_h, out_host, sentinel_h, SENTINEL
+    )
+
+    print(
+        "    OK: ",
+        M_static * N_static,
+        " elements match for both closures; C untouched",
+    )
+
+    _ = a_d^
+    _ = b_d^
+    _ = b_pre_d^
+    _ = sfa_d^
+    _ = sfb_pre_d^
+    _ = sfb_raw_d^
+    _ = c_direct_d^
+    _ = c_sentinel_d^
+    _ = out_d^
+
+
+def _assert_matches_direct[
+    M_static: Int, N_static: Int
+](
+    direct_h: HostBuffer[.float32],
+    out_host: HostBuffer[.float32],
+    sentinel_h: HostBuffer[.float32],
+    sentinel: Float32,
+) raises:
+    """Applies both gates: the epilogue output equals the direct store, and
+    the sentinel-filled C was never written."""
     var mismatches = 0
     var saw_nonzero = False
     for i in range(M_static * N_static):
@@ -201,7 +248,7 @@ def _run_case[
                     i % N_static,
                     "] direct=",
                     direct_h[i],
-                    " lambda=",
+                    " epilogue=",
                     out_host[i],
                 )
             mismatches += 1
@@ -210,21 +257,9 @@ def _run_case[
 
     var clobbered = 0
     for i in range(M_static * N_static):
-        if sentinel_h[i] != SENTINEL:
+        if sentinel_h[i] != sentinel:
             clobbered += 1
     assert_equal(clobbered, 0)
-
-    print("    OK: ", M_static * N_static, " elements match; C untouched")
-
-    _ = a_d^
-    _ = b_d^
-    _ = b_pre_d^
-    _ = sfa_d^
-    _ = sfb_pre_d^
-    _ = sfb_raw_d^
-    _ = c_direct_d^
-    _ = c_sentinel_d^
-    _ = out_d^
 
 
 def main() raises:

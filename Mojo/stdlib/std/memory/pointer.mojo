@@ -28,7 +28,6 @@ from std.memory import Pointer
 from std.sys import (
     align_of,
     bit_width_of,
-    is_apple_gpu,
     is_gpu,
     is_nvidia_gpu,
     size_of,
@@ -177,6 +176,34 @@ Parameters:
     address_space: The address space of the pointer.
 """
 
+comptime OptionalMutPointer[
+    T: AnyType,
+    origin: MutOrigin,
+    *,
+    address_space: AddressSpace = .GENERIC,
+] = OptionalPointer[T, origin, address_space=address_space]
+"""An optional (nullable) mutable `Pointer`.
+
+Parameters:
+    T: The pointee type.
+    origin: The origin of the pointer.
+    address_space: The address space of the pointer.
+"""
+
+comptime OptionalImmPointer[
+    T: AnyType,
+    origin: ImmOrigin,
+    *,
+    address_space: AddressSpace = .GENERIC,
+] = OptionalPointer[T, origin, address_space=address_space]
+"""An optional (nullable) immutable `Pointer`.
+
+Parameters:
+    T: The pointee type.
+    origin: The origin of the pointer.
+    address_space: The address space of the pointer.
+"""
+
 comptime OpaquePointer[
     mut: Bool,
     //,
@@ -299,7 +326,7 @@ struct Pointer[
     ```mojo
     from std.memory.alloc import alloc, dealloc, Layout
 
-    var allocation = alloc(Layout[Float32](count=4))
+    var allocation = alloc(Layout[Float32](length=4))
     var ptr = allocation.unsafe_ptr()
     for i in range(4):
         ptr.unsafe_store(i, Float32(i))
@@ -313,7 +340,7 @@ struct Pointer[
     ```mojo
     from std.memory.alloc import alloc, dealloc, Layout
 
-    var allocation = alloc(Layout[Int32](count=8))
+    var allocation = alloc(Layout[Int32](length=8))
     var ptr = allocation.unsafe_ptr()
     var vec = SIMD[.int32, 4](1, 2, 3, 4)
     ptr.unsafe_store(0, vec)
@@ -327,7 +354,7 @@ struct Pointer[
     ```mojo
     from std.memory.alloc import alloc, dealloc, Layout
 
-    var allocation = alloc(Layout[Int32](count=3))
+    var allocation = alloc(Layout[Int32](length=3))
     var ptr = allocation.unsafe_ptr()
     ptr.unsafe_offset(0)[] = 10  # offset by 0, then dereference to write
     ptr.unsafe_offset(1)[] = 20  # offset by 1, then dereference to write
@@ -368,9 +395,8 @@ struct Pointer[
     if random_float64() > 0.5:
         maybe_ptr = alloc(layout).unsafe_leak()
 
-    # Check for absence, then unwrap to use the pointer.
-    if maybe_ptr:
-        var ptr = maybe_ptr.value()
+    # Unwrap the pointer only if it is present.
+    if case .Some(ptr) = maybe_ptr:
         ptr.write(42)
         print(ptr[])  # => 42
         dealloc(
@@ -590,9 +616,9 @@ struct Pointer[
             A reference to the value.
         """
         return __get_litref_as_mvalue(
-            __mlir_op.`lit.ref.from_pointer`[_type=Self._mlir_lit_ref](
-                self._mlir_value
-            )
+            __mlir_op.`lit.ref.from_pointer`[
+                _type=Self._mlir_lit_ref, name="(pointer pointee)".value
+            ](self._mlir_value)
         )
 
     @__unsafe_nested_origins_read_only
@@ -676,7 +702,9 @@ struct Pointer[
             `>`,
         ]
         return __get_litref_as_mvalue(
-            __mlir_op.`lit.ref.from_pointer`[_type=ref_type](self._mlir_value)
+            __mlir_op.`lit.ref.from_pointer`[
+                _type=ref_type, name="(pointer pointee)".value
+            ](self._mlir_value)
         )
 
     @inline(.always)
@@ -713,7 +741,9 @@ struct Pointer[
             `>`,
         ]
         return __get_litref_as_mvalue(
-            __mlir_op.`lit.ref.from_pointer`[_type=ref_type](self._mlir_value)
+            __mlir_op.`lit.ref.from_pointer`[
+                _type=ref_type, name="(pointer pointee)".value
+            ](self._mlir_value)
         )
 
     @doc_hidden
@@ -828,7 +858,7 @@ struct Pointer[
         ```mojo
         from std.memory.alloc import alloc, dealloc, Layout
 
-        var allocation = alloc(Layout[Int32](count=4))
+        var allocation = alloc(Layout[Int32](length=4))
         var ptr = allocation.unsafe_ptr()
         var end = ptr.unsafe_offset(3)
         print(end - ptr)  # => 3
@@ -1246,7 +1276,7 @@ struct Pointer[
         ```mojo
         from std.memory.alloc import alloc, dealloc, Layout
 
-        var allocation = alloc(Layout[Int32](count=4))
+        var allocation = alloc(Layout[Int32](length=4))
         var ptr = allocation.unsafe_ptr()
         var end = ptr.unsafe_offset(3)
         print(end.offset_from(ptr))  # => 3
@@ -1298,10 +1328,8 @@ struct Pointer[
         ```
         """
         comptime alignment = align_of[Self.T]()
-        comptime if CurrentPlugin.unsafe_dangling_fn:
-            comptime address = CurrentPlugin.unsafe_dangling_fn.value()[
-                alignment
-            ]()
+        comptime if case .Some(dangling_fn) = CurrentPlugin.unsafe_dangling_fn:
+            comptime address = dangling_fn[alignment]()
             comptime assert (
                 address != 0
             ), "Pointer cannot be constructed with address 0"
@@ -1414,7 +1442,7 @@ struct Pointer[
         ```mojo
         from std.memory.alloc import alloc, dealloc, Layout
 
-        var allocation = alloc(Layout[Int32](count=8))
+        var allocation = alloc(Layout[Int32](length=8))
         var p = allocation.unsafe_ptr()
         p.unsafe_store(0, SIMD[.int32, 4](1, 2, 3, 4))
         var v = p.unsafe_load[width=4]()
@@ -1785,7 +1813,7 @@ struct Pointer[
         ```mojo
         from std.memory.alloc import alloc, dealloc, Layout
 
-        var allocation = alloc(Layout[Float32](count=4))
+        var allocation = alloc(Layout[Float32](length=4))
         var p = allocation.unsafe_ptr()
         var vec = SIMD[.float32, 4](1.0, 2.0, 3.0, 4.0)
         p.unsafe_store(vec)
@@ -2066,9 +2094,9 @@ struct Pointer[
             alignment.is_power_of_two()
         ), "alignment must be a power of two integer value"
 
-        comptime if is_apple_gpu():
-            # `Int(self)` would erase the address space; on Apple AIR the
-            # resulting GENERIC load silently reads zero (MOCO-3762).
+        comptime if not CurrentPlugin.has_generic_address_space:
+            # The vector path below rebuilds lane pointers from `Int(self)`,
+            # which loses the address space, so load through `self` instead.
             var result = default
             comptime for i in range(width):
                 if mask[i]:
@@ -2163,8 +2191,11 @@ struct Pointer[
             alignment.is_power_of_two()
         ), "alignment must be a power of two integer value"
 
-        comptime if is_apple_gpu():
-            # See `gather` for the address-space rationale (MOCO-3762).
+        comptime if not CurrentPlugin.has_generic_address_space or (
+            Self.address_space != .GENERIC and Self.address_space != .GLOBAL
+        ):
+            # `Int(self)` on a shared or local pointer is an offset into its
+            # window, not a generic address; see `unsafe_gather`.
             comptime for i in range(width):
                 if mask[i]:
                     self.unsafe_store[alignment=alignment](
@@ -2733,6 +2764,4 @@ struct Pointer[
         """
         __get_address_as_uninit_lvalue(
             self.unsafe_address_space_cast[.GENERIC]()._mlir_value
-        ) = __get_address_as_owned_value(
-            src.unsafe_address_space_cast[.GENERIC]()._mlir_value
-        )
+        ) = __get_address_as_owned_value(src._mlir_value)

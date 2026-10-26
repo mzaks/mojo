@@ -12,7 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.collections.dict import DictEntry
-from std.hashlib import Hasher
+from std.hash import Hasher
 from std.random.random import random_si64, seed
 from std.sys import size_of
 
@@ -282,8 +282,10 @@ def bench_dict_eq[size: Int](mut b: Bencher) raises:
 # ===-----------------------------------------------------------------------===#
 
 
-def total_bytes_used[H: Hasher](items: Dict[Int, Int, H]) -> Int:
-    # The SIMD group width used internally by Dict's Swiss Table.
+def total_bytes_used[
+    H: Hasher & Defaultable & Deinitable
+](items: Dict[Int, Int, H]) -> Int:
+    # The SIMD group width used internally by Dict's SwissTable.
     comptime _BENCH_GROUP_WIDTH: Int = 16
     # ctrl bytes: capacity + GROUP_WIDTH for SIMD mirroring
     var ctrl_bytes = (items._reserved() + _BENCH_GROUP_WIDTH) * size_of[UInt8]()
@@ -304,7 +306,7 @@ def main() raises:
     comptime sizes = (10, 30, 50, 100, 1000, 10_000, 100_000, 1_000_000)
 
     comptime for i in range(len(sizes)):
-        comptime size = rebind[Int](sizes[i])
+        comptime size = sizes[i]
         m.bench_function(
             bench_dict_insert[size],
             BenchId(String("bench_dict_insert[", size, "]")),
@@ -380,6 +382,6 @@ def main() raises:
         print(k_v.key, k_v.value[0], sep=",")
 
     comptime for i in range(len(sizes)):
-        comptime size = rebind[Int](sizes[i])
+        comptime size = sizes[i]
         var mem_s = total_bytes_used(make_dict[size]())
         print("dict_memory_size[", size, "]: ", mem_s, sep="")

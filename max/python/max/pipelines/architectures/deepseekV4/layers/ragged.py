@@ -22,37 +22,57 @@ two tables built here:
 * :class:`RaggedRows` -- per token: which request it belongs to, its index
   within that request's chunk, and its absolute position.
 * :class:`WindowRows` -- per compression ratio: the candidate windows every
-  request's chunk touches, laid end to end (``W`` rows), with the source rows
-  each window pools -- an absolute token row when the source position is in
-  the chunk, a state-leaf slot when it is before it. Chunk and window counts
-  differ per request, so both axes are ragged and their lengths symbolic.
+  request's chunk touches, laid end to end, as per-request offsets.
 
-There is no ``cumsum`` or ``repeat_interleave`` on the GPU (KERN-1095), so
-prefix sums and segment ids are written as compare-and-reduce over ``[n, b]``
-masks, which for serving batch sizes is nothing.
+The window count ``W`` is a sum of per-request ceilings, so it is data, and
+reading it back would sync every forward and rule out device graph capture.
+The cached path never needs it on the host: one op pools every window, sized
+by a bound derived from shapes
+(:func:`~max.nn.kernels.compress_windows_ragged`). Only the cache-less
+reference path, whose lengths are fixed at graph build, lays the windows out
+row by row (:class:`WindowTables`).
+
+Segment ids are a prefix sum over segment ends rather than a
+``repeat_interleave``, whose GPU kernel is scalar-repeats only (a
+tensor-repeats kernel is still outstanding, AGENT-491).
+
+A :class:`RaggedRows` is a :mod:`max.tree` node, so a block that takes one
+can be built as a subgraph. Two compiler limits shape what crosses the call:
+
+- An op sized only by a symbolic dim reads no operand, so inside a body the
+  compiler hoists it into a constant subgraph that runs at load with the dim
+  unbound. The :class:`WindowRows` are therefore built once per batch in the
+  calling graph and passed in.
+- A subgraph signature takes no dim expression. ``starts`` keeps the cache's
+  own batch dim and is never rebound to the offsets' ``b``, and no table
+  sized ``b`` (the per-request lengths or window counts) crosses a call.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 from max.dtype import DType
 from max.graph import DeviceRef, Dim, DimLike, StaticDim, TensorValue, ops
 
-from .cache import arange, idiv, row_offsets, scalar
+from .cache import arange, row_offsets, scalar
 
 
-def host_scalar(value: TensorValue | DimLike) -> TensorValue:
+def window_coff(ratio: int) -> int:
+    """Windows a compressed entry pools: two when overlapping (ratio 4)."""
+    return 2 if ratio == 4 else 1
+
+
+def host_scalar(value: DimLike) -> TensorValue:
     """``value`` as an int32 scalar on the host, as ``ops.range`` reads bounds.
 
-    A device-resident tensor is transferred (a scalar per call); a symbolic
-    dim is read off the shape; a static one is a constant.
+    Only shapes: a symbolic dim is read off the shape and a static one is a
+    constant. A bound held in a device tensor would be read back to the host
+    every forward, which no device graph capture can record.
     """
-    if isinstance(value, TensorValue):
-        if not value.device.is_cpu():
-            value = ops.transfer_to(value, DeviceRef.CPU())
-        return ops.cast(value, DType.int32)
     if isinstance(value, str):
         raise TypeError(f"a dim name ({value!r}) has no value; pass the count")
     if isinstance(value, StaticDim):
@@ -64,8 +84,13 @@ def host_scalar(value: TensorValue | DimLike) -> TensorValue:
     return ops.constant(int(value), DType.int32, DeviceRef.CPU())
 
 
+def window_count(lengths: Sequence[int] | np.ndarray, ratio: int) -> int:
+    """``W`` of :class:`WindowRows` for chunks of ``lengths`` tokens."""
+    return int(sum(-(-int(n) // ratio) for n in lengths))
+
+
 def arange_to(
-    stop: TensorValue | DimLike, out_dim: DimLike, device: DeviceRef
+    stop: DimLike, out_dim: DimLike, device: DeviceRef
 ) -> TensorValue:
     """``[0, stop)`` int32 on ``device`` with length ``out_dim``."""
     return ops.range(
@@ -80,43 +105,34 @@ def arange_to(
 
 def count_offsets(counts: TensorValue) -> TensorValue:
     """Exclusive prefix sums: ``[b]`` int32 counts -> ``[b + 1]`` int32."""
-    device = counts.device
-    b = counts.shape[0]
-    rows = arange_to(b + 1, b + 1, device)
-    cols = arange_to(b, b, device)
-    mask = ops.reshape(cols, [1, b]) < ops.reshape(rows, [b + 1, 1])
-    contrib = ops.where(mask, ops.reshape(counts, [1, b]), scalar(0, device))
-    return ops.squeeze(ops.sum(contrib, axis=-1), axis=-1)
+    zero = ops.reshape(scalar(0, counts.device), [1])
+    return ops.concat([zero, ops.cumsum(counts, axis=0)], axis=0)
 
 
 def segment_ids(
     offsets: TensorValue,
     total: DimLike,
     device: DeviceRef,
-    stop: TensorValue | None = None,
 ) -> tuple[TensorValue, TensorValue]:
     """Which segment each of ``total`` rows falls in, and the row numbers.
 
     Args:
         offsets: ``[b + 1]`` int32 segment boundaries; row ``r`` belongs to
             segment ``i`` when ``offsets[i] <= r < offsets[i + 1]``.
-        total: The row count ``offsets[b]`` as a graph dim, or the name of
-            the symbolic dim to give it when it is only known at run time.
-        stop: The row count as a tensor when ``total`` is a name.
+        total: The row count ``offsets[b]`` as a graph dim.
     """
     b = offsets.shape[0] - 1
-    idx = arange_to(total if stop is None else stop, total, device)
-    ends = ops.reshape(
-        ops.gather(offsets, arange_to(b, b, device) + 1, axis=0), [1, b]
+    # A row's segment is the number of segment ends at or before it. Ends at
+    # or past ``total`` land in an extra sink row; zero-length segments
+    # repeat an end, hence the add.
+    pos = arange_to(Dim(total) + 1, Dim(total) + 1, device)
+    ends = ops.gather(offsets, arange_to(b, b, device) + 1, axis=0)
+    ends = ops.min(ends, pos[-1])
+    hist = ops.scatter_add(
+        pos * 0, ops.broadcast_to(scalar(1, device), [b]), ends, axis=0
     )
-    ids = ops.squeeze(
-        ops.sum(
-            ops.cast(ops.reshape(idx, [total, 1]) >= ends, DType.int32),
-            axis=-1,
-        ),
-        axis=-1,
-    )
-    return ids, idx
+    ids = ops.rebind(ops.cumsum(hist, axis=0)[:-1], [total])
+    return ids, ops.rebind(pos[:-1], [total])
 
 
 @dataclass
@@ -126,9 +142,8 @@ class RaggedRows:
     offsets: TensorValue
     """``[b + 1]`` uint32 row offsets, as the ragged kernels take them."""
     starts: TensorValue
-    """``[b]`` int32 tokens already cached per request (``cache_lengths``)."""
-    lengths: TensorValue
-    """``[b]`` int32 tokens of each request in this batch."""
+    """``[b]`` int32 tokens already cached per request (``cache_lengths``),
+    in the cache's own batch dim."""
     bid: TensorValue
     """``[T]`` int32 request index of each token."""
     index: TensorValue
@@ -140,10 +155,38 @@ class RaggedRows:
     total: Dim
     """``T``."""
     device: DeviceRef
+    windows: dict[int, WindowRows] = field(default_factory=dict)
+    """Per compression ratio, the batch's :class:`WindowRows`."""
 
-    @property
-    def batch(self) -> Dim:
-        return self.lengths.shape[0]
+    def __tree_flatten__(self) -> tuple[dict[str, Any], None]:
+        children = {
+            "offsets": self.offsets,
+            "starts": self.starts,
+            "bid": self.bid,
+            "index": self.index,
+            "local": self.local,
+            "positions": self.positions,
+            "windows": self.windows,
+        }
+        return children, None
+
+    @classmethod
+    def __tree_unflatten__(
+        cls, _: None, children: Mapping[str, Any]
+    ) -> RaggedRows:
+        index: TensorValue = children["index"]
+        offsets: TensorValue = children["offsets"]
+        return cls(
+            offsets=offsets,
+            starts=children["starts"],
+            bid=children["bid"],
+            index=index,
+            local=children["local"],
+            positions=children["positions"],
+            total=index.shape[0],
+            device=offsets.device,
+            windows=dict(children["windows"]),
+        )
 
     @property
     def offsets_i32(self) -> TensorValue:
@@ -160,12 +203,17 @@ class RaggedRows:
         offsets: TensorValue,
         total: DimLike,
         starts: TensorValue | None = None,
+        windows: Mapping[int, DimLike | None] | None = None,
     ) -> RaggedRows:
         """Build from the graph's ``input_row_offsets`` and ``cache_lengths``.
 
-        ``starts`` carries the manager's symbolic batch dim; it is rebound to
-        the offsets' so the two can be combined. ``None`` is a fresh batch at
-        position 0.
+        ``starts`` keeps the manager's symbolic batch dim; it is only ever
+        gathered by request, never combined elementwise with a table sized by
+        the offsets (see the module docstring). ``None`` is a fresh batch at
+        position 0. ``windows`` maps each compression ratio the batch's
+        attention uses to the batch's :func:`window_count`, which only the
+        cache-less path needs (``None`` otherwise); each ratio's
+        :class:`WindowRows` is built here.
         """
         device = offsets.device
         off = ops.cast(offsets, DType.int32)
@@ -175,15 +223,14 @@ class RaggedRows:
         if starts is None:
             starts = ops.broadcast_to(scalar(0, device), [b])
         else:
-            starts = ops.rebind(ops.cast(starts, DType.int32), [b])
+            starts = ops.cast(starts, DType.int32)
         bid, index = segment_ids(off, total, device)
         local = index - ops.gather(off, bid, axis=0)
         positions = ops.gather(starts, bid, axis=0) + local
         total_dim = index.shape[0]
-        return cls(
+        rows = cls(
             offsets=ops.cast(offsets, DType.uint32),
             starts=starts,
-            lengths=lengths,
             bid=bid,
             index=index,
             local=local,
@@ -191,6 +238,11 @@ class RaggedRows:
             total=total_dim,
             device=device,
         )
+        rows.windows = {
+            r: WindowRows.build(rows, lengths, r, w)
+            for r, w in (windows or {}).items()
+        }
+        return rows
 
     @classmethod
     def uniform(
@@ -199,11 +251,37 @@ class RaggedRows:
         seq_len: int,
         device: DeviceRef,
         starts: TensorValue | None = None,
+        ratios: Sequence[int] = (),
     ) -> RaggedRows:
         """A padded ``[batch, seq_len]`` chunk, flattened row-major."""
         return cls.from_offsets(
-            row_offsets(batch, seq_len, device), batch * seq_len, starts
+            row_offsets(batch, seq_len, device),
+            batch * seq_len,
+            starts,
+            {r: window_count([seq_len] * batch, r) for r in ratios},
         )
+
+
+@dataclass
+class WindowTables:
+    """The source rows of every window, laid out for the cache-less path.
+
+    That path pools with graph ops over a table per window, so the window
+    count ``W`` has to be known at graph build; the cached path pools in
+    place (:func:`~max.nn.kernels.compress_windows_ragged`) and builds none.
+    """
+
+    start: TensorValue
+    """``[W]`` int32 first position of each window."""
+    present: TensorValue
+    """``[W, coff * ratio]`` bool, false before position 0."""
+    fresh_row: TensorValue
+    """``[W, coff * ratio]`` int32 token rows (clamped into the request)."""
+
+    @property
+    def total(self) -> Dim:
+        """``W``."""
+        return self.start.shape[0]
 
 
 @dataclass
@@ -212,52 +290,71 @@ class WindowRows:
 
     Request ``r``'s chunk of ``s`` tokens at ``P`` touches ``ceil(s / ratio)``
     windows starting at ``A = P - P % ratio``; all requests' windows are laid
-    end to end (``W`` rows, ``woff`` the per-request offsets). Window ``w``
-    pools ``coff * ratio`` source positions -- its own ``ratio`` and, when
-    overlapping, its predecessor's -- and each source is either a row of this
-    chunk (``fresh_row``, an absolute token row) or a slot of the state leaf
-    (``cache_slot``), told apart by ``from_cache``; ``present`` is false
-    before position 0. Dead entries are clamped onto live ones and masked.
+    end to end, ``woff`` the per-request offsets. Window ``w`` pools
+    ``coff * ratio`` source positions -- its own ``ratio`` and, when
+    overlapping, its predecessor's.
     """
 
     ratio: int
-    coff: int
     base: TensorValue
     """``[b]`` int32 entries closed before each request's chunk, ``P // ratio``."""
-    n_new: TensorValue
-    """``[b]`` int32 windows per request."""
     woff: TensorValue
     """``[b + 1]`` int32 window offsets."""
-    bid: TensorValue
-    """``[W]`` int32 request of each window."""
-    start: TensorValue
-    """``[W]`` int32 first position of each window."""
-    present: TensorValue
-    """``[W, coff * ratio]`` bool."""
-    from_cache: TensorValue
-    """``[W, coff * ratio]`` bool."""
-    fresh_row: TensorValue
-    """``[W, coff * ratio]`` int32 token rows (clamped into the request)."""
-    cache_slot: TensorValue
-    """``[W, coff * ratio]`` int32 state-leaf slots (clamped to live ones)."""
-    total: Dim
-    """``W``."""
+    tables: WindowTables | None = None
+    """The windows row by row, when :meth:`build` was given their count."""
+
+    @property
+    def coff(self) -> int:
+        return window_coff(self.ratio)
+
+    def __tree_flatten__(self) -> tuple[dict[str, TensorValue], int]:
+        children = {"base": self.base, "woff": self.woff}
+        if self.tables is not None:
+            children["start"] = self.tables.start
+            children["present"] = self.tables.present
+            children["fresh_row"] = self.tables.fresh_row
+        return children, self.ratio
 
     @classmethod
-    def build(cls, rows: RaggedRows, ratio: int, coff: int) -> WindowRows:
-        device = rows.device
-        base = idiv(rows.starts, ratio)
-        aligned = base * ratio
-        n_new = idiv(rows.lengths + scalar(ratio - 1, device), ratio)
-        woff = count_offsets(n_new)
-        bid, wid = segment_ids(
-            woff,
-            f"windows_r{ratio}",
-            device,
-            stop=ops.reshape(ops.max(woff), []),
+    def __tree_unflatten__(
+        cls, ratio: int, children: Mapping[str, TensorValue]
+    ) -> WindowRows:
+        tables = None
+        if "start" in children:
+            tables = WindowTables(
+                start=children["start"],
+                present=children["present"],
+                fresh_row=children["fresh_row"],
+            )
+        return cls(
+            ratio=ratio,
+            base=children["base"],
+            woff=children["woff"],
+            tables=tables,
         )
+
+    @classmethod
+    def build(
+        cls,
+        rows: RaggedRows,
+        lengths: TensorValue,
+        ratio: int,
+        count: DimLike | None = None,
+    ) -> WindowRows:
+        """``ratio``'s windows over ``rows``; ``lengths`` is each request's
+        ``[b]`` int32 chunk length and ``count``, given for the cache-less
+        path's :class:`WindowTables`, is ``W``."""
+        device = rows.device
+        base = rows.starts // ratio
+        n_new = (lengths + scalar(ratio - 1, device)) // ratio
+        woff = count_offsets(n_new)
+        if count is None:
+            return cls(ratio=ratio, base=base, woff=woff)
+
+        coff = window_coff(ratio)
+        bid, wid = segment_ids(woff, count, device)
         total = wid.shape[0]
-        start = ops.gather(aligned, bid, axis=0) + (
+        start = ops.gather(base * ratio, bid, axis=0) + (
             wid - ops.gather(woff, bid, axis=0)
         ) * scalar(ratio, device)
 
@@ -265,7 +362,7 @@ class WindowRows:
         rel = ops.reshape(arange(n, device) - (coff - 1) * ratio, [1, n])
         pos = ops.reshape(start, [total, 1]) + rel
         p = ops.reshape(ops.gather(rows.starts, bid, axis=0), [total, 1])
-        length = ops.reshape(ops.gather(rows.lengths, bid, axis=0), [total, 1])
+        length = ops.reshape(ops.gather(lengths, bid, axis=0), [total, 1])
         first_row = ops.reshape(
             ops.gather(rows.offsets_i32, bid, axis=0), [total, 1]
         )
@@ -274,18 +371,11 @@ class WindowRows:
         fresh_row = first_row + ops.min(
             ops.max(pos - p, zero), ops.max(length - one, zero)
         )
-        cache_slot = ops.min(ops.max(pos, zero), ops.max(p - one, zero))
         return cls(
             ratio=ratio,
-            coff=coff,
             base=base,
-            n_new=n_new,
             woff=woff,
-            bid=bid,
-            start=start,
-            present=pos >= zero,
-            from_cache=pos < p,
-            fresh_row=fresh_row,
-            cache_slot=cache_slot,
-            total=total,
+            tables=WindowTables(
+                start=start, present=pos >= zero, fresh_row=fresh_row
+            ),
         )

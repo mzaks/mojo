@@ -27,7 +27,6 @@ from max.gpu.host import DeviceContext
 
 from layout import (
     Coord,
-    Idx,
     DefaultEngine,
     TileTensor,
     coord_to_index_list,
@@ -38,6 +37,9 @@ from nn.topk import (
     _top_k_cpu,
     _topk_dead_val,
     _topk_gpu,
+    _TOPK_MAX_BLOCKS_PER_INPUT,
+    _topk_stage2_smem_budget,
+    _topk_stage2_smem_bytes,
     gumbel_sampling_fused_gpu,
     gumbel_sampling_gpu,
     topk_gpu,
@@ -116,7 +118,7 @@ def test_case_batched[
         out_idxs_shape.flattened_length()
     )
 
-    # Create LayoutTensor for fill_fn (required by function signature)
+    # Create TileTensor for fill_fn (required by function signature)
     var in_tensor = TileTensor(in_host_ptr, row_major(Coord(in_shape)))
 
     # Fill the buffer with consecutive values
@@ -133,9 +135,9 @@ def test_case_batched[
         out_idxs_shape.flattened_length()
     )
 
-    var num_blocks_per_input_: Int = ceildiv(
-        N, block_size
-    ) if not num_blocks_per_input else num_blocks_per_input.value()
+    var num_blocks_per_input_: Int = num_blocks_per_input.or_else(
+        ceildiv(N, block_size)
+    )
     var local_topk_shape = IndexList[2](batch_size, num_blocks_per_input_ * K)
     var device_local_topk_vals = ctx.enqueue_create_buffer[dtype](
         local_topk_shape.flattened_length()
@@ -371,7 +373,7 @@ def test_case_multi_rank[
         out_idxs_shape.flattened_length()
     )
 
-    # Create LayoutTensor for fill_fn (required by function signature)
+    # Create TileTensor for fill_fn (required by function signature)
     var in_tensor = TileTensor(in_host_ptr, row_major(Coord(input_shape)))
 
     # Fill the buffer with consecutive values
@@ -511,9 +513,10 @@ def fill_random[
     comptime min_val = -1e9
     comptime max_val = 1e9
     var total_elements = buffer.num_elements()
+    var flat = buffer.reshape(row_major(total_elements))
     for i in range(total_elements):
         var random_value = random_float64(min_val, max_val)
-        buffer.raw_store(i, random_value.cast[dtype]())
+        flat[i] = random_value.cast[dtype]()
 
 
 def fill_constant[
@@ -524,11 +527,12 @@ def fill_constant[
     ]
 ):
     var total_elements = buffer.num_elements()
+    var flat = buffer.reshape(row_major(total_elements))
     for i in range(total_elements):
         if i % 3 == 1:
-            buffer.raw_store(i, 1.0)
+            flat[i] = 1.0
         else:
-            buffer.raw_store(i, 0.0)
+            flat[i] = 0.0
 
 
 def fill_nan[
@@ -542,8 +546,9 @@ def fill_nan[
     emits invalid token) and Bug 3 (p==-1 sentinel causes OOB read/write)."""
     var nan_val = nan[dtype]()
     var total_elements = buffer.num_elements()
+    var flat = buffer.reshape(row_major(total_elements))
     for i in range(total_elements):
-        buffer.raw_store(i, nan_val)
+        flat[i] = nan_val
 
 
 def fill_iota[
@@ -607,8 +612,8 @@ struct TestCaseMultiRank[_sampling: Bool, rank: Int, _largest: Bool = True](
 
 def print_test_case(test_case: TestCase):
     var num_blocks_per_in_msg = "auto"
-    if test_case.num_blocks_per_input:
-        num_blocks_per_in_msg = String(test_case.num_blocks_per_input.value())
+    if case .Some(num_blocks_per_input) = test_case.num_blocks_per_input:
+        num_blocks_per_in_msg = String(num_blocks_per_input)
     print(
         "==== Running Top-K "
         + (test_case.name + " " if test_case.name else "")
@@ -629,11 +634,11 @@ def print_test_case(test_case: TestCase):
 
 def print_test_case(test_case: TestCaseMultiRank):
     var num_blocks_per_in_msg = "auto"
-    if test_case.num_blocks_per_input:
-        num_blocks_per_in_msg = String(test_case.num_blocks_per_input.value())
+    if case .Some(num_blocks_per_input) = test_case.num_blocks_per_input:
+        num_blocks_per_in_msg = String(num_blocks_per_input)
     var block_size_msg = "auto"
-    if test_case.block_size:
-        block_size_msg = String(test_case.block_size.value())
+    if case .Some(block_size) = test_case.block_size:
+        block_size_msg = String(block_size)
     print(
         "==== Running Top-K sampling=",
         test_case.sampling,
@@ -693,7 +698,7 @@ def test_multi_rank[dtype: DType, sampling: Bool](ctx: DeviceContext) raises:
     comptime test_case_multi_rank1 = TestCaseMultiRank[
         _sampling=sampling, rank=1, _largest=True
     ](
-        input_shape=IndexList[1](4096),
+        input_shape=(4096,),
         K=10,
         block_size=256,
     )
@@ -1273,6 +1278,30 @@ def main() raises:
         ](input_shape=IndexList[2](2, 4096), K=2048, num_blocks_per_input=8)
         print_test_case(test_case_large_k_nb)
         test_case_multi_rank[dtype](ctx, test_case_large_k_nb, fill_iota)
+
+        # The largest K whose stage-2 request at the full partition count fits
+        # the device budget, and the first K past it, which the clamp must
+        # reduce by one partition. Both launch with the budget as the stage-2
+        # ceiling and must match the CPU reference.
+        var budget = _topk_stage2_smem_budget(ctx)
+        var k_edge = 1
+        while (
+            _topk_stage2_smem_bytes[dtype](
+                k_edge + 1, _TOPK_MAX_BLOCKS_PER_INPUT
+            )
+            <= budget
+        ):
+            k_edge += 1
+        var test_case_budget_edge = TestCaseMultiRank[
+            _sampling=False, rank=2, _largest=True
+        ](input_shape=(2, 16384), K=k_edge)
+        print_test_case(test_case_budget_edge)
+        test_case_multi_rank[dtype](ctx, test_case_budget_edge, fill_iota)
+        var test_case_budget_round = TestCaseMultiRank[
+            _sampling=False, rank=2, _largest=True
+        ](input_shape=(2, 16384), K=k_edge + 1)
+        print_test_case(test_case_budget_round)
+        test_case_multi_rank[dtype](ctx, test_case_budget_round, fill_iota)
 
         # Run multi-rank tests
         test_multi_rank[dtype, False](ctx)

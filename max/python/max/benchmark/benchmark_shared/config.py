@@ -22,13 +22,21 @@ from typing import Annotated, Any, Literal
 import yaml
 from cyclopts import Parameter
 from max.config import ConfigFileModel
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from openai.types.chat import ChatCompletionToolParam
+from openai.types.chat.completion_create_params import ResponseFormat
+from pydantic import (
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .backend_names import Backend
 from .datasets import (
     DatasetMode,
     DistributionParameter,
-    ImageTurn,
     TurnSelector,
 )
 from .utils import int_or_none, parse_comma_separated
@@ -270,60 +278,61 @@ class BaseBenchmarkConfig(ConfigFileModel):
         return value
 
 
-def _mapping_from_argument(value: object, field: str) -> dict[str, Any]:
-    """Resolve one argument into a mapping, from any of its three spellings.
+# response_format and tools are typed as plain JSON containers because
+# cyclopts cannot take a union of TypedDicts as a flag; their validators check
+# the OpenAI shapes with these.
+_RESPONSE_FORMAT_ADAPTER: TypeAdapter[ResponseFormat] = TypeAdapter(
+    ResponseFormat
+)
+_TOOLS_ADAPTER: TypeAdapter[list[ChatCompletionToolParam]] = TypeAdapter(
+    list[ChatCompletionToolParam]
+)
 
-    A field holding structured data is reachable three ways: as a mapping
-    (from a config or workload YAML), as an inline JSON object string, and as
-    a path to a YAML/JSON file.
+
+def _json_from_argument(value: object, field: str, inline_start: str) -> object:
+    """Resolve one argument into parsed JSON, from any of its spellings.
+
+    A string is inline JSON when it starts with ``inline_start``, and
+    otherwise a path to a JSON/YAML file.
+    Anything else is already parsed, as from a config or workload YAML, and
+    passes through for the field's type to check.
 
     Args:
         value: The raw argument.
         field: The field's name, for error messages.
+        inline_start: The character an inline value starts with.
 
     Returns:
-        The resolved mapping.
+        The parsed value.
 
     Raises:
-        ValueError: If the string is neither an inline object nor a readable
-            file, the content fails to parse, or it does not resolve to an
-            object.
+        ValueError: If the string is neither inline JSON nor a readable
+            file, or the content fails to parse or is empty.
     """
-    if isinstance(value, Mapping):
-        return dict(value)
     if not isinstance(value, str):
-        raise ValueError(
-            f"{field} must be a mapping, an inline JSON string, or a path "
-            f"to a YAML/JSON file; got {type(value).__name__}."
-        )
+        return value
     text = value.strip()
-    if text.startswith("{"):
+    if text.startswith(inline_start):
         source, origin = text, "inline JSON"
     else:
         path = Path(text)
-        if not path.is_file():
-            raise ValueError(
-                f"{field} {text!r} is not a readable file path; "
-                "an inline value must be a JSON object starting "
-                "with '{'."
-            )
         try:
             source = path.read_text()
         except OSError as e:
             raise ValueError(
-                f"{field} {text!r} is not a readable file path: {e}"
+                f"{field} {text!r} is not a readable file path; an inline "
+                f"value must start with {inline_start!r}: {e}"
             ) from e
-        origin = f"file {text!r}"
+        origin = f"file {str(path)!r}"
     try:
         parsed = yaml.safe_load(source)
     except yaml.YAMLError as e:
         raise ValueError(f"Failed to parse {field} ({origin}): {e}") from e
-    if not isinstance(parsed, Mapping):
-        raise ValueError(
-            f"{field} ({origin}) must be a mapping/object, got "
-            f"{type(parsed).__name__}."
-        )
-    return dict(parsed)
+    # An empty or null-only file loads as None, which would silently unset
+    # the field.
+    if parsed is None:
+        raise ValueError(f"{field} ({origin}) is empty.")
+    return parsed
 
 
 class BaseServingBenchmarkConfig(BaseBenchmarkConfig):
@@ -539,7 +548,21 @@ class ServingBenchmarkConfig(BaseServingBenchmarkConfig):
 
     max_output_len: int | None = Field(
         default=None,
+        gt=0,
         description="Maximum output length per request.",
+        json_schema_extra={"group": "Output Control"},
+    )
+
+    disable_ignore_eos: bool = Field(
+        default=False,
+        description=(
+            "Let requests stop at EOS. By default requests ignore EOS and "
+            "generate their full target length, so every backend generates "
+            "the same number of tokens. With this flag the target length only "
+            "caps generation, which speculative decoding needs: a drafter "
+            "cannot predict tokens past a forced EOS. Matches SGLang's "
+            "--disable-ignore-eos."
+        ),
         json_schema_extra={"group": "Output Control"},
     )
 
@@ -571,11 +594,16 @@ class ServingBenchmarkConfig(BaseServingBenchmarkConfig):
         json_schema_extra={"group": "Output Control"},
     )
 
-    response_format: str | None = Field(
+    # accepts_keys=False for the same reason extra_body needs it.
+    response_format: Annotated[
+        dict[str, Any] | None, Parameter(accepts_keys=False)
+    ] = Field(
         default=None,
         description=(
-            "JSON response format for structured output. Can be a JSON string "
-            "or '@path/to/schema.json' to load from file. "
+            "JSON response format for structured output. Can be a JSON string, "
+            "or a path to a JSON/YAML file ('path/to/schema.json'); in a "
+            "--workload-config YAML, a relative path resolves against the "
+            "YAML's directory, or the cwd when nothing is there. "
             'Example: \'{"type": "json_schema", "json_schema": {...}}\'. '
             "Applied to the share of traffic --response-format-fraction "
             "selects, except chat-judge workloads, whose driver builds its "
@@ -609,6 +637,43 @@ class ServingBenchmarkConfig(BaseServingBenchmarkConfig):
             "Which user turns of a multi-turn chat session "
             "--response-format-fraction may constrain: 'every', 'first', or "
             "'last'. Ignored for single-turn requests."
+        ),
+        json_schema_extra={"group": "Output Control"},
+    )
+
+    tools: Annotated[
+        list[dict[str, Any]] | None,
+        Parameter(accepts_keys=False),
+    ] = Field(
+        default=None,
+        description=(
+            "OpenAI chat-completions tool definitions to send, as a JSON list "
+            "or a path to a JSON/YAML file ('path/to/tools.json'); in a "
+            "--workload-config YAML, a relative path resolves against the "
+            "YAML's directory, or the cwd when nothing is there. Applied to "
+            "the share "
+            "of traffic --tools-fraction selects, except chat-judge "
+            "workloads, whose driver builds its own requests, and requests "
+            "whose dataset already attached tools. The rendered definitions "
+            "are carved out of a chat session's first turn or a single-turn "
+            "string prompt, so the drawn input length still describes the "
+            "whole prompt. Unrelated to --agentic-tool-profiles, which shapes "
+            "agent-loop load and sends no tools."
+        ),
+        json_schema_extra={"group": "Output Control"},
+    )
+
+    tools_fraction: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        description=(
+            "Fraction (0.0-1.0) of requests (single-turn) or of chat sessions "
+            "(multi-turn) that carry --tools. A selected session carries them "
+            "on every turn, as a real agent does, so the realized request "
+            "share tracks the fraction but is weighted by session length. "
+            "Defaults to 1.0, so --tools alone applies to everything."
         ),
         json_schema_extra={"group": "Output Control"},
     )
@@ -810,7 +875,21 @@ class ServingBenchmarkConfig(BaseServingBenchmarkConfig):
         ge=0.0,
         le=1.0,
         allow_inf_nan=False,
-        description="Fraction (0.0-1.0) of requests (single-turn) or chat sessions (multi-turn) that get at least one generated image mixed in, on top of whatever dataset is selected via --dataset-name. Mutually exclusive with --random-image-count/--random-image-size.",
+        description=(
+            "Fraction (0.0-1.0) of requests (single-turn) or chat sessions "
+            "(multi-turn) that get at least one generated image mixed in, on "
+            "top of whatever dataset is selected via --dataset-name. Drawn "
+            "per session in multi-turn rather than per request, because the "
+            "chat driver resends history: with --image-turn every and "
+            "--image-count 1 it equals both newly-encoded images per request "
+            "and the share of requests carrying one, whereas 'first'/'last' "
+            "encode once per session and so cut the encoder rate by roughly "
+            "the session's turn count. Only the image turn and later turns "
+            "resend it, so 'first' keeps the share of requests carrying one "
+            "at the fraction while 'last' cuts it like the encoder rate. "
+            "Mutually exclusive with "
+            "--random-image-count/--random-image-size."
+        ),
         json_schema_extra={"group": "Multimodal"},
     )
     image_count: DistributionParameter = Field(
@@ -828,9 +907,23 @@ class ServingBenchmarkConfig(BaseServingBenchmarkConfig):
         description="Distribution for each generated image's width/height ratio (used with --image-fraction). 1.0 produces square images.",
         json_schema_extra={"group": "Multimodal"},
     )
-    image_turn: ImageTurn = Field(
+    image_turn: TurnSelector = Field(
         default="first",
-        description="Which user turn(s) in a multi-turn chat session get images when selected: 'first', 'last', or 'every'. Ignored for single-turn requests.",
+        description=(
+            "Which user turn(s) in a multi-turn chat session get images when "
+            "selected: 'first', 'last', or 'every'. Ignored for single-turn "
+            "requests."
+        ),
+        json_schema_extra={"group": "Multimodal"},
+    )
+    image_num_turns: DistributionParameter | None = Field(
+        default=None,
+        description=(
+            "Distribution for the number of user turns in a chat session "
+            "selected for images (used with --image-fraction). A longer "
+            "session is cut to the drawn length; a shorter one is kept. "
+            "Unset leaves image sessions as sampled."
+        ),
         json_schema_extra={"group": "Multimodal"},
     )
     random_input_len: DistributionParameter = Field(
@@ -962,14 +1055,41 @@ class ServingBenchmarkConfig(BaseServingBenchmarkConfig):
         json_schema_extra={"group": "Control Flags"},
     )
 
+    gpu_metrics_prometheus_url: str = Field(
+        default="",
+        description=(
+            "Base URL of a Prometheus that scrapes the engine nodes' DCGM "
+            "exporter with Kubernetes pod mapping (e.g. "
+            "'http://kps-prometheus.kube-prometheus-stack.svc:9090'). When "
+            "set with --gpu-metrics-selector, --collect-gpu-stats reports "
+            "each GPU's aggregates over the measured window from Prometheus, "
+            "ahead of --gpu-metrics-host and local NVML."
+        ),
+        json_schema_extra={"group": "Control Flags"},
+    )
+
+    gpu_metrics_selector: str = Field(
+        default="",
+        description=(
+            "PromQL label matchers, without braces, that select the engine's "
+            "GPUs in --gpu-metrics-prometheus-url (e.g. "
+            '\'namespace="bench",pod=~"engine-.*"\'). Required with '
+            "--gpu-metrics-prometheus-url, so idle GPUs elsewhere stay out "
+            "of the mean."
+        ),
+        json_schema_extra={"group": "Control Flags"},
+    )
+
     gpu_metrics_host: str = Field(
         default="",
         description=(
             "DCGM-exporter host, 'host:port', or full URL to scrape GPU "
             "utilization from when the benchmark runs off the accelerator "
-            "node (e.g. a disaggregated Mammoth deployment). When set, "
+            "node and no Prometheus scrapes it (Mammoth uses "
+            "--gpu-metrics-prometheus-url instead). When set, "
             "--collect-gpu-stats reads this remote endpoint instead of local "
-            "NVML. A bare host expands to 'http://<host>:9400/metrics'. "
+            "NVML; --gpu-metrics-prometheus-url takes precedence. A bare host "
+            "expands to 'http://<host>:9400/metrics'. "
             "Accepts a comma-separated list of endpoints (one exporter pod "
             "per accelerator node) for multi-node engines; every endpoint is "
             "scraped each interval and merged into one snapshot."
@@ -986,6 +1106,12 @@ class ServingBenchmarkConfig(BaseServingBenchmarkConfig):
     dry_run: bool = Field(
         default=False,
         description="Build the dataset and print workload stats + warmup-sampling preview, then exit without contacting the server.",
+        json_schema_extra={"group": "Control Flags"},
+    )
+
+    workload_stats_json: str | None = Field(
+        default=None,
+        description="Write the statistics of the requests the workload would send (lengths by turn, long-context shares, tool, image and structured-output shares) as JSON to this path. Combine with --dry-run to get them without a server. With --warmup-to-steady-state, describes the sampled workload before warmup picks drop candidate sessions, so the run sends fewer requests than reported.",
         json_schema_extra={"group": "Control Flags"},
     )
 
@@ -1109,7 +1235,8 @@ class ServingBenchmarkConfig(BaseServingBenchmarkConfig):
         default=None,
         description=(
             "When set, num_prompts is computed as num_prompts_multiplier * max_concurrency "
-            "for each concurrency level, replacing the default 300s duration timeout."
+            "for each concurrency level. Mutually exclusive with --num-prompts. Each level "
+            "still stops at --max-benchmark-duration-s, which defaults to 300s."
         ),
         json_schema_extra={"group": "Sweep Configuration"},
     )
@@ -1158,23 +1285,102 @@ class ServingBenchmarkConfig(BaseServingBenchmarkConfig):
         """Parse the flag from a mapping, inline JSON, or a file path.
 
         Raises:
-            ValueError: If the value does not resolve to a mapping.
+            ValueError: If a string is neither inline JSON nor a readable file.
         """
         if value is None or (isinstance(value, str) and not value.strip()):
             return None
-        return _mapping_from_argument(value, "agentic_tool_profiles")
+        return _json_from_argument(value, "agentic_tool_profiles", "{")
+
+    @field_validator("response_format", mode="before")
+    @classmethod
+    def _parse_response_format(cls, value: object) -> object:
+        """Parse ``response_format`` from a mapping, inline JSON, or a file.
+
+        Raises:
+            ValueError: If a string is neither inline JSON nor a readable file.
+        """
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        return _json_from_argument(value, "response_format", "{")
+
+    @field_validator("tools", mode="before")
+    @classmethod
+    def _parse_tools(cls, value: object) -> object:
+        """Parse ``tools`` from a list, inline JSON, or a file.
+
+        Raises:
+            ValueError: If a string is neither inline JSON nor a readable file.
+        """
+        # cyclopts hands a list-typed flag over as a list of its one token,
+        # which it has already JSON-decoded when it could.
+        if (
+            isinstance(value, list)
+            and len(value) == 1
+            and isinstance(value[0], (str, list))
+        ):
+            value = value[0]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        return _json_from_argument(value, "tools", "[")
+
+    @field_validator("response_format")
+    @classmethod
+    def _check_response_format(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Check ``response_format`` against the OpenAI response formats.
+
+        Raises:
+            ValueError: If it matches none of them.
+        """
+        if value is None:
+            return None
+        # pydantic collects only ValueError and AssertionError from a
+        # validator.
+        try:
+            return dict(_RESPONSE_FORMAT_ADAPTER.validate_python(value))
+        except ValidationError as e:
+            raise ValueError(f"Invalid response_format: {e}") from e
+
+    @field_validator("tools")
+    @classmethod
+    def _check_tools(
+        cls, value: list[dict[str, Any]] | None
+    ) -> list[dict[str, Any]] | None:
+        """Check ``tools`` against the OpenAI tool definition.
+
+        Raises:
+            ValueError: If the list is empty, which would select requests
+                and send them no tools, or holds an invalid definition.
+        """
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("tools must hold at least one tool definition.")
+        try:
+            tools = _TOOLS_ADAPTER.validate_python(value)
+        except ValidationError as e:
+            raise ValueError(f"Invalid tools: {e}") from e
+        return [dict(tool) for tool in tools]
+
+    @property
+    def openai_response_format(self) -> ResponseFormat | None:
+        """``response_format`` as the OpenAI type its validator checked."""
+        if self.response_format is None:
+            return None
+        return _RESPONSE_FORMAT_ADAPTER.validate_python(self.response_format)
 
     @field_validator("extra_body", mode="before")
     @classmethod
-    def _parse_extra_body(cls, value: object) -> dict[str, Any]:
+    def _parse_extra_body(cls, value: object) -> object:
         """Parse ``extra_body`` from a mapping, inline JSON, or a file path.
 
         Raises:
-            ValueError: If the value does not resolve to a mapping.
+            ValueError: If a string is neither inline JSON nor a readable file.
         """
         if value is None or (isinstance(value, str) and not value.strip()):
             return {}
-        return _mapping_from_argument(value, "extra_body")
+        return _json_from_argument(value, "extra_body", "{")
 
     @model_validator(mode="after")
     def _check_warmup_runtime_estimates(self) -> ServingBenchmarkConfig:
@@ -1187,6 +1393,22 @@ class ServingBenchmarkConfig(BaseServingBenchmarkConfig):
                 "--warmup-delay-estimated-ttft-ms /"
                 " --warmup-delay-estimated-tpot-ms require"
                 " --warmup-delay-biased to be set."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_gpu_metrics_selector(self) -> ServingBenchmarkConfig:
+        """A Prometheus source needs a selector, or the mean spans the cluster.
+
+        Checked at parse time so a missing selector fails before warmup
+        rather than after it.
+        """
+        if (
+            self.gpu_metrics_prometheus_url
+            and not self.gpu_metrics_selector.strip()
+        ):
+            raise ValueError(
+                "--gpu-metrics-prometheus-url requires --gpu-metrics-selector."
             )
         return self
 

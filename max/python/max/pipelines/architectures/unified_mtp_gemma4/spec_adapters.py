@@ -14,17 +14,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 from max.dtype import DType
-from max.graph import (
-    BufferType,
-    DeviceRef,
-    DimLike,
-    TensorType,
-    TensorValue,
-    ops,
-)
+from max.graph import DeviceRef, DimLike, TensorValue, ops
 from max.nn.transformer import ReturnHiddenStates, ReturnLogits
 from max.pipelines.speculative.driver import (
     CarryDimNames,
@@ -75,15 +66,12 @@ class Gemma4Target:
             batch.vision_embeddings,
             batch.vision_scatter_indices,
         )
-        # VARIABLE logits + ALL_NORMALIZED hidden states ->
-        # (last_logits, logits, offsets, hs_0..hs_{n-1}).
         return Verified(
-            logits=outputs[1],
-            hidden=list(outputs[3 : 3 + batch.n_devs]),
+            logits=outputs.logits["logits"],
+            hidden=list(
+                outputs.hidden_states[ReturnHiddenStates.ALL_NORMALIZED.value]
+            ),
         )
-
-    def ep_input_types(self) -> Sequence[TensorType | BufferType]:
-        return ()
 
 
 class Gemma4MTPProposer:
@@ -99,6 +87,7 @@ class Gemma4MTPProposer:
     carry_dim_names = CarryDimNames(prefix="mtp_step")
     step_hidden_mode = ReturnHiddenStates.LAST_PER_DEVICE
     uses_thinking_phase = True
+    supports_zero_draft_rows = True
 
     def __init__(self, draft: Gemma4Assistant, hidden_dim: DimLike) -> None:
         self.draft = draft
@@ -126,8 +115,8 @@ class Gemma4MTPProposer:
         self.draft.return_hidden_states = self.step_hidden_mode
         self.draft.return_logits = ReturnLogits.LAST_TOKEN
         return Proposed(
-            logits=outputs[1],
-            hidden=list(outputs[3 : 3 + batch.n_devs]),
+            logits=outputs.logits["logits"],
+            hidden=list(outputs.hidden_states[ReturnHiddenStates.ALL.value]),
         )
 
     def step(
@@ -151,6 +140,6 @@ class Gemma4MTPProposer:
             rope_cache_lengths=batch.draft_cache_lengths,
         )
         return Proposed(
-            logits=outputs[0],
-            hidden=list(outputs[1 : 1 + batch.n_devs]),
+            logits=outputs.logits["next_token_logits"],
+            hidden=list(outputs.hidden_states[self.step_hidden_mode.value]),
         )

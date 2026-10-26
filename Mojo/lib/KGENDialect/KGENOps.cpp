@@ -106,20 +106,6 @@ bool ParamConstantOp::isImplicitlyParametric() {
 void ParamConstantOp::walkDefinitions(
     function_ref<void(ParamDeclAttr, const ParamDefValue &)> walkDef) {}
 
-void ParamConstantOp::getEffects(
-    SmallVectorImpl<mlir::MemoryEffects::EffectInstance> &effects) {
-
-  // This is a hack designed to stop the CSE of "none" in closures.
-  //
-  // See MSTDL-1123 for more context, but until cross-device compilation is
-  // more robust, we need this to avoid some edge case behavior around None.
-  //
-  // TODO(MOCO-1101): remove the need for this and make op Pure again.
-  if (isa<KGEN::NoneType>(getValue().getType()) &&
-      getOperation()->getParentOfType<KGEN::ParamDeclareRegionOp>())
-    effects.emplace_back(mlir::MemoryEffects::Allocate::get());
-}
-
 //===----------------------------------------------------------------------===//
 // ObligationOp
 //===----------------------------------------------------------------------===//
@@ -317,121 +303,6 @@ LogicalResult ParamDeclareOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
-// ParamDeclareRegionOp
-//===----------------------------------------------------------------------===//
-
-static ParseResult parseRegionOnly(OpAsmParser &p,
-                                   ParamDeclArrayAttr &inputParams,
-                                   TypeAttr &functionType, TypeAttr &type,
-                                   Attribute &inlineLevel, Region &body) {
-  SmallVector<OpAsmParser::Argument> args;
-  FunctionType functionTypeValue;
-  FuncTypeGeneratorType sigGenType;
-  llvm::SMLoc bodyLoc;
-  ParamDeclArrayAttr resultParams;
-  if (parseFunctionFuncTypeGenerator(p, args, inputParams, resultParams,
-                                     functionTypeValue, sigGenType) ||
-      parseOptionalInline(p, inlineLevel) || p.getCurrentLocation(&bodyLoc) ||
-      p.parseRegion(body, args))
-    return failure();
-  if (!resultParams.empty())
-    return p.emitError(p.getCurrentLocation(), "invalid result parameters");
-
-  // Form the Signature.
-  SmallVector<Type> argTypes;
-  for (const OpAsmParser::Argument &arg : args)
-    argTypes.push_back(arg.type);
-  functionType = TypeAttr::get(functionTypeValue);
-  type = TypeAttr::get(sigGenType);
-  return success();
-}
-
-static ParseResult
-parseRegionDeclaration(OpAsmParser &p, ParamDeclAttr &paramDecl,
-                       StringAttr &sourceName, ParamDeclArrayAttr &inputParams,
-                       TypeAttr &functionType, TypeAttr &type,
-                       Attribute &inlineLevel, Region &body) {
-  StringAttr paramName;
-  if (parseParamName(p, paramName))
-    return failure();
-
-  if (p.parseOptionalLSquare()) {
-    sourceName = paramName;
-  } else {
-    std::string str;
-    if (p.parseKeywordOrString(&str) || p.parseRSquare())
-      return failure();
-    sourceName = StringAttr::get(p.getContext(), str);
-  }
-
-  if (p.parseEqual() ||
-      parseRegionOnly(p, inputParams, functionType, type, inlineLevel, body))
-    return failure();
-  paramDecl = ParamDeclAttr::get(paramName, type.getValue());
-  return success();
-}
-
-static void printRegionOnly(OpAsmPrinter &p, Operation *op,
-                            ParamDeclArrayAttr inputParams,
-                            TypeAttr functionType, TypeAttr type,
-                            Attribute inlineLevel, Region &body) {
-  printFunctionFuncTypeGenerator(p, &body, inputParams, {},
-                                 cast<FunctionType>(functionType.getValue()),
-                                 cast<FuncTypeGeneratorType>(type.getValue()));
-  printOptionalInline(p, inlineLevel);
-  p << ' ';
-  p.printRegion(body, /*printEntryBlockArgs=*/false);
-}
-
-static void printRegionDeclaration(OpAsmPrinter &p, Operation *op,
-                                   ParamDeclAttr paramDecl,
-                                   StringAttr sourceName,
-                                   ParamDeclArrayAttr inputParams,
-                                   TypeAttr functionType, TypeAttr type,
-                                   Attribute inlineLevel, Region &body) {
-  printParamName(p, paramDecl.getName());
-  if (paramDecl.getName() != sourceName) {
-    p << "[";
-    p.printKeywordOrString(sourceName.getValue());
-    p << "]";
-  }
-  p << " = ";
-  printRegionOnly(p, op, inputParams, functionType, type, inlineLevel, body);
-}
-
-bool ParamDeclareRegionOp::isIsolatedFromAbove(unsigned regionNum) {
-  assert(regionNum == 0);
-  return getIsolated();
-}
-
-void ParamDeclareRegionOp::notifyKnownIsolatedFromAbove(unsigned regionNum) {
-  assert(regionNum == 0);
-  setIsolated(true);
-}
-
-void ParamDeclareRegionOp::walkDefinitions(
-    function_ref<void(ParamDeclAttr, const ParamDefValue &)> walkDef) {
-  walkDef(getParamDecl(), &getBodyRegion());
-}
-
-/// This operation has no uses to collect in its current scope.
-void ParamDeclareRegionOp::collectParameterUses(
-    function_ref<void(Attribute)> scanAttr, function_ref<void(Type)> scanType) {
-}
-
-LogicalResult ParamDeclareRegionOp::verify() {
-  if (failed(verifyInlineLevel(*this, getInlineLevelAttr())))
-    return failure();
-
-  if (ArrayAttr fnArgAttrs = getFnArgAttrs();
-      !fnArgAttrs.empty() && fnArgAttrs.size() != getNumArguments())
-    return emitOpError("fnArgAttrs size does not equal number of "
-                       "arguments, got ")
-           << fnArgAttrs.size();
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
 // ParamApplyOp
 //===----------------------------------------------------------------------===//
 
@@ -540,8 +411,20 @@ parseGeneratorOp(OpAsmParser &p, ExportKindAttr &exportKind,
 
   if (parseOptionalInline(p, inlineLevel) ||
       parseOptionalDecorators(p, decorators) ||
-      p.parseOptionalAttrDictWithKeyword(attrs) ||
-      p.parseRegion(body, args, /*enableNameShadowing=*/true))
+      p.parseOptionalAttrDictWithKeyword(attrs))
+    return failure();
+
+  // The printer spells out a signature the printed types cannot rebuild.
+  if (Attribute explicitSignature = attrs.erase("funcTypeGenerator")) {
+    auto typeAttr = dyn_cast<TypeAttr>(explicitSignature);
+    if (!typeAttr || !isa<FuncTypeGeneratorType>(typeAttr.getValue()))
+      return p.emitError(p.getCurrentLocation(),
+                         "expected 'funcTypeGenerator' to be a function "
+                         "type generator");
+    signatureAttr = typeAttr;
+  }
+
+  if (p.parseRegion(body, args, /*enableNameShadowing=*/true))
     return failure();
   return success();
 }
@@ -564,10 +447,21 @@ static void printGeneratorOp(OpAsmPrinter &p, Operation *op,
 
   auto gen = cast<GeneratorOp>(op);
   SmallVector<StringRef, 10> elidedAttrs{
-      gen.getExportKindAttrName(),        gen.getSymNameAttrName(),
-      gen.getFuncTypeGeneratorAttrName(), gen.getFunctionTypeAttrName(),
-      gen.getInputParamsAttrName(),       gen.getInlineLevelAttrName(),
-      gen.getDecoratorsAttrName()};
+      gen.getExportKindAttrName(),   gen.getSymNameAttrName(),
+      gen.getFunctionTypeAttrName(), gen.getInputParamsAttrName(),
+      gen.getInlineLevelAttrName(),  gen.getDecoratorsAttrName()};
+
+  // The parser rebuilds `funcTypeGenerator` from the printed body-view types,
+  // which only works when they reference nothing but the input parameters. A
+  // signature that names a parameter the body lifts, for example, has to be
+  // printed as well.
+  auto signatureType = cast<FuncTypeGeneratorType>(signature.getValue());
+  FuncType signatureBody = signatureType.getBody();
+  if (FuncTypeGeneratorType::remapToFuncTypeGenerator(
+          inputParams.getValue(), cast<FunctionType>(functionType.getValue()),
+          signatureBody.getArgConventions(),
+          signatureBody.getFnEffects()) == signatureType)
+    elidedAttrs.push_back(gen.getFuncTypeGeneratorAttrName());
   ArrayAttr emptyArray = ArrayAttr::get(op->getContext(), {});
   if (attrs.get(gen.getFnAttrsAttrName()) == emptyArray)
     elidedAttrs.push_back(gen.getFnAttrsAttrName());
@@ -685,9 +579,6 @@ static void printFuncOp(OpAsmPrinter &p, Operation *op,
   if (attrs.get(func.getFnArgAttrsAttrName()) ==
       ArrayAttr::get(op->getContext(), {}))
     elidedAttrs.push_back(func.getFnArgAttrsAttrName());
-  if (attrs.get(func.getCrossDeviceCapturesAttrName()) ==
-      StringArrayAttr::get(func.getContext(), {}))
-    elidedAttrs.push_back(func.getCrossDeviceCapturesAttrName());
   p.printOptionalAttrDictWithKeyword(attrs.getValue(), elidedAttrs);
 
   p << ' ';
@@ -698,8 +589,7 @@ LogicalResult FuncOp::verify() {
   if (failed(verifyInlineLevel(*this, getInlineLevelAttr())))
     return failure();
 
-  // Skip body-based checks for functions whose body has not been filled in yet
-  // (e.g. populate_captures stubs created before offload compilation).
+  // External declarations have no body to check.
   if (getBodyRegion().empty())
     return success();
   FunctionType type = getFunctionType();
@@ -857,36 +747,15 @@ void StructGeneratorOp::getFieldTypes(SmallVectorImpl<TypedAttr> &types,
   }
 }
 
-/// Pick the entry for `fieldIndex` out of a per-field array attribute, or the
-/// struct's own attribute when the index is negative.
-static Attribute selectAnnotationAttr(Attribute own, ArrayAttr perField,
-                                      int64_t fieldIndex) {
-  if (fieldIndex < 0)
-    return own;
-  if (perField && fieldIndex < static_cast<int64_t>(perField.size()))
-    return perField[fieldIndex];
-  return {};
-}
+FailureOr<ArrayAttr>
+StructGeneratorOp::getAnnotations(std::optional<int> fieldIdx) {
+  if (!fieldIdx.has_value())
+    return getAnnotationsAttr();
 
-void StructGeneratorOp::getAnnotationValues(SmallVectorImpl<TypedAttr> &values,
-                                            int64_t fieldIndex) {
-  auto annotations =
-      dyn_cast_if_present<ParameterExprArrayAttr>(selectAnnotationAttr(
-          getAnnotationsAttr(), getFieldAnnotationsAttr(), fieldIndex));
-  if (annotations)
-    llvm::append_range(values, annotations.getValue());
-}
-
-void StructGeneratorOp::getAnnotationTypes(SmallVectorImpl<TypedAttr> &types,
-                                           Type metaType, int64_t fieldIndex) {
-  auto recorded =
-      dyn_cast_if_present<ParameterExprArrayAttr>(selectAnnotationAttr(
-          getAnnotationTypesAttr(), getFieldAnnotationTypesAttr(), fieldIndex));
-  if (!recorded)
-    return;
-  // Convert from !kgen.type to the requested metatype, as getFieldTypes does.
-  for (TypedAttr typeValue : recorded.getValue())
-    types.push_back(ParamOperatorAttr::getRebind(typeValue, metaType));
+  auto structType = cast<StructInstanceType>(getValueDomainType());
+  if (fieldIdx < structType.getFields().size())
+    return structType.getFields()[*fieldIdx].getAnnotations();
+  return failure();
 }
 
 //===----------------------------------------------------------------------===//
@@ -1006,163 +875,31 @@ LogicalResult CallParamOp::verify() {
   return verifyCallOp(*this, getOperands(), getCalleeType().getBody());
 }
 //===----------------------------------------------------------------------===//
-// StageClosureOp
-//===----------------------------------------------------------------------===//
-
-static ParseResult parseStageClosureOp(OpAsmParser &p, Type &resultType,
-                                       Region &body) {
-  // we expect the following syntax:
-  // kgen.stage_closure = () capturing -> index {
-  // } { name = foo }
-  FuncTypeGeneratorType signatureType;
-  ParamDeclArrayAttr inputParams;
-  ParamDeclArrayAttr resultParams;
-  FunctionType functionTypeValue;
-  SmallVector<OpAsmParser::Argument> args;
-  llvm::SMLoc bodyLoc;
-  if (p.parseEqual() ||
-      parseFunctionFuncTypeGenerator(p, args, inputParams, resultParams,
-                                     functionTypeValue, signatureType) ||
-      p.getCurrentLocation(&bodyLoc) || p.parseRegion(body, args))
-    return failure();
-  if (!inputParams.empty() || !resultParams.empty())
-    return p.emitError(bodyLoc, "staged closures cannot have parameters");
-  resultType = signatureType;
-  return success();
-}
-
-static void printStageClosureOp(OpAsmPrinter &p, Operation *op,
-                                FuncTypeGeneratorType resultType,
-                                Region &body) {
-  p << "= ";
-  printFunctionFuncTypeGenerator(p, &body, {}, {},
-                                 resultType.getBody().getValues(), resultType);
-  p << ' ';
-  p.printRegion(body, /*printEntryBlockArgs=*/false);
-}
-
-//===----------------------------------------------------------------------===//
-// CreateClosureOp
+// CreateFuncPtrOp
 //===----------------------------------------------------------------------===//
 
 LogicalResult
-CreateClosureOp::inferReturnTypes(MLIRContext *ctx, std::optional<Location> loc,
+CreateFuncPtrOp::inferReturnTypes(MLIRContext *ctx, std::optional<Location> loc,
                                   Adaptor adaptor,
                                   SmallVectorImpl<Type> &results) {
   auto callee = dyn_cast_or_null<TypedAttr>(adaptor.getCalleeAttr());
   if (!callee) {
     return mlir::emitOptionalError(
-        loc, "'create_closure' expected TypedAttr 'callee'");
+        loc, "'create_func_ptr' expected TypedAttr 'callee'");
   }
   auto sigGen = dyn_cast<FuncTypeGeneratorType>(callee.getType());
   if (!sigGen) {
     return mlir::emitOptionalError(
         loc,
-        "'create_closure' attribute 'callee' must have FuncTypeGeneratorType");
+        "'create_func_ptr' attribute 'callee' must have FuncTypeGeneratorType");
   }
-
-  ValueRange captures = adaptor.getOperands();
-  FuncType sig = sigGen.getBody();
-  unsigned numCaptures = captures.size();
-  if (numCaptures > sig.getNumArguments()) {
-    return mlir::emitOptionalError(loc, "provided ", numCaptures,
-                                   " operands but callee only has ",
-                                   sig.getNumArguments(), " to bind");
-  }
-
-  ArrayRef<Type> newArgTypes = sig.getArguments().drop_front(numCaptures);
-  ArrayRef<ArgConvention> newArgConvs =
-      sig.getArgConventions().drop_front(numCaptures);
-
-  FnEffects effects = sig.getFnEffects();
-  if (!captures.empty())
-    effects.setCapturing();
-
-  // Drop the first `numCaptures` positional pogs from `argListAttrs` (they're
-  // now bound by the closure).
-  PogListAttr argListAttrs = sig.getArgListAttrs();
-  if (argListAttrs && !argListAttrs.getPogs().empty()) {
-    ArrayRef<PogMetadataAttr> newPogs =
-        argListAttrs.getPogs().drop_front(numCaptures);
-    argListAttrs =
-        PogListAttr::get(ctx, newPogs, argListAttrs.getBodyConstraints(),
-                         argListAttrs.getOrigVariadicConvention());
-  }
-  results.push_back(FuncTypeGeneratorType::get(
-      sigGen.getInputParamTypes(),
-      Builder(ctx).getFunctionType(newArgTypes, sig.getResults()), newArgConvs,
-      effects, sig.getMetadata(), sigGen.getParamListAttrs(), argListAttrs));
+  results.push_back(sigGen);
   return mlir::success();
 }
 
-static ParseResult
-parseClosureCaptureTypes(AsmParser &p, TypedAttr callee,
-                         ArrayRef<OpAsmParser::UnresolvedOperand> captures,
-                         SmallVectorImpl<Type> &captureTypes) {
-  auto sigGen = dyn_cast<FuncTypeGeneratorType>(callee.getType());
-  if (!sigGen) {
-    return p.emitError(p.getCurrentLocation(),
-                       "expected type of callee to be FuncTypeGeneratorType");
-  }
-  FuncType sig = sigGen.getBody();
-
-  unsigned numCaptures = captures.size();
-  if (numCaptures > sig.getNumArguments()) {
-    return p.emitError(p.getCurrentLocation(), "provided ")
-           << numCaptures << " operands but callee only has "
-           << sig.getNumArguments() << " to bind";
-  }
-
-  ArrayRef<Type> inputs = sig.getArguments().take_front(numCaptures);
-  captureTypes.append(inputs.begin(), inputs.end());
-  return success();
-}
-
-static void printClosureCaptureTypes(AsmPrinter &p, Operation *,
-                                     TypedAttr callee, ValueRange captures,
-                                     TypeRange captureTypes) {}
-
-LogicalResult CreateClosureOp::verify() {
-  FuncType calleeSig = getCalleeType().getBody();
-  if (getNumOperands() > calleeSig.getNumArguments()) {
-    return emitOpError("provided ")
-           << getNumOperands() << " operands but callee only has "
-           << calleeSig.getNumArguments() << " to bind";
-  }
-  unsigned expectedArgs = calleeSig.getNumArguments() - getNumOperands();
-  FuncType sig = getType().getBody();
-  if (sig.getNumArguments() != expectedArgs) {
-    return emitOpError("result signature has ")
-           << sig.getNumArguments() << " arguments but expected "
-           << expectedArgs;
-  }
-
-  for (auto [i, type, argType] :
-       llvm::enumerate(getOperandTypes(),
-                       calleeSig.getArguments().take_front(getNumOperands()))) {
-    if (type != argType) {
-      return emitOpError("operand #")
-             << i << " has type " << type
-             << " but callee argument type expected " << argType;
-    }
-  }
-  for (auto [i, type, argType] :
-       llvm::enumerate(sig.getArguments(),
-                       calleeSig.getArguments().drop_front(getNumOperands()))) {
-    if (type != argType) {
-      return emitOpError("result signature argument #")
-             << i << " type is " << argType << " but expected to be " << type;
-    }
-  }
-
-  if (!getCaptures().empty() && !sig.isCapturing())
-    return emitOpError("has captures, so result signature must be 'capturing'");
-  return success();
-}
-
-FailureOr<InlineResult> CreateClosureOp::prepInline(mlir::RewriterBase &b) {
-  auto op = StageClosureOp::create(b, getLoc(), getType());
-  return {{op, [](Operation *) {}}};
+FailureOr<InlineResult> CreateFuncPtrOp::prepInline(mlir::RewriterBase &b) {
+  // Materializing a function pointer is not a call and cannot be inlined.
+  return failure();
 }
 
 //===----------------------------------------------------------------------===//
@@ -1621,9 +1358,10 @@ LogicalResult StructLoadIndirectOp::inferReturnTypes(
   // `kgen.pack.load`).
   auto mappedTypes = ParamOperatorAttr::get(
       POC::VariadicPtrRemoveMap, structType.getElementTypesVariadic());
+  assert(structType.getDomain() != StructDomain::Value && "Unexpected domain");
   types.push_back(StructType::get(ctx, mappedTypes, /*memOnly*/ {},
-                                  /*minAlign*/ {},
-                                  structType.getIsParamPack()));
+                                  /*minAlign*/ {}, structType.getIsParamPack(),
+                                  structType.getDomain()));
   return success();
 }
 

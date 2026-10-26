@@ -16,6 +16,18 @@ lit.struct.decl @FooStruct<size, dtype: dtype, ty: type> {
 lit.struct.decl @EmptyStruct {
 }
 
+// A case's payload types are absent until they are resolved.
+// CHECK-LABEL: lit.struct.decl @Color attributes {isEnum}
+// CHECK-NEXT: lit.enum.case red : []{{$}}
+// CHECK-NEXT: lit.enum.case rgb : [index, index] {docString = #doc_string}
+// CHECK-NEXT: lit.enum.case unresolved{{$}}
+// CHECK-NEXT: }
+lit.struct.decl @Color attributes {isEnum} {
+  lit.enum.case red : []
+  lit.enum.case rgb : [index, index] {docString = #lit.doc.string<"Red, green.">}
+  lit.enum.case unresolved
+}
+
 // CHECK-LABEL: lit.struct.decl @ValueType
 lit.struct.decl @ValueType
  // CHECK-NEXT: move :() -> () @ValueType::@__moveinit__
@@ -185,8 +197,8 @@ lit.fn @ref_pointer<life: origin<true>, ilife: origin<false>>
      (%ref1: !lit.ref<@MyStruct, mut life>) {
   // CHECK: %0 = lit.ref.to_pointer %ref1 : <!lit.struct<@MyStruct>, mut life>
   %ptr = lit.ref.to_pointer %ref1: <!lit.struct<@MyStruct>, mut life>
-  // CHECK: %1 = lit.ref.from_pointer %0 : <!lit.struct<@MyStruct>, imm ilife>
-  %ref2 = lit.ref.from_pointer %ptr: !lit.ref<!lit.struct<@MyStruct>, imm ilife>
+  // CHECK: %1 = lit.ref.from_pointer %0 : <!lit.struct<@MyStruct>, imm ilife> {name = "reference value"}
+  %ref2 = lit.ref.from_pointer %ptr: !lit.ref<!lit.struct<@MyStruct>, imm ilife> {name = "reference value"}
 
   // CHECK: %2 = lit.ref.to_pointer %1 : <!lit.struct<@MyStruct>, imm ilife>
   %ptr2 = lit.ref.to_pointer %ref2: !lit.ref<!lit.struct<@MyStruct>, imm ilife>
@@ -211,19 +223,6 @@ kgen.generator @ref_pack_from_pointer_pack(
   %0 = lit.ref.pack.from_pointer_pack %pack
     : !kgen.struct<(pointer<index, 4>, pointer<f32, 4>) isParamPack>
    -> !lit.ref.pack<:param_list<!kgen.type> [index, f32], imm #lit.any.origin, 4>
-  hlcf.return
-}
-
-// CHECK-LABEL: lit.fn @nested_function_region
-lit.fn @nested_function_region() {
-  // CHECK-NEXT: hlcf.loop
-  hlcf.loop {
-    // CHECK-NEXT: lit.fn nested_fn()
-    lit.fn nested_fn() {
-      hlcf.return
-    }
-    hlcf.continue
-  }
   hlcf.return
 }
 
@@ -606,4 +605,21 @@ lit.fn @has_body_constraints<
   %none = kgen.param.constant: none = <#kgen.none>
   lit.return %none : !kgen.none
   lit.end_fn
+}
+
+// -----
+
+// CHECK-LABEL: lit.package namespace @ns {
+// CHECK-NEXT: lit.package @sub {
+lit.package namespace @ns {
+  lit.package @sub {
+  }
+}
+
+// CHECK-LABEL: lit.package @pkg {
+lit.package @pkg {
+}
+
+// CHECK-LABEL: lit.package @dependent attributes {dependencies = #kgen<link.dependencies[@pkg, @ns::@sub]>} {
+lit.package @dependent attributes {dependencies = #kgen<link.dependencies[@pkg, @ns::@sub]>} {
 }

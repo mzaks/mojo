@@ -186,6 +186,9 @@ def build_kv_params(
             data_parallel_degree=data_parallel_degree,
             is_mla=spec.kv_dim == 1,
             num_q_heads=num_q_heads,
+            # The MHA-shaped state leaves have one head, which every TP rank
+            # needs whole.
+            allow_kv_head_replication=spec.kv_dim == 2,
             speculative_method=speculative_method,
             num_draft_tokens=num_draft_tokens,
             slots_per_page=spec.slots_per_page(page_size),
@@ -307,10 +310,6 @@ class DeepseekV4Config(ArchConfigWithKVCache):
     graph_mode: str = "auto"  # "auto" | "prefill" | "decode"
     return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN
     return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE
-    # Whether to build the DSpark draft stages (``mtp.*``). Serving leaves them
-    # out: the checkpoint adapter drops their weights and their decode path is
-    # unverified (ISSUES.md Issue 28).
-    dspark_stages: bool = True
 
     def __post_init__(self) -> None:
         if self.hidden_act != "silu":
@@ -362,6 +361,11 @@ class DeepseekV4Config(ArchConfigWithKVCache):
 
     def layer_compress_ratio(self, layer_idx: int) -> int:
         return self.compress_ratios[layer_idx]
+
+    @property
+    def window_ratios(self) -> list[int]:
+        """The compression ratios the trunk's attention layers use."""
+        return sorted(set(self.compress_ratios[: self.num_hidden_layers]) - {0})
 
     def layer_has_indexer(self, layer_idx: int) -> bool:
         return self.compress_ratios[layer_idx] == 4

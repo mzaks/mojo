@@ -34,7 +34,7 @@ from std.collections.dict import (
     _DictValueIter,
 )
 import std.format._utils as fmt
-from std.hashlib import Hasher, default_hasher
+from std.hash import Hasher, default_hasher
 
 from std.utils import Variant
 
@@ -42,7 +42,7 @@ from std.utils import Variant
 @fieldwise_init
 struct Counter[
     V: KeyElement & Copyable & Deinitable,
-    H: Hasher = default_hasher,
+    H: Hasher & Defaultable & Deinitable = default_hasher,
 ](
     Boolable,
     Copyable,
@@ -503,7 +503,7 @@ struct Counter[
         result.update(self)
         result.update(other)
 
-        return +result^  # Remove zero and negative counts
+        return +result  # Remove zero and negative counts
 
     def __iadd__(mut self, other: Self):
         """Add counts from another `Counter` to this `Counter`.
@@ -528,7 +528,7 @@ struct Counter[
 
         result.subtract(other)
 
-        return +result^  # Remove zero and negative counts
+        return +result  # Remove zero and negative counts
 
     def __isub__(mut self, other: Self):
         """Subtract counts from another `Counter` from this `Counter`, but keep

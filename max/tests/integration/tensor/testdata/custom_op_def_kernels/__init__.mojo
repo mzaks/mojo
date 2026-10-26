@@ -18,7 +18,7 @@ data-dependent, so no dim of a declared `CustomOp` signature can size it.
 # MXF-353
 
 import extensibility
-from extensibility import InputTensor, OutputTensor, foreach
+from extensibility import InputTensor, OutputTensor, TileTensorable, foreach
 from max.gpu.host import DeviceContext
 from std.utils.coord import Coord, coord_to_index_list
 from std.utils.index import IndexList
@@ -115,15 +115,17 @@ struct Mxf353Filter:
 
 
 @extensibility.register_shape_function("mxf353_filter")
-def mxf353_filter_shape(x: InputTensor) raises -> IndexList[2]:
+def mxf353_filter_shape(x: Some[TileTensorable]) raises -> IndexList[2]:
     """Counts the rows of `x` whose first column is positive: the
     data-dependent output row count for `mxf353_filter`.
     """
+    var input = x.to_tile_tensor()
+    var shape = coord_to_index_list(x.shape())
     var count = 0
-    for row in range(x.dim_size(0)):
-        if x[row, 0] > 0:
+    for row in range(shape[0]):
+        if input[row, 0] > 0:
             count += 1
-    return IndexList[2](count, x.dim_size(1))
+    return IndexList[2](count, shape[1])
 
 
 # --- Device-portable NVFP4 pipeline ops -------------------------------------
@@ -184,7 +186,7 @@ def _block_absmax(
     """Returns the largest magnitude in *block* of *row*."""
     var hi: Float32 = 0.0
     for i in range(_NVFP4_BLOCK):
-        var v = abs(x.load[1](IndexList[2](row, block * _NVFP4_BLOCK + i))[0])
+        var v = abs(x.load[1]((row, block * _NVFP4_BLOCK + i))[0])
         if v > hi:
             hi = v
     return hi
@@ -210,16 +212,16 @@ struct Mxf353NVFP4Quantize:
         @always_inline
         def block_scale[
             width: Int
-        ](idx: Coord) capturing -> SIMD[DType.float32, width]:
+        ](idx: Coord) {var} -> SIMD[DType.float32, width]:
             var at = coord_to_index_list(idx)
             var hi = _block_absmax(x, at[0], at[1])
             var scale = hi / _NVFP4_MAX
             return SIMD[DType.float32, width](1.0 if scale == 0.0 else scale)
 
-        foreach[block_scale, target=target, simd_width=1](scales, ctx)
+        foreach[target=target, simd_width=1](block_scale, scales, ctx)
 
         @always_inline
-        def pack[width: Int](idx: Coord) capturing -> SIMD[DType.uint8, width]:
+        def pack[width: Int](idx: Coord) {var} -> SIMD[DType.uint8, width]:
             var at = coord_to_index_list(idx)
             var row = at[0]
             var lo_k = at[1] * 2
@@ -228,12 +230,12 @@ struct Mxf353NVFP4Quantize:
             var scale = hi / _NVFP4_MAX
             if scale == 0.0:
                 scale = 1.0
-            var lo = x.load[1](IndexList[2](row, lo_k))[0] / scale
-            var up = x.load[1](IndexList[2](row, lo_k + 1))[0] / scale
+            var lo = x.load[1]((row, lo_k))[0] / scale
+            var up = x.load[1]((row, lo_k + 1))[0] / scale
             var byte = _nvfp4_encode(lo) | (_nvfp4_encode(up) << 4)
             return SIMD[DType.uint8, width](byte)
 
-        foreach[pack, target=target, simd_width=1](packed, ctx)
+        foreach[target=target, simd_width=1](pack, packed, ctx)
 
 
 @extensibility.register("mxf353_nvfp4_matmul")
@@ -256,7 +258,7 @@ struct Mxf353NVFP4Matmul:
         ctx: DeviceContext,
     ) raises:
         @always_inline
-        def dot[width: Int](idx: Coord) capturing -> SIMD[DType.float32, width]:
+        def dot[width: Int](idx: Coord) {var} -> SIMD[DType.float32, width]:
             var at = coord_to_index_list(idx)
             var row = at[0]
             var col = at[1]
@@ -264,10 +266,10 @@ struct Mxf353NVFP4Matmul:
             var acc: Float32 = 0.0
             for j in range(bytes):
                 var block = (j * 2) // _NVFP4_BLOCK
-                var a_scale = a_scales.load[1](IndexList[2](row, block))[0]
-                var b_scale = b_scales.load[1](IndexList[2](col, block))[0]
-                var a_byte = a_packed.load[1](IndexList[2](row, j))[0]
-                var b_byte = b_packed.load[1](IndexList[2](col, j))[0]
+                var a_scale = a_scales.load[1]((row, block))[0]
+                var b_scale = b_scales.load[1]((col, block))[0]
+                var a_byte = a_packed.load[1]((row, j))[0]
+                var b_byte = b_packed.load[1]((col, j))[0]
                 acc += (
                     _nvfp4_decode(a_byte & 15)
                     * a_scale
@@ -282,7 +284,7 @@ struct Mxf353NVFP4Matmul:
                 )
             return SIMD[DType.float32, width](acc)
 
-        foreach[dot, target=target, simd_width=1](out_tensor, ctx)
+        foreach[target=target, simd_width=1](dot, out_tensor, ctx)
 
 
 @extensibility.register("mxf353_relu")
@@ -298,8 +300,8 @@ struct Mxf353Relu:
         ctx: DeviceContext,
     ) raises:
         @always_inline
-        def relu[width: Int](idx: Coord) capturing -> SIMD[x.dtype, width]:
+        def relu[width: Int](idx: Coord) {var} -> SIMD[x.dtype, width]:
             var v = x.load[width](idx)
             return max(v, 0)
 
-        foreach[relu, target=target](output, ctx)
+        foreach[target=target](relu, output, ctx)

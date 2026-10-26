@@ -14,10 +14,8 @@ from std.collections import OptionalReg
 
 import linalg.matmul.vendor.blas as vendor_blas
 from max.gpu.host import DeviceContext
-from std.memory import alloc
 from layout import (
     TileTensor,
-    Coord,
     CoordLike,
     row_major,
     Idx,
@@ -52,9 +50,9 @@ def test_warp_specialize_gemm_with_multicasting[
     use_tma_store: Bool = False,
     splits: Int = 2,
 ](ctx: DeviceContext, m: MType, n: NType, k: KType,) raises:
-    var M = Int(m.value())
-    var N = Int(n.value())
-    var K = Int(k.value())
+    var M = Int(m)
+    var N = Int(n)
+    var K = Int(k)
 
     comptime BM = block_tile_shape[0]
     comptime BN = block_tile_shape[1]
@@ -63,18 +61,16 @@ def test_warp_specialize_gemm_with_multicasting[
     comptime CLUSTER_N = cluster_shape[0]
     comptime CLUSTER_M = cluster_shape[1]
 
-    var a_shape = row_major(Coord(m, Idx[KType.static_value]))
+    var a_shape = row_major(m, Idx[KType.static_value])
     var b_shape = row_major(
-        Coord(
-            Idx[NType.static_value if transpose_b else KType.static_value],
-            Idx[KType.static_value if transpose_b else NType.static_value],
-        )
+        Idx[NType.static_value if transpose_b else KType.static_value],
+        Idx[KType.static_value if transpose_b else NType.static_value],
     )
-    var c_shape = row_major(Coord(m, Idx[NType.static_value]))
+    var c_shape = row_major(m, Idx[NType.static_value])
 
-    var a_size = Int(m.value()) * Int(k.value())
-    var b_size = Int(n.value()) * Int(k.value())
-    var c_size = Int(m.value()) * Int(n.value())
+    var a_size = Int(m) * Int(k)
+    var b_size = Int(n) * Int(k)
+    var c_size = Int(m) * Int(n)
 
     var a_host_ptr = ctx.enqueue_create_host_buffer[a_type](a_size)
     var b_host_ptr = ctx.enqueue_create_host_buffer[b_type](b_size)
@@ -113,9 +109,11 @@ def test_warp_specialize_gemm_with_multicasting[
 
     comptime num_consumer: Int = 1 if BM == 64 else 2
 
-    comptime wgmma_shape = Index(
-        64, BN, 32
-    ) if a_type == .float8_e4m3fn else Index(64, BN, 16)
+    comptime wgmma_shape = (
+        64,
+        BN,
+        32,
+    ) if a_type == .float8_e4m3fn else (64, BN, 16)
 
     print(
         "wgmma_n",

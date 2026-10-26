@@ -55,7 +55,7 @@ def build_fp8_quant_config(
 
     Nemotron-H FP8 (modelopt ``quant_algo=FP8``) stores, per quantized Linear,
     an ``F8_E4M3`` weight plus a scalar ``weight_scale`` and ``input_scale``
-    (both fp32) — i.e. per-tensor static activation+weight scaling. Returns
+    (both fp32), that is, per-tensor static activation+weight scaling. Returns
     ``None`` if the checkpoint is not FP8 (no ``weight_scale`` tensors).
 
     The generic ``mlp_quantized_layers`` / ``attn_quantized_layers`` machinery
@@ -121,7 +121,7 @@ def parse_hybrid_pattern(pattern: str) -> list[str]:
     """Map a Nemotron-H ``hybrid_override_pattern`` to per-layer kinds.
 
     ``M`` -> ``"mamba"``, ``*`` -> ``"attention"``, ``-`` -> ``"mlp"``,
-    ``E`` -> ``"moe"`` (the Nemotron-3 MoE hybrids, e.g. 30B-A3B).
+    ``E`` -> ``"moe"`` (the Nemotron-3 MoE hybrids, for example, 30B-A3B).
     """
     kinds: list[str] = []
     for ch in pattern:
@@ -220,6 +220,9 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
     fp8_mamba_layers: set[int] = field(default_factory=set)
     fp8_mlp_layers: set[int] = field(default_factory=set)
     fp8_moe_layers: set[int] = field(default_factory=set)
+    # ``fp8_attention_layers``: attention layers whose q/k/v/o are FP8 (the 8B
+    # Reasoning checkpoint).
+    fp8_attention_layers: set[int] = field(default_factory=set)
     is_fp8: bool = False
 
     quantization_encoding: SupportedEncoding | None = None
@@ -259,7 +262,7 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
         return [i for i, k in enumerate(self.layer_kinds) if k == "attention"]
 
     def populate_fp8_layers(self, state_dict: Mapping[str, WeightData]) -> None:
-        """Record which mamba/MLP layers are FP8 from the checkpoint.
+        """Record which mamba/MLP/MoE/attention layers are FP8 from the checkpoint.
 
         A Linear is FP8 iff its ``weight_scale`` is present in the checkpoint
         (the exact inverse of the modelopt ``exclude_modules`` list). Names are
@@ -269,6 +272,7 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
         fp8_mamba: set[int] = set()
         fp8_mlp: set[int] = set()
         fp8_moe: set[int] = set()
+        fp8_attention: set[int] = set()
         for name in state_dict:
             if not name.endswith("weight_scale"):
                 continue
@@ -282,6 +286,8 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
                     fp8_mamba.add(li)
                 elif proj in ("up_proj", "down_proj"):
                     fp8_mlp.add(li)
+                elif proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                    fp8_attention.add(li)
                 # MoE routed/shared experts nest one level deeper:
                 # blocks.{i}.mixer.experts.{j}.{up,down}_proj.weight_scale and
                 # blocks.{i}.mixer.shared_experts.{up,down}_proj.weight_scale.
@@ -290,10 +296,12 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
         self.fp8_mamba_layers = fp8_mamba
         self.fp8_mlp_layers = fp8_mlp
         self.fp8_moe_layers = fp8_moe
-        self.is_fp8 = bool(fp8_mamba or fp8_mlp or fp8_moe)
+        self.fp8_attention_layers = fp8_attention
+        self.is_fp8 = bool(fp8_mamba or fp8_mlp or fp8_moe or fp8_attention)
         logger.info(
             f"Nemotron-H FP8: {len(fp8_mamba)} mamba layers,"
-            f" {len(fp8_mlp)} MLP layers, {len(fp8_moe)} MoE layers quantized"
+            f" {len(fp8_mlp)} MLP layers, {len(fp8_moe)} MoE layers,"
+            f" {len(fp8_attention)} attention layers quantized"
         )
 
     @staticmethod

@@ -41,6 +41,66 @@ kgen.func @memory_only_struct(
   hlcf.return
 }
 
+// COM: A param pack keeps its elements' type values, so an element whose type
+// COM: value differs from its layout cannot use the parenthesized form, which
+// COM: holds layouts only.
+// CHECK-LABEL: @param_pack_type_values
+// CHECK-SAME: %arg0: !kgen.struct<{{\[\[}}typevalue<#kgen.genref<@Span>>, struct<(pointer<none>, scalar<index>)>{{\]\]}} isParamPack>,
+// CHECK-SAME: %arg1: !kgen.struct<(struct<(pointer<none>, scalar<index>)>) isParamPack>
+kgen.func @param_pack_type_values(
+  %arg0: !kgen.struct<[[typevalue<#kgen.genref<@Span>>, struct<(pointer<none>, scalar<index>)>]] isParamPack>,
+  %arg1: !kgen.struct<(struct<(pointer<none>, scalar<index>)>) isParamPack>
+) {
+  hlcf.return
+}
+
+// COM: A param pack over a trait metatype already prints its element list in
+// COM: full, so the parenthesized-form check must not touch it.
+// CHECK-LABEL: @trait_param_pack
+// CHECK-SAME: %arg0: !kgen.struct<:param_list<trait<@AnyType>> [index] isParamPack>
+kgen.func @trait_param_pack(
+  %arg0: !kgen.struct<:!kgen.param_list<!lit.trait<@AnyType>> [index] isParamPack>
+) {
+  hlcf.return
+}
+
+// COM: `(...)` is a layout. `[...]` or an expression has no domain unless it
+// COM: says `layout` or `value`. A layout keeps only the layout half of each
+// COM: element, and a value struct keeps what it is given, even plain elements.
+// CHECK-LABEL: @struct_domains
+// CHECK-SAME: %arg0: !kgen.struct<(index, f32)>,
+// CHECK-SAME: %arg1: !kgen.struct<[index, f32]>,
+// CHECK-SAME: %arg2: !kgen.struct<[index, f32] value>,
+// CHECK-SAME: %arg3: !kgen.struct<(T)>,
+// CHECK-SAME: %arg4: !kgen.struct<[T]>,
+// CHECK-SAME: %arg5: !kgen.struct<(T)>,
+// CHECK-SAME: %arg6: !kgen.struct<[T] value>,
+// CHECK-SAME: %arg7: !kgen.struct<Ts>,
+// CHECK-SAME: %arg8: !kgen.struct<Ts layout>,
+// CHECK-SAME: %arg9: !kgen.struct<Ts value>,
+// CHECK-SAME: %arg10: !kgen.struct<Ts isParamPack layout align(8)>,
+// CHECK-SAME: %arg11: !kgen.struct<{{\[\[}}typevalue<#kgen.genref<@Foo>>, struct<(scalar<f32>)>{{\]\]}}>,
+// CHECK-SAME: %arg12: !kgen.struct<(struct<(scalar<f32>)>)>,
+// CHECK-SAME: %arg13: !kgen.struct<{{\[\[}}typevalue<#kgen.genref<@Foo>>, struct<(scalar<f32>)>{{\]\]}} value>
+kgen.generator @struct_domains<T: type, Ts: param_list<type>>(
+  %arg0: !kgen.struct<(index, f32)>,
+  %arg1: !kgen.struct<[index, f32]>,
+  %arg2: !kgen.struct<[index, f32] value>,
+  %arg3: !kgen.struct<(T)>,
+  %arg4: !kgen.struct<[T]>,
+  %arg5: !kgen.struct<[T] layout>,
+  %arg6: !kgen.struct<[T] value>,
+  %arg7: !kgen.struct<Ts>,
+  %arg8: !kgen.struct<Ts layout>,
+  %arg9: !kgen.struct<Ts value>,
+  %arg10: !kgen.struct<Ts isParamPack layout align(8)>,
+  %arg11: !kgen.struct<[[typevalue<#kgen.genref<@Foo>>, struct<(scalar<f32>)>]]>,
+  %arg12: !kgen.struct<[[typevalue<#kgen.genref<@Foo>>, struct<(scalar<f32>)>]] layout>,
+  %arg13: !kgen.struct<[[typevalue<#kgen.genref<@Foo>>, struct<(scalar<f32>)>]] value>
+) {
+  hlcf.return
+}
+
 // CHECK-LABEL: @aligned_struct
 // CHECK-SAME: %arg0: !kgen.struct<(index) align(64)>,
 // CHECK-SAME: %arg1: !kgen.struct<(index) memoryOnly align(128)>

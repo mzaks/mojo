@@ -12,12 +12,11 @@
 # ===----------------------------------------------------------------------=== #
 """Shared spec list and graph construction for the row-wise reduction tests.
 
-The CPU producer (``precompile_rowwise_reductions``) and the GPU consumer
-(``test_rowwise_reductions``) both import this module so they build the
-*identical* graph -- the producer compiles each spec to a MEF with no GPU
-attached, the consumer initializes that MEF and executes it. Keeping the spec
-list and the construction in one place is what guarantees the compiled
-artifact and the runtime inputs can't drift apart.
+``test_rowwise_reductions`` compiles each spec's graph, and Bazel records those
+compiles in CPU build actions (``precompile_mefs``) so the GPU worker only
+initializes and executes. Keeping the spec list and the construction in one
+place is what guarantees the recorded artifact and the runtime inputs can't
+drift apart.
 
 Every graph here is weightless: the ``layer_norm`` and ``rms_norm`` parameters
 are graph *inputs*, not weights, so the consumer initializes with no weights
@@ -84,11 +83,11 @@ _BOTH_DEVICES = ("cpu", "gpu")
 # Inner-axis matrix: precision-sensitive ops in both dtypes; exact
 # selection/compare ops (max/min_and_max/arg) in bfloat16 only.
 #
-# reduce_min/reduce_mean/logsoftmax/argmin are deliberately absent: each is
-# redundant with a sibling already in this matrix (reduce_max, reduce_sum,
-# softmax, argmax respectively) -- same monoid/combine mechanics, differing
-# only in comparison direction or a trivial final step (a divide, or the
-# elementwise map after the shared OnlineLogSumExp reduce). A bug in the
+# reduce_min/logsoftmax/argmin are deliberately absent: each is redundant with
+# a sibling already in this matrix (reduce_max, softmax, argmax respectively)
+# -- same monoid/combine mechanics, differing only in comparison direction or
+# the elementwise map after the shared OnlineLogSumExp reduce. reduce_mean
+# stays: it is a sum with a division by the symbolic axis length fused in. A bug in the
 # shared scaffolder path shows up in the sibling that's still tested; the two
 # confirmed bugs that genuinely needed both directions tested (the bool
 # subword-state crash, the split-K join_parallel bug) have their own narrow
@@ -96,6 +95,7 @@ _BOTH_DEVICES = ("cpu", "gpu")
 # exercises both regardless of this trim.
 _INNER_BOTH = [
     "reduce_sum",
+    "reduce_mean",
     "reduce_product",
     "softmax",
     "layer_norm",
@@ -121,8 +121,8 @@ INNER_SPECS = [
 
 # Non-inner (reduce over axis 0): the pure arbitrary-axis reductions. Precision-
 # sensitive sum in both dtypes; the rest in bfloat16 only. See the inner-axis
-# matrix above for why reduce_min/reduce_mean/argmin are absent (redundant
-# with reduce_max/reduce_sum/argmax).
+# matrix above for why reduce_min/argmin are absent (redundant with
+# reduce_max/argmax).
 _NONINNER_CASES = [
     (op, DType.bfloat16)
     for op in [
@@ -175,7 +175,7 @@ WIDE_CPU_SPECS = [
 # output column.
 #
 # Which (op, dtype) pairs have a sub-word state, per each monoid's
-# `join_parallel` in max/kernels/src/algorithm/reduce_op.mojo:
+# `join_parallel` in max/kernels/src/graph_compiler/builtin_kernels/monoids.mojo:
 #   reduce_product  -- no hardware-fast scalar product exists, so every dtype
 #                      takes the combine; fp16/bf16 make the state 2 bytes.
 #   reduce_max/min  -- the fast-reducer dtype list covers only the 32/64-bit

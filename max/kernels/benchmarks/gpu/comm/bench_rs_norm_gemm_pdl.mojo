@@ -123,7 +123,7 @@ def bench_rs_norm_gemm_pdl[
     comptime BK = swizzle.bytes() // size_of[in_dtype]()
     comptime MMA_K = 16
     comptime block_tile_shape = Index(bm, bn, BK)
-    comptime mma_shape = Index(2 * bm, 2 * bn, MMA_K)
+    comptime mma_shape = (2 * bm, 2 * bn, MMA_K)
 
     comptime gemm_config_off = MatmulConfig[in_dtype, in_dtype, in_dtype, True](
         cluster_shape=Index(2, 1, 1),
@@ -244,20 +244,20 @@ def bench_rs_norm_gemm_pdl[
     # consumer's operands are built with `Idx[...]` further down because the
     # SM100 kernel needs static N and K.
     comptime InTensorType = TileTensor[
-        in_dtype, type_of(row_major(Coord(Index(0, num_cols)))), ImmutAnyOrigin
+        in_dtype, type_of(row_major(Coord(0, num_cols))), ImmutAnyOrigin
     ]
     comptime OutShardType = TileTensor[
-        in_dtype, type_of(row_major(Coord(Index(0, num_cols)))), MutAnyOrigin
+        in_dtype, type_of(row_major(Coord(0, num_cols))), MutAnyOrigin
     ]
     comptime GammaShardType = TileTensor[
-        in_dtype, type_of(row_major(Coord(Index(0)))), ImmutAnyOrigin
+        in_dtype, type_of(row_major(Coord(0))), ImmutAnyOrigin
     ]
     # `[N, K]` (transpose_b) with BOTH dims static, as the SM100 kernel needs.
     # Built from the rotating cache-bust window rather than the base pointer so
     # each iteration streams cold weights -- the cost the prefetch must hide.
     comptime WeightType = TileTensor[
         in_dtype,
-        type_of(row_major(Coord(Idx[gemm_n], Idx[num_cols]))),
+        type_of(row_major(Idx[gemm_n], Idx[num_cols])),
         ImmutAnyOrigin,
     ]
     var in_bufs = Array[InTensorType, ngpus](uninitialized=True)
@@ -266,7 +266,7 @@ def bench_rs_norm_gemm_pdl[
             ref normed, imm config
         } -> OutShardType: OutShardType(
             normed[i].unsafe_ptr().as_unsafe_any_origin(),
-            row_major(Coord(Index(config.rank_units(i), num_cols))),
+            row_major(Coord(config.rank_units(i), num_cols)),
         )
     )
     var sum_shards = Array[OutShardType, ngpus](
@@ -274,7 +274,7 @@ def bench_rs_norm_gemm_pdl[
             ref fused_sum, imm config
         } -> OutShardType: OutShardType(
             fused_sum[i].unsafe_ptr().as_unsafe_any_origin(),
-            row_major(Coord(Index(config.rank_units(i), num_cols))),
+            row_major(Coord(config.rank_units(i), num_cols)),
         )
     )
     var gamma_shards = Array[GammaShardType, ngpus](
@@ -282,7 +282,7 @@ def bench_rs_norm_gemm_pdl[
             rebind[ImmPointer[Scalar[in_dtype], ImmutAnyOrigin]](
                 gamma_dev[i].unsafe_ptr()
             ),
-            row_major(Coord(Index(num_cols))),
+            row_major(Coord(num_cols)),
         )
     )
 
@@ -328,7 +328,7 @@ def bench_rs_norm_gemm_pdl[
                     rebind[ImmPointer[Scalar[in_dtype], ImmutAnyOrigin]](
                         cb_inputs[_j].offset_ptr(0)
                     ),
-                    row_major(Coord(Index(num_rows, num_cols))),
+                    row_major(Coord(num_rows, num_cols)),
                 )
             reducescatter_rmsnorm[pdl_level=v_pdl](
                 in_bufs,
@@ -352,17 +352,17 @@ def bench_rs_norm_gemm_pdl[
                 ](
                     TileTensor(
                         c_dev[i] if verify_variant == 1 else c_ref_dev[i],
-                        row_major(Coord(local_rows, Idx[gemm_n])),
+                        row_major(local_rows, Idx[gemm_n]),
                     ),
                     TileTensor(
                         normed[i],
-                        row_major(Coord(local_rows, Idx[num_cols])),
+                        row_major(local_rows, Idx[num_cols]),
                     ),
                     WeightType(
                         rebind[ImmPointer[Scalar[in_dtype], ImmutAnyOrigin]](
                             cb_weights[i].offset_ptr(0)
                         ),
-                        row_major(Coord(Idx[gemm_n], Idx[num_cols])),
+                        row_major(Idx[gemm_n], Idx[num_cols]),
                     ),
                     list_of_ctx[i],
                 )
@@ -432,7 +432,7 @@ def bench_rs_norm_gemm_pdl[
                             rebind[
                                 ImmPointer[Scalar[in_dtype], ImmutAnyOrigin]
                             ](cb_inputs[_j].offset_ptr(cache_iter)),
-                            row_major(Coord(Index(num_rows, num_cols))),
+                            row_major(Coord(num_rows, num_cols)),
                         )
                     reducescatter_rmsnorm[pdl_level=prod_pdl](
                         in_bufs,
@@ -459,17 +459,17 @@ def bench_rs_norm_gemm_pdl[
                         ](
                             TileTensor(
                                 c_dev[ctx_idx],
-                                row_major(Coord(local_rows, Idx[gemm_n])),
+                                row_major(local_rows, Idx[gemm_n]),
                             ),
                             TileTensor(
                                 normed[ctx_idx],
-                                row_major(Coord(local_rows, Idx[num_cols])),
+                                row_major(local_rows, Idx[num_cols]),
                             ),
                             WeightType(
                                 rebind[
                                     ImmPointer[Scalar[in_dtype], ImmutAnyOrigin]
                                 ](cb_weights[ctx_idx].offset_ptr(cache_iter)),
-                                row_major(Coord(Idx[gemm_n], Idx[num_cols])),
+                                row_major(Idx[gemm_n], Idx[num_cols]),
                             ),
                             ctx_inner,
                         )

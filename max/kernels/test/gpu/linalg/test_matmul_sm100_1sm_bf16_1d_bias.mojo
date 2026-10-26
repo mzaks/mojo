@@ -17,6 +17,7 @@ import linalg.matmul.vendor.blas as vendor_blas
 from max.gpu.host import DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.memory import alloc
+from std.memory.alloc import unsafe_alloc
 from internal_utils import assert_almost_equal
 from std.random import rand
 from layout import TileTensor, Coord, CoordLike, row_major, Idx
@@ -27,6 +28,7 @@ from linalg.matmul.gpu.sm100_structured.structured_kernels.config import (
     MatmulConfig,
 )
 
+from std.utils.coord import DynamicCoord
 from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
 
@@ -40,7 +42,7 @@ def test_blackwell_matmul_with_1d_bias[
     b_type: DType,
     c_type: DType,
     block_tile_shape: IndexList[3],
-    mma_shape: IndexList[3],
+    mma_shape: DynamicCoord[.int, 3],
     cluster_shape: StaticTuple[Int32, 3],
     cta_group: Int = 1,
     transpose_b: Bool = True,
@@ -53,9 +55,9 @@ def test_blackwell_matmul_with_1d_bias[
     num_clc_pipeline_stages: Int = 2,
     swapAB: Bool = False,
 ](ctx: DeviceContext, m: MType, n: NType, k: KType) raises:
-    var M = Int(m.value())
-    var N = Int(n.value())
-    var K = Int(k.value())
+    var M = Int(m)
+    var N = Int(n)
+    var K = Int(k)
 
     print(
         t"[1D bias] in/out dtypes=({a_type}, {b_type}, {c_type})  problem"
@@ -63,31 +65,29 @@ def test_blackwell_matmul_with_1d_bias[
         t" mma_shape={mma_shape} block_tile_shape={block_tile_shape}"
     )
 
-    var a_shape = row_major(Coord(m, Idx[KType.static_value]))
+    var a_shape = row_major(m, Idx[KType.static_value])
     var b_shape = row_major(
-        Coord(
-            Idx[NType.static_value if transpose_b else KType.static_value],
-            Idx[KType.static_value if transpose_b else NType.static_value],
-        )
+        Idx[NType.static_value if transpose_b else KType.static_value],
+        Idx[KType.static_value if transpose_b else NType.static_value],
     )
-    var c_shape = row_major(Coord(m, Idx[NType.static_value]))
+    var c_shape = row_major(m, Idx[NType.static_value])
     # 1D bias: shape [N] — broadcast across all M rows.
-    var bias_shape = row_major(Coord(Idx[NType.static_value]))
+    var bias_shape = row_major(Idx[NType.static_value])
 
     var a_size = M * K
     var b_size = N * K if transpose_b else K * N
     var c_size = M * N
 
     # Host allocations
-    var a_host_ptr = alloc[Scalar[a_type]](a_size)
+    var a_host_ptr = unsafe_alloc[Scalar[a_type]](a_size)
     var a_host = TileTensor(a_host_ptr, a_shape)
-    var b_host_ptr = alloc[Scalar[b_type]](b_size)
+    var b_host_ptr = unsafe_alloc[Scalar[b_type]](b_size)
     var b_host = TileTensor(b_host_ptr, b_shape)
-    var c_host_ptr = alloc[Scalar[c_type]](c_size)
+    var c_host_ptr = unsafe_alloc[Scalar[c_type]](c_size)
     var c_host = TileTensor(c_host_ptr, c_shape)
-    var c_host_ref_ptr = alloc[Scalar[c_type]](c_size)
+    var c_host_ref_ptr = unsafe_alloc[Scalar[c_type]](c_size)
     var c_host_ref = TileTensor(c_host_ref_ptr, c_shape)
-    var bias_host_ptr = alloc[Scalar[c_type]](N)
+    var bias_host_ptr = unsafe_alloc[Scalar[c_type]](N)
     var bias_host = TileTensor(bias_host_ptr, bias_shape)
 
     # Device allocations
@@ -179,11 +179,11 @@ def test_blackwell_matmul_with_1d_bias[
     print("\n=== TEST PASSED ===\n")
 
     # Cleanup
-    a_host_ptr.free()
-    b_host_ptr.free()
-    c_host_ptr.free()
-    c_host_ref_ptr.free()
-    bias_host_ptr.free()
+    a_host_ptr.unsafe_free()
+    b_host_ptr.unsafe_free()
+    c_host_ptr.unsafe_free()
+    c_host_ref_ptr.unsafe_free()
+    bias_host_ptr.unsafe_free()
     _ = a_device^
     _ = b_device^
     _ = c_device^
@@ -217,8 +217,8 @@ def main() raises:
                     192,
                     256,
                 ]:
-                    comptime block_tile_shape = Index(mma_m, mma_n, BK)
-                    comptime umma_shape = Index(mma_m, mma_n, MMA_K)
+                    comptime block_tile_shape = (mma_m, mma_n, BK)
+                    comptime umma_shape = (mma_m, mma_n, MMA_K)
 
                     test_blackwell_matmul_with_1d_bias[
                         dtype,
@@ -301,8 +301,8 @@ def main() raises:
             # AB_swapped + 1D bias (1SM)
             comptime for mma_m in [64, 128]:
                 comptime for mma_n in [8, 16, 32, 48, 64, 88, 128]:
-                    comptime block_tile_shape = Index(mma_m, mma_n, BK)
-                    comptime umma_shape = Index(mma_m, mma_n, MMA_K)
+                    comptime block_tile_shape = (mma_m, mma_n, BK)
+                    comptime umma_shape = (mma_m, mma_n, MMA_K)
 
                     test_blackwell_matmul_with_1d_bias[
                         dtype,
@@ -350,8 +350,8 @@ def main() raises:
             # which reach up to BM-1 at the last warp.
             comptime for mma_m in [64, 128]:
                 comptime for mma_n in [16, 64, 128]:
-                    comptime block_tile_shape = Index(mma_m, mma_n, BK)
-                    comptime umma_shape = Index(mma_m, mma_n, MMA_K)
+                    comptime block_tile_shape = (mma_m, mma_n, BK)
+                    comptime umma_shape = (mma_m, mma_n, MMA_K)
 
                     # M=3: odd, smaller than warp size
                     test_blackwell_matmul_with_1d_bias[
@@ -395,8 +395,8 @@ def main() raises:
 
             # Non-swapAB with M=1 (single-row, non-transpose bias path)
             comptime for mma_n in [16, 64, 128]:
-                comptime block_tile_shape = Index(128, mma_n, BK)
-                comptime umma_shape = Index(128, mma_n, MMA_K)
+                comptime block_tile_shape = (128, mma_n, BK)
+                comptime umma_shape = (128, mma_n, MMA_K)
 
                 test_blackwell_matmul_with_1d_bias[
                     dtype,

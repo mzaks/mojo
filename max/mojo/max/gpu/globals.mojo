@@ -21,10 +21,85 @@ The constants are resolved at compile time based on the target GPU architecture 
 are used to optimize code generation and ensure hardware compatibility.
 """
 
-
-@__doc_inline
-from std._gpu.globals import (
-    MAX_THREADS_PER_BLOCK_METADATA,
-    WARP_SIZE,
-    WARPGROUP_SIZE,
+from std.sys.info import (
+    CompilationTarget,
+    current_accelerator,
+    is_amd_gpu,
+    is_apple_gpu,
+    is_nvidia_gpu,
 )
+
+from max._plugin import CurrentMaxPlugin
+
+# ===-----------------------------------------------------------------------===#
+# WARP_SIZE
+# ===-----------------------------------------------------------------------===#
+
+
+comptime WARP_SIZE: Int = CurrentMaxPlugin.warp_size
+"""The number of threads that execute in lockstep within a warp on the GPU.
+
+This constant represents the hardware warp size, which is the number of threads that execute
+instructions synchronously as a unit. The target's MAX plugin sets it:
+- 32 threads per warp on NVIDIA GPUs
+- 32 threads per warp on AMD RDNA GPUs
+- 64 threads per warp on AMD CDNA3/CDNA4 GPUs
+- 32 threads per warp on AMD CDNA5 GPUs
+- 32 threads per warp on Apple GPUs
+- In host code, the warp size of the build's accelerator, or 0 without one
+
+Host code that sizes a launch should use the warp size of the device it
+launches on, `ctx.default_device_info.warp_size`, rather than this constant.
+
+The warp size is a fundamental parameter that affects:
+- Thread scheduling and execution
+- Memory access coalescing
+- Synchronization primitives
+- Overall performance optimization
+"""
+
+
+# ===-----------------------------------------------------------------------===#
+# WARPGROUP_SIZE
+# ===-----------------------------------------------------------------------===#
+
+
+comptime WARPGROUP_SIZE: Int = _resolve_warpgroup_size()
+"""The number of threads in a warpgroup on Nvidia GPUs.
+
+On Nvidia GPUs after hopper, a warpgroup consists of 4 subsequent arps
+i.e. 128 threads. The first warp id must be multiple of 4.
+
+Warpgroup is used for wgmma instructions on Hopper and tcgen05.ld on Blackwell.
+"""
+
+
+def _resolve_warpgroup_size() -> Int:
+    # We can't constrain it here because the constant is used on host for
+    # compilation test w/o nvidia GPUs.
+    # comptime assert is_nvidia_gpu(), "Warpgroup only applies to Nvidia GPUs."
+
+    return 128
+
+
+# ===-----------------------------------------------------------------------===#
+# MAX_THREADS_PER_BLOCK_METADATA
+# ===-----------------------------------------------------------------------===#
+
+comptime MAX_THREADS_PER_BLOCK_METADATA = _resolve_max_threads_per_block_metadata()
+"""This is metadata tag that is used in conjunction with __llvm_metadata to
+give a hint to the compiler about the max threads per block that's used."""
+
+
+def _resolve_max_threads_per_block_metadata() -> __mlir_type.`!kgen.string`:
+    comptime if current_accelerator().is_nvidia_gpu():
+        return "nvvm.maxntid".value
+    elif current_accelerator().is_amd_gpu():
+        return "rocdl.flat_work_group_size".value
+    elif is_apple_gpu():
+        # That attribute is used to represent Metal's [[max_total_threads_per_threadgroup(x)]]
+        return "pop.air.max_work_group_size".value
+    else:
+        CompilationTarget.unsupported_target_error[
+            operation="MAX_THREADS_PER_BLOCK_METADATA",
+        ]()

@@ -37,8 +37,7 @@ from max.gpu.host import DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
 from std.utils.index import Index
-from std.utils.static_tuple import StaticTuple
-from layout import Coord, Idx, TileTensor, row_major
+from layout import Idx, TileTensor, row_major
 from linalg.matmul.gpu.sm100.block_scaled_matmul import (
     blackwell_block_scaled_matmul_tma_umma_warp_specialized,
 )
@@ -70,7 +69,7 @@ comptime mma_n = get_defined_int["mma_n", 128]()
 comptime cta_group = get_defined_int["cta_group", 1]()
 
 comptime block_tile_shape = Index(bm, mma_n // cta_group, BK)
-comptime umma_shape = Index(cta_group * bm, mma_n, MMA_K)
+comptime umma_shape = (cta_group * bm, mma_n, MMA_K)
 
 comptime fuzz_seed = get_defined_int["fuzz_seed", 12345]()
 comptime budget = get_defined_int["budget", 16]()
@@ -108,9 +107,9 @@ def run_one_case(
     var m = spec.m
     comptime transpose_b = True
 
-    var a_shape = row_major(Coord(m, Idx[K]))
-    var b_shape = row_major(Coord(Idx[N], Idx[K]))
-    var c_shape = row_major(Coord(m, Idx[N]))
+    var a_shape = row_major(m, Idx[K])
+    var b_shape = row_major(Idx[N], Idx[K])
+    var c_shape = row_major(m, Idx[N])
 
     var a_size = m * K
     var b_size = N * K
@@ -133,22 +132,18 @@ def run_one_case(
     var c_ref_tensor = TileTensor(c_device_ref, c_shape)
 
     var a_scales_shape = row_major(
-        Coord(
-            ceildiv(m, SF_MN_GROUP_SIZE),
-            Idx[ceildiv(K, SF_VECTOR_SIZE * SF_ATOM_K)],
-            Idx[SF_ATOM_M[0]],
-            Idx[SF_ATOM_M[1]],
-            Idx[SF_ATOM_K],
-        )
+        ceildiv(m, SF_MN_GROUP_SIZE),
+        Idx[ceildiv(K, SF_VECTOR_SIZE * SF_ATOM_K)],
+        Idx[SF_ATOM_M[0]],
+        Idx[SF_ATOM_M[1]],
+        Idx[SF_ATOM_K],
     )
     var b_scales_shape = row_major(
-        Coord(
-            Idx[ceildiv(N, SF_MN_GROUP_SIZE)],
-            Idx[ceildiv(K, SF_VECTOR_SIZE * SF_ATOM_K)],
-            Idx[SF_ATOM_M[0]],
-            Idx[SF_ATOM_M[1]],
-            Idx[SF_ATOM_K],
-        )
+        Idx[ceildiv(N, SF_MN_GROUP_SIZE)],
+        Idx[ceildiv(K, SF_VECTOR_SIZE * SF_ATOM_K)],
+        Idx[SF_ATOM_M[0]],
+        Idx[SF_ATOM_M[1]],
+        Idx[SF_ATOM_K],
     )
 
     var a_scales_total = a_scales_shape.product()

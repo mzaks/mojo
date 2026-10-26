@@ -19,7 +19,7 @@ from std.collections.string.string_span import _to_string_list
 from std.math import isinf, isnan
 
 from std.memory import unsafe_memcpy
-from std.python import Python, PythonObject
+from std.python import Python
 from std.testing import (
     assert_equal,
     assert_false,
@@ -28,6 +28,8 @@ from std.testing import (
     assert_true,
 )
 from std.testing import TestSuite
+from std.sys import size_of
+from test_utils import check_niches
 
 
 def test_constructors() raises:
@@ -1293,8 +1295,9 @@ def test_format_args() raises:
     var s = " {} , {} {} !".format("Hello", "Beautiful", "World")
     assert_equal(s, " Hello , Beautiful World !")
 
-    def curly(c: StaticString) -> String:
-        return "there is a single curly " + c + " left unclosed or unescaped"
+    var curly = lambda (c: StaticString) -> String: (
+        "there is a single curly " + c + " left unclosed or unescaped"
+    )
 
     with assert_raises(contains=curly("{")):
         _ = String("{ {}").format(1)
@@ -1629,7 +1632,7 @@ def test_copyinit() raises:
     var test_current_size = 1
 
     comptime for sizes_index in range(len(sizes)):
-        comptime current_size = rebind[Int](sizes[sizes_index])
+        comptime current_size = sizes[sizes_index]
         var x = ""
         for i in range(current_size):
             x += String(i)[byte=0]
@@ -1843,6 +1846,57 @@ def test_string_zero_init() raises:
     assert_equal(Int(s._ptr_or_data), 0)
     assert_equal(s._len_or_data, 0)
     assert_equal(s._capacity_or_data, String.FLAG_IS_INLINE)
+
+
+def test_string_niche() raises:
+    assert_equal(String.niche_count(), String.FLAG_IS_REF_COUNTED)
+    assert_equal(size_of[Optional[String]](), size_of[String]())
+    check_niches[String]()
+
+    def assert_optional_keeps(s: String) raises:
+        var some = Optional(s)
+        assert_true(some)
+        assert_equal(some.value(), s)
+
+    # Every representation must read back as a live value.
+    var empty = String()
+    assert_equal(empty.capacity_bytes(), String.INLINE_CAPACITY)
+    assert_optional_keeps(empty)
+
+    var literal = String("static literal")
+    assert_equal(literal.capacity_bytes(), literal.byte_length())
+    assert_optional_keeps(literal)
+    var literal_copy = literal
+    assert_optional_keeps(literal)
+    assert_optional_keeps(literal_copy)
+
+    var span = String(StaticString("static span"))
+    assert_equal(span.capacity_bytes(), span.byte_length())
+    assert_optional_keeps(span)
+    var span_copy = span
+    assert_optional_keeps(span)
+    assert_optional_keeps(span_copy)
+
+    var inline = String("short")
+    inline += "!"
+    assert_equal(inline.capacity_bytes(), String.INLINE_CAPACITY)
+    assert_optional_keeps(inline)
+    _ = inline.as_c_string_span()
+    assert_optional_keeps(inline)
+    var inline_copy = inline
+    assert_optional_keeps(inline)
+    assert_optional_keeps(inline_copy)
+
+    var heap = String("x") * 64
+    assert_true(heap.capacity_bytes() >= 64)
+    assert_optional_keeps(heap)
+    _ = heap.as_c_string_span()
+    assert_optional_keeps(heap)
+    var heap_copy = heap
+    assert_optional_keeps(heap)
+    assert_optional_keeps(heap_copy)
+
+    assert_false(Optional[String](None))
 
 
 def main() raises:

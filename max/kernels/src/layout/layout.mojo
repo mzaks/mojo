@@ -40,6 +40,7 @@ Common use cases:
 Example:
 
 ```mojo
+from std.collections import Optional
 from layout import Layout, IntTuple
 from layout.layout import blocked_product
 
@@ -60,7 +61,7 @@ from std.collections.string.string import _calc_initial_buffer_size_int32
 from std.os import abort
 
 
-from std.utils import IndexList
+from std.utils.coord import Coord
 
 from .int_tuple import (
     UNKNOWN_VALUE,
@@ -71,7 +72,6 @@ from .int_tuple import (
     flatten,
     idx2crd,
     inner_product,
-    is_flat,
     is_int,
     is_tuple,
     mul,
@@ -271,9 +271,6 @@ struct Layout(
     for complex memory access patterns like blocked or tiled layouts.
     """
 
-    comptime has_shape = True
-    """Indicates whether the layout has a valid shape."""
-
     var shape: IntTuple
     """The dimensions of the layout.
 
@@ -412,19 +409,16 @@ struct Layout(
         return Layout(shape, prefix_product(shape))
 
     @staticmethod
-    def col_major[rank: Int](tuple: IndexList[rank]) -> Layout:
-        """Creates a col-major layout from a IndexList with compile-time rank.
+    def col_major(tuple: Coord) -> Layout:
+        """Creates a col-major layout from a `Coord` of dimensions.
 
         This method creates a col-major layout where the first dimension varies fastest in memory.
         It handles both known and unknown dimensions at compile time, properly calculating
         strides for each dimension. If any dimension is unknown, subsequent strides will
         also be marked as unknown.
 
-        Parameters:
-            rank: The compile-time rank (number of dimensions) of the layout.
-
         Args:
-            tuple: An IndexList containing the dimensions of the layout.
+            tuple: A `Coord` containing the dimensions of the layout.
 
         Returns:
             A col-major Layout with the specified dimensions and computed strides.
@@ -433,11 +427,10 @@ struct Layout(
 
             ```mojo
             from layout import Layout
-            from std.utils import IndexList
+            from std.utils.coord import Coord
 
-            # Create a row-major layout with compile-time rank
-            var idx_list = IndexList[2](3, 4)
-            var layout = Layout.col_major[2](idx_list)
+            # Create a col-major layout
+            var layout = Layout.col_major(coord[3, 4])
             # Result: Layout with shape (3,4) and stride (1,3)
             ```
         """
@@ -445,13 +438,13 @@ struct Layout(
         var shape = IntTuple()
         var stride = IntTuple(c_stride)
 
-        comptime for i in range(rank):
-            shape.append(tuple[i])
+        comptime for i in range(tuple.rank):
+            shape.append(Int(tuple[i]))
 
         var unknown_flag = False
 
-        comptime for i in range(rank - 1):
-            var dim = tuple[i]
+        comptime for i in range(tuple.rank - 1):
+            var dim = Int(tuple[i])
 
             if dim == UNKNOWN_VALUE:
                 unknown_flag = True
@@ -488,19 +481,16 @@ struct Layout(
         return Self.row_major(shape)
 
     @staticmethod
-    def row_major[rank: Int](tuple: IndexList[rank]) -> Layout:
-        """Creates a row-major layout from a IndexList with compile-time rank.
+    def row_major(tuple: Coord) -> Layout:
+        """Creates a row-major layout from a `Coord` of dimensions.
 
         This method creates a row-major layout where the last dimension varies fastest in memory.
         It handles both known and unknown dimensions at compile time, properly calculating
         strides for each dimension. If any dimension is unknown, subsequent strides will
         also be marked as unknown.
 
-        Parameters:
-            rank: The compile-time rank (number of dimensions) of the layout.
-
         Args:
-            tuple: An IndexList containing the dimensions of the layout.
+            tuple: A `Coord` containing the dimensions of the layout.
 
         Returns:
             A row-major Layout with the specified dimensions and computed strides.
@@ -509,11 +499,10 @@ struct Layout(
 
             ```mojo
             from layout import Layout
-            from std.utils import IndexList
+            from std.utils.coord import Coord
 
             # Create a row-major layout with compile-time rank
-            var idx_list = IndexList[2](3, 4)
-            var layout = Layout.row_major[2](idx_list)
+            var layout = Layout.row_major(coord[3, 4])
             # Result: Layout with shape (3,4) and stride (4,1)
             ```
         """
@@ -523,11 +512,11 @@ struct Layout(
 
         var unknown_flag = False
 
-        comptime for i in range(rank):
-            shape.append(tuple[i])
+        comptime for i in range(tuple.rank):
+            shape.append(Int(tuple[i]))
 
-        comptime for i in range(rank - 1):
-            var dim = tuple[rank - 1 - i]
+        comptime for i in range(tuple.rank - 1):
+            var dim = Int(tuple[tuple.rank - 1 - i])
 
             if dim == UNKNOWN_VALUE:
                 unknown_flag = True
@@ -774,18 +763,6 @@ struct Layout(
         return self.shape.all_known() and self.stride.all_known()
 
     @inline(.nodebug)
-    def known_shape(self) -> Bool:
-        """Checks if all shape dimensions in the layout have known values.
-
-        A dimension is considered unknown if its shape is set to the special
-        `UNKNOWN_VALUE` constant. This method only checks shapes, not strides.
-
-        Returns:
-            True if all shape dimensions have known values, False otherwise.
-        """
-        return self.shape.all_known()
-
-    @inline(.nodebug)
     def transpose(self) -> Layout:
         """Transposes the layout by reversing the order of dimensions.
 
@@ -893,9 +870,9 @@ def MakeTileLayoutList[*tile_sizes: Int]() -> LayoutList:
     Returns:
         A LayoutList containing layouts for each tile size.
     """
-    var layout_list = LayoutList(capacity=tile_sizes.size)
+    var layout_list = LayoutList(capacity=tile_sizes.length)
 
-    comptime for i in range(tile_sizes.size):
+    comptime for i in range(tile_sizes.length):
         comptime arg = tile_sizes[i]
         layout_list.append(Layout(arg, 1))
 
@@ -1407,8 +1384,8 @@ def tile_to_shape(
         tiler_shape.append(a // b)
 
     var new_order: IntTuple
-    if order:
-        new_order = order.value()
+    if case .Some(order) = order:
+        new_order = order
     else:
         new_order = prefix_product(tiler_shape)  # default to column major
     var tiler = make_ordered_layout(tiler_shape, new_order)
@@ -1639,8 +1616,7 @@ def format_layout[W: Writer](layout: Layout, mut writer: W):
         writer: The writer to output the formatted layout to.
     """
 
-    @__parameter
-    def _write_divider(column_count: Int, cell_width: Int):
+    def _write_divider(column_count: Int, cell_width: Int) {mut writer}:
         for _ in range(column_count):
             writer.write("+")
             for _ in range(cell_width):
@@ -1977,24 +1953,34 @@ def is_row_major[rank: Int](layout: Layout) -> Bool:
     return True
 
 
-def is_contiguous_dim(layout: Layout, dim: Int) -> Bool:
-    """Checks if a flat layout is contiguous in a specific dimension.
+def _compute_distribute_layout[
+    data_layout: Layout,
+    threads_layout: Layout,
+    axis: Optional[Int] = None,
+]() -> Layout:
+    """Computes a layout for distributing threads across data.
 
-    This function checks if a flat layout is contiguous in a specified
-    dimension, considering both positive strides and zero strides with a single
-    element. The latter case is necessary for coalesced layouts.
+    Distributes thread_layout into data_layout. If axis is provided, distributes
+    into threads_layout projected into this axis.
 
-    Args:
-        layout: The layout to check.
-        dim: The dimension to check.
+    Parameters:
+        data_layout: The layout of the data to be distributed.
+        threads_layout: The layout of the threads.
+        axis: Optional axis for projection-based distribution.
 
     Returns:
-        True if the layout is contiguous in the specified dimension,
-        False otherwise.
+        A layout representing the distribution of threads across data.
     """
-    if not is_flat(layout.shape):
-        abort("layout must be flat")
+    var thread_tile = LayoutList()
 
-    return layout.stride[dim] == 1 or (
-        layout.stride[dim] == 0 and layout.shape[dim] == 1
-    )
+    comptime if case .Some(axis_idx) = axis:
+        return zipped_divide(
+            materialize[data_layout](),
+            Layout(threads_layout.shape[axis_idx]),
+        )
+
+    else:
+        for dim in threads_layout.shape:
+            thread_tile.append(Layout(dim))
+
+        return zipped_divide(materialize[data_layout](), thread_tile)

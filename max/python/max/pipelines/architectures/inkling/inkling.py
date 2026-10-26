@@ -15,7 +15,8 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -25,13 +26,16 @@ from max.graph import (
     BufferType,
     BufferValue,
     DeviceRef,
+    Graph,
     ShardingStrategy,
     TensorType,
     TensorValue,
+    Type,
     Value,
     Weight,
     ops,
 )
+from max.graph import Module as GraphModule
 from max.nn.comm import Signals
 from max.nn.embedding import Embedding, VocabParallelEmbedding
 from max.nn.kv_cache import (
@@ -44,10 +48,10 @@ from max.nn.kv_cache import (
 )
 from max.nn.layer import LayerList, Module
 from max.nn.linear import MLP, ColumnParallelLinear, Linear
-from max.nn.moe import make_interleaved_gated_activation_fn
 from max.nn.norm import RMSNorm
 from max.nn.quant_config import QuantConfig
 from max.nn.transformer import (
+    DecoderOutputs,
     ReturnHiddenStates,
     ReturnLogits,
     forward_sequential_layers,
@@ -160,9 +164,7 @@ class InklingDecoderLayer(Module):
                 # is what keeps the sinks unquantized in max.nn.moe.
                 dtype=DType.uint8 if routed_quant is not None else dtype,
                 shared_experts_dtype=dtype,
-                gated_activation_fn=make_interleaved_gated_activation_fn(
-                    ops.silu
-                ),
+                interleaved_gate_up=True,
                 quant_config=routed_quant,
             )
         else:
@@ -204,6 +206,7 @@ class InklingDecoderLayer(Module):
         log_scaling: Sequence[TensorValue],
         conv_pools: Sequence[Sequence[BufferValue]],
         conv_rows: Sequence[Sequence[TensorValue]],
+        layer_rows: Sequence[TensorValue],
         cache_layer_idx: TensorValue,
         signal_buffers: Sequence[BufferValue],
     ) -> list[TensorValue]:
@@ -229,6 +232,7 @@ class InklingDecoderLayer(Module):
             log_scaling,
             conv_pools,
             conv_rows,
+            layer_rows,
             cache_layer_idx,
             signal_buffers,
         )
@@ -243,6 +247,7 @@ class InklingDecoderLayer(Module):
         log_scaling: Sequence[TensorValue],
         conv_pools: Sequence[Sequence[BufferValue]],
         conv_rows: Sequence[Sequence[TensorValue]],
+        layer_rows: Sequence[TensorValue],
         cache_layer_idx: TensorValue,
         signal_buffers: Sequence[BufferValue],
     ) -> list[TensorValue]:
@@ -259,9 +264,11 @@ class InklingDecoderLayer(Module):
                 positions=positions[rank],
                 log_scaling=log_scaling[rank],
                 k_conv_ring=conv_pools[rank][ConvSite.K],
-                k_conv_row=conv_rows[rank][ConvSite.K],
+                k_conv_rows=conv_rows[rank][ConvSite.K],
+                k_layer_row=layer_rows[ConvSite.K],
                 v_conv_ring=conv_pools[rank][ConvSite.V],
-                v_conv_row=conv_rows[rank][ConvSite.V],
+                v_conv_rows=conv_rows[rank][ConvSite.V],
+                v_layer_row=layer_rows[ConvSite.V],
                 cache_layer_idx=cache_layer_idx,
             )
             for rank, shard in enumerate(self.attn_shards)
@@ -272,6 +279,7 @@ class InklingDecoderLayer(Module):
             attention,
             [pools[ConvSite.ATTN_OUT] for pools in conv_pools],
             [rows[ConvSite.ATTN_OUT] for rows in conv_rows],
+            layer_rows[ConvSite.ATTN_OUT],
             input_row_offsets,
             positions,
         )
@@ -283,6 +291,7 @@ class InklingDecoderLayer(Module):
             self._feed_forward(norm_outs),
             [pools[ConvSite.MLP_OUT] for pools in conv_pools],
             [rows[ConvSite.MLP_OUT] for rows in conv_rows],
+            layer_rows[ConvSite.MLP_OUT],
             input_row_offsets,
             positions,
         )
@@ -297,6 +306,7 @@ class InklingDecoderLayer(Module):
         log_scaling: Sequence[TensorValue],
         conv_pools: Sequence[Sequence[BufferValue]],
         conv_rows: Sequence[Sequence[TensorValue]],
+        layer_rows: Sequence[TensorValue],
         cache_layer_idx: TensorValue,
         signal_buffers: Sequence[BufferValue],
     ) -> list[TensorValue]:
@@ -317,6 +327,7 @@ class InklingDecoderLayer(Module):
             log_scaling,
             conv_pools,
             conv_rows,
+            layer_rows,
             cache_layer_idx,
             signal_buffers,
         )
@@ -329,6 +340,7 @@ class InklingDecoderLayer(Module):
         partials: Sequence[TensorValue],
         pools: Sequence[BufferValue],
         rows: Sequence[TensorValue],
+        layer_row: TensorValue,
         input_row_offsets: Sequence[TensorValue],
         positions: Sequence[TensorValue],
     ) -> list[TensorValue]:
@@ -342,6 +354,7 @@ class InklingDecoderLayer(Module):
                 partials[rank],
                 pools[rank],
                 rows[rank],
+                layer_row,
                 input_row_offsets[rank],
                 positions[rank],
             )
@@ -585,7 +598,7 @@ class Inkling(Module):
         signal_buffers: list[BufferValue],
         kv_collections: dict[str, list[PagedCacheValues]],
         state: list[RecurrentStateInputsPerDevice[TensorValue, BufferValue]],
-    ) -> tuple[TensorValue, ...]:
+    ) -> DecoderOutputs:
         """Runs the whole text model over one ragged batch."""
         if self.num_devices > 1:
             assert isinstance(self.embed, VocabParallelEmbedding)
@@ -614,25 +627,33 @@ class Inkling(Module):
 
         def sites_for_layer(
             layer_idx: int,
-        ) -> tuple[list[list[BufferValue]], list[list[TensorValue]]]:
-            """This layer's four pools and the row it holds in each."""
+        ) -> tuple[
+            list[list[BufferValue]], list[list[TensorValue]], list[TensorValue]
+        ]:
+            """Returns a layer's pools, its slot tables, and its row in each.
+
+            The kernels index the whole ``[num_layers, batch]`` table, so no
+            per-layer slice is materialized.
+            """
             pools: list[list[BufferValue]] = []
-            rows: list[list[TensorValue]] = []
+            tables: list[list[TensorValue]] = []
             sites = [
                 self.conv_layout.row_for(layer_idx, site) for site in ConvSite
             ]
             for rank in range(num_devices):
                 leaves = state[rank].leaves
                 pools.append([leaves[leaf].pool for leaf, _ in sites])
-                rows.append(
-                    [leaves[leaf].live_row_id(row) for leaf, row in sites]
-                )
-            return pools, rows
+                tables.append([leaves[leaf].live_row_ids for leaf, _ in sites])
+            layer_rows = [
+                ops.constant(row, DType.uint32, device=DeviceRef.CPU())
+                for _, row in sites
+            ]
+            return pools, tables, layer_rows
 
         def inputs_for_layer(
             layer_idx: int, previous: list[TensorValue]
         ) -> list[Tree[Any]]:
-            pools, rows = sites_for_layer(layer_idx)
+            pools, rows, layer_rows = sites_for_layer(layer_idx)
             # Each layer consumes and returns [hs..., delta...].
             return [
                 previous[:num_devices],
@@ -643,6 +664,7 @@ class Inkling(Module):
                 log_scaling,
                 pools,
                 rows,
+                layer_rows,
                 ops.constant(
                     self.layer_cache_indices[layer_idx],
                     DType.uint32,
@@ -825,4 +847,43 @@ class Inkling(Module):
             [value.buffer for value in signals],
             kv_collections_by_key(kv_tree),
             state,
+        )
+
+    def trace(
+        self,
+        *input_types: Type[Any],
+        name: str | None = None,
+        module: GraphModule | None = None,
+        custom_extensions: Iterable[Path] = (),
+        is_device_graph: bool = False,
+    ) -> Graph:
+        """Traces the graph, whose inputs are :meth:`input_types`.
+
+        Splits the flat graph inputs into :meth:`__call__`'s arguments with
+        :meth:`unpack_inputs`.
+
+        Args:
+            *input_types: The graph's input types, :meth:`input_types`.
+            name: The name of the graph. Defaults to the class's qualified
+                name.
+            module: The MLIR module to add the graph to. Defaults to a new
+                module.
+            custom_extensions: Paths to custom kernel libraries the graph
+                uses.
+            is_device_graph: Whether to build a device graph.
+
+        Returns:
+            The traced :class:`~max.graph.Graph`.
+        """
+
+        def forward(*inputs: Value[Any]) -> DecoderOutputs:
+            return self(*self.unpack_inputs(inputs))
+
+        return Graph(
+            type(self).__qualname__ if name is None else name,
+            forward,
+            input_types=input_types,
+            custom_extensions=list(custom_extensions),
+            module=module,
+            is_device_graph=is_device_graph,
         )

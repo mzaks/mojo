@@ -15,7 +15,7 @@
 Two cases exercised from `main()`:
 
   - **plain**: standard split-K (no lambda), output written to `c`.
-  - **epilogue**: split-K with `elementwise_lambda_fn`. Each output
+  - **epilogue**: split-K with an `epilogue_fn` value. Each output
     cell is reduced from `num_splits` f32 partials, then the lambda
     fires ONCE on the final reduced value (not per partial). Verifies
     both lambda accuracy vs vendor BLAS and lambda exclusivity (`c`
@@ -29,7 +29,6 @@ from std.sys import align_of, get_defined_int
 
 from layout import Coord, TileTensor, row_major
 from max.gpu.host import DeviceContext
-from std.utils import IndexList
 import linalg.matmul.vendor.blas as vendor_blas
 from std.testing import assert_equal
 from std.random import random_float64
@@ -162,7 +161,7 @@ def test_4wave_split_k_epilogue[
     var a_tt = TileTensor(device_a, row_major[M, K]())
     var b_tt = TileTensor(device_b, row_major[N, K]())
     var c_tt = TileTensor(device_c, row_major[M, N]())
-    # Capture the raw pointer: `@__copy_capture` byte-copies, so a
+    # Capture the raw pointer: a `{var}` capture byte-copies, so a
     # `DeviceBuffer`-backed tile would reach the device as a host reference.
     var out_tt = TileTensor(device_out.unsafe_ptr(), row_major[M, N]())
 
@@ -179,27 +178,23 @@ def test_4wave_split_k_epilogue[
 
     ctx.enqueue_memset(device_out, 0)
 
-    @__parameter
     @inline(.always)
-    @__copy_capture(out_tt)
     def epilogue_fn[
         _dtype: DType,
         width: SIMDLength,
         *,
-        alignment: Int = align_of[SIMD[_dtype, width]](),
-    ](idx: IndexList[2], val: SIMD[_dtype, width]) capturing -> None:
-        var coord = Coord(idx)
-        comptime assert coord.flat_rank == out_tt.flat_rank
-        out_tt.store[width=width, alignment=alignment](
-            coord, rebind[SIMD[out_dtype, width]](val)
+        alignment: Int,
+    ](idx: Coord, val: SIMD[_dtype, width]) {var} -> None:
+        comptime assert idx.rank == 2, "the matmul epilogue contract is rank 2"
+        comptime assert idx.flat_rank == out_tt.flat_rank
+        out_tt.store[alignment=alignment](
+            idx, rebind[SIMD[out_dtype, width]](val)
         )
 
     var workspace = SplitKWorkspace[num_splits](ctx, M * N)
     amd_4wave_split_k_matmul[
-        num_splits=num_splits,
-        enable_swizzle=enable_swizzle,
-        elementwise_lambda_fn=epilogue_fn,
-    ](a_tt, b_tt, c_tt, ctx, workspace=workspace)
+        num_splits=num_splits, enable_swizzle=enable_swizzle
+    ](a_tt, b_tt, c_tt, epilogue_fn, ctx, workspace=workspace)
 
     with device_out.map_to_host() as host_out, device_c_ref.map_to_host() as host_c_ref, device_c.map_to_host() as host_c:
         # 1. Lambda accuracy: out_tt vs vendor BLAS reference

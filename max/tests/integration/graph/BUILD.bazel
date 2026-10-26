@@ -1,6 +1,5 @@
-load("//bazel:api.bzl", "modular_py_binary", "modular_py_library", "modular_py_test", "requirement")
-load("//max/tests/integration/test_common:mef_precompile.bzl", "precompiled_mefs")
-load(":rowwise_reduction_specs.bzl", "ROWWISE_REDUCTION_SPECS")
+load("//bazel:api.bzl", "modular_py_library", "modular_py_test", "requirement")
+load("//bazel:config.bzl", "REQUIRES_INTERNAL_KERNELS")
 
 package(default_visibility = [
     "//:__pkg__",
@@ -26,6 +25,7 @@ _CPU_ONLY_TESTS = [
     "test_is_nan.py",
     "test_matmul_packed.py",
     "test_reduce_add.py",
+    "test_rowwise_fusion.py",
     "test_shard_and_stack.py",
     "test_symbolic_dimension_validation.py",
 ]
@@ -37,6 +37,7 @@ _SEPARATE_TARGET_TESTS = [
     "test_buffer_create_init_gpu.py",
     "test_debug_config.py",
     "test_debug_config_integration.py",
+    "test_device_graph_side_stream_reclaim.py",
     "test_device_graph_synthesis.py",
     "test_engine_device_graph.py",
     "test_execution_spans.py",
@@ -46,8 +47,11 @@ _SEPARATE_TARGET_TESTS = [
     "test_load_weights_no_deps.py",
     "test_logits_processor_gpu.py",
     "test_mega_ffn_nvfp4_fusion_gpu.py",
+    "test_mega_ffn_nvfp4_fusion_ir.py",
     "test_rowwise_reductions.py",
+    "test_rowwise_reductions_fuzz.py",
     "test_runtime_source_notes.py",
+    "test_nms.py",
     "test_scatter.py",
     "test_tile_based_fusion.py",
     "test_typical_llm_snifftest.py",
@@ -59,12 +63,15 @@ _GRAPH_COMMON_DATA = [
     "//max/tests/integration/Inputs/kernel_override_ops",
     "//max/tests/integration/Inputs/kernel_verification_ops",
     "//max/tests/integration/Inputs/test_user_op",
+    "//max/tests/integration/graph/testdata/bad_kernel_ops",
+    "//max/tests/integration/graph/testdata/bad_kernel_ops:__init__.mojo",
     "//max/tests/integration/graph/testdata/compile_config_ops",
     "//max/tests/integration/graph/testdata/counter_ops",
     "//max/tests/tests/graph/testdata",
 ]
 
 _GRAPH_COMMON_ENV = {
+    "MODULAR_BAD_KERNEL_OPS_PATH": "$(rootpath //max/tests/integration/graph/testdata/bad_kernel_ops)",
     "MODULAR_COUNTER_OPS_PATH": "$(rootpath //max/tests/integration/graph/testdata/counter_ops)",
     "MODULAR_KERNEL_OVERRIDE_OPS_PATH": "$(rootpath //max/tests/integration/Inputs/kernel_override_ops)",
     "MODULAR_KERNEL_VERIFICATION_OPS_PATH": "$(rootpath //max/tests/integration/Inputs/kernel_verification_ops)",
@@ -99,10 +106,9 @@ _GRAPH_COMMON_DEPS = [
     requirement("torchvision"),
 ]
 
-# The legacy bulk `graph` target: every graph test under the default (legacy)
-# pipeline, one per-file target each. Kept as a plain glob (identical to the
-# pre-adv-fusion form) so `modular_py_test` fans each file out into its own
-# target running only that file. A filegroup can't be used here -- its members
+# The bulk `graph` target: every graph test, one per-file target each. Kept as
+# a plain glob so `modular_py_test` fans each file out into its own target
+# running only that file. A filegroup can't be used here -- its members
 # are opaque to the fan-out, so it would be attached as a shared src to every
 # target, making each one collect and run the whole directory.
 modular_py_test(
@@ -111,10 +117,10 @@ modular_py_test(
     srcs = glob(
         ["*.py"],
         exclude = _AMD_ONLY_TESTS + _NVIDIA_ONLY_TESTS + _CPU_ONLY_TESTS + _SEPARATE_TARGET_TESTS + [
+            "_mega_ffn_graphs.py",
             "_rowwise_reduction_specs.py",
             "buffer_create_init_shared.py",
             "fusion_utils.py",
-            "precompile_rowwise_reductions.py",
             "test_nan_check.py",
         ],
     ),
@@ -139,13 +145,42 @@ modular_py_test(
     # transitively via //max/python/max/engine.
     ignore_unresolved_imports = ["max._core.mlrt.AsyncValue"],
     mojo_deps = _GRAPH_COMMON_MOJO_DEPS,
+    # Every case compiles its own graph, which times the file out as one shard.
+    per_test_shard_count = {
+        "test_horizontal_fusion.py": 4,
+        "test_mamba2_fused_inputs.py": 4,
+    },
     per_test_tags = {
         "test_epilogue_fusion.py": ["postsubmit"],
+    },
+    per_test_target_compatible_with = {
+        # Needs kda_chunk, kda_decode, registered only by the closed-source kernels.
+        "test_kda_ops.py": REQUIRES_INTERNAL_KERNELS,
+    },
+    precompile_mefs = True,
+    precompile_shards = {
+        "test_mamba2_fused_inputs.py": 4,
+        "test_resize_linear.py": 4,
+        "test_resize_nearest.py": 8,
     },
     tags = [
         "gpu",
     ],
     deps = _GRAPH_COMMON_DEPS,
+)
+
+# The MoE FFN graphs both MegaFFN fusion targets below build.
+modular_py_library(
+    name = "mega_ffn_graphs",
+    testonly = True,
+    srcs = ["_mega_ffn_graphs.py"],
+    imports = ["."],
+    deps = [
+        "//max/python/max/dtype",
+        "//max/python/max/graph",
+        "//max/python/max/nn",
+        requirement("numpy"),
+    ],
 )
 
 # Shared by every `test_*_fusion.py` file in the bulk `graph` target above:
@@ -161,7 +196,6 @@ modular_py_library(
         "//max/python/max/engine",
         "//max/python/max/graph",
         requirement("numpy"),
-        requirement("pytest"),
     ],
 )
 
@@ -208,6 +242,32 @@ modular_py_test(
 )
 
 modular_py_test(
+    name = "test_nms",
+    srcs = [
+        "conftest.py",
+        "test_nms.py",
+    ],
+    exec_properties = {
+        "test.resources:gpu-memory": "1",
+    },
+    gpu_constraints = ["//:has_gpu"] + select({
+        "//:apple_gpu": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    tags = [
+        "gpu",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        requirement("hypothesis"),
+        requirement("numpy"),
+    ],
+)
+
+modular_py_test(
     name = "test_scatter",
     srcs = [
         "conftest.py",
@@ -220,6 +280,7 @@ modular_py_test(
         "//:apple_gpu": ["@platforms//:incompatible"],  # FIXME: MOCO-2411
         "//conditions:default": [],
     }),
+    precompile_mefs = True,
     shard_count = 4,
     tags = [
         "gpu",
@@ -251,6 +312,7 @@ modular_py_test(
     # transitively through its own lazy internals; optional at runtime, like
     # the experimental package's own ignore_extra_deps for the same target.
     ignore_unresolved_imports = ["max.engine.InferenceSession"],
+    precompile_mefs = True,
     tags = [
         "gpu",
     ],
@@ -317,6 +379,7 @@ modular_py_test(
         "conftest.py",
         "test_matmul_packed.py",
         "test_reduce_add.py",
+        "test_rowwise_fusion.py",
         "test_shard_and_stack.py",
         "test_symbolic_dimension_validation.py",
     ],
@@ -372,6 +435,7 @@ modular_py_test(
         "test.resources:gpu-memory": "1",
     },
     gpu_constraints = ["//:has_gpu"],
+    precompile_mefs = True,
     tags = ["gpu"],
     deps = [
         ":buffer_create_init_shared",
@@ -393,36 +457,10 @@ modular_py_library(
     ],
 )
 
-modular_py_binary(
-    name = "precompile_rowwise_reductions_bin",
-    testonly = True,
-    srcs = ["precompile_rowwise_reductions.py"],
-    imports = ["."],
-    main = "precompile_rowwise_reductions.py",
-    tags = ["manual"],
-    deps = [
-        ":rowwise_reduction_specs",
-        "//max/python/max/graph",
-        "//max/tests/integration/test_common:mef_precompile",
-    ],
-)
-
-# One CPU build action per spec. The graphs are plain reduce/softmax/norm ops
-# that build on every lane, so the only gate is the consumer's own.
-precompiled_mefs(
-    name = "rowwise_reduction_mefs",
-    producer = ":precompile_rowwise_reductions_bin",
-    specs = ROWWISE_REDUCTION_SPECS,
-    target_compatible_with = ["//:has_gpu"] + select({
-        "//:apple_gpu": ["@platforms//:incompatible"],
-        "//conditions:default": [],
-    }),
-)
-
-# Row-wise reduction correctness tests. Each parametrization initializes one
-# precompiled symbolic-dimension MEF and feeds several concrete shapes as data;
-# the compiles moved to the CPU build actions above, so no graph is compiled on
-# the GPU worker.
+# Row-wise reduction correctness tests. Each parametrization compiles one
+# symbolic-dimension graph and feeds several concrete shapes as data. The
+# compiles happen in CPU build actions (`precompile_mefs`, eight of them), so
+# the GPU worker only initializes and executes.
 #
 # Needs a GPU lane: every case is parametrized over CPU and GPU, and the GPU half
 # is the priority -- the cooperative tiers, the cross-thread combine and the
@@ -438,10 +476,6 @@ modular_py_test(
         "conftest.py",
         "test_rowwise_reductions.py",
     ],
-    data = [":rowwise_reduction_mefs"],
-    env = {
-        "ROWWISE_MEF_RLOCATIONS": "$(rlocationpaths :rowwise_reduction_mefs)",
-    },
     exec_properties = {
         "test.resources:gpu-memory": "2",
     },
@@ -450,13 +484,49 @@ modular_py_test(
         "//conditions:default": [],
     }),
     imports = ["."],
+    precompile_mefs = True,
+    precompile_shards = 8,
     tags = ["gpu"],
     deps = [
         ":rowwise_reduction_specs",
         "//max/python/max/driver",
         "//max/python/max/dtype",
         "//max/python/max/engine",
-        "//max/tests/integration/test_common:mef_precompile",
+        "//max/tests/integration/test_common:reduction_graphs",
+        requirement("hypothesis"),
+        requirement("numpy"),
+        requirement("torch"),
+    ],
+)
+
+# Property tests for sum, max, min and mean, on CPU and GPU. They replace the
+# kernel-level fuzzing of the hand-written reductions these ops used to run.
+# Each case compiles one graph in a CPU build action (`precompile_mefs`), and
+# hypothesis draws fixed (`derandomize`) extents and values for it.
+modular_py_test(
+    name = "test_rowwise_reductions_fuzz",
+    size = "large",
+    srcs = [
+        "conftest.py",
+        "test_rowwise_reductions_fuzz.py",
+    ],
+    exec_properties = {
+        "test.resources:gpu-memory": "2",
+    },
+    gpu_constraints = ["//:has_gpu"] + select({
+        "//:apple_gpu": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    imports = ["."],
+    precompile_mefs = True,
+    precompile_shards = 4,
+    shard_count = 4,
+    tags = ["gpu"],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
         "//max/tests/integration/test_common:reduction_graphs",
         requirement("hypothesis"),
         requirement("numpy"),
@@ -512,6 +582,36 @@ modular_py_test(
         "//:apple_gpu": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
+    precompile_mefs = True,
+    tags = [
+        "gpu",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        requirement("hypothesis"),
+        requirement("numpy"),
+    ],
+)
+
+# A small VMM budget with fine granules, so filling the free budget after a
+# capture is cheap and the allocator's reuse of released memory is visible.
+modular_py_test(
+    name = "test_device_graph_side_stream_reclaim",
+    srcs = [
+        "conftest.py",
+        "test_device_graph_side_stream_reclaim.py",
+    ],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE": "2147483648",
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM": "1",
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM_PAGE_MB": "2",
+    },
+    # TODO(CENG-1259): Run on AMD too once HIP keeps side-stream views alive
+    # after capture; the fix this test covers is CUDA only.
+    gpu_constraints = ["//:nvidia_gpu"],
     tags = [
         "gpu",
     ],
@@ -535,6 +635,7 @@ modular_py_test(
         "//:apple_gpu": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
+    precompile_mefs = True,
     tags = [
         "gpu",
     ],
@@ -559,6 +660,7 @@ modular_py_test(
         "//:apple_gpu": ["@platforms//:incompatible"],  # FIXME: MOCO-2411
         "//conditions:default": [],
     }),
+    precompile_mefs = True,
     tags = ["gpu"],
     deps = [
         "//max/python/max/driver",
@@ -575,24 +677,58 @@ modular_py_test(
     srcs = [
         "test_mega_ffn_nvfp4_fusion_gpu.py",
     ],
-    # Disable the MEF compile cache so the `*_fires_in_mo_ir` tests always run
-    # the MO pipeline (and emit the IR dump they grep): the cache key is
-    # structural, so their graph would otherwise be a cache hit off the
-    # compiles-and-runs test's identical graph and skip the pipeline (no dump).
-    env = {"MODULAR_MAX_ENABLE_MODEL_IR_CACHE": "false"},
     # B200-only: the fused MegaFFN NVFP4 kernel the fusion lowers to is SM100a
     # (Blackwell) specific. Off SM100 the pattern does not fire and the legs
     # run as standalone kernels, so there is nothing to exercise.
+    gpu_constraints = ["//:b200_gpu"],
+    precompile_mefs = True,
+    precompile_shards = 3,
     tags = ["gpu"],
-    target_compatible_with = ["//:b200_gpu"],
+    # Needs mo.composite.mega_ffn_nvfp4, registered only by the closed-source kernels.
+    target_compatible_with = REQUIRES_INTERNAL_KERNELS,
     deps = [
+        ":mega_ffn_graphs",
         "//max/python/max/driver",
         "//max/python/max/dtype",
         "//max/python/max/engine",
         "//max/python/max/graph",
-        "//max/python/max/nn",
         requirement("numpy"),
         requirement("torch"),
+    ],
+)
+
+# The fusion's IR checks only compile, so they run on a CPU worker against a
+# virtual SM100 device. Virtual-device mode latches process-wide, so this is
+# its own target.
+modular_py_test(
+    name = "test_mega_ffn_nvfp4_fusion_ir",
+    size = "large",
+    srcs = [
+        "test_mega_ffn_nvfp4_fusion_ir.py",
+    ],
+    # The checks read the IR dump a compile writes, which a cache hit skips.
+    env = {"MODULAR_MAX_ENABLE_MODEL_IR_CACHE": "false"},
+    # The checks target a virtual device, so the host CPU doesn't matter; run
+    # them on m7i only.
+    # TODO(SDLC-4684): run on asan in a scheduled tier once CI supports one.
+    tags = [
+        "skip-ci-asan",
+        "skip-ci-m7g",
+        "skip-ci-ubsan",
+        "skip-external-ci",
+    ],
+    # The virtual CUDA (sm_100a) graphs need the NVPTX compiler to elaborate
+    # kernels, which is Linux-only (CUDACompilationDevice).
+    # Needs mo.composite.mega_ffn_nvfp4, registered only by the closed-source kernels.
+    target_compatible_with = select({
+        "@platforms//os:macos": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }) + REQUIRES_INTERNAL_KERNELS,
+    deps = [
+        ":mega_ffn_graphs",
+        "//max/python/max/driver",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
     ],
 )
 
@@ -653,6 +789,7 @@ modular_py_test(
         "//:apple_gpu": ["@platforms//:incompatible"],  # FIXME: SDLC-2743
         "//conditions:default": [],
     }),
+    precompile_mefs = True,
     tags = [
         "gpu",
     ],
@@ -685,6 +822,7 @@ modular_py_test(
         "//:amd_gpu": ["@platforms//:incompatible"],  # ROCm aborts on GPU trap
         "//conditions:default": [],
     }),
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -814,6 +952,7 @@ modular_py_test(
         "//:amd_gpu": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",

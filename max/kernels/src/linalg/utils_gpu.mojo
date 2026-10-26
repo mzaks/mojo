@@ -13,13 +13,12 @@
 
 """Provides GPU matmul configuration selection, block-swizzling, and Hilbert-curve tile-ordering utilities."""
 
-from std.hashlib.hasher import Hasher
+from std.hash.hasher import Hasher
 from std.math import ceildiv
 from std.math.uutils import uceildiv
 from std.sys import (
     get_defined_int,
     get_defined_bool,
-    has_nvidia_gpu_accelerator,
     size_of,
 )
 from std.ffi import external_call, _get_global_or_null
@@ -33,6 +32,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 from max.gpu.host.info import A100
 from layout.tensor_core import get_mma_shape
 
+from std.utils.coord import Coord, DynamicCoord, coord_to_index_list
 from std.utils.index import Index, IndexList
 from std.utils.numerics import get_accum_type
 
@@ -174,7 +174,9 @@ struct MatmulConfig[
         *,
         block_tile_shape: IndexList[3] = Index(128, 128, 32),
         warp_tile_shape: IndexList[3] = Index(64, 64, 32),
-        mma_shape: IndexList[3] = get_mma_shape[Self.a_type, Self.accum_type](),
+        mma_shape: DynamicCoord[.int, 3] = get_mma_shape[
+            Self.a_type, Self.accum_type
+        ](),
         cluster_shape: IndexList[3] = Index(1, 1, 1),
         num_pipeline_stages: Int = 4,
         num_k_partitions: Int = 1,
@@ -186,7 +188,7 @@ struct MatmulConfig[
     ):
         self.block_tile_shape = block_tile_shape
         self.warp_tile_shape = warp_tile_shape
-        self.mma_shape = mma_shape
+        self.mma_shape = coord_to_index_list(mma_shape)
         self.num_pipeline_stages = num_pipeline_stages
         self.num_k_partitions = num_k_partitions
         self.k_group_size = k_group_size
@@ -239,15 +241,15 @@ struct MatmulConfig[
             self.num_warp_k_partitions,
         )
 
-    def grid_dim(self, m: Int, n: Int) -> IndexList[3]:
-        return Index(
+    def grid_dim(self, m: Int, n: Int) -> DynamicCoord[.int, 3]:
+        return (
             uceildiv(n, self.block_tile_shape[1]),
             uceildiv(m, self.block_tile_shape[0]),
             self.num_k_partitions,
         )
 
-    def block_dim(self) -> IndexList[3]:
-        return Index(self.num_threads(), 1, 1)
+    def block_dim(self) -> DynamicCoord[.int, 3]:
+        return (self.num_threads(), 1, 1)
 
     def work_space_size(self, M: Int, N: Int) -> Int:
         return M * N * (self.num_k_partitions - 1)
@@ -457,7 +459,7 @@ def select_config[
     comptime gpu_info = ctx.default_device_info
 
     # TODO(KERN-1310): This disables split-k for AMD, enable it after fixing KERN-1310.
-    comptime max_num_k_partitions = 8 if has_nvidia_gpu_accelerator() else 1
+    comptime max_num_k_partitions = 8 if ctx.target.is_nvidia_gpu() else 1
     comptime min_k_partition = 1024
 
     # Initial values overwritten in loop
@@ -593,7 +595,7 @@ def create_hilbert_lut(
     """
     var num_blocks = grid_x * grid_y
     # Allocate temporary host buffer.
-    var host = alloc(AllocLayout[UInt32](count=num_blocks)).into_managed()
+    var host = alloc(AllocLayout[UInt32](length=num_blocks)).into_managed()
 
     # Next power-of-two square dimension enclosing the rectangle.
     var dim_pow2 = 1
@@ -652,8 +654,8 @@ def get_hilbert_lut_with_cache(
     # use runtime lookup since key is computed at runtime
     var cached_ptr = _get_global_or_null(key_str)
 
-    if cached_ptr:
-        var device_ptr = cached_ptr.unsafe_value().unsafe_bitcast[UInt32]()
+    if case .Some(cached_ptr) = cached_ptr:
+        var device_ptr = cached_ptr.unsafe_bitcast[UInt32]()
         var num_blocks = grid_x * grid_y
         # the cached buffer stays alive as long as the program runs
         return DeviceBuffer[.uint32](ctx, device_ptr, num_blocks, owning=False)
@@ -666,7 +668,7 @@ def get_hilbert_lut_with_cache(
     # store the device pointer directly in global cache
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(key_str),
-        device_ptr.bitcast[NoneType](),
+        device_ptr.unsafe_bitcast[NoneType](),
     )
 
     # the buffer will live for the duration of the program

@@ -167,8 +167,8 @@ struct MaskTileOp[
         # Decompose lane via the warp layout: WarpLayout is col-major
         # (warp_rows, warp_cols), so idx2crd(lane) = (lane_row, lane_col).
         var lane_coord = Self.WarpLayoutT().idx2crd(Int(lane_id()))
-        var lane_row = Int(lane_coord[0].value())
-        var lane_col = Int(lane_coord[1].value())
+        var lane_row = Int(lane_coord[0])
+        var lane_col = Int(lane_coord[1])
         var lane_col_off = lane_col * Self._lane_col_stride
 
         # Token fold: S = valid_rows / H (= 1 off the fold path, byte-identical).
@@ -311,7 +311,7 @@ struct MaskTileOp[
                         # at its KV head's first. S==1 is split out
                         # (byte-identical). Only head-keyed masks consume this;
                         # Causal/Null ignore it.
-                        var q_head_idx = Int(block_idx.x)
+                        var q_head_idx = block_idx.x
                         comptime if Self.token_gen:
                             comptime if fold_seq_len == 1:
                                 q_head_idx = block_idx.y * Self.group + umod(
@@ -327,7 +327,7 @@ struct MaskTileOp[
                                     % Self.num_heads_per_token
                                 )
                                 q_head_idx = (
-                                    Int(block_idx.y) * Self.head_base_stride
+                                    block_idx.y * Self.head_base_stride
                                     + head_in_token
                                 )
                         comptime for j in range(0, output_frag_size, 1):

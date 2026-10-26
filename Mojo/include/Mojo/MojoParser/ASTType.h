@@ -372,14 +372,17 @@ struct ASTTypePrinterContext {
   /// prints `Self` in place of the fully-expanded form.
   ASTType selfType = {};
 
-  /// Set to true to print closure trait signature.
-  bool suppressThin = false;
+  /// Set to true when printing a closure trait signature.
+  bool isClosureSignature = false;
 
   ASTTypePrinterContext() {}
   ASTTypePrinterContext(SharedState *shared) : shared(shared) {}
   ASTTypePrinterContext(SharedState *shared, ASTType selfType)
       : shared(shared), selfType(selfType) {}
 };
+
+/// Returns true for `SIMD[_, 1]`.
+bool isScalarSIMDType(StructType type);
 
 } // namespace KGEN::LIT
 

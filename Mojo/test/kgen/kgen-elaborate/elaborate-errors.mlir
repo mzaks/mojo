@@ -216,7 +216,7 @@ kgen.generator @will_pass<a, b>() -> (index, index) {
   hlcf.return %0, %1 : index, index
 }
 
-!capture = !kgen.struct<(string, index, (!kgen.pointer<pointer<none>>) capturing -> !kgen.none)>
+!capture = !kgen.struct<(string, index, (!kgen.pointer<pointer<none>>) -> !kgen.none)>
 
 // expected-error @below {{function instantiation failed}}
 kgen.generator export @main() {
@@ -378,73 +378,6 @@ kgen.struct.generator @FieldTypeTestStruct = struct_inst<"FieldTypeTestStruct"(a
 kgen.generator @test_field_type_not_found() {
   // expected-note @below {{struct 'FieldTypeTestStruct' has no field named 'missing'}}
   kgen.param.constant: type = <#kgen.struct_field_type_by_name<#field_type_test_struct, "missing">>
-  hlcf.return
-}
-
-// -----
-
-// Reading past the end of a struct's `@__annotation` list is reported rather
-// than folded away, so the failure names the index the source asked for.
-
-kgen.struct.generator @Annotated = struct_inst<"Annotated"(value: index)>
-    attributes {
-  annotationTypes = #kgen<exprs[#kgen.type<index> : !kgen.type]>,
-  annotations = #kgen<exprs[7 : index]>
-}
-
-#annotated = #kgen.type<typevalue<:type #kgen.genref<@Annotated>>,
-                        struct<(index)>> : !kgen.type
-
-// expected-error @below {{function instantiation failed}}
-kgen.generator @test_annotation_out_of_bounds() {
-  // expected-note @+1 {{annotation index 3 is out of bounds; there is 1 annotation}}
-  kgen.param.constant: !kgen.param<#kgen.param_list.get<:param_list<type> #kgen.struct_annotation_types<#annotated, -1> : !kgen.param_list<!kgen.type>, 3>> = <#kgen.struct_annotation<#annotated, -1, 3, !kgen.param_list<!kgen.type>>>
-  hlcf.return
-}
-
-// -----
-
-// The field index has to name a real field. Without the check an out-of-range
-// index reads as an empty list, and any negative index other than the -1
-// sentinel silently selects the struct's own annotations.
-
-kgen.struct.generator @TwoFields
-    = struct_inst<"TwoFields"(first: index, second: i32)>
-
-#two_fields = #kgen.type<typevalue<:type #kgen.genref<@TwoFields>>,
-                         struct<(index, i32)>> : !kgen.type
-
-// expected-error @below {{function instantiation failed}}
-kgen.generator @test_field_index_out_of_bounds() {
-  // expected-note @+1 {{field index 99 is out of bounds; there are 2 fields}}
-  kgen.param.constant: param_list<type> = <#kgen.struct_annotation_types<#two_fields, 99> : !kgen.param_list<!kgen.type>>
-  hlcf.return
-}
-
-// -----
-
-kgen.struct.generator @TwoFields
-    = struct_inst<"TwoFields"(first: index, second: i32)>
-
-#two_fields = #kgen.type<typevalue<:type #kgen.genref<@TwoFields>>,
-                         struct<(index, i32)>> : !kgen.type
-
-// expected-error @below {{function instantiation failed}}
-kgen.generator @test_field_index_negative() {
-  // expected-note @+1 {{field index -5 is negative; only -1 selects the struct's own annotations}}
-  kgen.param.constant: param_list<type> = <#kgen.struct_annotation_types<#two_fields, -5> : !kgen.param_list<!kgen.type>>
-  hlcf.return
-}
-
-// -----
-
-// An operand that does not name a struct at all, the way
-// `struct_field_types` reports it.
-
-// expected-error @below {{function instantiation failed}}
-kgen.generator @test_annotation_non_struct_type() {
-  // expected-note @+1 {{struct_annotation_types requires a struct type}}
-  kgen.param.constant: param_list<type> = <#kgen.struct_annotation_types<i32, -1> : !kgen.param_list<!kgen.type>>
   hlcf.return
 }
 
@@ -639,4 +572,20 @@ kgen.generator export @nary_identical_unknown_with_target() -> !kgen.scalar<bool
   %0 = kgen.param.constant: !kgen.scalar<bool> = <value>
   hlcf.return %0 : !kgen.scalar<bool>
 }
+}
+
+// -----
+
+// Test that a constant shift-right amount outside the operand's bit width gets
+// a clear diagnostic from validateForElaborator instead of the generic
+// "could not simplify operator" note.
+//
+// `shl` with matching types folds to zero before reaching validateForElaborator,
+// so it cannot produce this diagnostic and is not tested here.
+
+// expected-error @below {{function instantiation failed}}
+kgen.generator @shift_out_of_range_shr() {
+  // expected-note @below {{shift amount 9 is outside the valid range 0..7 for scalar<ui8>}}
+  %0 = kgen.param.constant: !kgen.scalar<ui8> = <shr(1, 9)>
+  hlcf.return
 }

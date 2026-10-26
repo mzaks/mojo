@@ -51,7 +51,7 @@ class GeneralPipelineHandler(
     """General pipeline handler for OpenResponses API requests.
 
     This is a minimal implementation that can be extended for specific
-    modalities (image, video, etc.).
+    modalities (image, video and so on).
     """
 
     async def next(
@@ -80,6 +80,7 @@ class GeneralPipelineHandler(
             self._preprocess_cache_stats.record(
                 carried_media=_carries_media(request)
             )
+            self._chat_encoder_outcomes.record()
 
             # Stream responses from the engine. Awaiting the submit hands the
             # request off to the model worker, so a failed handoff raises here.

@@ -17,7 +17,7 @@ kgen.func @inreg_args(%arg0: index owned) {
 // CHECK-LABEL: kgen.func @indirectly_referenced
 // CHECK-SAME: %arg0: !kgen.pointer<index> imm_mem
 kgen.func @indirectly_referenced(%arg0: !kgen.pointer<index> imm_mem) {
-  kgen.create_closure[(!kgen.pointer<index> imm_mem) -> (): @indirectly_referenced]()
+  kgen.create_func_ptr[(!kgen.pointer<index> imm_mem) -> (): @indirectly_referenced]()
   hlcf.return
 }
 
@@ -32,6 +32,21 @@ kgen.func @too_large(%arg0: !kgen.pointer<array<64, f64>> imm_mem) {
 kgen.func @used_as_store_arg(%arg0: !kgen.pointer<index> imm_mem) {
   %0 = pop.stack_allocation 1 x pointer<index>
   pop.store %arg0, %0 : !kgen.pointer<pointer<index>>
+  hlcf.return
+}
+
+// CHECK-LABEL: kgen.func @atomic_load
+// CHECK-SAME: %arg0: !kgen.pointer<index> imm_mem
+kgen.func @atomic_load(%arg0: !kgen.pointer<index> imm_mem) -> index {
+  %0 = pop.load atomic seq_cst %arg0 : !kgen.pointer<index>
+  hlcf.return %0 : index
+}
+
+// CHECK-LABEL: kgen.func @atomic_store
+// CHECK-SAME: %arg0: !kgen.pointer<index> mut
+kgen.func @atomic_store(%arg0: !kgen.pointer<index> mut) {
+  %idx0 = kgen.param.constant: index = <0>
+  pop.store atomic release %idx0, %arg0 : !kgen.pointer<index>
   hlcf.return
 }
 
@@ -256,6 +271,23 @@ kgen.func @recursion(%arg0: !kgen.pointer<index> mut) {
   // CHECK-NEXT: store %2, %0
   // CHECK-NEXT: %3 = pop.load %0
   // CHECK-NEXT: return %3
+  hlcf.return
+}
+
+// A promoted 'out' leaves no argument behind, so its entry goes too.
+// CHECK-LABEL: kgen.func @arg_metadata_follows_promoted_args
+// CHECK-SAME: (%arg0: index, %arg1: !kgen.pointer<index> imm_mem) -> index
+// CHECK-SAME: fnArgAttrs = [{nvvm.grid_constant}, {llvm.noalias}]
+kgen.func @arg_metadata_follows_promoted_args(
+    %arg0: !kgen.pointer<index> imm_mem,
+    %arg1: !kgen.pointer<index> imm_mem,
+    %arg2: !kgen.pointer<index> byref_result) attributes {
+  fnArgAttrs = [{nvvm.grid_constant = unit}, {llvm.noalias = unit}, {}]
+} {
+  %0 = pop.load %arg0 : !kgen.pointer<index>
+  pop.store %0, %arg2 : !kgen.pointer<index>
+  %1 = pop.stack_allocation 1 x pointer<index>
+  pop.store %arg1, %1 : !kgen.pointer<pointer<index>>
   hlcf.return
 }
 

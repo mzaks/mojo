@@ -14,7 +14,7 @@ before elaboration. Results are diagnostics with source locations. It needs
 `z3` on `PATH` (or `z3-path=`).
 
 ```bash
-./bazelw build --config=build-mojo //Mojo/tools/kgen:kgen //Mojo/stdlib/std:std
+./bazelw build //Mojo/tools/kgen:kgen //Mojo/stdlib/std:std
 bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
     Mojo/test/kgen/verify-contracts/straight_line.mojo \
     -elaborate --verify-contracts="verbose=true"
@@ -37,7 +37,7 @@ obligations. It is a corpus driver, not an example of what is proven:
 expect about 40 CPU minutes cold.
 
 ```bash
-./bazelw build --config=build-mojo //max/kernels/src/layout:layout
+./bazelw build //max/kernels/src/layout:layout
 bazel-bin/Mojo/tools/kgen/kgen -I bazel-bin/Mojo/stdlib/std \
     -I bazel-bin/max/mojo/max -I bazel-bin/max/kernels/src/layout \
     Mojo/test/kgen/verify-contracts/tensors.mojo \

@@ -57,8 +57,7 @@ from std.benchmark import (
 from std.random import rand
 
 from max.benchmark import bencher_iter_custom
-from max.gpu.host import DeviceContext, get_gpu_target
-from max.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.host import DeviceContext
 from max.gpu.primitives.grid_controls import PDLLevel
 
 from internal_utils import CacheBustingBuffer, arg_parse
@@ -111,12 +110,12 @@ def bench_rms_norm_gemm_pdl[
     """
     comptime assert dtype == .bfloat16, "this bench is bf16-only"
 
-    comptime simd_size = simd_width_of[dtype, target=get_gpu_target()]()
+    comptime simd_size = simd_width_of[dtype, target=ctx.target]()
     comptime MMA_K = 16
 
     comptime gemm_config_off = MatmulConfig[dtype, dtype, dtype, True](
         cluster_shape=Index(cta_group, 1, 1),
-        mma_shape=Index(mma_m, mma_n, MMA_K),
+        mma_shape=(mma_m, mma_n, MMA_K),
         cta_group=cta_group,
         num_pipeline_stages=num_pipeline_stages,
         num_accum_pipeline_stages=1,
@@ -126,7 +125,7 @@ def bench_rms_norm_gemm_pdl[
     )
     comptime gemm_config_prefetch = MatmulConfig[dtype, dtype, dtype, True](
         cluster_shape=Index(cta_group, 1, 1),
-        mma_shape=Index(mma_m, mma_n, MMA_K),
+        mma_shape=(mma_m, mma_n, MMA_K),
         cta_group=cta_group,
         num_pipeline_stages=num_pipeline_stages,
         num_accum_pipeline_stages=1,
@@ -139,9 +138,9 @@ def bench_rms_norm_gemm_pdl[
     var a_elems = num_rows * num_cols
     var w_elems = gemm_n * num_cols
     var c_elems = num_rows * gemm_n
-    var epsilon = Float32(1e-5)
+    comptime epsilon = Float32(1e-5)
     # 0.0 matches the plain RMSNorm this pair models (no Gemma-style offset).
-    var weight_offset = Scalar[dtype](0.0)
+    comptime weight_offset = Float32(0.0)
 
     var a_host = List[Scalar[dtype]](unsafe_uninit_length=a_elems)
     rand(a_host.unsafe_ptr(), a_elems)
@@ -178,13 +177,11 @@ def bench_rms_norm_gemm_pdl[
     ctx.enqueue_copy(a_raw_dev, a_host)
     ctx.enqueue_copy(gamma_dev, gamma_host)
 
-    var a_raw = TileTensor(a_raw_dev, row_major(Coord(num_rows, Idx[num_cols])))
-    var a_normed = TileTensor(
-        a_normed_dev, row_major(Coord(num_rows, Idx[num_cols]))
-    )
-    var gamma = TileTensor(gamma_dev, row_major(Coord(Idx[num_cols])))
-    var c_out = TileTensor(c_dev, row_major(Coord(num_rows, Idx[gemm_n])))
-    var c_ref = TileTensor(c_ref_dev, row_major(Coord(num_rows, Idx[gemm_n])))
+    var a_raw = TileTensor(a_raw_dev, row_major(num_rows, Idx[num_cols]))
+    var a_normed = TileTensor(a_normed_dev, row_major(num_rows, Idx[num_cols]))
+    var gamma = TileTensor(gamma_dev, row_major(Idx[num_cols]))
+    var c_out = TileTensor(c_dev, row_major(num_rows, Idx[gemm_n]))
+    var c_ref = TileTensor(c_ref_dev, row_major(num_rows, Idx[gemm_n]))
     var norm_shape = Index(num_rows, num_cols)
 
     # `[N, K]` (transpose_b) with BOTH dims static, as the SM100 kernel needs.
@@ -192,7 +189,7 @@ def bench_rms_norm_gemm_pdl[
     # each iteration streams cold weights -- the cost the prefetch must hide.
     comptime WeightType = TileTensor[
         dtype,
-        type_of(row_major(Coord(Idx[gemm_n], Idx[num_cols]))),
+        type_of(row_major(Idx[gemm_n], Idx[num_cols])),
         ImmutAnyOrigin,
     ]
 
@@ -201,16 +198,6 @@ def bench_rms_norm_gemm_pdl[
     comptime GammaType = type_of(gamma)
     comptime CBWeightsType = type_of(cb_weights)
     comptime NormShapeType = type_of(norm_shape)
-
-    @inline(.always)
-    @__copy_capture(a_normed)
-    @__parameter
-    def output_fn[
-        width: SIMDLength, alignment: Int
-    ](coords: Coord, val: SIMD[dtype, width]) -> None:
-        a_normed.raw_store[width=width, alignment=alignment](
-            a_normed.layout(coords), val
-        )
 
     @inline(.always)
     def run_pair[
@@ -227,24 +214,28 @@ def bench_rms_norm_gemm_pdl[
         a_normed: ANormedType,
         mut cb_weights: CBWeightsType,
         gamma: GammaType,
-        epsilon: Float32,
-        weight_offset: Scalar[dtype],
         norm_shape: NormShapeType,
     ) raises {}:
         @inline(.always)
-        @__copy_capture(a_raw)
-        @__parameter
-        def input_fn[width: Int](coords: Coord) -> SIMD[dtype, width]:
-            return a_raw.raw_load[width=width](a_raw.layout(coords))
+        def input_fn[
+            width: Int
+        ](coords: Coord) {var a_raw} -> SIMD[dtype, width]:
+            return a_raw.load[width=width](coords)
+
+        @inline(.always)
+        def output_fn[
+            width: SIMDLength, alignment: Int
+        ](coords: Coord, val: SIMD[dtype, width]) {var a_normed} -> None:
+            a_normed.store[alignment=alignment](coords, val)
 
         comptime if not gemm_only:
             rms_norm_gpu[
                 2,
-                input_fn,
-                output_fn,
+                epsilon=epsilon,
+                weight_offset=weight_offset,
                 multiply_before_cast=True,
                 pdl_level=norm_pdl,
-            ](Coord(norm_shape), gamma, epsilon, weight_offset, ctx_inner)
+            ](input_fn, output_fn, Coord(norm_shape), gamma, ctx_inner)
 
         comptime if not norm_only:
             comptime gemm_config = (
@@ -259,7 +250,7 @@ def bench_rms_norm_gemm_pdl[
                     rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                         cb_weights.offset_ptr(cache_iter)
                     ),
-                    row_major(Coord(Idx[gemm_n], Idx[num_cols])),
+                    row_major(Idx[gemm_n], Idx[num_cols]),
                 ),
                 ctx_inner,
             )
@@ -276,8 +267,6 @@ def bench_rms_norm_gemm_pdl[
         a_normed,
         cb_weights,
         gamma,
-        epsilon,
-        weight_offset,
         norm_shape,
     )
     ctx.synchronize()
@@ -298,8 +287,6 @@ def bench_rms_norm_gemm_pdl[
             a_normed,
             cb_weights,
             gamma,
-            epsilon,
-            weight_offset,
             norm_shape,
         )
         ctx.synchronize()
@@ -362,8 +349,6 @@ def bench_rms_norm_gemm_pdl[
             imm a_raw,
             imm a_normed,
             imm gamma,
-            var epsilon,
-            var weight_offset,
             var norm_shape,
         }:
             run_pair[
@@ -380,8 +365,6 @@ def bench_rms_norm_gemm_pdl[
                 a_normed,
                 cb_weights,
                 gamma,
-                epsilon,
-                weight_offset,
                 norm_shape,
             )
 

@@ -206,8 +206,7 @@ def ok_unrolled(xs: List[Int]) -> Int:
     var sum = 0
     var at = 0
 
-    @__parameter
-    def step():
+    def step() {mut sum, mut at, imm}:
         sum += xs[at]
         at += 1
 
@@ -393,8 +392,7 @@ def bad_unrolled(xs: List[Int]) -> Int:
     var sum = 0
     var at = 0
 
-    @__parameter
-    def step():
+    def step() {mut sum, mut at, imm}:
         sum += xs[at]
         at += 1
 
@@ -412,8 +410,7 @@ def bad_closure_counter(xs: List[Int]) -> Int:
     var sum = 0
     var at = 0
 
-    @__parameter
-    def step():
+    def step() {mut sum, mut at, imm}:
         sum += xs[at]
         at += 1  # written in the closure: the loop below changes it
 

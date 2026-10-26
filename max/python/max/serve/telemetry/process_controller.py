@@ -33,7 +33,8 @@ from typing import Any
 import prometheus_client
 from max.serve.config import MetricRecordingMethod, Settings
 from max.serve.process_control import subprocess_manager
-from max.serve.telemetry.common import configure_metrics, configure_tracing
+from max.serve.telemetry._tracing import configure_tracing
+from max.serve.telemetry.common import configure_metrics
 from max.serve.telemetry.metrics import (
     MaxMeasurement,
     MetricClient,
@@ -54,11 +55,11 @@ class ProcessMetricClient(MetricClient):
     ``transaction_buffer`` / ``transaction_depth`` are deliberately
     unsynchronized. This is safe because of a single-emitter invariant: the
     only process that opens transactions is the model worker, which emits
-    metrics from one async event loop, and every transaction body (e.g.
+    metrics from one async event loop, and every transaction body (such as
     ``construct_batch`` / ``_publish_metrics``) is fully synchronous — no
     ``await`` inside — so no other measurement can interleave. Do not open a
     ``transaction()`` from a context where measurements are produced
-    concurrently (e.g. the API server's per-request handlers) without first
+    concurrently (such as the API server's per-request handlers) without first
     making this state thread-local; otherwise unrelated measurements would be
     swept into the batch and the buffer mutations would race.
     """
@@ -165,7 +166,11 @@ async def start_process_consumer(
             await proc.ready(alive, settings.telemetry_worker_spawn_timeout)
 
             if settings.use_heartbeat:
-                proc.watch_heartbeat(alive, timeout=5)
+                # Use the same limit as the model worker. Under memory
+                # pressure the host can stall all processes for seconds.
+                # A crash is seen at once by the process sentinel, so this
+                # only needs to catch a hang.
+                proc.watch_heartbeat(alive, timeout=settings.mw_health_fail_s)
 
             yield controller
         finally:

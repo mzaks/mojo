@@ -180,7 +180,6 @@ def test_ep_moe_fp8(
         shared_experts_dim=MOE_DIM,
         ep_size=n_devices,
         dtype=dtype,
-        apply_router_weight_first=False,
         ep_batch_manager=ep_batch_manager,
         quant_config=fp8_config,
     )
@@ -230,7 +229,7 @@ def test_ep_moe_fp8(
 
         outputs = forward_moe_sharded_layers(moe_shards, inputs_tensors)
 
-        graph.output(*outputs)
+        graph.output(outputs)
 
     # Compile and execute
     compiled = session.load(graph, weights_registry=moe.state_dict())

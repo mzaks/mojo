@@ -13,7 +13,7 @@
 """Apple (Metal) M5 MMA-based flash-attention (FA2) prefill kernel.
 
 Two `MmaOpApple` 16x16 simdgroup GEMMs (Q.K^T and P.V) sandwiching an online
-softmax, for Apple silicon prefill (`compute_capability == 5`), paged KV via
+softmax, for Apple silicon prefill (`compute_capability >= 5`), paged KV via
 `MHAOperand`, BF16/FP16 storage with FP32 accumulation.
 
 4 simdgroups share one threadgroup with no threadgroup memory and no
@@ -62,25 +62,20 @@ from std.utils.numerics import get_accum_type
 
 
 from layout import (
-    UNKNOWN_VALUE,
     Idx,
-    Layout,
-    LayoutTensor,
     TensorEngine,
     TileTensor,
 )
 from layout.coord import Coord
-from layout.tile_layout import (
-    Layout as TileLayout,
-    RowMajorLayout,
-    TensorLayout,
-    row_major,
-)
+from layout.tile_layout import Layout as TileLayout, TensorLayout, row_major
 
 from linalg.arch.apple.mma import MmaOpApple
 
 from nn.attention.mha_mask import CausalMask, MHAMask, TileMaskStatus
 from nn.attention.mha_operand import MHAOperand
+from nn.attention.gpu.nvidia.common import (
+    ImmutTileTensor1D,
+)
 
 comptime NEG_INF = Float32(-3.0e38)
 
@@ -174,8 +169,10 @@ def _softmax_seed_sink(
 def _softmax_row_max[
     num_n_mmas: Int
 ](
-    scores: MmaOpApple[.float32, DType.float32, 1, num_n_mmas].AccumType,
-) -> Array[Float32, _SOFTMAX_FRAG_ROWS]:
+    scores: MmaOpApple[.float32, .float32, 1, num_n_mmas].AccumType,
+) -> Array[
+    Float32, _SOFTMAX_FRAG_ROWS
+]:
     """Full-row max over the single score row-block (across all `ni` cols).
 
     Returns `[rb_max, rb8_max]` for the two rows this lane owns. The per-fragment
@@ -203,12 +200,8 @@ def _softmax_update[
 ](
     mut sm_m: Array[Float32, _SOFTMAX_FRAG_ROWS],
     mut sm_l: Array[Float32, _SOFTMAX_FRAG_ROWS],
-    mut scores: MmaOpApple[
-        DType.float32, DType.float32, 1, num_n_mmas
-    ].AccumType,
-    mut output: MmaOpApple[
-        DType.float32, DType.float32, 1, out_num_n_mmas
-    ].AccumType,
+    mut scores: MmaOpApple[.float32, .float32, 1, num_n_mmas].AccumType,
+    mut output: MmaOpApple[.float32, .float32, 1, out_num_n_mmas].AccumType,
 ):
     """One online-softmax step over the masked score tile `scores`.
 
@@ -270,9 +263,7 @@ def _softmax_normalize[
     out_num_n_mmas: Int
 ](
     sm_l: Array[Float32, _SOFTMAX_FRAG_ROWS],
-    mut output: MmaOpApple[
-        DType.float32, DType.float32, 1, out_num_n_mmas
-    ].AccumType,
+    mut output: MmaOpApple[.float32, .float32, 1, out_num_n_mmas].AccumType,
 ):
     """Final epilogue: divide each output row by its running denominator `l`.
 
@@ -422,7 +413,6 @@ def fa_prefill_apple_core[
         so a 16-key sub-tile never crosses a page boundary. Other page sizes are
         gated to `mha_gpu_naive` by the dispatcher.
     """
-    var _batch_size = Int(batch_size)
     var _max_prompt_len = Int(max_prompt_len)
     var _max_cache_size = Int(max_cache_size)
     var _num_heads = Int(num_heads)
@@ -443,15 +433,13 @@ def fa_prefill_apple_core[
     # longest poles don't form the makespan tail; light low-row tiles backfill the
     # grid drain.
     var num_q_tiles = ceildiv(_max_prompt_len, NumSimdgroups * SQ)
-    var q_tile_id = (num_q_tiles - 1) - Int(block_idx.x)
-    var head_id = Int(block_idx.y)
-    var batch_id = Int(block_idx.z)
+    var q_tile_id = (num_q_tiles - 1) - block_idx.x
+    var head_id = block_idx.y
+    var batch_id = block_idx.z
     var kv_head = head_id // _group
     var sg = Int(warp_id())  # this simdgroup's slot in the threadgroup
     var lane = Int(lane_id())
-    var rb_cb = _apple_frag_layout(lane)
-    var rb = rb_cb[0]
-    var cb = rb_cb[1]
+    var rb, cb = _apple_frag_layout(lane)
 
     # Offset math — mirror `_bmm0_bs` / `_bmm1_bs` (mha.mojo).
     var seq_start: Int
@@ -548,7 +536,7 @@ def fa_prefill_apple_core[
     # ScoreMma loads K in its native dtype; q and k share the model dtype in
     # attention, so `k_t.dtype == q_type` in practice.
     comptime ScoreMma = MmaOpApple[
-        DType.float32,
+        .float32,
         q_type,
         1,
         1,
@@ -558,7 +546,7 @@ def fa_prefill_apple_core[
     # Full Sk-wide score storage (NumNMmas col-blocks), filled one page-resolved
     # 16-key column-block at a time.
     comptime ScoreAccum = MmaOpApple[
-        DType.float32,
+        .float32,
         q_type,
         1,
         NumNMmas,
@@ -660,17 +648,17 @@ def fa_prefill_apple_core[
             comptime k_align = align_of[Scalar[k_t.dtype]]()
             comptime if DEPTH_MMAS % 2 == 0:
                 comptime for sp in range(DEPTH_MMAS // 2):
-                    var qlo = q_tile.raw_load[width=8, alignment=q_align](
-                        rb * q_row_stride + 32 * sp + 2 * cb
+                    var qlo = q_tile.load[width=8, alignment=q_align](
+                        (rb, 32 * sp + 2 * cb)
                     )
-                    var qhi = q_tile.raw_load[width=8, alignment=q_align](
-                        (rb + 8) * q_row_stride + 32 * sp + 2 * cb
+                    var qhi = q_tile.load[width=8, alignment=q_align](
+                        (rb + 8, 32 * sp + 2 * cb)
                     )
-                    var klo = k_tile.raw_load[width=8, alignment=k_align](
-                        rb * kv_row_stride + 32 * sp + 2 * cb
+                    var klo = k_tile.load[width=8, alignment=k_align](
+                        (rb, 32 * sp + 2 * cb)
                     )
-                    var khi = k_tile.raw_load[width=8, alignment=k_align](
-                        (rb + 8) * kv_row_stride + 32 * sp + 2 * cb
+                    var khi = k_tile.load[width=8, alignment=k_align](
+                        (rb + 8, 32 * sp + 2 * cb)
                     )
                     _mma_apple_transposable(
                         score_col[0],
@@ -730,9 +718,9 @@ def fa_prefill_apple_core[
                 comptime for ni in range(NumNMmas):
                     var kbase = kv0 + ni * 16 + cb
                     # Per-key in-bounds mask for the 4 consecutive keys.
-                    var keys = SIMD[.int32, 4](Int32(kbase)) + SIMD[
-                        DType.int32, 4
-                    ](0, 1, 2, 3)
+                    var keys = SIMD[.int32, 4](Int32(kbase)) + SIMD[.int32, 4](
+                        0, 1, 2, 3
+                    )
                     var k_ok = keys.lt(Int32(cur_cache_len))
                     var neg = SIMD[.float32, 4](NEG_INF)
                     var lrow_lo = rb
@@ -865,19 +853,18 @@ def fa_prefill_apple_core[
     var row_lo = rb
     var lo_ok = row_lo < valid_q
     var hi_ok = row_lo + 8 < valid_q
-    var off_lo = rb * q_row_stride + cb
-    var off_hi = (rb + 8) * q_row_stride + cb
+    comptime o_align = align_of[Scalar[output_type]]()
     comptime for ni in range(DEPTH_MMAS):
         var o_sub = out_tile.tile[MMA_DIM, MMA_DIM](0, ni)
         comptime assert o_sub.flat_rank == 2, "output sub-tile must be 2D"
         var frag = output_accum[ni]
         if lo_ok:
-            o_sub.raw_store(
-                off_lo, frag.slice[4, offset=0]().cast[output_type]()
+            o_sub.store[alignment=o_align](
+                (rb, cb), frag.slice[4, offset=0]().cast[output_type]()
             )
         if hi_ok:
-            o_sub.raw_store(
-                off_hi, frag.slice[4, offset=4]().cast[output_type]()
+            o_sub.store[alignment=o_align](
+                (rb + 8, cb), frag.slice[4, offset=4]().cast[output_type]()
             )
 
 
@@ -912,108 +899,14 @@ def fa_prefill_apple[
     depth: Int,
     group: Int,
     ctx: DeviceContext,
-    sink_weights: OptionalReg[
-        LayoutTensor[
-            mut=False, q.dtype, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
-        ]
-    ] = None,
-) raises:
-    """TileTensor overload of `fa_prefill_apple`. Bridges to LayoutTensor
-    internally.
-
-    Parameters:
-        output_type: Element type of the attention output.
-        k_t: Key operand type (dense or KV-cache).
-        v_t: Value operand type (dense or KV-cache).
-        mask_t: Attention mask type.
-        ragged: `True` for ragged-batch inputs.
-        sink: `True` to enable attention-sink mode.
-        _use_valid_length: `True` to honour per-sequence valid lengths.
-        _is_cache_length_accurate: `True` when the cache length already
-            excludes the current prompt.
-        num_simdgroups: Number of SIMD groups per threadgroup.
-
-    Args:
-        q: Query `TileTensor` with BSHD layout.
-        k: Key operand.
-        v: Value operand.
-        mask_functor: Mask instance used to apply the attention mask.
-        output: Mutable output `TileTensor`.
-        valid_length: Per-sequence valid lengths as a `TileTensor`.
-        scale: Softmax temperature scale applied to Q·Kᵀ.
-        batch_size: Number of sequences in the batch.
-        max_prompt_len: Maximum query sequence length in the batch.
-        max_cache_size: Maximum key/value sequence length.
-        num_heads: Number of query heads.
-        depth: Attention head depth (key/value dimension per head).
-        group: GQA group size (query heads per key/value head).
-        ctx: GPU device context for kernel dispatch.
-        sink_weights: Optional sink-token weight tensor for attention sinks.
-    """
-    fa_prefill_apple[
-        ragged=ragged,
-        sink=sink,
-        _use_valid_length=_use_valid_length,
-        _is_cache_length_accurate=_is_cache_length_accurate,
-        num_simdgroups=num_simdgroups,
-    ](
-        q.to_layout_tensor(),
-        k,
-        v,
-        mask_functor,
-        output.to_layout_tensor(),
-        valid_length.to_layout_tensor(),
-        scale,
-        batch_size,
-        max_prompt_len,
-        max_cache_size,
-        num_heads,
-        depth,
-        group,
-        ctx,
-        sink_weights,
-    )
-
-
-def fa_prefill_apple[
-    output_type: DType,
-    k_t: MHAOperand,
-    v_t: MHAOperand,
-    mask_t: MHAMask,
-    //,
-    ragged: Bool = False,
-    sink: Bool = False,
-    _use_valid_length: Bool = False,
-    _is_cache_length_accurate: Bool = False,
-    num_simdgroups: Int = 4,
-](
-    q: LayoutTensor[mut=False, address_space=.GENERIC, ...],
-    k: k_t,
-    v: v_t,
-    mask_functor: mask_t,
-    output: LayoutTensor[mut=True, output_type, address_space=.GENERIC, ...],
-    valid_length: LayoutTensor[mut=False, .uint32, address_space=.GENERIC, ...],
-    scale: Float32,
-    batch_size: Int,
-    max_prompt_len: Int,
-    max_cache_size: Int,
-    num_heads: Int,
-    depth: Int,
-    group: Int,
-    ctx: DeviceContext,
-    sink_weights: OptionalReg[
-        LayoutTensor[
-            mut=False, q.dtype, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
-        ]
-    ] = None,
+    sink_weights: OptionalReg[ImmutTileTensor1D[q.dtype]] = None,
 ) raises:
     """Host launcher for the Apple M5 flash-attention prefill kernel.
 
     Mirrors `mha_gpu_naive`'s `MHAOperand` overload so `flash_attention_dispatch`
     routes to it like the fallback, and specializes one kernel per supported
     `depth` (a multiple of 16 up to `FA_PREFILL_APPLE_MAX_HEAD_DIM`). The external
-    `LayoutTensor` ABI is converted to `TileTensor` at the enqueue boundary so the
-    kernel is TileTensor-only.
+    tensor operands remain native through the enqueue boundary.
 
     Parameters:
         output_type: The dtype of the output tensor (inferred).
@@ -1074,39 +967,14 @@ def fa_prefill_apple[
     comptime NumNMmas = DEFAULT_NUM_N_MMAS
     comptime SQ = MMA_DIM
 
-    # Flatten the LayoutTensor ABI to 1D TileTensors; the kernel bakes the
+    # Flatten to 1-D views; the kernel bakes the
     # ragged/BSHD + q_row0 offset into each per-simdgroup tile base.
-    var q_flat = TileTensor(
-        q.ptr.as_imm().as_unsafe_any_origin(),
-        row_major(Coord(Int(q.size()))),
+    var q_flat = (
+        q.as_imm().as_unsafe_any_origin().reshape(row_major(q.num_elements()))
     )
-    var output_flat = TileTensor(
-        output.ptr.as_unsafe_any_origin(),
-        row_major(Coord(Int(output.size()))),
+    var output_flat = output.as_unsafe_any_origin().reshape(
+        row_major(output.num_elements())
     )
-    var valid_length_flat = TileTensor(
-        valid_length.ptr.as_imm().as_unsafe_any_origin(),
-        row_major(Coord(Int(valid_length.size()))),
-    )
-
-    # Sink weights as a nullable `OptionalReg[TileTensor]` (not a dangling
-    # pointer). None when sink=False; converted to a TileTensor so the kernel
-    # stays TileTensor-only and indexes by head_id.
-    var sink_layout_val = row_major(Coord(num_heads))
-    comptime SinkTile = TileTensor[
-        q_type, type_of(sink_layout_val), ImmutAnyOrigin
-    ]
-    var sink_tile: OptionalReg[SinkTile]
-    comptime if sink:
-        var sw = sink_weights.value()
-        sink_tile = OptionalReg[SinkTile](
-            SinkTile(
-                sw.ptr.as_imm().as_unsafe_any_origin(),
-                sink_layout_val,
-            )
-        )
-    else:
-        sink_tile = None
 
     # MODULAR_APPLE_FA_PREFILL_NUM_SIMDGROUPS={4,8,16,32} overrides the
     # simdgroups-per-threadgroup at runtime; otherwise the `num_simdgroups`
@@ -1118,8 +986,7 @@ def fa_prefill_apple[
         comptime D = di * MMA_DIM
         if depth == D:
 
-            @__parameter
-            def _enqueue[sg: Int]() raises:
+            def _enqueue[sg: Int]() raises {var}:
                 comptime core_kernel = fa_prefill_apple_core[
                     q_type,
                     output_type,
@@ -1129,12 +996,12 @@ def fa_prefill_apple[
                     mask_t,
                     type_of(q_flat).LayoutType,
                     type_of(output_flat).LayoutType,
-                    type_of(valid_length_flat).LayoutType,
-                    type_of(sink_layout_val),
+                    type_of(valid_length).LayoutType,
+                    ImmutTileTensor1D[q_type].LayoutType,
                     type_of(output_flat).Engine,
                     type_of(q_flat).Engine,
-                    type_of(valid_length_flat).Engine,
-                    SinkTile.Engine,
+                    type_of(valid_length).Engine,
+                    ImmutTileTensor1D[q_type].Engine,
                     ragged=ragged,
                     sink=sink,
                     _use_valid_length=_use_valid_length,
@@ -1150,8 +1017,8 @@ def fa_prefill_apple[
                     k,
                     v,
                     mask_functor,
-                    valid_length_flat,
-                    sink_tile,
+                    valid_length.as_unsafe_any_origin(),
+                    sink_weights,
                     scale,
                     Int32(batch_size),
                     Int32(max_prompt_len),
@@ -1163,17 +1030,17 @@ def fa_prefill_apple[
                     block_dim=sg * WARP_SIZE,
                 )
 
-            @__parameter
-            def _dispatch[sg: Int]() raises:
+            def _dispatch[sg: Int]() raises {var}:
                 _enqueue[sg]()
 
-            if sg_env == "4":
-                _dispatch[4]()
-            elif sg_env == "8":
-                _dispatch[8]()
-            elif sg_env == "16":
-                _dispatch[16]()
-            elif sg_env == "32":
-                _dispatch[32]()
-            else:
-                _dispatch[num_simdgroups]()
+            match sg_env:
+                case "4":
+                    _dispatch[4]()
+                case "8":
+                    _dispatch[8]()
+                case "16":
+                    _dispatch[16]()
+                case "32":
+                    _dispatch[32]()
+                case _:
+                    _dispatch[num_simdgroups]()

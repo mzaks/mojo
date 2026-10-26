@@ -876,6 +876,60 @@ lit.fn @self_recursive_arg_diff(%a: index) -> !kgen.none {
   lit.end_fn
 }
 
+// #7016: Should not warn "self recursive call will cause an infinite loop"
+lit.fn @self_recursive_in_loop(%c: !kgen.scalar<bool>) -> !kgen.none {
+  lit.loop {
+    hlcf.if %c {
+      lit.break
+      hlcf.yield
+    } else {
+      hlcf.yield
+    }
+    // No warning.
+    lit.call @self_recursive_in_loop(%c) : !lit.generator<("c": !kgen.scalar<bool>) -> !kgen.none>
+    lit.loop.continue
+  } else {
+    lit.loop.yield
+  }
+  // expected-warning @+1 {{self recursive call will cause an infinite loop}}
+  lit.call @self_recursive_in_loop(%c) : !lit.generator<("c": !kgen.scalar<bool>) -> !kgen.none>
+  %none = kgen.param.constant: none = <#kgen.none>
+  lit.return %none : !kgen.none
+  lit.end_fn
+}
+
+// #7016: Should not warn "self recursive call will cause an infinite loop" even when 
+// breaking out of outer loop
+lit.fn @self_recursive_labeled_break(%c: !kgen.scalar<bool>) -> !kgen.none {
+  lit.loop {
+    hlcf.if %c {
+      hlcf.yield
+    } else {
+      lit.loop.break.else
+    }
+    lit.loop {
+      hlcf.if %c {
+        hlcf.break "_loop_0"
+      } else {
+        hlcf.yield
+      }
+      lit.loop.continue
+    } else {
+      lit.loop.yield
+    }
+    // No warning: breaking out of "_loop_0" makes this call conditional.
+    lit.call @self_recursive_labeled_break(%c) : !lit.generator<("c": !kgen.scalar<bool>) -> !kgen.none>
+    lit.loop.continue
+  } else {
+    lit.loop.yield
+  }
+  // expected-warning @+1 {{self recursive call will cause an infinite loop}}
+  lit.call @self_recursive_labeled_break(%c) : !lit.generator<("c": !kgen.scalar<bool>) -> !kgen.none>
+  %none = kgen.param.constant: none = <#kgen.none>
+  lit.return %none : !kgen.none
+  lit.end_fn
+}
+
 // CHECK-LABEL: lit.fn @elif
 // CHECK-NEXT: %idx0 = index.constant 0
 // CHECK-NEXT: %idx1 = index.constant 1
@@ -1050,14 +1104,6 @@ lit.fn @mangle_params_finally_2<x>(%c: !kgen.scalar<bool> imm) -> !kgen.none {
 // CHECK-LABEL: lit.fn @mangle_params_finally_3
 lit.fn @mangle_params_finally_3<x>(%c: !kgen.scalar<bool> imm) -> !kgen.none {
   lit.try {
-    // CHECK: lit.fn nested()
-    lit.fn nested() -> !kgen.none {
-      // CHECK-NEXT: %[[NONE:.*]] = kgen.param.constant: none
-      %none_0 = kgen.param.constant: none = <#kgen.none>
-      // CHECK-NEXT: hlcf.return %[[NONE:.*]]
-      lit.return %none_0 : !kgen.none
-      lit.end_fn
-    }
     // CHECK: hlcf.if
     hlcf.if %c {
       %none_0 = kgen.param.constant: none = <#kgen.none>

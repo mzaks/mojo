@@ -200,12 +200,14 @@ class TestEnvVarMechanism:
             assert InferenceSession.debug.op_log_level == "DEBUG"
             assert InferenceSession.debug.print_style == PrintStyle.COMPACT
             assert InferenceSession.debug.ir_output_dir == "/tmp/ir"
+            assert InferenceSession.debug.uninitialized_read_mode == "report"
             print("PASS")
             """,
             env_overrides={
                 "MODULAR_DEBUG": (
                     "assert-level=all,op-log-level=DEBUG,"
-                    "print-style=compact,ir-output-dir=/tmp/ir"
+                    "print-style=compact,ir-output-dir=/tmp/ir,"
+                    "uninitialized-read-mode=report"
                 )
             },
         )
@@ -360,10 +362,12 @@ class TestPythonAPIMechanism:
             from max.engine import InferenceSession
             from max.graph import Graph
             InferenceSession.debug.sensible_mode = True
+            InferenceSession.debug.uninitialized_read_mode = "report"
             InferenceSession.debug.reset()
             assert InferenceSession.debug.nan_check is False
             assert InferenceSession.debug.device_sync_mode is False
             assert InferenceSession.debug.assert_level == ""
+            assert InferenceSession.debug.uninitialized_read_mode == ""
             assert Graph.debug.source_tracebacks is False
             print("PASS")
             """,
@@ -482,14 +486,15 @@ class TestReaderMigration:
             with_locs = module._to_mlir_str(source_locations=True)
             after = module.mlir_module.asm(enable_debug_info=True)
 
-            # The serialized text traces ops back to the building Python code.
-            assert ".py" in with_locs, with_locs
+            # The serialized text traces ops back to the building Python code,
+            # this script, which Python names `<string>`.
+            assert "<string>" in with_locs, with_locs
             # The flag gates it: the plain form carries no source locations.
-            assert ".py" not in module._to_mlir_str(source_locations=False)
+            assert "<string>" not in module._to_mlir_str(source_locations=False)
             # Serializing does not mutate the module: its own locations are
             # untouched and still carry no materialized Python frames.
             assert before == after
-            assert ".py" not in after
+            assert "<string>" not in after
             print("PASS")
             """,
             env_overrides={"MODULAR_DEBUG": "source-tracebacks"},
@@ -557,7 +562,7 @@ class TestReaderMigration:
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
         # The pipeline writes one file per stage with extensions like
-        # `.mo.mlir`, `.mo-pre-mogg.mlir`, `.mogg.mlir`, etc.  We just
+        # `.mo.mlir`, `.mo-pre-map.mlir`, `.mogg-pre-mgp.mlir`, etc.  We just
         # require at least one MLIR file landed.
         assert any(name.endswith(".mlir") for name in files), (
             f"Expected at least one .mlir file in {ir_dir}, got {files}"

@@ -116,8 +116,7 @@ def ok_comptime_expression[flag: Bool](xs: List[Int], n: Int) -> Int
 def ok_closure_parameter(xs: List[Int]) -> Int:
     var total = 0
 
-    @__parameter
-    def add[k: Int]():
+    def add[k: Int]() {mut total, imm}:
         total += xs[k]  # checked at each call, for that call's `k`
 
     if len(xs) >= 4:
@@ -133,8 +132,7 @@ def at_most[limit: Int](x: Int) -> Int requires x <= limit:
 def ok_closure_passes_parameter[limit: Int](x: Int) -> Int:
     var total = 0
 
-    @__parameter
-    def add[k: Int]():
+    def add[k: Int]() {mut total, imm}:
         # `limit` is the enclosing function's, in the callee's clause too.
         total += at_most[limit](x - k)
 
@@ -250,8 +248,7 @@ def bad_comptime_expression[flag: Bool](xs: List[Int], n: Int) -> Int
 def bad_closure_parameter(xs: List[Int]) -> Int:
     var total = 0
 
-    @__parameter
-    def add[k: Int]():
+    def add[k: Int]() {mut total, imm}:
         total += xs[k]
 
     if len(xs) >= 4:

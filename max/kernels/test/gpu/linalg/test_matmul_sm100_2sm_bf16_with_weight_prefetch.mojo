@@ -25,7 +25,12 @@ from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu.primitives.grid_controls import PDLLevel
 from internal_utils import assert_almost_equal
 from std.random import rand
-from layout import TileTensor, Coord, CoordLike, row_major, Idx
+from layout import (
+    TileTensor,
+    CoordLike,
+    row_major,
+    Idx,
+)
 from linalg.matmul.gpu.sm100_structured.default.matmul import (
     blackwell_matmul_tma_umma_warp_specialized,
 )
@@ -33,6 +38,7 @@ from linalg.matmul.gpu.sm100_structured.structured_kernels.config import (
     MatmulConfig,
 )
 
+from std.utils.coord import DynamicCoord
 from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
 
@@ -46,7 +52,7 @@ def test_blackwell_matmul_with_weight_prefetch[
     b_type: DType,
     c_type: DType,
     block_tile_shape: IndexList[3],
-    mma_shape: IndexList[3],
+    mma_shape: DynamicCoord[.int, 3],
     cluster_shape: StaticTuple[Int32, 3],
     transpose_b: Bool = True,
     a_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
@@ -58,9 +64,9 @@ def test_blackwell_matmul_with_weight_prefetch[
     pdl_level: PDLLevel = PDLLevel.OVERLAP_AT_END,
     prefetch_tiles_n: Int = 2,
 ](ctx: DeviceContext, m: MType, n: NType, k: KType) raises:
-    var M = Int(m.value())
-    var N = Int(n.value())
-    var K = Int(k.value())
+    var M = Int(m)
+    var N = Int(n)
+    var K = Int(k)
 
     print(
         t"weight prefetch 2SM: dtype={a_type} shape=({M}, {N}, {K})"
@@ -68,22 +74,16 @@ def test_blackwell_matmul_with_weight_prefetch[
         t" swapAB={swapAB} prefetch_tiles_n={prefetch_tiles_n}"
     )
 
-    var a_shape = row_major(Coord(m, Idx[KType.static_value]))
+    var a_shape = row_major(m, Idx[KType.static_value])
     var b_shape = row_major(
-        Coord(
-            Idx[NType.static_value if transpose_b else KType.static_value],
-            Idx[KType.static_value if transpose_b else NType.static_value],
-        )
+        Idx[NType.static_value if transpose_b else KType.static_value],
+        Idx[KType.static_value if transpose_b else NType.static_value],
     )
-    var c_shape = row_major(Coord(m, Idx[NType.static_value]))
+    var c_shape = row_major(m, Idx[NType.static_value])
 
-    var a_size = Int(m.value()) * Int(k.value())
-    var b_size = (
-        Int(n.value())
-        * Int(k.value()) if transpose_b else Int(k.value())
-        * Int(n.value())
-    )
-    var c_size = Int(m.value()) * Int(n.value())
+    var a_size = Int(m) * Int(k)
+    var b_size = Int(n) * Int(k) if transpose_b else Int(k) * Int(n)
+    var c_size = Int(m) * Int(n)
 
     var a_host_ptr = ctx.enqueue_create_host_buffer[a_type](a_size)
     var a_host = TileTensor(a_host_ptr, a_shape)
@@ -190,8 +190,8 @@ def main() raises:
                     112,
                     128,
                 ]:
-                    comptime block_tile_shape = Index(bm, bn, BK)
-                    comptime umma_shape = Index(2 * bm, 2 * bn, MMA_K)
+                    comptime block_tile_shape = (bm, bn, BK)
+                    comptime umma_shape = (2 * bm, 2 * bn, MMA_K)
 
                     test_blackwell_matmul_with_weight_prefetch[
                         dtype,
@@ -310,8 +310,8 @@ def main() raises:
                 dtype,
                 dtype,
                 .bfloat16,
-                block_tile_shape=Index(64, 128, 64),
-                mma_shape=Index(128, 256, 16),
+                block_tile_shape=(64, 128, 64),
+                mma_shape=(128, 256, 16),
                 cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
                 block_swizzle_size=8,
                 swapAB=swapAB,
@@ -324,8 +324,8 @@ def main() raises:
                 dtype,
                 dtype,
                 .bfloat16,
-                block_tile_shape=Index(64, 128, 64),
-                mma_shape=Index(128, 256, 16),
+                block_tile_shape=(64, 128, 64),
+                mma_shape=(128, 256, 16),
                 cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
                 block_swizzle_size=8,
                 swapAB=swapAB,
@@ -338,8 +338,8 @@ def main() raises:
                 dtype,
                 dtype,
                 .bfloat16,
-                block_tile_shape=Index(64, 128, 64),
-                mma_shape=Index(128, 256, 16),
+                block_tile_shape=(64, 128, 64),
+                mma_shape=(128, 256, 16),
                 cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
                 block_swizzle_size=8,
                 swapAB=swapAB,

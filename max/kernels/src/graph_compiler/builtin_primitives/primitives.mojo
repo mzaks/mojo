@@ -12,18 +12,19 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.logger import Logger
-from std.math import fma, gcd
+from std.math import gcd
 from std.ffi import external_call, c_size_t
 from std.sys import size_of, align_of
-from std.sys.intrinsics import strided_load, strided_store
 
 from max.algorithm.functional import elementwise
+from algorithm.reduce_op import ReduceOp
+from algorithm.rowwise import launch, pick_simd_width
+from algorithm.rowwise_types import RowBody
 
 from extensibility import StaticTensorSpec
 from extensibility import (
     ComputeOutputFusion,
     ComputeOutputFusionTile,
-    ElementwiseFusion,
     ElementwiseFusionTile,
     InputFusion,
     OutputFusion,
@@ -38,10 +39,12 @@ from max.gpu.host import (
     DeviceGraphBuilder,
     DeviceGraphCache,
     DeviceGraphInput,
+    DeviceGraphInputKind,
+    StableAddr,
 )
-from max.gpu.host.device_context import _DeviceBufferPtr, _DeviceContextPtr
+from max.gpu.host import _DeviceContextPtr
 from max.gpu.host.info import is_accelerator, is_cpu, is_gpu
-from std.memory import OwnedPointer, MaybeUninit, alloc, dealloc
+from std.memory import OwnedPointer, MaybeUninit, alloc
 from std.os import abort
 from layout import (
     Coord,
@@ -60,18 +63,17 @@ from layout.tile_io import (
 )
 from layout.tile_tensor import stack_allocation
 from std.memory import unsafe_memcpy
-from std.memory.unsafe_pointer import unsafe_cast
 
 from nn.concat import concat
 from nn.reshape import reshape
 from nn.slice import slice_as_view
-from layout.coord import DynamicCoord
 from layout.int_tuple import _IntTupleToCoordLike, UNKNOWN_VALUE
 from layout.tile_layout import Layout as TileLayout
 from extensibility import register_internal
 from extensibility import (
     IOSpec,
     ManagedTensorSlice,
+    StableTensor,
 )
 from extensibility import IO
 from extensibility import (
@@ -80,16 +82,14 @@ from extensibility import (
     get_kernel_simd_width,
     simd_load_from_managed_tensor_slice,
 )
-from extensibility.managed_tensor_slice import _gcd_pow2
 
 from std.utils import Index, IndexList, StaticTuple
 
 from max.runtime.async_value import AnyAsyncValueRef, _AsyncValuePtr
 
-from .buffer_plan import BufferPlanState, BufferPlanStats
+from .buffer_plan import BufferPlanState
 
 comptime MutByteBuffer = DynamicTensor[.int8, 1]
-comptime ImmutByteBuffer = DynamicTensor[.int8, 1]
 comptime logger = Logger()
 
 # ===-----------------------------------------------------------------------===#
@@ -250,8 +250,8 @@ struct OwnedByteBuffer(DeviceGraphInput, ImplicitlyCopyable, Movable):
         # silently discard those writes.
         #
         # Mutability now survives lowering: `!mo.buffer` lowers to a
-        # mut-marked `!mgp.tensor`, and `OwnedTensor[.., mut=True]` handles
-        # the in-place registration (`register_in_place_input` +
+        # mut-marked `!mgp.tensor`, and `OwnedTensor[.., kind=.mutable]`
+        # handles the in-place registration (`register_in_place_input` +
         # address-in-key). A raw `!mgp.buffer` reaching `add_input` therefore
         # indicates a lowering bug, not a missing feature; if a legitimate
         # buffer-typed graph input ever appears, implement it the same way
@@ -260,7 +260,9 @@ struct OwnedByteBuffer(DeviceGraphInput, ImplicitlyCopyable, Movable):
 
 
 struct OwnedTensor[
-    dtype: DType, rank: Int, mut: Bool = False, host: Bool = False
+    dtype: DType,
+    rank: Int,
+    kind: DeviceGraphInputKind = DeviceGraphInputKind.data,
 ](DeviceGraphInput, ImplicitlyCopyable, Movable):
     """Owning composite for an `mgp.tensor` value: a non-owning `DynamicTensor`
     view (precomputed pointer + shape) plus an `AnyAsyncValueRef` storage handle
@@ -273,18 +275,13 @@ struct OwnedTensor[
     Parameters:
         dtype: The element dtype of the tensor view.
         rank: The rank of the tensor view.
-        mut: Whether the tensor is mutable (the lowered form of `!mo.buffer`,
-            e.g. a KV cache the model writes in place). A mutable tensor used
-            as a device-graph input must not be copied to a graph-private
-            stable location; its address joins the graph cache key instead.
-        host: Whether the tensor's data is host-resident (the lowered form of
-            a cpu-placed `!mgp.tensor`, e.g. attention dispatch metadata).
-            Recorded ops read host values at enqueue time, freezing them into
-            the graph, so a host tensor used as a device-graph input has its
-            full contents baked into the graph cache key: changed bytes miss
-            the cache and re-record instead of replaying stale dispatch.
-            Mutually exclusive with `mut` (in-place host writes contradict
-            value-keyed replay; the op verifiers reject the combination).
+        kind: How the tensor participates as a device-graph input; see
+            `DeviceGraphInputKind`. `mutable` is the lowered form of
+            `!mo.buffer` (a KV cache the model writes in place), `host` a
+            cpu-placed `!mgp.tensor` (dispatch metadata read at enqueue time),
+            and `shape_only` a tensor the graph reads only for its shape. The
+            kind is fixed when the tensor is unpacked; `with_kind` rebinds it
+            for one graph's `add_input`.
     """
 
     var tensor: DynamicTensor[Self.dtype, Self.rank]
@@ -303,6 +300,10 @@ struct OwnedTensor[
         """
         self.tensor = tensor
         self.storage = storage^
+
+    @staticmethod
+    def shape_only() -> Bool:
+        return Self.kind == DeviceGraphInputKind.shape_only
 
     def unsafe_ptr(self) -> Pointer[Scalar[Self.dtype], MutAnyOrigin]:
         """Returns the view's raw device data pointer.
@@ -366,21 +367,37 @@ struct OwnedTensor[
         )
         return AnyAsyncValueRef(handle)
 
+    def with_kind[
+        new_kind: DeviceGraphInputKind
+    ](self) -> OwnedTensor[Self.dtype, Self.rank, new_kind]:
+        """Returns the same tensor viewed with another input kind.
+
+        A tensor is unpacked once per kernel with the kind its type implies,
+        but a collective's graphs may treat it differently: the graph on the
+        device that owns it reads its data, while a peer device's graph may
+        read only its shape. Rebinding the kind shares the view and retains
+        the storage; nothing is copied.
+
+        Parameters:
+            new_kind: The kind the returned tensor participates as.
+
+        Returns:
+            The same view and storage under `new_kind`.
+        """
+        return {self.tensor, self.storage}
+
     def write_graph_key(self, mut writer: Some[Writer]):
-        comptime assert not (
-            Self.mut and Self.host
-        ), "a device-graph input cannot be both mutable and host-resident"
-        comptime if Self.mut:
-            # A mutable input is recorded at its live address (no stable twin),
-            # so the address is part of what distinguishes graphs: a moved
-            # buffer must miss the cache and rebuild rather than replay stale
-            # addresses.
-            writer.write(
-                t"MutTensor({self.dtype}, {self.shape()}, "
-                t"{Int(self.unsafe_ptr())})"
-            )
-        else:
-            comptime if Self.host:
+        comptime match Self.kind:
+            case DeviceGraphInputKind.mutable:
+                # A mutable input is recorded at its live address (no stable twin),
+                # so the address is part of what distinguishes graphs: a moved
+                # buffer must miss the cache and rebuild rather than replay stale
+                # addresses.
+                writer.write(
+                    t"MutTensor({self.dtype}, {self.shape()}, "
+                    t"{Int(self.unsafe_ptr())})"
+                )
+            case DeviceGraphInputKind.host:
                 # Recorded ops read host values at enqueue time, so replay is
                 # only sound for the exact bytes that were recorded: the full
                 # contents join the key, and changed bytes re-record. Bytes
@@ -391,66 +408,66 @@ struct OwnedTensor[
                 for i in range(self.bytecount()):
                     writer.write(Int(raw[unsafe_offset=i]), ",")
                 writer.write(")")
-            else:
+            case _:
+                # `data` and `shape_only` both key on the shape alone. A shape-only
+                # input is recorded at its live address like a mutable one, but the
+                # graph baked nothing but its shape, so a same-shape tensor at any
+                # address may replay it and the address must stay out of the key.
                 writer.write(t"Tensor({self.dtype}, {self.shape()})")
 
     def allocate_stable(self, mut builder: DeviceGraphBuilder) raises -> Self:
-        comptime assert not (
-            Self.mut and Self.host
-        ), "a device-graph input cannot be both mutable and host-resident"
-        comptime if Self.mut:
-            # A mutable tensor (the lowered form of !mo.buffer, e.g. a KV
-            # cache) is written in place by the graph: a graph-private stable
-            # copy would silently discard those writes. Register an in-place
-            # marker so the replay copy skips this position, and record
-            # against the caller's live buffer. `write_graph_key` puts the
-            # address in the cache key, which is what makes replaying the
-            # recorded address sound.
-            #
-            # This is not the storage-pinning trap the immutable path's
-            # comment warns about: the returned copy retains `self.storage`
-            # only for the build closure's lifetime -- the graph itself
-            # retains nothing. Address stability across replays is the
-            # buffer owner's property (e.g. the KV manager's block pool),
-            # policed by address-in-key.
-            builder.register_in_place_input()
-            return self
-        else:
-            var shape = self.shape()
+        comptime match Self.kind:
+            case .mutable | .shape_only:
+                # A mutable tensor (the lowered form of !mo.buffer, e.g. a KV
+                # cache) is written in place by the graph: a graph-private stable
+                # copy would silently discard those writes. Register an in-place
+                # marker so the replay copy skips this position, and record
+                # against the caller's live buffer. `write_graph_key` puts the
+                # address in the cache key, which is what makes replaying the
+                # recorded address sound.
+                #
+                # A shape-only tensor takes the same path for the opposite reason:
+                # the graph reads only its shape, so there is nothing to copy and
+                # the address is irrelevant; the shape in the key is what keeps
+                # replay correct.
+                #
+                # This is not the storage-pinning trap the immutable path's
+                # comment warns about: the returned copy retains `self.storage`
+                # only for the build closure's lifetime -- the graph itself
+                # retains nothing. Address stability across replays is the
+                # buffer owner's property (e.g. the KV manager's block pool),
+                # policed by address-in-key.
+                builder.register_in_place_input()
+                return self
+            case _:
+                comptime is_host = Self.kind == DeviceGraphInputKind.host
+                var shape = self.shape()
 
-            # The stable twin lives where the input's data lives: recorded
-            # kernels read device inputs where they run, and recorded enqueues
-            # (dispatch reads, HtoD copy nodes) bake the *host* address of a
-            # host input, so both need a graph-stable location.
-            var buffer = builder.create_input_buffer[Self.dtype](
-                shape.flattened_length(), is_host=Self.host
-            )
+                # The stable twin lives where the input's data lives: recorded
+                # kernels read device inputs where they run, and recorded enqueues
+                # (dispatch reads, HtoD copy nodes) bake the *host* address of a
+                # host input, so both need a graph-stable location.
+                var buffer = builder.create_input_buffer[Self.dtype](
+                    shape.flattened_length(), is_host=is_host
+                )
 
-            var view = DynamicTensor[Self.dtype, Self.rank](
-                buffer.unsafe_ptr(), shape
-            )
+                var view = DynamicTensor[Self.dtype, Self.rank](
+                    buffer.unsafe_ptr(), shape
+                )
 
-            comptime if Self.host:
-                # Host values are read at enqueue time while the build closure
-                # records, so the stable buffer must hold the caller's bytes
-                # *before* any op is recorded against it. (The replay-time
-                # refresh copies the same bytes again -- byte-identical by
-                # cache-key construction -- purely to keep the positional
-                # input-refresh invariant uniform.)
-                var src = self.unsafe_ptr().unsafe_bitcast[UInt8]()
-                var dst = view.unsafe_ptr().unsafe_bitcast[UInt8]()
-                for i in range(self.bytecount()):
-                    dst[unsafe_offset=i] = src[unsafe_offset=i]
+                comptime if is_host:
+                    # Host values are read at enqueue time while the build closure
+                    # records, so the stable buffer must hold the caller's bytes
+                    # *before* any op is recorded against it.
+                    var src = self.unsafe_ptr().unsafe_bitcast[UInt8]()
+                    var dst = view.unsafe_ptr().unsafe_bitcast[UInt8]()
+                    for i in range(self.bytecount()):
+                        dst[unsafe_offset=i] = src[unsafe_offset=i]
 
-            # Storage is the pool buffer, never `self.storage` -- retaining
-            # the caller's handle would pin its memory for the graph's
-            # lifetime.
-            return Self(view, AnyAsyncValueRef(storage_buf=buffer^))
-
-
-@export
-def empty_destructor(ptr: Pointer[UInt8, MutUntrackedOrigin]) abi("Mojo"):
-    pass
+                # Storage is the pool buffer, never `self.storage` -- retaining
+                # the caller's handle would pin its memory for the graph's
+                # lifetime.
+                return Self(view, AnyAsyncValueRef(storage_buf=buffer^))
 
 
 @inline(.never)
@@ -499,9 +516,8 @@ def unpack_tensor[
     buffer_rank: Int,
     tensor_rank: Int,
     dtype: DType,
-    mut: Bool = False,
-    host: Bool = False,
-](async_ref: AnyAsyncValueRef) -> OwnedTensor[dtype, buffer_rank, mut, host]:
+    kind: DeviceGraphInputKind = DeviceGraphInputKind.data,
+](async_ref: AnyAsyncValueRef) -> OwnedTensor[dtype, buffer_rank, kind]:
     # Tensor and the underlying buffer must have the same rank, unless it is a
     # scalar tensor stored with a DynamicTensor<[1]>
     comptime assert tensor_rank == buffer_rank or (
@@ -542,13 +558,6 @@ def unpack_tensor_spec[
     return shape
 
 
-@inline(.always)
-def get_buffer_data(
-    buffer: MutByteBuffer,
-) -> Pointer[Int8, MutAnyOrigin]:
-    return buffer.unsafe_ptr()
-
-
 # ===-----------------------------------------------------------------------===#
 # MGP Tensor Primitives
 # ===-----------------------------------------------------------------------===#
@@ -560,13 +569,12 @@ def mgp_tensor_create[
     spec_rank: Int,
     buffer_rank: Int,
     dtype: DType,
-    mut: Bool = False,
-    host: Bool = False,
+    kind: DeviceGraphInputKind = DeviceGraphInputKind.data,
 ](
     buffer: OwnedByteBuffer,
     spec: IndexList[spec_rank],
 ) -> OwnedTensor[
-    dtype, buffer_rank, mut, host
+    dtype, buffer_rank, kind
 ]:
     # The tensor shares the buffer's backing memory, so it retains the buffer's
     # storage handle (copy) to keep it alive independently.
@@ -588,13 +596,53 @@ def mgp_tensor_create[
         return {view, storage^}
 
 
+@register_internal("mgp.device_graph.stable.tensor")
+@inline(.never)
+def mgp_device_graph_stable_tensor[
+    spec_rank: Int,
+    buffer_rank: Int,
+    dtype: DType,
+    kind: DeviceGraphInputKind = DeviceGraphInputKind.data,
+](
+    addr: StableAddr,
+    spec: IndexList[spec_rank],
+) -> OwnedTensor[
+    dtype, buffer_rank, kind
+]:
+    """Views a stable address slot as the tensor it stands for.
+
+    The view's data pointer is the slot's address, not the pointer the slot
+    holds, so a kernel recorded against the tensor dereferences the slot at
+    replay. The slot belongs to the `DeviceGraphCache` for the model's
+    lifetime, so the tensor carries no storage handle.
+    """
+    var ptr = (
+        addr.ptr.unsafe_bitcast[Scalar[dtype]]()
+        .unsafe_origin_cast[MutAnyOrigin]()
+        .unsafe_mut_cast[target_mut=True]()
+    )
+    comptime if spec_rank == 0:
+        # We promote scalar tensor to tensor<[1]>
+        comptime assert buffer_rank == 1
+        var view = DynamicTensor[dtype, buffer_rank](
+            ptr, rebind[IndexList[buffer_rank]](IndexList[1](1))
+        )
+        return {view, AnyAsyncValueRef()}
+    else:
+        comptime assert spec_rank == buffer_rank
+        var view = DynamicTensor[dtype, buffer_rank](
+            ptr, rebind[IndexList[buffer_rank]](spec)
+        )
+        return {view, AnyAsyncValueRef()}
+
+
 @register_internal("mgp.tensor.extract.tensor_spec")
 @inline(.never)
 def mgp_tensor_extract_tensor_spec[
     tensor_rank: Int,
     buffer_rank: Int,
     dtype: DType,
-](tensor: OwnedTensor[dtype, buffer_rank, _, _]) -> IndexList[tensor_rank]:
+](tensor: OwnedTensor[dtype, buffer_rank, _]) -> IndexList[tensor_rank]:
     comptime if tensor_rank == 0:
         comptime assert buffer_rank == 1
         return rebind[IndexList[tensor_rank]](IndexList[0]())
@@ -608,7 +656,9 @@ def mgp_tensor_extract_tensor_spec[
 def mgp_tensor_extract_buffer[
     buffer_rank: Int,
     dtype: DType,
-](tensor: OwnedTensor[dtype, buffer_rank, _, _]) -> OwnedByteBuffer:
+](tensor: OwnedTensor[dtype, buffer_rank, _]) -> OwnedByteBuffer:
+    comptime assert not tensor.shape_only()
+
     # Unwrap the tensor into a size-less buffer view, retaining the tensor's
     # storage so the buffer keeps the backing memory alive independently.
     var view = MutByteBuffer(
@@ -628,7 +678,9 @@ def mgp_tensor_slice[
     output_spec: IndexList[rank],
     start: OwnedTensor[.int64, 1, ...],
     dev_context: DeviceContext,
-) raises -> OwnedTensor[dtype, rank, input.mut, input.host]:
+) raises -> OwnedTensor[dtype, rank, input.kind]:
+    comptime assert not input.shape_only()
+
     var input_shape = input.shape()
 
     # Find k: the first non-size-1 input dimension (the sliced dimension).
@@ -704,7 +756,7 @@ def mgp_buffer_alloc(
 @inline(.never)
 def mgp_device_graph_alloc[
     is_host: Bool
-](byte_size: Int, builder: DeviceGraphBuilder) raises -> OwnedByteBuffer:
+](byte_size: Int, mut builder: DeviceGraphBuilder) raises -> OwnedByteBuffer:
     return {builder.create_buffer[.int8](byte_size, is_host=is_host)}
 
 
@@ -719,7 +771,7 @@ def mgp_buffer_constant(
     # Constant memory is owned by the resource system, not refcounted, so the
     # storage handle is the empty (non-tracked) reference.
     var view = MutByteBuffer(
-        resource_ptr.unsafe_bitcast[Int8](), IndexList[1](resource_bytecount)
+        resource_ptr.unsafe_bitcast[Int8](), (resource_bytecount,)
     )
     return OwnedByteBuffer(view, AnyAsyncValueRef())
 
@@ -907,7 +959,6 @@ def mgp_buffer_plan[
         - offsets: Offsets for each allocation (static_sizes first, then runtime_sizes).
     """
 
-    @__parameter
     def compute_static_allocations(
         out result: BufferPlanState[
             alignments,
@@ -946,22 +997,20 @@ def mgp_buffer_concat[
 ) raises:
     var output_lt = TileTensor(
         output.unsafe_ptr(),
-        row_major(Coord(output.size())),
+        row_major(output.size()),
     )
     var input_tensors = StaticTuple[_, inputs.length](
-        TileTensor(inputs[0].unsafe_ptr(), row_major(Coord(inputs[0].size())))
+        TileTensor(inputs[0].unsafe_ptr(), row_major(inputs[0].size()))
         .as_unsafe_any_origin()
         .as_imm()
     )
     for i in range(1, len(inputs)):
         input_tensors[i] = (
-            TileTensor(
-                inputs[i].unsafe_ptr(), row_major(Coord(inputs[i].size()))
-            )
+            TileTensor(inputs[i].unsafe_ptr(), row_major(inputs[i].size()))
             .as_unsafe_any_origin()
             .as_imm()
         )
-    concat[.int8, bDevice, None](output_lt, 0, input_tensors, context=call_ctx)
+    concat[.int8, bDevice](output_lt, 0, input_tensors, context=call_ctx)
 
 
 @register_internal("mgp.buffer.device_to_host")
@@ -1090,22 +1139,25 @@ def mgp_buffer_memset[
     """
     # `cast` to the matching-width unsigned int truncates to the low N bits,
     # which is exactly the little-endian low-byte pattern.
-    if elem_size == 1:
-        _memset_buffer[.uint8, bDevice](
-            buffer, value_bits.cast[.uint8](), dev_context
-        )
-    elif elem_size == 2:
-        _memset_buffer[.uint16, bDevice](
-            buffer, value_bits.cast[.uint16](), dev_context
-        )
-    elif elem_size == 4:
-        _memset_buffer[.uint32, bDevice](
-            buffer, value_bits.cast[.uint32](), dev_context
-        )
-    elif elem_size == 8:
-        _memset_buffer[.uint64, bDevice](buffer, value_bits, dev_context)
-    else:
-        raise Error("mgp.buffer.memset: elem_size must be one of {1, 2, 4, 8}")
+    match elem_size:
+        case 1:
+            _memset_buffer[.uint8, bDevice](
+                buffer, value_bits.cast[.uint8](), dev_context
+            )
+        case 2:
+            _memset_buffer[.uint16, bDevice](
+                buffer, value_bits.cast[.uint16](), dev_context
+            )
+        case 4:
+            _memset_buffer[.uint32, bDevice](
+                buffer, value_bits.cast[.uint32](), dev_context
+            )
+        case 8:
+            _memset_buffer[.uint64, bDevice](buffer, value_bits, dev_context)
+        case _:
+            raise Error(
+                "mgp.buffer.memset: elem_size must be one of {1, 2, 4, 8}"
+            )
 
 
 @register_internal("mgp.buffer.host_to_device")
@@ -1190,12 +1242,6 @@ def mgp_tensor_spec_get_dim[
 # ===-----------------------------------------------------------------------===#
 
 
-@export
-def mgp_device_context_destroy(dev_ctx: DeviceContext) abi("Mojo"):
-    # DeviceContext is refcounted, we don't need to explicitly destroy it
-    pass
-
-
 @register_internal("mgp.sync")
 @inline(.never)
 def mgp_sync(ctx: StateContext, dev_ctx: DeviceContext) raises:
@@ -1223,8 +1269,8 @@ def mgp_debug_print[
 ](ctx: StateContext) raises:
     var prefix = String()
     if bLabel:
-        prefix = "[" + bLabel + "] "
-    print(prefix + aDebugString)
+        prefix = String(t"[{bLabel}] ")
+    print(t"{prefix}{aDebugString}")
 
 
 @register_internal("mgp.debug.print.int")
@@ -1234,8 +1280,8 @@ def mgp_debug_print_int[
 ](ctx: StateContext, value: Int):
     var prefix = String()
     if aLabel:
-        prefix = "[" + aLabel + "] "
-    print(prefix + String(value))
+        prefix = String(t"[{aLabel}] ")
+    print(t"{prefix}{value}")
 
 
 @register_internal("mgp.debug.tensor.print")
@@ -1279,33 +1325,6 @@ def get_simd_width_for_dtypes[
     return width
 
 
-# TODO: this should take IOSpec as a param -- will require graph compiler changes
-# Used by the graph compiler to construct tensors from MGP repr. of tensor
-@inline(.always)
-def to_managed_tensor_slice[
-    dtype: DType, rank: Int, mut: Bool, input: IO
-](
-    data: Pointer[Scalar[dtype], MutAnyOrigin],
-    shape: Pointer[Int, ImmutAnyOrigin],
-) -> ManagedTensorSlice[
-    io_spec=IOSpec[mut, input](),
-    static_spec=StaticTensorSpec[dtype, rank, ...].get_unknown(),
-]:
-    var shape_ptr = shape
-    var shape_tuple = IndexList[rank]()
-
-    var stride_tuple = IndexList[rank]()
-    var stride: Int = 1
-
-    comptime for i in reversed(range(rank)):
-        # Start from the back so we can accumulate the strides.
-        shape_tuple[i] = shape_ptr[unsafe_offset=i]
-        stride_tuple[i] = stride
-        stride *= shape_tuple[i]
-
-    return {data, shape_tuple, stride_tuple}
-
-
 # Extract a scalar from a managed tensor slice.
 @inline(.always)
 def _get_scalar_from_managed_tensor_slice[
@@ -1314,77 +1333,8 @@ def _get_scalar_from_managed_tensor_slice[
     # Assumes that tensor is on the host!
     # This is used instead of [0] since __getitem__ for `ManagedTesnorSlice`
     # does not work with `register_internal` out of the box.
-    return tensor.load[width=1](IndexList[1](0))
+    return tensor.load[width=1]((0,))
 
-
-# ===-----------------------------------------------------------------------===#
-# Opaque Test Primitives
-# ===-----------------------------------------------------------------------===#
-
-
-struct MyInt(Movable):
-    var val: Int
-
-    def __init__(out self, val: Int):
-        self.val = val
-
-    def __init__(out self, *, deinit move: MyInt):
-        print("MyInt.__moveinit__", move.val)
-        self.val = move.val
-
-    def __deinit__(deinit self):
-        print("MyInt.__deinit__", self.val)
-
-
-@register_internal("testfuse.my_int.from_index")
-@inline(.never)
-def test_my_int_from_index(x: Int) -> MyInt:
-    return MyInt(x)
-
-
-@register_internal("testfuse.my_int.square")
-@inline(.never)
-def test_my_int_square(x: MyInt) -> MyInt:
-    return MyInt(x.val * x.val)
-
-
-@register_internal("testfuse.my_int.to_index")
-@inline(.never)
-def test_my_int_to_index(x: MyInt) -> Int:
-    return x.val
-
-
-struct MyIntReg2(ImplicitlyCopyable, RegisterPassable):
-    var val: Int
-
-    def __init__(out self, val: Int):
-        self.val = val
-
-    def __deinit__(deinit self):
-        print("MyIntReg2.__deinit__", self.val)
-
-
-@register_internal("testfuse.my_int_reg2.from_index")
-@inline(.never)
-def test_my_int_reg2_from_index(x: Int) -> MyIntReg2:
-    return MyIntReg2(x)
-
-
-@register_internal("testfuse.my_int_reg2.square")
-@inline(.never)
-def test_my_int_reg2_square(x: MyIntReg2) -> MyIntReg2:
-    return MyIntReg2(x.val * x.val)
-
-
-@register_internal("testfuse.my_int_reg2.to_index")
-@inline(.never)
-def test_my_int_reg2_to_index(x: MyIntReg2) -> Int:
-    return x.val
-
-
-# ===-----------------------------------------------------------------------===#
-# Mojo generation hooks
-# ===-----------------------------------------------------------------------===#
 
 # ===-----------------------------------------------------------------------===#
 # Mojo-C++ interop aliases
@@ -1399,25 +1349,6 @@ def test_my_int_reg2_to_index(x: MyIntReg2) -> Int:
 # Therefore, we alias it to OpaquePointer which will have the same bitwidth as
 # C++'s pointers.
 comptime AnyAsyncValueRefPtr = OpaquePointer[MutAnyOrigin]
-
-
-# Opaque stand-in for the C++ `M::MLRT::TensorBufferRef` type. Mojo never sees
-# the layout of the C++ struct; this only gives the C pointer a distinct pointee
-# type so it can't be confused with other opaque handles (e.g. the async-value
-# storage handle), mirroring how `DeviceContext` uses `_DeviceContextCpp`.
-struct _TensorBufferRefCpp:
-    pass
-
-
-# Typed C pointer to the C++ tensor-buffer ref. Primitives only ever manipulate
-# a reference to it (never its layout); the default `UntrackedOrigin` marks the
-# pointee as living outside the Mojo program (its lifetime is managed by the C++
-# runtime), mirroring `_DeviceContextPtr`.
-comptime TensorBufferRefPtr[
-    mut: Bool,
-    //,
-    origin: Origin[mut=mut] = UntrackedOrigin[mut=mut],
-] = OptionalPointer[_TensorBufferRefCpp, origin]
 
 
 # Opaque stand-in for the C++ `M::MLRT::StateContext` type. Mojo never sees the
@@ -1702,7 +1633,7 @@ def mogg_async_error_value(
     """Returns a fresh error `AsyncValue`."""
     var error_message = String(err)
     if source_notes:
-        error_message = "\n" + source_notes + "\n\n" + error_message
+        error_message = String(t"\n{source_notes}\n\n{error_message}")
     var handle = external_call[
         "MGP_RT_AsyncRT_CreateAsync_Error", _AsyncValuePtr[mut=True]
     ](
@@ -1753,6 +1684,46 @@ def mogg_tensor_init[
     }
 
 
+@register_internal("mogg.tensor.__init__.stable")
+@inline(.always)
+def mogg_stable_tensor_init[
+    LayoutType: TensorLayout,
+    //,
+    dtype: DType,
+    rank: Int,
+    mut: Bool,
+    input: IO,
+    alignment: Int,
+](
+    ptr: Pointer[mut=True, NoneType, _],
+    layout: LayoutType,
+    out result: StableTensor[
+        io_spec=IOSpec[mut, input](),
+        static_spec=StaticTensorSpec[
+            dtype,
+            rank,
+            static_layout=LayoutType,
+        ](alignment, .GENERIC),
+    ],
+):
+    """
+    Helper for constructing a StableTensor from a layout and the data pointer
+    of a stable `mgp.tensor`, which is the address of its slot. Selected by
+    `mogg.tensor.__init__` when its result `!mo.tensor` is marked `stable`.
+    """
+    var addr = StableAddr(
+        ptr.unsafe_bitcast[
+            Pointer[NoneType, MutUntrackedOrigin]
+        ]().unsafe_origin_cast[MutUntrackedOrigin]()
+    )
+    result = {
+        addr,
+        type_of(result).RuntimeLayout(
+            layout.shape_coord(), layout.stride_coord()
+        ),
+    }
+
+
 @register_internal("mogg.async.join")
 @inline(.never)
 def mogg_async_check_task_error(mut error: Optional[Error]) raises:
@@ -1763,6 +1734,10 @@ def mogg_async_check_task_error(mut error: Optional[Error]) raises:
     """
     if error:
         raise error.take()
+
+
+# Starts every error `mogg_format_kernel_error` formats.
+comptime _KERNEL_ERROR_HEADER = 'An error occurred in kernel named "'
 
 
 @register_internal("mogg.raise")
@@ -1779,15 +1754,12 @@ def mogg_format_kernel_error(
     and eventually caught by the outer MGP region's except handler.
     """
     var msg = (
-        String('An error occurred in kernel named "')
-        + kernel_name
-        + '":\n'
-        + String(error)
+        String(_KERNEL_ERROR_HEADER) + kernel_name + '":\n' + String(error)
     )
     if fusion_info:
-        msg += "\n\nFusion info:\n" + fusion_info
+        msg += String(t"\n\nFusion info:\n{fusion_info}")
     if traceback:
-        msg += "\n\nSource Traceback:\n" + traceback
+        msg += String(t"\n\nSource Traceback:\n{traceback}")
     return Error(msg)
 
 
@@ -1800,34 +1772,17 @@ def mogg_format_region_error(
     """Format a region error with the entry point name prefix.
 
     Called from MGP ABI stub except handlers after catching a kernel error.
+    A kernel error already names its kernel, so it passes through as is.
     """
+    var message = String(error)
+    if message.startswith(_KERNEL_ERROR_HEADER):
+        return Error(message^)
     return Error(
         String('An error occurred in kernel entry point named "')
         + region_name
         + '":\n'
-        + String(error)
+        + message
     )
-
-
-@register_internal("mogg.tensor.reshape")
-@inline(.always)
-def reshape_contiguous_buffer[
-    static_layout: TensorLayout, new_rank: Int
-](
-    buffer: ManagedTensorSlice,
-    shape: IndexList[new_rank],
-) -> ManagedTensorSlice[
-    io_spec=buffer.io_spec,
-    static_spec=StaticTensorSpec[
-        buffer.dtype,
-        new_rank,
-        static_layout=static_layout,
-    ](1, .GENERIC),
-]:
-    """
-    Constructs a new ManagedTensorSlice with a new shape and static spec.
-    """
-    return {buffer._ptr, shape}
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1872,76 +1827,6 @@ def all_zeros(indices: IndexList) -> Bool:
 # ===----------------------------------------------------------------------===#
 # Affine view kernels
 # ===----------------------------------------------------------------------===#
-
-
-@register_internal("mo.split_dim")
-@inline(.always)
-def split_dim_indices[
-    rank: Int, axis: Int
-](indices: IndexList[rank], new_shape_dim: Int) -> IndexList[rank + 1]:
-    var out = IndexList[rank + 1]()
-
-    # This op is transforming the INDICES of an access into a reshaped tensor.
-    # Consider the tensor is [40, 30, 2] and we reshape it to [5, 8, 30, 2].
-    # If we are accessing the index [21, 16, 1] in the original shape then to
-    # preserve the reshape we would need to transform the indices into [2, 5, 16, 1].
-    # Or [21 // 8, 21 % 8, ...old dims...].
-    # In this case, the axis = 0 and the new_shape_dim = 8.
-
-    comptime for i in range(rank + 1):
-        comptime if i == axis:
-            out[i] = indices[axis] // new_shape_dim
-        elif i == axis + 1:
-            out[i] = indices[axis] % new_shape_dim
-        elif i < axis:
-            out[i] = indices[i]
-        elif i > axis:
-            out[i] = indices[i - 1]
-
-    return out
-
-
-@register_internal("mo.merge_dim")
-@inline(.always)
-def merge_dim_indices[
-    rank: Int, axis: Int
-](indices: IndexList[rank], old_shape_dim: Int) -> IndexList[rank - 1]:
-    var out = IndexList[rank - 1]()
-
-    # This op is transforming the INDICES of an access into a reshaped tensor.
-    # Consider the tensor is [5, 8, 30, 2] and we reshape it to [40, 30, 2].
-    # If we are accessing the index [2, 5, 16, 1] in the original shape then to
-    # preserve the reshape we would need to transform the indices into [21, 16, 1].
-    # Or [2 * 8 + 5, 16, 1].
-    # In this case, the axis = 0 and the old_shape_dim = 8.
-
-    comptime for i in range(rank - 1):
-        comptime if i == axis:
-            out[i] = fma(indices[i], old_shape_dim, indices[i + 1])
-        elif i < axis:
-            out[i] = indices[i]
-        elif i > axis:
-            out[i] = indices[i + 1]
-
-    return out
-
-
-@register_internal("mo.add_singleton_dim")
-@inline(.always)
-def insert_index[
-    rank: Int, axis: Int, value: Int
-](indices: IndexList[rank]) -> IndexList[rank + 1]:
-    var out = IndexList[rank + 1]()
-
-    comptime for i in range(rank + 1):
-        comptime if i < axis:
-            out[i] = indices[i]
-        elif i > axis:
-            out[i] = indices[i - 1]
-        else:
-            out[i] = value
-
-    return out
 
 
 @inline(.always)
@@ -2063,7 +1948,7 @@ def mogg_index_reshape[
     # Reindex `index` (a point in the from-shape) to the point in the to-shape
     # with the same row-major linear offset. Backs `mogg.index.reshape`: the
     # per-index (store-side) counterpart of the whole-tensor
-    # `mogg._tensor.create.reshape` view, used for a reshape fused into an
+    # `mogg.tensor.create.reshape` view, used for a reshape fused into an
     # epilogue's store. `from_static_shape`/`to_static_shape` are the compile-time
     # shapes (a dim is `-1`, `UNKNOWN_VALUE`, where dynamic); `from_shape`/
     # `to_shape` are their runtime values, read only where a dim is dynamic.
@@ -2151,6 +2036,96 @@ def mogg_index_reshape[
     return out
 
 
+@register_internal("mogg.index.slice.select")
+@inline(.always)
+def mogg_index_slice_select[
+    rank: Int,
+    //,
+    static_starts: IntTuple,
+    static_steps: IntTuple,
+    in_static_shape: IntTuple,
+    out_static_shape: IntTuple,
+](
+    index: IndexList[rank],
+    in_shape: IndexList[rank] = _reshape_static_index_list[
+        rank, in_static_shape
+    ](),
+    out_shape: IndexList[rank] = _reshape_static_index_list[
+        rank, out_static_shape
+    ](),
+) -> Tuple[IndexList[rank], Bool]:
+    """Maps an index into a slice's input to the index into its output.
+
+    Backs `mogg.index.slice.select`, whose body runs at the returned index
+    only where the slice selects `index`. The slice follows `mo.slice`: a
+    start resolves against its input dim the numpy way, and the output shape
+    bounds the slice, so stops are never read. A runtime shape is read only
+    where its static counterpart is `UNKNOWN_VALUE`, and a dim the static
+    bounds and shapes prove unsliced costs nothing.
+
+    Parameters:
+        rank: The rank of the slice's input and output.
+        static_starts: The slice's start per dim, as written.
+        static_steps: The slice's positive step per dim.
+        in_static_shape: The slice's input shape, where statically known.
+        out_static_shape: The slice's output shape, where statically known.
+
+    Args:
+        index: An index into the slice's input.
+        in_shape: The input's runtime shape.
+        out_shape: The output's runtime shape.
+
+    Returns:
+        The index into the slice's output, and whether the slice selects
+        `index` at all. The index means nothing where it does not.
+    """
+    var result = index
+    var in_slice = True
+    comptime for d in range(rank):
+        comptime start = Int(static_starts[d])
+        comptime step = Int(static_steps[d])
+        comptime n_in = Int(in_static_shape[d])
+        comptime n_out = Int(out_static_shape[d])
+        comptime unsliced = (
+            start == 0 and step == 1 and n_in != UNKNOWN_VALUE and n_in == n_out
+        )
+        comptime if not unsliced:
+            var in_dim: Int
+            comptime if n_in != UNKNOWN_VALUE:
+                in_dim = n_in
+            else:
+                in_dim = in_shape[d]
+            var out_dim: Int
+            comptime if n_out != UNKNOWN_VALUE:
+                out_dim = n_out
+            else:
+                out_dim = out_shape[d]
+            # Numpy's start resolution, which `MOToMAP` already applied where
+            # the dim is static: from the end if negative, then clamped to 0.
+            # A start past the end needs no clamp, since `out_dim` is then 0.
+            # Nor does a negative start whose clamp a static `n_out` rules
+            # out: it fires only on an input dim too short to hold `n_out`
+            # elements `step` apart, and the bound check below trusts `n_out`
+            # already.
+            var s = start
+            comptime if start < 0:
+                comptime clamp_needed = (
+                    n_out == UNKNOWN_VALUE or (n_out - 1) * step + 1 < -start
+                )
+                comptime if clamp_needed:
+                    s = max(start + in_dim, 0)
+                else:
+                    s = start + in_dim
+            var offset = index[d] - s
+            comptime if step != 1:
+                in_slice = in_slice and offset % step == 0
+            var j = offset // step
+            # Unsigned, a negative index wraps past `out_dim`: one compare.
+            in_slice = in_slice and UInt(j) < UInt(out_dim)
+            result[d] = j
+    return (result, in_slice)
+
+
 # ===----------------------------------------------------------------------===#
 # POP operations
 # ===----------------------------------------------------------------------===#
@@ -2180,55 +2155,6 @@ def simd_select[
 # ===-----------------------------------------------------------------------===#
 
 
-@register_internal("mogg.elemwise_for_each")
-@inline(.never)
-def foreach[
-    dtype: DType,
-    rank: Int,
-    //,
-    func: def[width: Int, element_alignment: Int](
-        IndexList[rank]
-    ) capturing -> SIMD[dtype, width],
-    *,
-    target: StaticString = "cpu",
-    simd_width: Int = get_kernel_simd_width[dtype, target](),
-    _trace_name: StaticString = "mogg.for_each",
-](
-    tensor: ManagedTensorSlice[mut=True, dtype=dtype, rank=rank, ...],
-    ctx: DeviceContext,
-) raises:
-    """Apply the function `func` to each element of the tensor slice.
-
-    Parameters:
-        dtype: The data type of the elements in the tensor slice.
-        rank: The rank of the tensor slice.
-        func: The function to apply to each element of the tensor slice.
-        target: Indicates the type of the target device (e.g. "cpu", "gpu").
-        simd_width: The SIMD width for the target (usually leave this as its default value).
-        _trace_name: Name of the executed operation displayed in the trace_description.
-
-    Args:
-        tensor: The output tensor slice which receives the return values from `func`.
-        ctx: The call context (forward this from the custom operation).
-    """
-
-    @inline(.always)
-    def elementwise_fn_wrapper[
-        width: Int,
-        alignment: Int = 1,
-    ](index: Coord) {var}:
-        var idx = coord_to_index_list(index)
-        var val = func[width, alignment](rebind[IndexList[tensor.rank]](idx))
-        tensor._fused_store[element_alignment=alignment](index, val)
-
-    elementwise[
-        simd_width,
-        target=target,
-        _trace_description=_trace_name,
-    ](elementwise_fn_wrapper, tensor.shape_coord(), ctx)
-
-
-@register_internal("mogg.elemwise_for_each")
 @inline(.never)
 def foreach[
     dtype: DType,
@@ -2287,120 +2213,7 @@ def foreach[
     ](wrapper, tensor.shape_coord(), ctx)
 
 
-@fieldwise_init
-struct _ElementwiseFusionAdapter[
-    dtype: DType,
-    rank: Int,
-    InFusion: InputFusion,
-    OutFusion: OutputFusion,
-    ComputeFusion: ComputeOutputFusion,
-    ComputeFusionTile: ComputeOutputFusionTile,
-    OutFusionTile: OutputFusionTile,
-    io_spec: IOSpec[True, _],
-    static_spec: StaticTensorSpec[
-        dtype,
-        rank,
-        _,
-        InFusion,
-        OutFusion,
-        ComputeFusion,
-        ComputeFusionTile,
-        OutFusionTile,
-    ],
-    //,
-    E: ElementwiseFusion,
-](
-    ImplicitlyCopyable,
-    RegisterPassable,
-    def[width: Int, alignment: Int = 1](Coord) -> None,
-):
-    """Per-element body for `foreach_fusion`, holding the fusion struct and
-    output tensor by value.
-
-    Named adapter twin of a `{var elem, var tensor}` closure: a closure over
-    the generic `E` synthesizes a parametric-witness `lit.closure.init` the
-    MOGG package loader can't resolve, so the body is a concrete
-    register-passable struct instead. Passing the instance by value to
-    `elementwise` carries `elem` (and the tensor's ptr/shape/strides) through
-    `crossDeviceCaptures` by value.
-
-    Parameters:
-        dtype: The data type of the tensor elements.
-        rank: The rank of the tensor.
-        InFusion: The tensor's input-fusion type.
-        OutFusion: The tensor's output-fusion type.
-        ComputeFusion: The tensor's compute-output-fusion type.
-        ComputeFusionTile: The tensor's compute-output-fusion-tile type.
-        OutFusionTile: The tensor's output-fusion-tile (store) type.
-        io_spec: The tensor's IO spec.
-        static_spec: The tensor's static spec.
-        E: The elementwise fusion struct type.
-    """
-
-    var elem: Self.E
-    var tensor: ManagedTensorSlice[
-        io_spec=Self.io_spec, static_spec=Self.static_spec
-    ]
-
-    @inline(.always)
-    def __call__[width: Int, alignment: Int = 1](self, index: Coord):
-        var idx = rebind[IndexList[Self.rank]](coord_to_index_list(index))
-        var val = self.elem.compute[Self.dtype, Self.rank, width, alignment](
-            idx
-        )
-        self.tensor._fused_store[element_alignment=alignment](idx, val)
-
-
 @register_internal("mogg.call.foreach")
-@inline(.never)
-def foreach_fusion[
-    dtype: DType,
-    rank: Int,
-    //,
-    E: ElementwiseFusion,
-    *,
-    target: StaticString = "cpu",
-    simd_width: Int = get_kernel_simd_width[dtype, target](),
-    _trace_name: StaticString = "mogg.for_each",
-](
-    tensor: ManagedTensorSlice[mut=True, dtype=dtype, rank=rank, ...],
-    var elem: E,
-    ctx: DeviceContext,
-) raises:
-    """Apply a pure elementwise fusion to each element of the tensor slice.
-
-    Parameters:
-        dtype: The data type of the elements in the tensor slice.
-        rank: The rank of the tensor slice.
-        E: The elementwise fusion struct type.
-        target: Indicates the type of the target device (e.g. "cpu", "gpu").
-        simd_width: The SIMD width for the target.
-        _trace_name: Name of the executed operation displayed in the trace.
-
-    Args:
-        tensor: The output tensor slice which receives the computed values.
-        elem: The elementwise fusion struct.
-        ctx: The call context (forward this from the custom operation).
-    """
-
-    # Capture `elem` by value through a named adapter struct rather than a
-    # closure. A `{var elem}` closure over the generic `E` synthesizes a
-    # `lit.closure.init` with parametric witnesses the package loader can't
-    # resolve (see functional.mojo `_IndexListToCoordAdapter`); the adapter is
-    # a concrete register-passable type, so passing it by value to
-    # `elementwise` sends `elem`'s decomposed ptr/shape/strides through
-    # `crossDeviceCaptures` by value — which the host-stack `@__parameter
-    # capturing` form did not.
-    var adapter = _ElementwiseFusionAdapter[E](elem, tensor)
-
-    elementwise[
-        simd_width=simd_width,
-        target=target,
-        _trace_description=_trace_name,
-    ](adapter, Coord(tensor.shape()), ctx)
-
-
-@register_internal("mogg._call.foreach")
 def _foreach[
     Lambda: ImplicitlyCopyable
     & RegisterPassable
@@ -2436,6 +2249,53 @@ def _foreach[
     ](lambda_, shape, ctx)
 
 
+@register_internal("mogg.call.rowwise")
+def _rowwise[
+    Body: RowBody,
+    //,
+    SimdMonoid: ReduceOp,
+    dtype: DType,
+    accum: DType,
+    *,
+    axis: Int,
+    target: StaticString,
+    num_phases: Int,
+    computationally_expensive: Bool,
+    dtype_size: Int,
+](body: Body, shape: Coord, ctx: DeviceContext) raises:
+    """Runs a Row API body once per row of `shape` along `axis`.
+
+    Parameters:
+        Body: The body's concrete type.
+        SimdMonoid: The fold monoid that picks the SIMD width, at width 1.
+        dtype: The element type of the input the folds walk.
+        accum: The type the folds' contributions are computed in.
+        axis: The reduced axis.
+        target: Indicates the type of the target device (e.g. "cpu", "gpu").
+        num_phases: 1 for a reduce-shaped body.
+        computationally_expensive: Whether the folds' per-element work is
+            expensive enough to change the GPU block tier's threshold.
+        dtype_size: The byte size of `dtype` when the body may split the
+            row, else 0.
+
+    Args:
+        body: The per-row body.
+        shape: The iteration domain.
+        ctx: The call context (forward this from the custom operation).
+    """
+    comptime simd_width = pick_simd_width[
+        SimdMonoid, target, 64, dtype, accum
+    ]()
+    launch[
+        axis=axis,
+        simd_width=simd_width,
+        target=target,
+        num_phases=num_phases,
+        computationally_expensive=computationally_expensive,
+        dtype_size=dtype_size,
+    ](body, shape, ctx)
+
+
 comptime _MoggSliceStrideTypesTabulator[
     input_stride_types: TypeList[Trait=CoordLike, ...],
     step_types: TypeList[Trait=CoordLike, ...],
@@ -2459,9 +2319,43 @@ comptime _MoggSliceStrideTypes[
 ]()
 
 
+def _dense_row_major_anchor_stride(
+    rank: Int, shape: IntTuple, strides: IntTuple
+) -> Int:
+    """Returns a stride that every dynamic stride of this layout is a whole
+    multiple of, or 0 when no such stride can be established.
+
+    Walks outward from the innermost dimension for as long as
+    `stride[k] == shape[k + 1] * stride[k + 1]` holds with every term static,
+    and returns the outermost stride of that run. Strides reaching a kernel are
+    dense row-major strides, possibly permuted by a transpose or scaled by a
+    slice step, and all three keep every outer stride a whole multiple of the
+    innermost dense-chain stride. A layout that is broadcast, permuted or
+    step-scaled across the run fails the equality and yields 0.
+    """
+    if rank < 2 or Int(strides[rank - 1]) != 1:
+        return 0
+
+    var anchor = 0
+    for k in range(rank - 2, -1, -1):
+        var stride = Int(strides[k])
+        var inner_shape = Int(shape[k + 1])
+        var inner_stride = Int(strides[k + 1])
+        if (
+            stride == UNKNOWN_VALUE
+            or inner_shape == UNKNOWN_VALUE
+            or inner_stride == UNKNOWN_VALUE
+            or stride != inner_shape * inner_stride
+        ):
+            break
+        anchor = stride
+    return anchor
+
+
 def _mogg_slice_view_alignment[
     rank: Int,
     dtype: DType,
+    input_shape: IntTuple,
     input_strides: IntTuple,
     static_starts: IntTuple,
     static_steps: IntTuple,
@@ -2473,6 +2367,9 @@ def _mogg_slice_view_alignment[
     comptime stride_types = _IntTupleToCoordLike[DType.int, input_strides]
     comptime start_types = _IntTupleToCoordLike[DType.int, static_starts]
     comptime step_types = _IntTupleToCoordLike[DType.int, static_steps]
+    comptime anchor = _dense_row_major_anchor_stride(
+        rank, input_shape, input_strides
+    )
 
     var alignment = input_alignment
     comptime for i in range(rank):
@@ -2483,14 +2380,20 @@ def _mogg_slice_view_alignment[
         comptime if not start_types[i].is_static_value:
             return 1
         comptime if start_types[i].static_value != 0:
-            comptime if not stride_types[i].is_static_value:
-                return 1
-            alignment = gcd(
-                alignment,
-                start_types[i].static_value
-                * stride_types[i].static_value
-                * align_of[dtype](),
-            )
+            comptime if stride_types[i].is_static_value:
+                alignment = gcd(
+                    alignment,
+                    start_types[i].static_value
+                    * stride_types[i].static_value
+                    * align_of[dtype](),
+                )
+            else:
+                comptime if anchor == 0:
+                    return 1
+                alignment = gcd(
+                    alignment,
+                    start_types[i].static_value * anchor * align_of[dtype](),
+                )
 
         # Iterating a non-innermost dim advances the pointer by
         # `step[i] * strides[i]` elements per step, so that stride bounds the
@@ -2500,18 +2403,24 @@ def _mogg_slice_view_alignment[
         # strided view over-report its alignment and emit a misaligned
         # (faulting) vector load on GPU.
         comptime if i != rank - 1:
-            comptime if not stride_types[i].is_static_value:
-                return 1
-            alignment = gcd(
-                alignment,
-                step_types[i].static_value
-                * stride_types[i].static_value
-                * align_of[dtype](),
-            )
+            comptime if stride_types[i].is_static_value:
+                alignment = gcd(
+                    alignment,
+                    step_types[i].static_value
+                    * stride_types[i].static_value
+                    * align_of[dtype](),
+                )
+            else:
+                comptime if anchor == 0:
+                    return 1
+                alignment = gcd(
+                    alignment,
+                    step_types[i].static_value * anchor * align_of[dtype](),
+                )
     return alignment
 
 
-@register_internal("mogg._tensor.create.slice")
+@register_internal("mogg.tensor.create.slice")
 def mogg_tensor_create_slice[
     dtype: DType,
     rank: Int,
@@ -2543,13 +2452,14 @@ def mogg_tensor_create_slice[
         _mogg_slice_view_alignment[
             rank,
             dtype,
+            input._static_shape_tuple,
             input._static_strides_tuple,
             static_starts,
             static_steps,
         ](input.alignment),
     ),
 ]:
-    """Backing primitive for `mogg._tensor.create.slice`: a zero-copy strided
+    """Backing primitive for `mogg.tensor.create.slice`: a zero-copy strided
     view of `input`, offset and re-strided per `starts`/`stops`/`steps`.
     `output_static_shape`/`static_starts`/`static_steps` carry whatever is
     known about the view's shape and bounds at compile time (an entry is
@@ -2617,7 +2527,7 @@ def _mogg_broadcast_view_strides[
     return new_strides
 
 
-@register_internal("mogg._tensor.create.broadcast")
+@register_internal("mogg.tensor.create.broadcast")
 def mogg_tensor_create_broadcast[
     dtype: DType,
     in_rank: Int,
@@ -2638,13 +2548,13 @@ def mogg_tensor_create_broadcast[
         ](),
     ](),
 ]:
-    """Backing primitive for `mogg._tensor.create.broadcast`: a zero-copy
+    """Backing primitive for `mogg.tensor.create.broadcast`: a zero-copy
     reindexed view of `input` that replicates it (numpy broadcasting
     semantics) up to `output_static_shape` -- a leading dimension `input`
     doesn't have, or an aligned dimension where `input`'s size is 1, gets
     stride 0. Preserves whatever static shape/stride information is known
     at compile time, mirroring
-    `StaticBroadcastTo.update_input_view`/`get_view_strides_list`.
+    `StaticBroadcastTo.input_view`/`get_view_strides_list`.
 
     Parameters:
         dtype: The element type of `input`.
@@ -2672,7 +2582,7 @@ def mogg_tensor_create_broadcast[
     return {input.unsafe_ptr(), new_shape, new_strides}
 
 
-@register_internal("mogg._tensor.create.reshape")
+@register_internal("mogg.tensor.create.reshape")
 def mogg_tensor_create_reshape[
     dtype: DType,
     in_rank: Int,
@@ -2689,13 +2599,13 @@ def mogg_tensor_create_reshape[
         output_static_shape,
     ](),
 ]:
-    """Backing primitive for `mogg._tensor.create.reshape`: a zero-copy view
+    """Backing primitive for `mogg.tensor.create.reshape`: a zero-copy view
     of `input` reinterpreted under `output_shape` -- valid only because
     `input` is contiguous, so de-linearizing/re-linearizing through one
     shared flat index produces row-major strides for the new shape.
     `output_static_shape` still types the return value's static layout with
     whatever dims ARE known at compile time (mirroring
-    `StaticReshape.update_input_view`), but `output_shape` -- not a cast of
+    `StaticReshape.input_view`), but `output_shape` -- not a cast of
     `output_static_shape` -- is what this op actually reshapes into: unlike
     broadcast/transpose, this op's own stride is a row-major
     de-linearization of the *output* shape's own values, with no input
@@ -2757,7 +2667,7 @@ comptime _MoggTransposeStrideTypes[
 ]()
 
 
-@register_internal("mogg._tensor.create.transpose")
+@register_internal("mogg.tensor.create.transpose")
 def mogg_tensor_create_transpose[
     dtype: DType,
     rank: Int,
@@ -2782,14 +2692,14 @@ def mogg_tensor_create_transpose[
         ],
     ](),
 ]:
-    """Backing primitive for `mogg._tensor.create.transpose`: a zero-copy
+    """Backing primitive for `mogg.tensor.create.transpose`: a zero-copy
     reindexed view of `input` that reorders its dimensions -- the view's
     dimension `i` comes from `input`'s dimension `perm[i]`. `perm` is known
     per dimension either at compile time (an entry of `static_permutations`)
     or, where that entry is `UNKNOWN_VALUE`, at runtime (the matching entry
     of the `permutations` operand). Preserves whatever static shape/stride
     information is known at compile time, mirroring
-    `Transpose.update_input_view`/`_TransposeStrideTypes`.
+    `Transpose.input_view`/`_TransposeStrideTypes`.
 
     Parameters:
         dtype: The element type of `input`.
@@ -2851,8 +2761,8 @@ struct _ElementwiseFusionTileAdapter[
     """Per-tile body for `foreach_fusion_tile`, holding the fusion struct and
     output tensor by value.
 
-    Analogous to `_ElementwiseFusionAdapter`, but for tile-based fusion: a
-    named, register-passable struct (not a closure) so `elem` and the tensor's
+    A named, register-passable struct (not a closure) for tile-based fusion, so
+    `elem` and the tensor's
     decomposed ptr/shape/strides cross into the GPU kernel by value. Its
     `__call__` drives one output *tile*, handing the fusion struct a load copier
     (used by `compute` to pull its inputs into `Copier.dst_address_space`) and
@@ -2888,14 +2798,12 @@ struct _ElementwiseFusionTileAdapter[
     ]
 
     @inline(.always)
-    def __call__(self) capturing:
+    def __call__(self):
         # One block per output tile: `block_idx.(y, x)` selects the tile row and
         # column. Carried into the kernel as a closure (the adapter is not
         # `DevicePassable`, so its captures cross via the same mechanism
         # `functional.elementwise` uses for its body closure).
-        var tile_coords = IndexList[Self.rank](
-            Int(block_idx.y), Int(block_idx.x)
-        )
+        var tile_coords = IndexList[Self.rank](block_idx.y, block_idx.x)
         # NOTE(GEX-3913): we likely want to replace the adapter defining the
         # load copier here with a `functional.tile_elementwise` primitive, so
         # the load / tiling policy is reusable.
@@ -2938,7 +2846,7 @@ struct _ElementwiseFusionTileAdapter[
         LocalToGenericTileCopier[Self.thread_layout]().copy(out_tile, res_local)
 
 
-@register_internal("mogg.call.foreach_tile")
+@register_internal("mogg.call.foreach.tile")
 @inline(.never)
 def foreach_fusion_tile[
     dtype: DType,
@@ -3012,40 +2920,44 @@ def foreach_fusion_tile[
     )
 
 
-@register_internal("mogg.for_each.out_func")
 @inline(.never)
 def foreach_out_func[
     dtype: DType,
     rank: Int,
+    OutFuncType: ImplicitlyCopyable
+    & RegisterPassable
+    & def[width: Int](IndexList[rank]) -> None,
     //,
-    func: def[width: Int](IndexList[rank]) capturing -> SIMD[dtype, width],
-    out_func: def[width: Int](IndexList[rank]) capturing[_] -> None,
     *,
     target: StaticString = "cpu",
     simd_width: Int = get_kernel_simd_width[dtype, target](),
     _trace_name: StaticString = "mogg.for_each",
 ](
+    var out_func: OutFuncType,
     tensor: ManagedTensorSlice[dtype=dtype, rank=rank, ...],
     ctx: DeviceContext,
 ) raises:
-    """Apply the function `func` to each element of the tensor slice.
+    """Apply `out_func` to each index of the tensor slice.
 
     Parameters:
         dtype: The data type of the elements in the tensor slice.
         rank: The rank of the tensor slice.
-        func: The function to apply to each element of the tensor slice.
-        out_func: The function to apply on each output element.
+        OutFuncType: The type of the per-index closure.
         target: Indicates the type of the target device (e.g. "cpu", "gpu").
         simd_width: The SIMD width for the target (usually leave this as its default value).
         _trace_name: Name of the executed operation displayed in the trace_description.
 
     Args:
-        tensor: The input tensor slice which the consumed values.
+        out_func: The closure to apply on each output index; it does its own
+            load and store.
+        tensor: The tensor slice whose shape is the iteration domain.
         ctx: The call context (forward this from the custom operation).
     """
 
     @inline(.always)
-    def out_func_shim[_width: Int, _alignment: Int = 1](index: Coord) {var}:
+    def out_func_shim[
+        _width: Int, _alignment: Int = 1
+    ](index: Coord) {var out_func^}:
         var idx = rebind[IndexList[rank]](coord_to_index_list(index))
         out_func[_width](idx)
 
@@ -3056,9 +2968,8 @@ def foreach_out_func[
     ](out_func_shim, tensor.shape_coord(), ctx)
 
 
-# TensorCopy intrinsic used by view kernels.
+# TensorCopy intrinsic used by the view ops (slice, reshape, transpose, ...).
 # z is a kernel output, and x a view of the input.
-@register_internal("mogg.call.materialize")
 @doc_hidden
 @inline(.never)
 def view_copy_impl[

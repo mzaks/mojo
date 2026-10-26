@@ -98,10 +98,14 @@ OriginTrackable::OriginTrackable(Value v) {
   // uninit on exit, CheckLifetimes will ensure the value gets consumed or
   // destroyed.
   if (auto refFromPtr = v.getDefiningOp<RefFromPointerOp>()) {
-    name = StringAttr::get(v.getContext(), "(reference value)");
+    name = refFromPtr.getNameAttr();
     isIndirect = true;
-    startsUninit = refFromPtr.getEndUninit();
-    endInitState = startsUninit ? EndsUninit : EndsInit;
+    // The operation's start state describes the path where it executes. At
+    // function boundaries this reference must have its end state, since some
+    // paths may skip the operation entirely.
+    bool isUninitAtFunctionBoundary = refFromPtr.getEndUninit();
+    startsUninit = isUninitAtFunctionBoundary;
+    endInitState = isUninitAtFunctionBoundary ? EndsUninit : EndsInit;
     return;
   }
 
@@ -269,9 +273,9 @@ void OperationEffects::analyzeCallOp(Operation &op) {
     conventions = signature.getArgConventions().drop_back(
         signature.getNumAsyncReturnSlots());
 
-    // CreateClosureOp has a subset of the operands of a call.
-    if (isa<CreateClosureOp>(op))
-      conventions = conventions.take_front(op.getNumOperands());
+    // CreateFuncPtrOp only references the callee and binds no arguments.
+    if (isa<CreateFuncPtrOp>(op))
+      conventions = {};
 
     assert(conventions.size() == op.getNumOperands());
   } else {
@@ -870,6 +874,11 @@ static bool scanForOrigins(TypeOrAttr typeOrAttr,
         handled = true;
       }
     }
+
+    // Ignore origin on a trait symbol (this can only happen for parametric
+    // closures trait).
+    if (isa<TraitSymbolAttr>(typeOrAttr))
+      handled = true;
   }
 
   // Values of function types should only consider any origins in the capture

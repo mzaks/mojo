@@ -51,8 +51,10 @@ comptime _Tile[LayoutType: TensorLayout] = TileTensor[
 
 
 def _fill_ramp[LayoutType: TensorLayout](tile: _Tile[LayoutType]):
-    for i in range(Int(tile.dim[0]())):
-        tile.raw_store[width=1](i, Float32(i + 1))
+    var count = Int(tile.dim[0]())
+    var flat = tile.reshape(row_major(count))
+    for i in range(count):
+        flat[i] = Float32(i + 1)
 
 
 def optional_reg_kernel[
@@ -60,8 +62,8 @@ def optional_reg_kernel[
 ](tile: OptionalReg[_Tile[LayoutType]]):
     if global_idx.x != 0:
         return
-    if tile:
-        _fill_ramp(tile.value())
+    if case .Some(tile) = tile:
+        _fill_ramp(tile)
 
 
 def optional_kernel[
@@ -69,8 +71,8 @@ def optional_kernel[
 ](tile: Optional[_Tile[LayoutType]]):
     if global_idx.x != 0:
         return
-    if tile:
-        _fill_ramp(tile.value())
+    if case .Some(tile) = tile:
+        _fill_ramp(tile)
 
 
 def _check(
@@ -123,20 +125,19 @@ def test_optional_reg_capture(ctx: DeviceContext, engaged: Bool) raises:
     # The capture is encoded through `encode_closure_state`, which dispatches
     # to `OptionalReg._to_device_type` like a direct argument.
     def kernel() {var arg}:
-        if arg:
-            _fill_ramp(arg.value())
+        if case .Some(arg) = arg:
+            _fill_ramp(arg)
 
     ctx.enqueue_function(kernel, grid_dim=1, block_dim=1)
     _check(ctx, buf, engaged)
 
 
 def optional_pointer_kernel(
-    ptr: Optional[UnsafePointer[Float32, MutAnyOrigin]], n: Int32
+    ptr: Optional[MutPointer[Float32, MutAnyOrigin]], n: Int32
 ):
     if global_idx.x != 0:
         return
-    if ptr:
-        var p = ptr.value()
+    if case .Some(p) = ptr:
         for i in range(Int(n)):
             p[unsafe_offset=i] = Float32(i + 1)
 

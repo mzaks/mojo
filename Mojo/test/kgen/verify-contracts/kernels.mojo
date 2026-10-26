@@ -32,15 +32,12 @@ from max.gpu import (
     thread_idx,
     warp_id,
 )
-from max.gpu.host import DeviceContext, get_gpu_target
+from max.gpu.host import DeviceContext, default_accelerator, get_gpu_target
 from max.gpu.memory import external_memory
 import max.gpu.primitives.warp as warp
 from std.math import ceildiv
 from std.math.uutils import udivmod, ufloordiv
-from std.utils.index import Index
 from std.sys.info import (
-    has_amd_gpu_accelerator,
-    has_nvidia_gpu_accelerator,
     is_gpu,
     is_nvidia_gpu,
     simd_width_of,
@@ -198,7 +195,7 @@ def ok_launch_host_arg(
     if Int(c.dim[1]()) > 0:
         # A closure passed by host layout, the kernel's last argument.
         ctx.enqueue_function[ok_host_kernel[type_of(value)]](
-            c, host_arg=value, grid_dim=m, block_dim=1
+            c, host_args=(value,), grid_dim=m, block_dim=1
         )
 
 
@@ -255,7 +252,7 @@ def nvidia_kernel(dst: Pointer[Int, MutAnyOrigin], n: Int)
 
 def ok_launch_on_nvidia(ctx: DeviceContext) raises:
     var buf = ctx.enqueue_create_buffer[DType.int](64)
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         ctx.enqueue_function[nvidia_kernel](
             buf, len(buf), grid_dim=1, block_dim=64
         )  # the build's accelerator is NVIDIA's
@@ -331,8 +328,7 @@ def ok_reshape(t: TileTensor[DType.float32, LD, MutAnyOrigin], n: Int):
 
 
 def ok_local_closure(t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int):
-    @__parameter
-    def write() raises:
+    def write() raises {imm}:
         t[0, i] = 0  # checked at the call, where `i` is in bounds
 
     if Int(t.dim[0]()) > 0 and 0 <= i and i < Int(t.dim[1]()):
@@ -350,8 +346,7 @@ def ok_rows_kernel[rows: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
 def ok_launch_in_closure(
     ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
 ) raises:
-    @__parameter
-    def launch[rows: Int]() raises:
+    def launch[rows: Int]() raises {imm}:
         ctx.enqueue_function[ok_rows_kernel[rows]](t, grid_dim=1, block_dim=1)
 
     launch[4]()
@@ -459,7 +454,9 @@ def ok_linear_offset[
     comptime assert (
         L.rank == 2 and L.flat_rank == 2 and L.static_stride[1] == 1
     ), "rows must be contiguous"
-    var offset = t._linear_offset(Index(i, j))
+    var offset = t.layout[linear_idx_type=type_of(t).linear_idx_type](
+        Coord(i, j)
+    )
     return t.ptr.unsafe_offset(Int(offset))[unsafe_offset=3]
 
 
@@ -602,7 +599,7 @@ def bad_launch_host_arg(
 
     if Int(c.dim[1]()) > 0:
         ctx.enqueue_function[ok_host_kernel[type_of(value)]](
-            c, host_arg=value, grid_dim=m + 1, block_dim=1  # one block too many
+            c, host_args=(value,), grid_dim=m + 1, block_dim=1  # one block too many
         )
 
 
@@ -630,7 +627,7 @@ def bad_warp_size_anywhere(p: Pointer[Float32, MutAnyOrigin], n: Int) -> Float32
 
 def bad_launch_on_amd(ctx: DeviceContext) raises:
     var buf = ctx.enqueue_create_buffer[DType.int](64)
-    comptime if has_amd_gpu_accelerator():
+    comptime if default_accelerator().is_amd_gpu():
         ctx.enqueue_function[nvidia_kernel](
             buf, len(buf), grid_dim=1, block_dim=64
         )  # an AMD GPU: neither assertion holds
@@ -684,8 +681,7 @@ def bad_reshape_larger(t: TileTensor[DType.float32, LD, MutAnyOrigin], n: Int):
 
 
 def bad_local_closure(t: TileTensor[DType.float32, LD, MutAnyOrigin], i: Int):
-    @__parameter
-    def write() raises:
+    def write() raises {imm}:
         t[0, i] = 0
 
     try:
@@ -701,8 +697,7 @@ def bad_rows_kernel[rows: Int](t: TileTensor[DType.float32, L88, MutAnyOrigin]):
 def bad_launch_in_closure(
     ctx: DeviceContext, t: TileTensor[DType.float32, L88, MutAnyOrigin]
 ) raises:
-    @__parameter
-    def launch[rows: Int]() raises:
+    def launch[rows: Int]() raises {imm}:
         ctx.enqueue_function[bad_rows_kernel[rows]](t, grid_dim=1, block_dim=1)
 
     launch[4]()
@@ -833,7 +828,9 @@ def bad_linear_offset[
     comptime assert (
         L.rank == 2 and L.flat_rank == 2 and L.static_stride[1] == 1
     ), "rows must be contiguous"
-    var offset = t._linear_offset(Index(i, j))
+    var offset = t.layout[linear_idx_type=type_of(t).linear_idx_type](
+        Coord(i, j)
+    )
     return t.ptr.unsafe_offset(Int(offset))[unsafe_offset=4]  # past the row
 
 
@@ -842,7 +839,9 @@ def bad_linear_offset_strided[
 ](t: TileTensor[DType.float32, L, MutAnyOrigin], i: Int, j: Int) -> Float32
     requires 0 <= i < Int(t.dim[0]()) and 0 <= j <= Int(t.dim[1]()) - 4:
     comptime assert L.rank == 2 and L.flat_rank == 2  # any last stride
-    var offset = t._linear_offset(Index(i, j))
+    var offset = t.layout[linear_idx_type=type_of(t).linear_idx_type](
+        Coord(i, j)
+    )
     return t.ptr.unsafe_offset(Int(offset))[unsafe_offset=3]
 
 

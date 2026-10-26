@@ -54,7 +54,13 @@ Entry point: block_scaled_matmul_amd()
 
 from std.math import ceildiv
 from std.memory import bitcast
-from std.sys import get_defined_bool, get_defined_int, simd_width_of, size_of
+from std.sys import (
+    align_of,
+    get_defined_bool,
+    get_defined_int,
+    simd_width_of,
+    size_of,
+)
 from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
@@ -71,7 +77,13 @@ from max.gpu.sync import (
     schedule_barrier,
     schedule_group_barrier,
 )
-from layout import Coord, Idx, TensorLayout, TensorEngine, TileTensor
+from layout import (
+    Coord,
+    Idx,
+    TensorLayout,
+    TensorEngine,
+    TileTensor,
+)
 from layout.tile_layout import row_major, col_major
 from layout.tile_tensor import stack_allocation
 from layout.swizzle import Swizzle
@@ -86,15 +98,14 @@ from structured_kernels.amd_tile_io import (
     RegTileLoader,
     RegTileWriter,
 )
-from ....utils import elementwise_epilogue_type
-from .amd_matmul_schedule import build_default_matmul_schedule
-from .amd_matmul_schedule import (
-    DefaultMatmulOps,
-    COMPUTE,
-    LOAD_DRAM,
-    LOAD_FRAG,
-    STORE_SMEM,
+from ....utils import (
+    ElementwiseComputeFn,
+    ElementwiseEpilogueFn,
+    no_compute_fn,
+    no_epilogue_fn,
 )
+from .amd_matmul_schedule import build_default_matmul_schedule
+from .amd_matmul_schedule import DefaultMatmulOps
 from pipeline.pipeline_dsl import ScheduleEntry
 
 from .block_scaled_preshuffle_loaders import PreshuffledBLoader
@@ -103,6 +114,8 @@ from .block_scaled_preshuffle_layouts import Shuffler
 from .amd_4wave_split_k_matmul import (
     SplitKWorkspace,
     _split_k_reduce_kernel,
+    _split_k_reduce_kernel_compute_fn,
+    _split_k_reduce_kernel_epilogue_fn,
 )
 
 # MXFP4: 32 MXFP4 elements per E8M0 scale.
@@ -191,8 +204,8 @@ def _swizzled_smem_off[
     """Flat `row*BK_BYTES + col_byte` in-tile byte offset, XOR-swizzled if enabled.
     """
     var off = row * BK_BYTES + col_byte
-    comptime if swizzle:
-        off = swizzle.value()(off)
+    comptime if case .Some(swizzle_fn) = swizzle:
+        off = swizzle_fn(off)
     return off
 
 
@@ -208,6 +221,7 @@ struct BlockScaledMmaOp[
     num_k_tiles: Int,
     num_b_slots: Int = 1,
     matrix_format: CDNA4F8F6F4MatrixFormat = CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1,
+    b_matrix_format: CDNA4F8F6F4MatrixFormat = matrix_format,
 ]:
     """Register ownership + block-scaled MFMA execution.
 
@@ -238,10 +252,15 @@ struct BlockScaledMmaOp[
             (`BK_BYTES // packed_k_per_mma`).
         num_b_slots: Number of B register slots for depth-2 prefetch
             (defaults to 1).
-        matrix_format: `f8f6f4` operand encoding for A and B. A lane covers
+        matrix_format: `f8f6f4` encoding of A. A lane covers
             32 K-elements in every format; what changes is the bytes that
             occupies -- 16 (FP4), 24 (FP6), 32 (FP8) -- which `lane_bytes`
             below derives.
+        b_matrix_format: Encoding of B, defaulting to `matrix_format` for
+            existing equal-format callers. The dense path also supports
+            E4M3 FP8 A against E2M1 FP4 B without materializing weights.
+            The MFMA consumes B first because its accumulator layout is
+            transposed, so its hardware format selectors follow that order.
     """
 
     comptime MMA_M = Self.mma_shape[0]
@@ -249,7 +268,7 @@ struct BlockScaledMmaOp[
     comptime MMA_K = Self.mma_shape[2]
 
     comptime a_bits = Self.matrix_format.bits_per_element()
-    comptime b_bits = Self.matrix_format.bits_per_element()
+    comptime b_bits = Self.b_matrix_format.bits_per_element()
     comptime bits_per_element = Self.a_bits
     comptime a_packed_k_per_mma = (Self.MMA_K * Self.a_bits) // 8
     comptime b_packed_k_per_mma = (Self.MMA_K * Self.b_bits) // 8
@@ -267,7 +286,7 @@ struct BlockScaledMmaOp[
     comptime mma_frag_width_bytes: Int = Self.a_frag_width_bytes
     comptime lane_bytes: Int = Self.mma_frag_width_bytes
     comptime a_reg_frag_bytes: Int = Self.matrix_format.simd_width()
-    comptime b_reg_frag_bytes: Int = Self.matrix_format.simd_width()
+    comptime b_reg_frag_bytes: Int = Self.b_matrix_format.simd_width()
     comptime reg_frag_bytes: Int = Self.a_reg_frag_bytes
     # At MXFP8 a lane's two 16-byte halves sit K_HALF_STRIDE apart in K, not
     # contiguous; treating them as contiguous mis-pairs the scale blocks.
@@ -320,6 +339,10 @@ struct BlockScaledMmaOp[
         and Self.a_frag_width_bytes == 24
         and Self.b_frag_width_bytes == 24
     )
+    # TODO(alexandrnikitin): Mixed E4M3 x E2M1 is untuned. Its A and B rows
+    # differ in width, so BK128 runs without this swizzle, and BK512 needs 444
+    # registers (256 VGPR + 188 AGPR) against ~146 at W4A4: 1 wave per SIMD
+    # instead of 3. Retune both before W4A8 becomes the default K3 path on AMD.
     comptime use_smem_swizzle = (
         Self.num_k_tiles == 1
         and Self.FRAG_HALF_BYTES == 16
@@ -388,6 +411,10 @@ struct BlockScaledMmaOp[
 
     @inline(.always)
     def __init__(out self):
+        comptime assert Self.matrix_format == Self.b_matrix_format or (
+            Self.matrix_format == CDNA4F8F6F4MatrixFormat.FLOAT8_E4M3
+            and Self.b_matrix_format == CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1
+        ), "only E4M3 A x E2M1 B is validated for mixed operand encodings"
         comptime assert (
             Self.num_m_mmas <= 4
         ), "num_m_mmas must be <= 4 for packed scales"
@@ -444,6 +471,9 @@ struct BlockScaledMmaOp[
         comptime assert slot < Self.num_b_slots, "slot out of range"
         comptime if Self.b_bits == 6:
             var b_reg8 = self._b_reg.vectorize[1, 8]()
+            var b_smem_flat = b_smem_warp.reshape(
+                row_major[type_of(b_smem_warp).LayoutType.static_product]()
+            )
             var b_lane = Int(lane_id())
             var b_lane_row = b_lane % Self.MMA_M
             var b_byte_base = (
@@ -461,12 +491,17 @@ struct BlockScaledMmaOp[
                     var b_off = _swizzled_smem_off[
                         Self.B_SMEM_ROW_BYTES, Self.smem_swizzle
                     ](b_row, b_byte_base + chunk * 8)
-                    b_reg8[b_idx, chunk] = b_smem_warp.raw_load[width=8](b_off)
+                    b_reg8[b_idx, chunk] = b_smem_flat.load[
+                        width=8, alignment=align_of[DType.uint8]()
+                    ](Coord(b_off))
         else:
             self._load_b_frag_vectorized[k_tile_idx, slot=slot](b_smem_warp)
 
         comptime if Self.a_bits == 6:
             var a_reg8 = self._a_reg.vectorize[1, 8]()
+            var a_smem_flat = a_smem_warp.reshape(
+                row_major[type_of(a_smem_warp).LayoutType.static_product]()
+            )
             var a_lane = Int(lane_id())
             var a_lane_row = a_lane % Self.MMA_M
             var a_byte_base = (
@@ -480,7 +515,9 @@ struct BlockScaledMmaOp[
                     var a_off = _swizzled_smem_off[
                         Self.A_SMEM_ROW_BYTES, Self.smem_swizzle
                     ](a_row, a_byte_base + chunk * 8)
-                    a_reg8[a_idx, chunk] = a_smem_warp.raw_load[width=8](a_off)
+                    a_reg8[a_idx, chunk] = a_smem_flat.load[
+                        width=8, alignment=align_of[DType.uint8]()
+                    ](Coord(a_off))
         else:
             self._load_a_frag_vectorized[k_tile_idx](a_smem_warp)
 
@@ -519,6 +556,9 @@ struct BlockScaledMmaOp[
         var lane_k_vec = Int(lane_crd[1])
 
         var b_reg_v = self._b_reg.vectorize[1, half_w]()
+        var b_smem_flat = b_smem_warp.reshape(
+            row_major[type_of(b_smem_warp).LayoutType.static_product]()
+        )
         comptime for i in range(Self.num_n_mmas):
             var b_idx = (
                 slot * Self._b_slot_stride + k_tile_idx * Self.num_n_mmas + i
@@ -533,7 +573,9 @@ struct BlockScaledMmaOp[
                 var off = _swizzled_smem_off[
                     Self.B_SMEM_ROW_BYTES, Self.smem_swizzle
                 ](row, col_byte)
-                b_reg_v[b_idx, h] = b_smem_warp.raw_load[width=half_w](off)
+                b_reg_v[b_idx, h] = b_smem_flat.load[
+                    width=half_w, alignment=align_of[DType.uint8]()
+                ](Coord(off))
 
     @inline(.always)
     def _load_a_frag_vectorized[
@@ -557,6 +599,9 @@ struct BlockScaledMmaOp[
         var lane_k_vec = Int(lane_crd[1])
 
         var a_reg_v = self._a_reg.vectorize[1, half_w]()
+        var a_smem_flat = a_smem_warp.reshape(
+            row_major[type_of(a_smem_warp).LayoutType.static_product]()
+        )
         comptime for i in range(Self.num_m_mmas):
             var a_idx = k_tile_idx * Self.num_m_mmas + i
             var row = i * Self.MMA_M + lane_row
@@ -569,7 +614,9 @@ struct BlockScaledMmaOp[
                 var off = _swizzled_smem_off[
                     Self.A_SMEM_ROW_BYTES, Self.smem_swizzle
                 ](row, col_byte)
-                a_reg_v[a_idx, h] = a_smem_warp.raw_load[width=half_w](off)
+                a_reg_v[a_idx, h] = a_smem_flat.load[
+                    width=half_w, alignment=align_of[DType.uint8]()
+                ](Coord(off))
 
     @inline(.always)
     def load_a_frag_from_smem[
@@ -591,6 +638,9 @@ struct BlockScaledMmaOp[
         var lane_row = Int(lane_crd[0])
         var lane_k_vec = Int(lane_crd[1])
         var a_reg_v = self._a_reg.vectorize[1, half_w]()
+        var a_smem_flat = a_smem_warp.reshape(
+            row_major[type_of(a_smem_warp).LayoutType.static_product]()
+        )
         comptime for i in range(Self.num_m_mmas):
             var a_idx = k_tile_idx * Self.num_m_mmas + i
             var row = i * Self.MMA_M + lane_row
@@ -603,7 +653,9 @@ struct BlockScaledMmaOp[
                 var off = _swizzled_smem_off[
                     Self.A_SMEM_ROW_BYTES, Self.smem_swizzle
                 ](row, col_byte)
-                a_reg_v[a_idx, h] = a_smem_warp.raw_load[width=half_w](off)
+                a_reg_v[a_idx, h] = a_smem_flat.load[
+                    width=half_w, alignment=align_of[DType.uint8]()
+                ](Coord(off))
 
     @inline(.always)
     def load_b_frag_preshuffled[
@@ -636,6 +688,9 @@ struct BlockScaledMmaOp[
                 iteration.
         """
         comptime assert slot < Self.num_b_slots, "slot out of range"
+        comptime assert (
+            Self.matrix_format == Self.b_matrix_format
+        ), "preshuffled B does not support mixed operand encodings"
         comptime assert Self.lane_bytes == 16, (
             "the preshuffled-B DRAM path is MXFP4-only; MXFP8 dense reads"
             " row-major B through the SMEM loaders"
@@ -705,7 +760,7 @@ struct BlockScaledMmaOp[
                 ]
             )
             a_packed = a_packed | bitcast[.int32](byte_val << UInt32(m_mma * 8))
-        self._a_scale_packed.raw_store(k_tile_idx, a_packed)
+        self._a_scale_packed[0, k_tile_idx] = a_packed
 
         var b_packed = Int32(0)
         comptime for n_mma in range(Self.num_n_mmas):
@@ -723,7 +778,7 @@ struct BlockScaledMmaOp[
                 ]
             )
             b_packed = b_packed | bitcast[.int32](byte_val << UInt32(n_mma * 8))
-        self._b_scale_packed.raw_store(k_tile_idx, b_packed)
+        self._b_scale_packed[0, k_tile_idx] = b_packed
 
     @inline(.always)
     def mma[k_tile_idx: Int, slot: Int = 0](self):
@@ -750,32 +805,28 @@ struct BlockScaledMmaOp[
                     + k_tile_idx * Self.num_n_mmas
                     + n
                 )
-                comptime a_off = a_row * Self.a_reg_frag_bytes
-                comptime b_off = b_row * Self.b_reg_frag_bytes
-                comptime c_off = (
-                    m * Self.num_n_mmas * Self.c_frag_size
-                    + n * Self.c_frag_size
-                )
+                var c_coord = Coord(m, n * Self.c_frag_size)
 
-                var a_frag = self._a_reg.raw_load[width=Self.a_reg_frag_bytes](
-                    a_off
-                )
-                var b_frag = self._b_reg.raw_load[width=Self.b_reg_frag_bytes](
-                    b_off
-                )
+                var a_frag = self._a_reg.load[
+                    width=Self.a_reg_frag_bytes,
+                    alignment=align_of[DType.uint8](),
+                ](Coord(a_row, 0))
+                var b_frag = self._b_reg.load[
+                    width=Self.b_reg_frag_bytes,
+                    alignment=align_of[DType.uint8](),
+                ](Coord(b_row, 0))
 
-                var c_frag = self._c_reg.raw_load[width=Self.c_frag_size](c_off)
+                var c_frag = self._c_reg.load[
+                    width=Self.c_frag_size,
+                    alignment=align_of[DType.float32](),
+                ](c_coord)
 
-                var a_scale = rebind[Int32](
-                    self._a_scale_packed.raw_load(k_tile_idx)
-                )
-                var b_scale = rebind[Int32](
-                    self._b_scale_packed.raw_load(k_tile_idx)
-                )
+                var a_scale = rebind[Int32](self._a_scale_packed[0, k_tile_idx])
+                var b_scale = rebind[Int32](self._b_scale_packed[0, k_tile_idx])
                 cdna4_block_scaled_mfma[
                     Int32(n),
                     Int32(m),
-                    Self.matrix_format,
+                    Self.b_matrix_format,
                     Self.matrix_format,
                 ](
                     c_frag,
@@ -785,7 +836,9 @@ struct BlockScaledMmaOp[
                     a_scale,
                 )
 
-                self._c_reg.raw_store[width=Self.c_frag_size](c_off, c_frag)
+                self._c_reg.store[alignment=align_of[DType.float32]()](
+                    c_coord, c_frag
+                )
 
 
 # ===----------------------------------------------------------------------=== #
@@ -804,11 +857,11 @@ struct BlockScaledMatmulAMD[
     MMA_K: Int = 128,
     num_stages: Int = 1,
     matrix_format: CDNA4F8F6F4MatrixFormat = CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1,
-    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
+    b_matrix_format: CDNA4F8F6F4MatrixFormat = matrix_format,
 ]:
-    """Native MXFP4 block-scaled matmul for AMD CDNA4.
+    """Native block-scaled matmul for AMD CDNA4.
 
-    Uses cdna4_block_scaled_mfma with FLOAT4_E2M1 format directly.
+    Uses cdna4_block_scaled_mfma with independent A/B operand encodings.
     Single-buffer pipeline, or at `num_stages == 2` an LDS ping-pong with a
     depth-2 B-fragment ring.
     SMEM is plain row-major (no blocked-product), with a conditional XOR
@@ -818,26 +871,22 @@ struct BlockScaledMatmulAMD[
     Parameters:
         BM: Block tile rows (output M per block). Default 128.
         BN: Block tile cols (output N per block). Default 128.
-        BK_ELEMS: Block tile K in logical FP4 elements. Default 128.
+        BK_ELEMS: Block tile K in logical elements. Default 128.
         WM: Warp tile rows. BM must be divisible by WM. Default 64.
         WN: Warp tile cols. BN must be divisible by WN. Default 64.
         MMA_M: MFMA tile rows. WM must be divisible by MMA_M. Default 16.
         MMA_N: MFMA tile cols. WN must be divisible by MMA_N. Default 16.
-        MMA_K: MFMA K-depth in logical FP4 elements. Default 128.
+        MMA_K: MFMA K-depth in logical elements. Default 128.
         num_stages: SMEM pipeline depth. 1 is the single-buffer schedule; 2
             ping-pongs LDS (even `tiles_per_split`, VGPR-bound occupancy).
-        matrix_format: `f8f6f4` operand encoding for A and B (FP4 E2M1 by
-            default). `BK_ELEMS` counts ELEMENTS, so a given `BK_ELEMS` costs
-            1.5x the registers and LDS at MXFP6 and 2x at MXFP8.
-        elementwise_lambda_fn: Optional fused epilogue. When set, each
-            output fragment is handed to the lambda with its global
-            `(m, n)` instead of being stored to `c`, which lets a caller
-            route output bands elsewhere (e.g. scattering K/V into a
-            paged KV cache). Requires `MMA_M == 16` and `num_splits == 1`.
+        matrix_format: Encoding of A (FP4 E2M1 by default). `BK_ELEMS`
+            counts logical elements; payload and LDS widths follow each
+            operand's own encoding.
+        b_matrix_format: Encoding of B. Defaults to `matrix_format` (A).
     """
 
     comptime a_bits = Self.matrix_format.bits_per_element()
-    comptime b_bits = Self.matrix_format.bits_per_element()
+    comptime b_bits = Self.b_matrix_format.bits_per_element()
     comptime bits_per_element = Self.a_bits
     comptime A_BK_BYTES = (Self.BK_ELEMS * Self.a_bits) // 8
     comptime B_BK_BYTES = (Self.BK_ELEMS * Self.b_bits) // 8
@@ -879,7 +928,7 @@ struct BlockScaledMatmulAMD[
         )
     )
     @__name(
-        t"mx_dense_lb{Self.lane_bytes}_BM{Self.BM}_BN{Self.BN}_WM{Self.WM}_WN{Self.WN}_BK{Self.BK_ELEMS}_N{b_layout.static_shape[0]}_KB{a_layout.static_shape[1]}_SK{num_splits}"
+        t"mx_dense_lb{Self.lane_bytes}_BM{Self.BM}_BN{Self.BN}_WM{Self.WM}_WN{Self.WN}_BK{Self.BK_ELEMS}_N{b_layout.static_shape[0]}_KB{a_layout.static_shape[1]}_SK{num_splits}{"" if Self.matrix_format == Self.b_matrix_format else "_w4a8"}"
     )
     @staticmethod
     def run[
@@ -906,7 +955,11 @@ struct BlockScaledMatmulAMD[
             .float8_e8m0fnu, sfb_layout, ImmutAnyOrigin, Engine=sfb_engine
         ],
     ):
-        """MXFP4 block-scaled GEMM kernel with SMEM pipeline.
+        """Block-scaled GEMM kernel with SMEM pipeline.
+
+        A and B are raw bytes in the `matrix_format` and `b_matrix_format`
+        encodings, which may differ (E4M3 A against E2M1 B), so each operand
+        has its own byte width for the same logical K.
 
         With `num_splits > 1` this is the inter-block split-K body: each
         `block_idx.z` slice accumulates one disjoint K-band into its own
@@ -935,15 +988,186 @@ struct BlockScaledMatmulAMD[
         Args:
             c: Output matrix `[M, N]` of dtype `out_dtype`; in split-K
                 mode a stacked `(num_splits * M, N)` float32 workspace.
-            a: Packed A operand `[M, K//2]` uint8, two MXFP4 nibbles
-                per byte.
-            b: Packed B operand `[N, K//2]` uint8, transposed with two
-                MXFP4 nibbles per byte.
+            a: A operand `[M, K*a_bits//8]` as raw uint8 bytes in the
+                `matrix_format` encoding (`K//2` at MXFP4, `K` at MXFP8).
+            b: Transposed B operand `[N, K*b_bits//8]` as raw uint8 bytes
+                in the `b_matrix_format` encoding.
             sfa: A block scales `[M, K//32]` as `float8_e8m0fnu`, one
-                scale per 32 MXFP4 elements.
+                scale per 32 logical elements.
             sfb: B block scales `[N, K//32]` as `float8_e8m0fnu`, one
-                scale per 32 MXFP4 elements.
+                scale per 32 logical elements.
         """
+        Self._run_impl[
+            num_splits=num_splits, has_epilogue_fn=False, has_compute_fn=False
+        ](c, a, b, sfa, sfb, no_epilogue_fn, no_compute_fn)
+
+    @__llvm_metadata(
+        MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+            Int32(Self.num_threads)
+        )
+    )
+    @__name(
+        t"mx_dense_epilogue_fn_lb{Self.lane_bytes}_BM{Self.BM}_BN{Self.BN}_WM{Self.WM}_WN{Self.WN}_BK{Self.BK_ELEMS}_N{b_layout.static_shape[0]}_KB{a_layout.static_shape[1]}{"" if Self.matrix_format == Self.b_matrix_format else "_w4a8"}"
+    )
+    @staticmethod
+    def run_with_epilogue_fn[
+        out_dtype: DType,
+        c_layout: TensorLayout,
+        a_layout: TensorLayout,
+        b_layout: TensorLayout,
+        sfa_layout: TensorLayout,
+        sfb_layout: TensorLayout,
+        c_engine: TensorEngine,
+        a_engine: TensorEngine,
+        b_engine: TensorEngine,
+        sfa_engine: TensorEngine,
+        sfb_engine: TensorEngine,
+        EpilogueFnType: ElementwiseEpilogueFn,
+    ](
+        c: TileTensor[out_dtype, c_layout, MutAnyOrigin, Engine=c_engine],
+        a: TileTensor[.uint8, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        b: TileTensor[.uint8, b_layout, ImmutAnyOrigin, Engine=b_engine],
+        sfa: TileTensor[
+            .float8_e8m0fnu, sfa_layout, ImmutAnyOrigin, Engine=sfa_engine
+        ],
+        sfb: TileTensor[
+            .float8_e8m0fnu, sfb_layout, ImmutAnyOrigin, Engine=sfb_engine
+        ],
+        epilogue_fn: EpilogueFnType,
+    ):
+        """Same as `run` without split-K, storing the output through
+        `epilogue_fn`.
+
+        Launch with `host_args=(epilogue_fn,)`.
+        Requires `MMA_M == 16`.
+
+        Parameters:
+            out_dtype: Element type of the output tensor `c`.
+            c_layout: Compile-time layout of the output tensor `c`.
+            a_layout: Compile-time layout of the A operand.
+            b_layout: Compile-time layout of the B operand.
+            sfa_layout: Compile-time layout of the A scales tensor `sfa`.
+            sfb_layout: Compile-time layout of the B scales tensor `sfb`.
+            c_engine: Engine of the output tensor `c`.
+            a_engine: Engine of the A operand.
+            b_engine: Engine of the B operand.
+            sfa_engine: Engine of the A scales tensor `sfa`.
+            sfb_engine: Engine of the B scales tensor `sfb`.
+            EpilogueFnType: Type of `epilogue_fn`.
+
+        Args:
+            c: Output matrix `[M, N]`. Only its shape is read.
+            a: A operand, as in `run`.
+            b: Transposed B operand, as in `run`.
+            sfa: A block scales, as in `run`.
+            sfb: B block scales, as in `run`.
+            epilogue_fn: Stores each output fragment at its global `(m, n)`.
+        """
+        Self._run_impl[
+            num_splits=1, has_epilogue_fn=True, has_compute_fn=False
+        ](c, a, b, sfa, sfb, epilogue_fn, no_compute_fn)
+
+    @__llvm_metadata(
+        MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+            Int32(Self.num_threads)
+        )
+    )
+    @__name(
+        t"mx_dense_compute_fn_lb{Self.lane_bytes}_BM{Self.BM}_BN{Self.BN}_WM{Self.WM}_WN{Self.WN}_BK{Self.BK_ELEMS}_N{b_layout.static_shape[0]}_KB{a_layout.static_shape[1]}{"" if Self.matrix_format == Self.b_matrix_format else "_w4a8"}"
+    )
+    @staticmethod
+    def run_with_compute_fn[
+        out_dtype: DType,
+        c_layout: TensorLayout,
+        a_layout: TensorLayout,
+        b_layout: TensorLayout,
+        sfa_layout: TensorLayout,
+        sfb_layout: TensorLayout,
+        c_engine: TensorEngine,
+        a_engine: TensorEngine,
+        b_engine: TensorEngine,
+        sfa_engine: TensorEngine,
+        sfb_engine: TensorEngine,
+        ComputeFnType: ElementwiseComputeFn,
+    ](
+        c: TileTensor[out_dtype, c_layout, MutAnyOrigin, Engine=c_engine],
+        a: TileTensor[.uint8, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        b: TileTensor[.uint8, b_layout, ImmutAnyOrigin, Engine=b_engine],
+        sfa: TileTensor[
+            .float8_e8m0fnu, sfa_layout, ImmutAnyOrigin, Engine=sfa_engine
+        ],
+        sfb: TileTensor[
+            .float8_e8m0fnu, sfb_layout, ImmutAnyOrigin, Engine=sfb_engine
+        ],
+        compute_fn: ComputeFnType,
+    ):
+        """Same as `run` without split-K, storing `compute_fn(idx, value)`
+        into `c`.
+
+        Launch with `host_args=(compute_fn,)`.
+        Requires `MMA_M == 16`.
+
+        Parameters:
+            out_dtype: Element type of the output tensor `c`.
+            c_layout: Compile-time layout of the output tensor `c`.
+            a_layout: Compile-time layout of the A operand.
+            b_layout: Compile-time layout of the B operand.
+            sfa_layout: Compile-time layout of the A scales tensor `sfa`.
+            sfb_layout: Compile-time layout of the B scales tensor `sfb`.
+            c_engine: Engine of the output tensor `c`.
+            a_engine: Engine of the A operand.
+            b_engine: Engine of the B operand.
+            sfa_engine: Engine of the A scales tensor `sfa`.
+            sfb_engine: Engine of the B scales tensor `sfb`.
+            ComputeFnType: Type of `compute_fn`.
+
+        Args:
+            c: Output matrix `[M, N]`.
+            a: A operand, as in `run`.
+            b: Transposed B operand, as in `run`.
+            sfa: A block scales, as in `run`.
+            sfb: B block scales, as in `run`.
+            compute_fn: Maps each output index and fragment to the value
+                to store.
+        """
+        Self._run_impl[
+            num_splits=1, has_epilogue_fn=False, has_compute_fn=True
+        ](c, a, b, sfa, sfb, no_epilogue_fn, compute_fn)
+
+    @staticmethod
+    @inline(.always)
+    def _run_impl[
+        out_dtype: DType,
+        c_layout: TensorLayout,
+        a_layout: TensorLayout,
+        b_layout: TensorLayout,
+        sfa_layout: TensorLayout,
+        sfb_layout: TensorLayout,
+        c_engine: TensorEngine,
+        a_engine: TensorEngine,
+        b_engine: TensorEngine,
+        sfa_engine: TensorEngine,
+        sfb_engine: TensorEngine,
+        EpilogueFnType: ElementwiseEpilogueFn,
+        ComputeFnType: ElementwiseComputeFn,
+        //,
+        *,
+        num_splits: Int,
+        has_epilogue_fn: Bool,
+        has_compute_fn: Bool,
+    ](
+        c: TileTensor[out_dtype, c_layout, MutAnyOrigin, Engine=c_engine],
+        a: TileTensor[.uint8, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        b: TileTensor[.uint8, b_layout, ImmutAnyOrigin, Engine=b_engine],
+        sfa: TileTensor[
+            .float8_e8m0fnu, sfa_layout, ImmutAnyOrigin, Engine=sfa_engine
+        ],
+        sfb: TileTensor[
+            .float8_e8m0fnu, sfb_layout, ImmutAnyOrigin, Engine=sfb_engine
+        ],
+        epilogue_fn: EpilogueFnType,
+        compute_fn: ComputeFnType,
+    ):
         comptime A_BK_BYTES = Self.A_BK_BYTES
         comptime B_BK_BYTES = Self.B_BK_BYTES
         comptime BK_BYTES = A_BK_BYTES
@@ -971,7 +1195,19 @@ struct BlockScaledMatmulAMD[
             " that divides K, or pad K."
         )
 
-        comptime K_SCALES = type_of(sfa).static_shape[1]  # K//32
+        comptime assert (
+            A_K_BYTES * 8 // Self.a_bits == B_K_BYTES * 8 // Self.b_bits
+        ), (
+            "A and B must have the same logical K, accounting for their"
+            " encodings"
+        )
+        comptime K_SCALES = type_of(sfa).static_shape[1]  # logical K//32
+        comptime assert (
+            K_SCALES == A_K_BYTES * 8 // Self.a_bits // MX_BLOCK_SIZE
+        ), "A scales must have one entry per 32 logical elements"
+        comptime assert (
+            type_of(sfb).static_shape[1] == K_SCALES
+        ), "A and B scale widths must match"
 
         # === Split-K K-banding ===
         # The K dimension is partitioned into `num_splits` disjoint bands.
@@ -994,7 +1230,7 @@ struct BlockScaledMatmulAMD[
         # grid_dim.z = num_experts, where block_idx.z is the expert index, not
         # a split. Forcing split_id = 0 there keeps the K range full and the
         # output offset zero — byte-identical to the no-split path.
-        var split_id = Int(block_idx.z) if num_splits > 1 else 0
+        var split_id = block_idx.z if num_splits > 1 else 0
 
         # Dynamic M for OOB bounds handling when M is not a multiple of Self.BM.
         var M = Int(a.dim[0]())
@@ -1003,8 +1239,8 @@ struct BlockScaledMatmulAMD[
         var warp_m, warp_n = divmod(_warp_id, Self.num_warps_n)
 
         # === GMEM views ===
-        var a_gmem = TileTensor(a.ptr.bitcast[UInt8](), a.layout)
-        var b_gmem = TileTensor(b.ptr.bitcast[UInt8](), b.layout)
+        var a_gmem = a.bitcast[.uint8]()
+        var b_gmem = b.bitcast[.uint8]()
 
         # === SMEM tiles (row-major allocation; access is conditionally
         # XOR-swizzled per BlockScaledMmaOp.use_smem_swizzle) ===
@@ -1100,7 +1336,9 @@ struct BlockScaledMatmulAMD[
             num_k_tiles=num_k_tiles,
             num_b_slots=num_stages,
             matrix_format=Self.matrix_format,
+            b_matrix_format=Self.b_matrix_format,
         ]()
+        comptime MmaOpT = type_of(mma_op)
 
         # === Output writer ===
         # RegTileWriter casts from float32 accumulators to out_dtype.
@@ -1113,8 +1351,8 @@ struct BlockScaledMatmulAMD[
         # M is not BM-aligned) are hardware-clamped to this split's region
         # and never bleed into the next split. For num_splits==1 the offset
         # is 0 and `c_split` is byte-identical to `c`.
-        var c_split = TileTensor(
-            c.ptr + split_id * M * N, row_major((Int(M), Idx[N]))
+        var c_split = c[split_id * M : (split_id + 1) * M, :].reshape(
+            row_major((Int(M), Idx[N]))
         )
         var c_writer = RegTileWriter[
             out_dtype, Self.MMA_M, WARP_SIZE // Self.MMA_M
@@ -1125,7 +1363,8 @@ struct BlockScaledMatmulAMD[
         # the reduce kernel instead. The 32x32 MFMA's per-lane fragment is
         # spread over non-contiguous columns, which the chunked writer below
         # cannot address as one span.
-        comptime if Bool(Self.elementwise_lambda_fn):
+        comptime has_fused_epilogue = has_epilogue_fn or has_compute_fn
+        comptime if has_fused_epilogue:
             comptime assert num_splits == 1, (
                 "fused epilogue is unsupported with split-K: it would fire on"
                 " each K partial rather than the reduced output"
@@ -1137,7 +1376,6 @@ struct BlockScaledMatmulAMD[
         var c_epilogue = RegTileEpilogue[
             out_dtype,
             Self.c_frag_size,
-            elementwise_lambda_fn=Self.elementwise_lambda_fn,
         ](c_split)
 
         # === Pipeline helpers ===
@@ -1150,8 +1388,7 @@ struct BlockScaledMatmulAMD[
         var k_scale_counter = split_id * tiles_per_split
 
         @inline(.always)
-        @__parameter
-        def load_tiles_from_dram():
+        def load_tiles_from_dram() {mut k_counter, imm}:
             """Load one BK-wide tile from DRAM to register buffers."""
             var a_block = a_blockrow.tile[Self.BM, A_BK_BYTES](0, k_counter)
             var b_block = b_blockrow.tile[Self.BN, B_BK_BYTES](0, k_counter)
@@ -1160,8 +1397,7 @@ struct BlockScaledMatmulAMD[
             k_counter += 1
 
         @inline(.always)
-        @__parameter
-        def copy_tiles_to_smem[stage: Int = 0]():
+        def copy_tiles_to_smem[stage: Int = 0]() {imm}:
             """Copy register buffers to SMEM in row-major order.
 
             Computes each thread's flat `row*SMEM_ROW_BYTES + col_byte` in-tile
@@ -1181,7 +1417,6 @@ struct BlockScaledMatmulAMD[
                 stage: SMEM pipeline stage. Swizzle the in-tile offset, then add
                     the stage base (a multiple of the swizzle's 1024-byte span).
             """
-            comptime MmaOpT = type_of(mma_op)
             # Stride by the SMEM row, not the payload: at FP6 the 96-byte BK
             # row is padded to 128 in the allocation above, so stepping by
             # `A_BK_BYTES` would put stage 1 short of where it was written.
@@ -1189,34 +1424,42 @@ struct BlockScaledMatmulAMD[
             # as wrong results on FP6.
             comptime a_stage_base = stage * Self.BM * A_SMEM_ROW_BYTES
             comptime b_stage_base = stage * Self.BN * B_SMEM_ROW_BYTES
-            var tid = Int(thread_idx.x)
+            var tid = thread_idx.x
 
             @inline(.always)
-            @__parameter
-            def store_a():
+            def store_a() {imm}:
                 var a_row = tid // a_load_cols
                 var a_col_byte = (tid % a_load_cols) * simd_width
+                var a_smem_flat = a_smem.reshape(
+                    row_major[type_of(a_smem).LayoutType.static_product]()
+                )
                 comptime for v in range(a_loads_per_tile):
                     var off = _swizzled_smem_off[
                         A_SMEM_ROW_BYTES, MmaOpT.smem_swizzle
                     ](a_row + v * a_load_rows, a_col_byte)
-                    a_smem.raw_store[width=simd_width](
-                        a_stage_base + off,
-                        a_load_reg.raw_load[width=simd_width](v * simd_width),
+                    a_smem_flat.store[alignment=align_of[DType.uint8]()](
+                        Coord(a_stage_base + off),
+                        a_load_reg.load[
+                            width=simd_width, alignment=align_of[DType.uint8]()
+                        ](Coord(0, v * simd_width)),
                     )
 
             @inline(.always)
-            @__parameter
-            def store_b():
+            def store_b() {imm}:
                 var b_row = tid // b_load_cols
                 var b_col_byte = (tid % b_load_cols) * simd_width
+                var b_smem_flat = b_smem.reshape(
+                    row_major[type_of(b_smem).LayoutType.static_product]()
+                )
                 comptime for v in range(b_loads_per_tile):
                     var off = _swizzled_smem_off[
                         B_SMEM_ROW_BYTES, MmaOpT.smem_swizzle
                     ](b_row + v * b_load_rows, b_col_byte)
-                    b_smem.raw_store[width=simd_width](
-                        b_stage_base + off,
-                        b_load_reg.raw_load[width=simd_width](v * simd_width),
+                    b_smem_flat.store[alignment=align_of[DType.uint8]()](
+                        Coord(b_stage_base + off),
+                        b_load_reg.load[
+                            width=simd_width, alignment=align_of[DType.uint8]()
+                        ](Coord(0, v * simd_width)),
                     )
 
             comptime if a_active_threads == num_threads:
@@ -1232,8 +1475,7 @@ struct BlockScaledMatmulAMD[
                     store_b()
 
         @inline(.always)
-        @__parameter
-        def load_scales_from_dram():
+        def load_scales_from_dram() {mut k_scale_counter, imm}:
             """Cooperatively read one BK iteration's scale tiles to registers.
 
             Scale tile per BK iteration: [Self.BM, scales_per_mma] for A and
@@ -1243,10 +1485,16 @@ struct BlockScaledMatmulAMD[
             Each active thread reads SCALE_WORDS_PER_ROW Int32 dwords per BK
             iteration, giving coalesced 4-byte aligned GMEM reads.
             """
-            var tid = Int(thread_idx.x)
+            var tid = thread_idx.x
             var base_scale_k = k_scale_counter * scales_per_mma * num_k_tiles
-            var a_base_row = Int(block_idx.y) * Self.BM
-            var b_base_row = Int(block_idx.x) * Self.BN
+            var a_base_row = block_idx.y * Self.BM
+            var b_base_row = block_idx.x * Self.BN
+            var sfa_words = sfa.bitcast[.int32]().reshape(
+                row_major(M * K_SCALES // 4)
+            )
+            var sfb_words = sfb.bitcast[.int32]().reshape(
+                row_major(N * K_SCALES // 4)
+            )
 
             # A scales: guard M-OOB rows.
             if tid < Self.BM:
@@ -1254,49 +1502,56 @@ struct BlockScaledMatmulAMD[
                 if row < M:
                     var src_word_base = (row * K_SCALES + base_scale_k) // 4
                     comptime for w in range(SCALE_WORDS_PER_ROW):
-                        sfa_load_reg.raw_store(
-                            w, sfa.ptr.bitcast[Int32]()[src_word_base + w]
+                        sfa_load_reg[0, w] = rebind[Int32](
+                            sfa_words.load[invariant=False](
+                                (src_word_base + w,)
+                            )
                         )
                 else:
                     comptime for w in range(SCALE_WORDS_PER_ROW):
-                        sfa_load_reg.raw_store(w, Int32(0))
+                        sfa_load_reg[0, w] = Int32(0)
             # B scales: guard N-OOB rows (B is transposed).
             if tid < Self.BN:
                 var row = b_base_row + tid
                 if row < N:
                     var src_word_base = (row * K_SCALES + base_scale_k) // 4
                     comptime for w in range(SCALE_WORDS_PER_ROW):
-                        sfb_load_reg.raw_store(
-                            w, sfb.ptr.bitcast[Int32]()[src_word_base + w]
+                        sfb_load_reg[0, w] = rebind[Int32](
+                            sfb_words.load[invariant=False](
+                                (src_word_base + w,)
+                            )
                         )
                 else:
                     comptime for w in range(SCALE_WORDS_PER_ROW):
-                        sfb_load_reg.raw_store(w, Int32(0))
+                        sfb_load_reg[0, w] = Int32(0)
 
             k_scale_counter += 1
 
         @inline(.always)
-        @__parameter
-        def copy_scales_to_smem[stage: Int = 0]():
+        def copy_scales_to_smem[stage: Int = 0]() {imm}:
             """Copy staged scale dwords to SMEM at the fragment-read offsets.
 
             Parameters:
                 stage: SMEM pipeline stage (0 unless `num_stages > 1`).
             """
-            comptime sfa_stage_base = stage * Self.BM * SCALE_WORDS_PER_ROW
-            comptime sfb_stage_base = stage * Self.BN * SCALE_WORDS_PER_ROW
-            var tid = Int(thread_idx.x)
+            var sfa_smem_words = sfa_smem.bitcast[DType.int32]().reshape(
+                row_major[num_stages * Self.BM, SCALE_WORDS_PER_ROW]()
+            )
+            var sfb_smem_words = sfb_smem.bitcast[DType.int32]().reshape(
+                row_major[num_stages * Self.BN, SCALE_WORDS_PER_ROW]()
+            )
+            var tid = thread_idx.x
 
             if tid < Self.BM:
                 comptime for w in range(SCALE_WORDS_PER_ROW):
-                    sfa_smem.ptr.bitcast[Int32]()[
-                        sfa_stage_base + tid * SCALE_WORDS_PER_ROW + w
-                    ] = sfa_load_reg.raw_load(w)
+                    sfa_smem_words[stage * Self.BM + tid, w] = sfa_load_reg[
+                        0, w
+                    ]
             if tid < Self.BN:
                 comptime for w in range(SCALE_WORDS_PER_ROW):
-                    sfb_smem.ptr.bitcast[Int32]()[
-                        sfb_stage_base + tid * SCALE_WORDS_PER_ROW + w
-                    ] = sfb_load_reg.raw_load(w)
+                    sfb_smem_words[stage * Self.BN + tid, w] = sfb_load_reg[
+                        0, w
+                    ]
 
         # === Schedule-driven pipeline ===
         # The schedule prologue pre-loads 2 tiles, so we need at least 2
@@ -1305,10 +1560,9 @@ struct BlockScaledMatmulAMD[
         comptime b_loads_per_thread = Self.BN // b_load_rows
 
         @inline(.always)
-        @__parameter
-        def simple_k_loop():
+        def simple_k_loop() {mut mma_op, imm}:
             """Fallback for small K where schedule prologue doesn't fit."""
-            for k_iter in range(tiles_per_split):
+            for _ in range(tiles_per_split):
                 load_tiles_from_dram()
                 load_scales_from_dram()
                 copy_tiles_to_smem()
@@ -1335,8 +1589,7 @@ struct BlockScaledMatmulAMD[
                 barrier()
 
         @inline(.always)
-        @__parameter
-        def scheduled_k_loop():
+        def scheduled_k_loop() {mut mma_op, imm}:
             """Pipelined K-loop via build_default_matmul_schedule."""
             comptime schedule = build_default_matmul_schedule[
                 num_k_tiles=num_k_tiles,
@@ -1349,59 +1602,65 @@ struct BlockScaledMatmulAMD[
                 b_loads_per_thread=b_loads_per_thread,
             ]()
 
-            @__parameter
             @inline(.always)
-            def _bind[entry: ScheduleEntry]():
-                comptime if entry.op.tag == LOAD_DRAM:
-                    load_tiles_from_dram()
-                    load_scales_from_dram()
-                elif entry.op.tag == STORE_SMEM:
-                    copy_tiles_to_smem()
-                    copy_scales_to_smem()
-                elif entry.op.tag == LOAD_FRAG:
-                    comptime k = entry.op.subtile
-                    var a_warp = a_smem.tile[Self.WM, A_SMEM_ROW_BYTES](
-                        warp_m, 0
-                    )
-                    var b_warp = b_smem.tile[Self.WN, B_SMEM_ROW_BYTES](
-                        warp_n, 0
-                    )
-                    mma_op.load_frag_from_smem[k](a_warp, b_warp)
-                    # k_tiles interleaved along the column axis.
-                    var sfa_k = sfa_smem.tile[Self.WM, scales_per_mma](
-                        warp_m, k
-                    )
-                    var sfb_k = sfb_smem.tile[Self.WN, scales_per_mma](
-                        warp_n, k
-                    )
-                    mma_op.load_scales_from_smem[k](sfa_k, sfb_k)
-                elif entry.op.tag == COMPUTE:
-                    mma_op.mma[entry.op.subtile]()
-                elif entry.op.tag == DefaultMatmulOps.BARRIER.value:
-                    barrier()
-                elif entry.op.tag == DefaultMatmulOps.SCHEDULE_BARRIER.value:
-                    schedule_barrier()
-                elif entry.op.tag == (
-                    DefaultMatmulOps.SCHED_GROUP_BARRIER.value
-                ):
-                    comptime sub = entry.op.subtile
-                    comptime wait = entry.op.wait_value
-                    comptime if sub == SCHED_MASK_DS_READ:
-                        schedule_group_barrier(
-                            AMDScheduleBarrierMask.DS_READ, Int32(wait), 0
+            def _bind[entry: ScheduleEntry]() {mut mma_op, imm}:
+                comptime op = DefaultMatmulOps(entry.op.tag)
+                comptime match op:
+                    case .LOAD_DRAM:
+                        load_tiles_from_dram()
+                        load_scales_from_dram()
+                    case .STORE_SMEM:
+                        copy_tiles_to_smem()
+                        copy_scales_to_smem()
+                    case .LOAD_FRAG:
+                        comptime k = entry.op.subtile
+                        var a_warp = a_smem.tile[Self.WM, A_SMEM_ROW_BYTES](
+                            warp_m, 0
                         )
-                    elif sub == SCHED_MASK_DS_WRITE:
-                        schedule_group_barrier(
-                            AMDScheduleBarrierMask.DS_WRITE, Int32(wait), 0
+                        var b_warp = b_smem.tile[Self.WN, B_SMEM_ROW_BYTES](
+                            warp_n, 0
                         )
-                    elif sub == SCHED_MASK_VMEM_READ:
-                        schedule_group_barrier(
-                            AMDScheduleBarrierMask.VMEM_READ, Int32(wait), 0
+                        mma_op.load_frag_from_smem[k](a_warp, b_warp)
+                        # k_tiles interleaved along the column axis.
+                        var sfa_k = sfa_smem.tile[Self.WM, scales_per_mma](
+                            warp_m, k
                         )
-                    elif sub == SCHED_MASK_MFMA:
-                        schedule_group_barrier(
-                            AMDScheduleBarrierMask.MFMA, Int32(wait), 0
+                        var sfb_k = sfb_smem.tile[Self.WN, scales_per_mma](
+                            warp_n, k
                         )
+                        mma_op.load_scales_from_smem[k](sfa_k, sfb_k)
+                    case .COMPUTE:
+                        mma_op.mma[entry.op.subtile]()
+                    case .BARRIER:
+                        barrier()
+                    case .SCHEDULE_BARRIER:
+                        schedule_barrier()
+                    case .SCHED_GROUP_BARRIER:
+                        comptime sub = entry.op.subtile
+                        comptime wait = entry.op.wait_value
+                        comptime match sub:
+                            case == SCHED_MASK_DS_READ:
+                                schedule_group_barrier(
+                                    AMDScheduleBarrierMask.DS_READ,
+                                    Int32(wait),
+                                    0,
+                                )
+                            case == SCHED_MASK_DS_WRITE:
+                                schedule_group_barrier(
+                                    AMDScheduleBarrierMask.DS_WRITE,
+                                    Int32(wait),
+                                    0,
+                                )
+                            case == SCHED_MASK_VMEM_READ:
+                                schedule_group_barrier(
+                                    AMDScheduleBarrierMask.VMEM_READ,
+                                    Int32(wait),
+                                    0,
+                                )
+                            case == SCHED_MASK_MFMA:
+                                schedule_group_barrier(
+                                    AMDScheduleBarrierMask.MFMA, Int32(wait), 0
+                                )
 
             # Prologue.
             comptime for i in range(len(schedule.prologue)):
@@ -1417,8 +1676,7 @@ struct BlockScaledMatmulAMD[
                 _bind[schedule.epilogue[i]]()
 
         @inline(.always)
-        @__parameter
-        def double_buffered_k_loop():
+        def double_buffered_k_loop() {mut mma_op, imm}:
             """Depth-2 LDS ping-pong: read stage `k%2` while writing tile k+1
             into `(k+1)%2`. One barrier per K-tile; B uses a matching ring.
             """
@@ -1429,8 +1687,7 @@ struct BlockScaledMatmulAMD[
             comptime n_pairs = (tiles_per_split - 2) // 2
 
             @inline(.always)
-            @__parameter
-            def load_frags[stage: Int, slot: Int]():
+            def load_frags[stage: Int, slot: Int](mut mma_op: MmaOpT) {imm}:
                 var a_warp = a_smem.tile[Self.WM, A_BK_BYTES](
                     stage * Self.num_warps_m + warp_m, 0
                 )
@@ -1448,8 +1705,7 @@ struct BlockScaledMatmulAMD[
                     mma_op.load_scales_from_smem[k](sfa_k, sfb_k)
 
             @inline(.always)
-            @__parameter
-            def step[cur: Int, prefetch_dram: Bool]():
+            def step[cur: Int, prefetch_dram: Bool]() {mut mma_op, imm}:
                 """One steady-state K-tile: stage/slot `cur` in, `1 - cur` out.
                 """
                 copy_tiles_to_smem[stage=1 - cur]()
@@ -1460,7 +1716,7 @@ struct BlockScaledMatmulAMD[
                 comptime for k in range(num_k_tiles):
                     mma_op.mma[k, slot=cur]()
                 barrier()
-                load_frags[1 - cur, 1 - cur]()
+                load_frags[1 - cur, 1 - cur](mma_op)
 
             # Prologue: stage 0 <- tile 0, DRAM regs <- tile 1, frags -> slot 0.
             load_tiles_from_dram()
@@ -1470,7 +1726,7 @@ struct BlockScaledMatmulAMD[
             load_tiles_from_dram()
             load_scales_from_dram()
             barrier()
-            load_frags[0, 0]()
+            load_frags[0, 0](mma_op)
 
             for _ in range(n_pairs):
                 step[0, True]()
@@ -1506,15 +1762,15 @@ struct BlockScaledMatmulAMD[
         # which iterates the source as 4 register groups of 4 floats and
         # reorders them via the CDNA 32x32 register permutation
         # (`src[4*n + 16*m]` → fragment position `4*m + n`).
-        comptime if Bool(Self.elementwise_lambda_fn):
-            # The lambda mode addresses the output by global (m, n) rather than
+        comptime if has_fused_epilogue:
+            # The fused epilogue addresses the output by global (m, n) rather than
             # through the buffer resource, so it loses the V#'s row clamp and
             # has to gate `m` itself. For the 16x16 MFMA each lane owns
             # `c_frag_size` contiguous columns of one row: row = lane % MMA_M,
             # first column = (lane // MMA_M) * c_frag_size.
             var lane_group, thread_m = divmod(Int(lane_id()), Self.MMA_M)
-            var m_warp_base = Int(block_idx.y) * Self.BM + Int(warp_m) * Self.WM
-            var n_warp_base = Int(block_idx.x) * Self.BN + Int(warp_n) * Self.WN
+            var m_warp_base = block_idx.y * Self.BM + Int(warp_m) * Self.WM
+            var n_warp_base = block_idx.x * Self.BN + Int(warp_n) * Self.WN
 
             comptime for m_mma in range(num_m_mmas):
                 var m_global = m_warp_base + m_mma * Self.MMA_M + Int(thread_m)
@@ -1522,16 +1778,27 @@ struct BlockScaledMatmulAMD[
                     comptime for n_mma in range(num_n_mmas):
                         var v = (
                             c_reg.tile[1, c_frag_size](m_mma, n_mma)
-                            .raw_load[width=c_frag_size](0)
+                            .load[
+                                width=c_frag_size,
+                                alignment=align_of[DType.float32](),
+                            ](Coord(0, 0))
                             .cast[out_dtype]()
                         )
-                        c_epilogue.store(
-                            v,
-                            m=m_global,
-                            n=n_warp_base
+                        var n_global = (
+                            n_warp_base
                             + n_mma * Self.MMA_N
-                            + Int(lane_group) * c_frag_size,
+                            + Int(lane_group) * c_frag_size
                         )
+                        comptime if has_epilogue_fn:
+                            c_epilogue.store_with_epilogue_fn(
+                                epilogue_fn, v, m=m_global, n=n_global
+                            )
+                        elif has_compute_fn:
+                            c_epilogue.store_with_compute_fn(
+                                compute_fn, v, m=m_global, n=n_global
+                            )
+                        else:
+                            c_epilogue.store(v, m=m_global, n=n_global)
         else:
             comptime for m_mma in range(num_m_mmas):
                 comptime for n_mma in range(num_n_mmas):
@@ -1558,7 +1825,7 @@ def _launch_block_scaled[
     MMA_N: Int = 16,
     MMA_K: Int = 128,
     matrix_format: CDNA4F8F6F4MatrixFormat = CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1,
-    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
+    b_matrix_format: CDNA4F8F6F4MatrixFormat = matrix_format,
 ](
     c: TileTensor[mut=True, ...],
     a: TileTensor,
@@ -1569,6 +1836,63 @@ def _launch_block_scaled[
     ctx: DeviceContext,
 ) raises:
     """Instantiate BlockScaledMatmulAMD with the given tile shape and launch."""
+    _launch_block_scaled_impl[
+        BM=BM,
+        BN=BN,
+        BK_ELEMS=BK_ELEMS,
+        WM=WM,
+        WN=WN,
+        MMA_M=MMA_M,
+        MMA_N=MMA_N,
+        MMA_K=MMA_K,
+        matrix_format=matrix_format,
+        b_matrix_format=b_matrix_format,
+        has_epilogue_fn=False,
+        has_compute_fn=False,
+    ](
+        c,
+        a,
+        b,
+        a_scales,
+        b_scales,
+        M,
+        no_epilogue_fn,
+        no_compute_fn,
+        ctx,
+    )
+
+
+def _launch_block_scaled_impl[
+    EpilogueFnType: ElementwiseEpilogueFn,
+    ComputeFnType: ElementwiseComputeFn,
+    //,
+    BM: Int,
+    BN: Int,
+    BK_ELEMS: Int,
+    WM: Int,
+    WN: Int,
+    MMA_M: Int = 16,
+    MMA_N: Int = 16,
+    MMA_K: Int = 128,
+    matrix_format: CDNA4F8F6F4MatrixFormat = CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1,
+    b_matrix_format: CDNA4F8F6F4MatrixFormat = matrix_format,
+    *,
+    has_epilogue_fn: Bool,
+    has_compute_fn: Bool,
+](
+    c: TileTensor[mut=True, ...],
+    a: TileTensor,
+    b: TileTensor,
+    a_scales: TileTensor,
+    b_scales: TileTensor,
+    M: Int,
+    epilogue_fn: EpilogueFnType,
+    compute_fn: ComputeFnType,
+    ctx: DeviceContext,
+) raises:
+    """`_launch_block_scaled`, optionally routing the output through
+    `epilogue_fn` or `compute_fn` (selected by `has_epilogue_fn` and
+    `has_compute_fn`)."""
     # Depth-2 LDS ping-pong: at BK=128 the K-sub-tile is one deep, so the
     # single-buffer body cannot overlap ds_write with MFMA. VGPR-bound, so 2x
     # LDS costs no occupancy (64 KiB of the 160 KiB budget at BM=BN=128).
@@ -1587,6 +1911,7 @@ def _launch_block_scaled[
             or matrix_format == CDNA4F8F6F4MatrixFormat.FLOAT6_E2M3
             or matrix_format == CDNA4F8F6F4MatrixFormat.FLOAT6_E3M2
         )
+        and matrix_format == b_matrix_format
         and BK_ELEMS == 128
         and BM == 128
         and BN == 128
@@ -1609,35 +1934,85 @@ def _launch_block_scaled[
         MMA_K=MMA_K,
         num_stages=num_stages,
         matrix_format=matrix_format,
-        elementwise_lambda_fn=elementwise_lambda_fn,
+        b_matrix_format=b_matrix_format,
     ]
     comptime N = type_of(c).static_shape[1]
 
     comptime out_dtype = type_of(c).dtype
 
-    comptime kernel = Kernel.run[
-        out_dtype,
-        type_of(c).LayoutType,
-        type_of(a).LayoutType,
-        type_of(b).LayoutType,
-        type_of(a_scales).LayoutType,
-        type_of(b_scales).LayoutType,
-        type_of(c).Engine,
-        type_of(a).Engine,
-        type_of(b).Engine,
-        type_of(a_scales).Engine,
-        type_of(b_scales).Engine,
-    ]
-
-    ctx.enqueue_function[kernel](
-        c,
-        a,
-        b,
-        a_scales,
-        b_scales,
-        grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
-        block_dim=Kernel.num_threads,
-    )
+    comptime if has_epilogue_fn:
+        comptime kernel = Kernel.run_with_epilogue_fn[
+            out_dtype,
+            type_of(c).LayoutType,
+            type_of(a).LayoutType,
+            type_of(b).LayoutType,
+            type_of(a_scales).LayoutType,
+            type_of(b_scales).LayoutType,
+            type_of(c).Engine,
+            type_of(a).Engine,
+            type_of(b).Engine,
+            type_of(a_scales).Engine,
+            type_of(b_scales).Engine,
+            EpilogueFnType,
+        ]
+        ctx.enqueue_function[kernel](
+            c,
+            a,
+            b,
+            a_scales,
+            b_scales,
+            host_args=(epilogue_fn,),
+            grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
+            block_dim=Kernel.num_threads,
+        )
+    elif has_compute_fn:
+        comptime kernel = Kernel.run_with_compute_fn[
+            out_dtype,
+            type_of(c).LayoutType,
+            type_of(a).LayoutType,
+            type_of(b).LayoutType,
+            type_of(a_scales).LayoutType,
+            type_of(b_scales).LayoutType,
+            type_of(c).Engine,
+            type_of(a).Engine,
+            type_of(b).Engine,
+            type_of(a_scales).Engine,
+            type_of(b_scales).Engine,
+            ComputeFnType,
+        ]
+        ctx.enqueue_function[kernel](
+            c,
+            a,
+            b,
+            a_scales,
+            b_scales,
+            host_args=(compute_fn,),
+            grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
+            block_dim=Kernel.num_threads,
+        )
+    else:
+        comptime kernel = Kernel.run[
+            out_dtype,
+            type_of(c).LayoutType,
+            type_of(a).LayoutType,
+            type_of(b).LayoutType,
+            type_of(a_scales).LayoutType,
+            type_of(b_scales).LayoutType,
+            type_of(c).Engine,
+            type_of(a).Engine,
+            type_of(b).Engine,
+            type_of(a_scales).Engine,
+            type_of(b_scales).Engine,
+        ]
+        ctx.enqueue_function[kernel](
+            c,
+            a,
+            b,
+            a_scales,
+            b_scales,
+            grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
+            block_dim=Kernel.num_threads,
+        )
 
 
 def _launch_block_scaled_split_k[
@@ -1655,7 +2030,6 @@ def _launch_block_scaled_split_k[
         CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1 if lane_bytes
         == 16 else CDNA4F8F6F4MatrixFormat.FLOAT8_E4M3
     ),
-    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
 ](
     c: TileTensor[mut=True, ...],
     a: TileTensor,
@@ -1667,16 +2041,75 @@ def _launch_block_scaled_split_k[
 ) raises:
     """Inter-block split-K launch of BlockScaledMatmulAMD + reduce.
 
+    See `_launch_block_scaled_split_k_impl`.
+    """
+    _launch_block_scaled_split_k_impl[
+        BM=BM,
+        BN=BN,
+        BK_ELEMS=BK_ELEMS,
+        WM=WM,
+        WN=WN,
+        num_splits=num_splits,
+        MMA_M=MMA_M,
+        MMA_N=MMA_N,
+        MMA_K=MMA_K,
+        matrix_format=matrix_format,
+        has_epilogue_fn=False,
+        has_compute_fn=False,
+    ](
+        c,
+        a,
+        b,
+        a_scales,
+        b_scales,
+        M,
+        no_epilogue_fn,
+        no_compute_fn,
+        ctx,
+    )
+
+
+def _launch_block_scaled_split_k_impl[
+    EpilogueFnType: ElementwiseEpilogueFn,
+    ComputeFnType: ElementwiseComputeFn,
+    //,
+    BM: Int,
+    BN: Int,
+    BK_ELEMS: Int,
+    WM: Int,
+    WN: Int,
+    num_splits: Int,
+    MMA_M: Int = 16,
+    MMA_N: Int = 16,
+    MMA_K: Int = 128,
+    matrix_format: CDNA4F8F6F4MatrixFormat = CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1,
+    *,
+    has_epilogue_fn: Bool,
+    has_compute_fn: Bool,
+](
+    c: TileTensor[mut=True, ...],
+    a: TileTensor,
+    b: TileTensor,
+    a_scales: TileTensor,
+    b_scales: TileTensor,
+    M: Int,
+    epilogue_fn: EpilogueFnType,
+    compute_fn: ComputeFnType,
+    ctx: DeviceContext,
+) raises:
+    """Inter-block split-K launch of BlockScaledMatmulAMD + reduce.
+
     Mirrors `amd_4wave_split_k_matmul`: allocate a `(num_splits * M, N)`
     float32 workspace, launch the matmul over a `grid_dim.z = num_splits`
     grid (each z-slice accumulates one K-band's partial into its `[M, N]`
     region), then run `_split_k_reduce_kernel` on the same stream to sum
     the partials and cast to `c`'s dtype.
 
-    `elementwise_lambda_fn` rides the REDUCE so it fires once on the summed
-    value: per-split firing would be wrong arithmetic and would repeat the
-    fused QKV+index consumer's KV-cache scatter. The reduce then routes every
-    element through the lambda and never stores to `c`.
+    `epilogue_fn` and `compute_fn` ride the REDUCE so they fire once on the
+    summed value: per-split firing would be wrong arithmetic and would
+    repeat the fused QKV+index consumer's KV-cache scatter. With
+    `epilogue_fn` the reduce routes every element through it and never
+    stores to `c`.
     """
     # The kernel below is instantiated at the default MFMA shape; refuse any
     # other request rather than silently downgrading it to 16x16x128.
@@ -1695,7 +2128,7 @@ def _launch_block_scaled_split_k[
     comptime N = type_of(c).static_shape[1]
     comptime c_dtype = type_of(c).dtype
 
-    # Without the lambda the matmul stores the f32 workspace through
+    # The matmul stores the f32 workspace through
     # `RegTileWriter`, which spills an unaligned last column block into the next
     # row (see `_sk_n_aligned`); this backstops a direct caller.
     comptime assert (
@@ -1745,18 +2178,58 @@ def _launch_block_scaled_split_k[
     comptime block_dim_x: Int = 256
     var total_elems = M * N
     var num_blocks = ceildiv(total_elems, block_dim_x)
-    comptime reduce_kernel = _split_k_reduce_kernel[
-        num_splits, c_dtype, elementwise_lambda_fn
-    ]
-    ctx.enqueue_function[reduce_kernel](
-        workspace.scratch.unsafe_ptr(),
-        c.ptr,
-        Int32(total_elems),
-        Int32(elems_per_split),
-        Int32(N),
-        grid_dim=num_blocks,
-        block_dim=block_dim_x,
-    )
+    comptime if has_epilogue_fn:
+        comptime reduce_kernel = _split_k_reduce_kernel_epilogue_fn[
+            num_splits,
+            c_dtype,
+            type_of(c).LayoutType,
+            type_of(c).Engine,
+            EpilogueFnType,
+        ]
+        ctx.enqueue_function[reduce_kernel](
+            workspace.scratch.unsafe_ptr(),
+            c,
+            Int32(total_elems),
+            Int32(elems_per_split),
+            Int32(N),
+            host_args=(epilogue_fn,),
+            grid_dim=num_blocks,
+            block_dim=block_dim_x,
+        )
+    elif has_compute_fn:
+        comptime reduce_kernel = _split_k_reduce_kernel_compute_fn[
+            num_splits,
+            c_dtype,
+            type_of(c).LayoutType,
+            type_of(c).Engine,
+            ComputeFnType,
+        ]
+        ctx.enqueue_function[reduce_kernel](
+            workspace.scratch.unsafe_ptr(),
+            c,
+            Int32(total_elems),
+            Int32(elems_per_split),
+            Int32(N),
+            host_args=(compute_fn,),
+            grid_dim=num_blocks,
+            block_dim=block_dim_x,
+        )
+    else:
+        comptime reduce_kernel = _split_k_reduce_kernel[
+            num_splits,
+            c_dtype,
+            type_of(c).LayoutType,
+            type_of(c).Engine,
+        ]
+        ctx.enqueue_function[reduce_kernel](
+            workspace.scratch.unsafe_ptr(),
+            c,
+            Int32(total_elems),
+            Int32(elems_per_split),
+            Int32(N),
+            grid_dim=num_blocks,
+            block_dim=block_dim_x,
+        )
 
     # Keep the workspace alive until both kernels are enqueued.
     _ = workspace^
@@ -1828,7 +2301,6 @@ def block_scaled_matmul_amd[
     MMA_N: Int = 16,
     MMA_K: Int = 128,
     lane_bytes: Int = 16,
-    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
 ](
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, .uint8, ...],
@@ -1857,10 +2329,6 @@ def block_scaled_matmul_amd[
         MMA_K: MFMA K-depth in logical FP4 elements. Default 128.
         lane_bytes: Operand bytes per lane per MFMA: 16 (MXFP4, default) or
             32 (MXFP8), which selects the operand format and byte extents.
-        elementwise_lambda_fn: Optional fused epilogue receiving each output
-            fragment with its global `(m, n)`; `c` is left untouched. Split-K
-            carries it too, on the reduce — one scalar per cell rather than a
-            fragment, still exactly once per cell.
 
     Args:
         c: Output [M, N] (any float dtype, e.g. float32 or bfloat16).
@@ -1870,7 +2338,132 @@ def block_scaled_matmul_amd[
         b_scales: B scales [N, K//32] float8_e8m0fnu.
         ctx: Device context for kernel launch.
     """
+    _block_scaled_matmul_amd_impl[
+        MMA_M=MMA_M,
+        MMA_N=MMA_N,
+        MMA_K=MMA_K,
+        lane_bytes=lane_bytes,
+        has_epilogue_fn=False,
+        has_compute_fn=False,
+    ](c, a, b, a_scales, b_scales, no_epilogue_fn, no_compute_fn, ctx)
 
+
+def block_scaled_matmul_amd[
+    EpilogueFnType: ElementwiseEpilogueFn,
+    //,
+    MMA_M: Int = 16,
+    MMA_N: Int = 16,
+    MMA_K: Int = 128,
+    lane_bytes: Int = 16,
+](
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[mut=False, .uint8, ...],
+    b: TileTensor[mut=False, .uint8, ...],
+    a_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    b_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    epilogue_fn: EpilogueFnType,
+    ctx: DeviceContext,
+) raises:
+    """Launches native MXFP4/MXFP8 block-scaled matmul on AMD CDNA4,
+    delivering each output fragment to an epilogue closure instead of
+    writing `c`.
+
+    Split-K routes apply `epilogue_fn` on the reduce, once per cell.
+
+    Parameters:
+        EpilogueFnType: Type of `epilogue_fn`.
+        MMA_M: MFMA tile rows (see the other overload).
+        MMA_N: MFMA tile cols.
+        MMA_K: MFMA K-depth in logical elements.
+        lane_bytes: 16 (MXFP4) or 32 (MXFP8).
+
+    Args:
+        c: Output [M, N]. Only its shape is read.
+        a: Packed A operand.
+        b: Packed, transposed B operand.
+        a_scales: A scales [M, K//32] float8_e8m0fnu.
+        b_scales: B scales [N, K//32] float8_e8m0fnu.
+        epilogue_fn: Stores each output chunk at its global `(m, n)`.
+        ctx: Device context for kernel launch.
+    """
+    _block_scaled_matmul_amd_impl[
+        MMA_M=MMA_M,
+        MMA_N=MMA_N,
+        MMA_K=MMA_K,
+        lane_bytes=lane_bytes,
+        has_epilogue_fn=True,
+        has_compute_fn=False,
+    ](c, a, b, a_scales, b_scales, epilogue_fn, no_compute_fn, ctx)
+
+
+def block_scaled_matmul_amd[
+    ComputeFnType: ElementwiseComputeFn,
+    //,
+    MMA_M: Int = 16,
+    MMA_N: Int = 16,
+    MMA_K: Int = 128,
+    lane_bytes: Int = 16,
+](
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[mut=False, .uint8, ...],
+    b: TileTensor[mut=False, .uint8, ...],
+    a_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    b_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    compute_fn: ComputeFnType,
+    ctx: DeviceContext,
+) raises:
+    """Launches native MXFP4/MXFP8 block-scaled matmul on AMD CDNA4,
+    storing `compute_fn(idx, value)` into `c`.
+
+    Split-K routes apply `compute_fn` on the reduce, once per cell.
+
+    Parameters:
+        ComputeFnType: Type of `compute_fn`.
+        MMA_M: MFMA tile rows (see the other overload).
+        MMA_N: MFMA tile cols.
+        MMA_K: MFMA K-depth in logical elements.
+        lane_bytes: 16 (MXFP4) or 32 (MXFP8).
+
+    Args:
+        c: Output [M, N].
+        a: Packed A operand.
+        b: Packed, transposed B operand.
+        a_scales: A scales [M, K//32] float8_e8m0fnu.
+        b_scales: B scales [N, K//32] float8_e8m0fnu.
+        compute_fn: Maps each output index and chunk to the value to store.
+        ctx: Device context for kernel launch.
+    """
+    _block_scaled_matmul_amd_impl[
+        MMA_M=MMA_M,
+        MMA_N=MMA_N,
+        MMA_K=MMA_K,
+        lane_bytes=lane_bytes,
+        has_epilogue_fn=False,
+        has_compute_fn=True,
+    ](c, a, b, a_scales, b_scales, no_epilogue_fn, compute_fn, ctx)
+
+
+def _block_scaled_matmul_amd_impl[
+    EpilogueFnType: ElementwiseEpilogueFn,
+    ComputeFnType: ElementwiseComputeFn,
+    //,
+    *,
+    MMA_M: Int,
+    MMA_N: Int,
+    MMA_K: Int,
+    lane_bytes: Int,
+    has_epilogue_fn: Bool,
+    has_compute_fn: Bool,
+](
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[mut=False, .uint8, ...],
+    b: TileTensor[mut=False, .uint8, ...],
+    a_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    b_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    epilogue_fn: EpilogueFnType,
+    compute_fn: ComputeFnType,
+    ctx: DeviceContext,
+) raises:
     # MMA tile c_frag_size is 4 regardless of block tile shape.
     comptime assert type_of(c).static_shape[1] % 4 == 0, (
         "N must be a multiple of c_frag_size=4 for the MXFP4 block-scaled"
@@ -2050,7 +2643,7 @@ def block_scaled_matmul_amd[
     #               BK512 fallback stays capped at M<=64 — see that branch.
     if M <= 16:
         comptime if _m3_mxfp8_qkv_projection and _mma_is_default:
-            _launch_block_scaled_split_k[
+            _launch_block_scaled_split_k_impl[
                 BM=16,
                 BN=64,
                 BK_ELEMS=SK_BK_ELEMS,
@@ -2061,13 +2654,14 @@ def block_scaled_matmul_amd[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
             return
         comptime if _m3_mxfp8_o_projection and _mma_is_default:
             # Reuses `_sk_splits` outside its `SK_BN=128` calibration, as the
             # `M <= 128` branch below does.
-            _launch_block_scaled_split_k[
+            _launch_block_scaled_split_k_impl[
                 BM=16,
                 BN=32,
                 BK_ELEMS=SK_BK_ELEMS,
@@ -2078,28 +2672,30 @@ def block_scaled_matmul_amd[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
             return
         comptime if _wide_n_short_k_decode and _mma_is_default:
             # Single kernel, no split-K, no reduce. BN=32 → ceildiv(N,32) CTAs
             # fill the GPU; BM=16 wastes no M rows. Mirrors aiter NUM_KSPLIT=1.
-            _launch_block_scaled[
+            _launch_block_scaled_impl[
                 BM=16,
                 BN=32,
                 BK_ELEMS=512,
                 WM=16,
                 WN=16,
                 matrix_format=_fmt,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
         elif (
             can_use_bk_256
             and _sk_splits > 1
             and _sk_n_aligned
             and _mma_is_default
         ):
-            _launch_block_scaled_split_k[
+            _launch_block_scaled_split_k_impl[
                 BM=SK16_BM,
                 BN=SK16_BN,
                 BK_ELEMS=SK_BK_ELEMS,
@@ -2110,10 +2706,11 @@ def block_scaled_matmul_amd[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
         elif can_use_bk_512:
-            _launch_block_scaled[
+            _launch_block_scaled_impl[
                 BM=64,
                 BN=32,
                 BK_ELEMS=512,
@@ -2123,10 +2720,11 @@ def block_scaled_matmul_amd[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
         else:
-            _launch_block_scaled[
+            _launch_block_scaled_impl[
                 BM=128,
                 BN=128,
                 BK_ELEMS=128,
@@ -2136,12 +2734,13 @@ def block_scaled_matmul_amd[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
     else:
         comptime if _m3_mxfp8_o_projection and _mma_is_default:
             if M <= 32:
-                _launch_block_scaled_split_k[
+                _launch_block_scaled_split_k_impl[
                     BM=32,
                     BN=SK_BN,
                     BK_ELEMS=SK_BK_ELEMS,
@@ -2152,14 +2751,15 @@ def block_scaled_matmul_amd[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                ](c, a, b, a_scales, b_scales, M, ctx)
+                    has_epilogue_fn=has_epilogue_fn,
+                    has_compute_fn=has_compute_fn,
+                ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
                 return
             if M <= 128:
                 # Reuses `_sk_splits` outside its `SK_BN=128` calibration: at
                 # BN=64 this overshoots the CTA cap, but measured faster, so
                 # the derivation is not authoritative for this branch.
-                _launch_block_scaled_split_k[
+                _launch_block_scaled_split_k_impl[
                     BM=64,
                     BN=64,
                     BK_ELEMS=SK_BK_ELEMS,
@@ -2170,8 +2770,9 @@ def block_scaled_matmul_amd[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                ](c, a, b, a_scales, b_scales, M, ctx)
+                    has_epilogue_fn=has_epilogue_fn,
+                    has_compute_fn=has_compute_fn,
+                ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
                 return
         comptime if (
             can_use_bk_256
@@ -2181,7 +2782,7 @@ def block_scaled_matmul_amd[
         ):
             # Past `_sk_route_max_m` the workspace round-trip outweighs the split.
             if M <= _sk_route_max_m:
-                _launch_block_scaled_split_k[
+                _launch_block_scaled_split_k_impl[
                     BM=SK_BM,
                     BN=SK_BN,
                     BK_ELEMS=SK_BK_ELEMS,
@@ -2192,10 +2793,11 @@ def block_scaled_matmul_amd[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                ](c, a, b, a_scales, b_scales, M, ctx)
+                    has_epilogue_fn=has_epilogue_fn,
+                    has_compute_fn=has_compute_fn,
+                ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
             else:
-                _launch_block_scaled[
+                _launch_block_scaled_impl[
                     BM=128,
                     BN=128,
                     BK_ELEMS=128,
@@ -2205,8 +2807,9 @@ def block_scaled_matmul_amd[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                ](c, a, b, a_scales, b_scales, M, ctx)
+                    has_epilogue_fn=has_epilogue_fn,
+                    has_compute_fn=has_compute_fn,
+                ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
         elif can_use_bk_512:
             # Non-split BK_ELEMS=512 fallback, M<=64 only (checked below at
             # runtime — `M` isn't comptime-known here). Reached when
@@ -2227,7 +2830,7 @@ def block_scaled_matmul_amd[
             # no factor, this small decode-tuned tile is a worse choice than
             # the general BM=128 kernel below, not a substitute for it.
             if M <= 64:
-                _launch_block_scaled[
+                _launch_block_scaled_impl[
                     BM=64,
                     BN=32,
                     BK_ELEMS=512,
@@ -2237,10 +2840,11 @@ def block_scaled_matmul_amd[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                ](c, a, b, a_scales, b_scales, M, ctx)
+                    has_epilogue_fn=has_epilogue_fn,
+                    has_compute_fn=has_compute_fn,
+                ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
             else:
-                _launch_block_scaled[
+                _launch_block_scaled_impl[
                     BM=128,
                     BN=128,
                     BK_ELEMS=128,
@@ -2250,10 +2854,11 @@ def block_scaled_matmul_amd[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                ](c, a, b, a_scales, b_scales, M, ctx)
+                    has_epilogue_fn=has_epilogue_fn,
+                    has_compute_fn=has_compute_fn,
+                ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
         else:
-            _launch_block_scaled[
+            _launch_block_scaled_impl[
                 BM=128,
                 BN=128,
                 BK_ELEMS=128,
@@ -2263,8 +2868,9 @@ def block_scaled_matmul_amd[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
 
 
 @inline(.always)
@@ -2318,7 +2924,6 @@ def _preb_grid_kernel[
     StoreSFB: TensorEngine,
     N: Int,
     K_BYTES: Int,
-    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
 ](
     c: TileTensor[mut=True, out_dtype, LayoutC, MutAnyOrigin, Engine=StoreC],
     a: TileTensor[DType.uint8, LayoutA, ImmutAnyOrigin, Engine=StoreA],
@@ -2340,7 +2945,6 @@ def _preb_grid_kernel[
         BK_ELEMS=BK_ELEMS,
         WN=WN,
         matrix_format=matrix_format,
-        elementwise_lambda_fn=elementwise_lambda_fn,
     ].run[
         out_dtype,
         LayoutC,
@@ -2356,7 +2960,157 @@ def _preb_grid_kernel[
         N,
         K_BYTES,
     ](
-        c, a, b_pre, sfa, sfb, Int(block_idx.x), Int(block_idx.y)
+        c, a, b_pre, sfa, sfb, block_idx.x, block_idx.y
+    )
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32(
+            BlockScaledMatmulAMD_PreB[
+                BM=BM,
+                BN=BN,
+                BK_ELEMS=BK_ELEMS,
+                WN=WN,
+                matrix_format=matrix_format,
+            ].num_threads
+        )
+    )
+)
+def _preb_grid_kernel_epilogue_fn[
+    BM: Int,
+    BN: Int,
+    BK_ELEMS: Int,
+    WN: Int,
+    matrix_format: CDNA4F8F6F4MatrixFormat,
+    out_dtype: DType,
+    LayoutC: TensorLayout,
+    LayoutA: TensorLayout,
+    LayoutBPre: TensorLayout,
+    LayoutSFA: TensorLayout,
+    LayoutSFB: TensorLayout,
+    StoreC: TensorEngine,
+    StoreA: TensorEngine,
+    StoreBPre: TensorEngine,
+    StoreSFA: TensorEngine,
+    StoreSFB: TensorEngine,
+    N: Int,
+    K_BYTES: Int,
+    EpilogueFnType: ElementwiseEpilogueFn,
+](
+    c: TileTensor[mut=True, out_dtype, LayoutC, MutAnyOrigin, Engine=StoreC],
+    a: TileTensor[DType.uint8, LayoutA, ImmutAnyOrigin, Engine=StoreA],
+    b_pre: TileTensor[
+        DType.uint8, LayoutBPre, ImmutAnyOrigin, Engine=StoreBPre
+    ],
+    sfa: TileTensor[
+        DType.float8_e8m0fnu, LayoutSFA, ImmutAnyOrigin, Engine=StoreSFA
+    ],
+    sfb: TileTensor[
+        DType.float8_e8m0fnu, LayoutSFB, ImmutAnyOrigin, Engine=StoreSFB
+    ],
+    epilogue_fn: EpilogueFnType,
+):
+    """`_preb_grid_kernel`, storing through `epilogue_fn`. Launch with
+    `host_args=(epilogue_fn,)`."""
+    BlockScaledMatmulAMD_PreB[
+        BM=BM,
+        BN=BN,
+        BK_ELEMS=BK_ELEMS,
+        WN=WN,
+        matrix_format=matrix_format,
+    ].run_with_epilogue_fn[
+        out_dtype,
+        LayoutC,
+        LayoutA,
+        LayoutBPre,
+        LayoutSFA,
+        LayoutSFB,
+        StoreC,
+        StoreA,
+        StoreBPre,
+        StoreSFA,
+        StoreSFB,
+        N,
+        K_BYTES,
+        EpilogueFnType,
+    ](
+        c, a, b_pre, sfa, sfb, block_idx.x, block_idx.y, epilogue_fn
+    )
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32(
+            BlockScaledMatmulAMD_PreB[
+                BM=BM,
+                BN=BN,
+                BK_ELEMS=BK_ELEMS,
+                WN=WN,
+                matrix_format=matrix_format,
+            ].num_threads
+        )
+    )
+)
+def _preb_grid_kernel_compute_fn[
+    BM: Int,
+    BN: Int,
+    BK_ELEMS: Int,
+    WN: Int,
+    matrix_format: CDNA4F8F6F4MatrixFormat,
+    out_dtype: DType,
+    LayoutC: TensorLayout,
+    LayoutA: TensorLayout,
+    LayoutBPre: TensorLayout,
+    LayoutSFA: TensorLayout,
+    LayoutSFB: TensorLayout,
+    StoreC: TensorEngine,
+    StoreA: TensorEngine,
+    StoreBPre: TensorEngine,
+    StoreSFA: TensorEngine,
+    StoreSFB: TensorEngine,
+    N: Int,
+    K_BYTES: Int,
+    ComputeFnType: ElementwiseComputeFn,
+](
+    c: TileTensor[mut=True, out_dtype, LayoutC, MutAnyOrigin, Engine=StoreC],
+    a: TileTensor[DType.uint8, LayoutA, ImmutAnyOrigin, Engine=StoreA],
+    b_pre: TileTensor[
+        DType.uint8, LayoutBPre, ImmutAnyOrigin, Engine=StoreBPre
+    ],
+    sfa: TileTensor[
+        DType.float8_e8m0fnu, LayoutSFA, ImmutAnyOrigin, Engine=StoreSFA
+    ],
+    sfb: TileTensor[
+        DType.float8_e8m0fnu, LayoutSFB, ImmutAnyOrigin, Engine=StoreSFB
+    ],
+    compute_fn: ComputeFnType,
+):
+    """`_preb_grid_kernel`, storing `compute_fn(idx, value)`. Launch with
+    `host_args=(compute_fn,)`."""
+    BlockScaledMatmulAMD_PreB[
+        BM=BM,
+        BN=BN,
+        BK_ELEMS=BK_ELEMS,
+        WN=WN,
+        matrix_format=matrix_format,
+    ].run_with_compute_fn[
+        out_dtype,
+        LayoutC,
+        LayoutA,
+        LayoutBPre,
+        LayoutSFA,
+        LayoutSFB,
+        StoreC,
+        StoreA,
+        StoreBPre,
+        StoreSFA,
+        StoreSFB,
+        N,
+        K_BYTES,
+        ComputeFnType,
+    ](
+        c, a, b_pre, sfa, sfb, block_idx.x, block_idx.y, compute_fn
     )
 
 
@@ -2394,13 +3148,13 @@ def _preshuffle_a_scale_4d_kernel[
     var total = Int(padded_M) * K_SCALES
     if idx >= total:
         return
-    var mn = idx // K_SCALES
-    var k_scale = idx % K_SCALES
+    var mn, k_scale = divmod(idx, K_SCALES)
     var byte_off = Shuffler[1].scale_4d_byte_off[K_SCALES=K_SCALES](mn, k_scale)
-    var value = src.raw_load[width=1](mn * K_SCALES + k_scale) if mn < Int(
-        M
-    ) else Scalar[DType.float8_e8m0fnu](0)
-    dst.raw_store[width=1](byte_off, value)
+    var src_flat = src.reshape(row_major(Int(M) * K_SCALES))
+    var value = rebind[Scalar[DType.float8_e8m0fnu]](
+        src_flat.load((idx,))
+    ) if mn < Int(M) else Scalar[DType.float8_e8m0fnu](0)
+    dst.reshape(row_major(total)).store(Coord(byte_off), value)
 
 
 def _launch_block_scaled_preb[
@@ -2409,7 +3163,6 @@ def _launch_block_scaled_preb[
     BK_ELEMS: Int,
     WN: Int,
     matrix_format: CDNA4F8F6F4MatrixFormat,
-    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
 ](
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, DType.uint8, ...],
@@ -2437,10 +3190,54 @@ def _launch_block_scaled_preb[
         BK_ELEMS: K tile size in FP6 elements per outer-K iteration.
         WN: Per-warp tile size along N.
         matrix_format: FP6 encoding of both operands.
-        elementwise_lambda_fn: Optional epilogue applied to each output
-            element in registers instead of storing it. The fused QKV ops
-            use it to scatter K/V into the paged cache.
     """
+    _launch_block_scaled_preb_impl[
+        BM,
+        BN,
+        BK_ELEMS,
+        WN,
+        matrix_format,
+        has_epilogue_fn=False,
+        has_compute_fn=False,
+    ](
+        c,
+        a,
+        b_pre,
+        a_scales,
+        b_scales_pre,
+        M,
+        no_epilogue_fn,
+        no_compute_fn,
+        ctx,
+    )
+
+
+def _launch_block_scaled_preb_impl[
+    EpilogueFnType: ElementwiseEpilogueFn,
+    ComputeFnType: ElementwiseComputeFn,
+    //,
+    BM: Int,
+    BN: Int,
+    BK_ELEMS: Int,
+    WN: Int,
+    matrix_format: CDNA4F8F6F4MatrixFormat,
+    *,
+    has_epilogue_fn: Bool,
+    has_compute_fn: Bool,
+](
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[mut=False, DType.uint8, ...],
+    b_pre: TileTensor[mut=False, DType.uint8, ...],
+    a_scales: TileTensor[mut=False, DType.float8_e8m0fnu, ...],
+    b_scales_pre: TileTensor[mut=False, DType.float8_e8m0fnu, ...],
+    M: Int,
+    epilogue_fn: EpilogueFnType,
+    compute_fn: ComputeFnType,
+    ctx: DeviceContext,
+) raises:
+    """`_launch_block_scaled_preb`, optionally routing the output through
+    `epilogue_fn` or `compute_fn` (selected by `has_epilogue_fn` and
+    `has_compute_fn`)."""
     comptime N = type_of(c).static_shape[1]
     comptime K_BYTES = type_of(a).static_shape[1]
     comptime SCALE_K = type_of(a_scales).static_shape[1]
@@ -2458,7 +3255,7 @@ def _launch_block_scaled_preb[
         total_scale_cells
     )
     var a_scales_pre_dst_tt = TileTensor[mut=True, Engine=_](
-        a_scales_pre_d, row_major(Coord(total_scale_cells))
+        a_scales_pre_d, row_major(total_scale_cells)
     )
     comptime PRESHUFFLE_BLOCK = 256
     ctx.enqueue_function[
@@ -2479,42 +3276,122 @@ def _launch_block_scaled_preb[
     )
 
     var a_scales_pre_view = TileTensor[mut=False, Engine=_](
-        a_scales_pre_d, row_major(Coord(a_scale_pad, Idx[SCALE_K]))
+        a_scales_pre_d, row_major(a_scale_pad, Idx[SCALE_K])
     )
 
     comptime out_dtype = type_of(c).dtype
-    comptime kernel = _preb_grid_kernel[
-        BM,
-        BN,
-        BK_ELEMS,
-        WN,
-        matrix_format,
-        out_dtype,
-        type_of(c).LayoutType,
-        type_of(a).LayoutType,
-        type_of(b_pre).LayoutType,
-        type_of(a_scales_pre_view).LayoutType,
-        type_of(b_scales_pre).LayoutType,
-        type_of(c).Engine,
-        type_of(a).Engine,
-        type_of(b_pre).Engine,
-        type_of(a_scales_pre_view).Engine,
-        type_of(b_scales_pre).Engine,
-        N,
-        K_BYTES,
-        elementwise_lambda_fn,
-    ]
-    ctx.enqueue_function[kernel](
-        c,
-        a,
-        b_pre,
-        a_scales_pre_view,
-        b_scales_pre,
-        grid_dim=(N // BN, ceildiv(M, BM)),
-        block_dim=BlockScaledMatmulAMD_PreB[
-            BM=BM, BN=BN, BK_ELEMS=BK_ELEMS, WN=WN, matrix_format=matrix_format
-        ].num_threads,
-    )
+    comptime if has_epilogue_fn:
+        comptime kernel = _preb_grid_kernel_epilogue_fn[
+            BM,
+            BN,
+            BK_ELEMS,
+            WN,
+            matrix_format,
+            out_dtype,
+            type_of(c).LayoutType,
+            type_of(a).LayoutType,
+            type_of(b_pre).LayoutType,
+            type_of(a_scales_pre_view).LayoutType,
+            type_of(b_scales_pre).LayoutType,
+            type_of(c).Engine,
+            type_of(a).Engine,
+            type_of(b_pre).Engine,
+            type_of(a_scales_pre_view).Engine,
+            type_of(b_scales_pre).Engine,
+            N,
+            K_BYTES,
+            EpilogueFnType,
+        ]
+        ctx.enqueue_function[kernel](
+            c,
+            a,
+            b_pre,
+            a_scales_pre_view,
+            b_scales_pre,
+            host_args=(epilogue_fn,),
+            grid_dim=(N // BN, ceildiv(M, BM)),
+            block_dim=BlockScaledMatmulAMD_PreB[
+                BM=BM,
+                BN=BN,
+                BK_ELEMS=BK_ELEMS,
+                WN=WN,
+                matrix_format=matrix_format,
+            ].num_threads,
+        )
+    elif has_compute_fn:
+        comptime kernel = _preb_grid_kernel_compute_fn[
+            BM,
+            BN,
+            BK_ELEMS,
+            WN,
+            matrix_format,
+            out_dtype,
+            type_of(c).LayoutType,
+            type_of(a).LayoutType,
+            type_of(b_pre).LayoutType,
+            type_of(a_scales_pre_view).LayoutType,
+            type_of(b_scales_pre).LayoutType,
+            type_of(c).Engine,
+            type_of(a).Engine,
+            type_of(b_pre).Engine,
+            type_of(a_scales_pre_view).Engine,
+            type_of(b_scales_pre).Engine,
+            N,
+            K_BYTES,
+            ComputeFnType,
+        ]
+        ctx.enqueue_function[kernel](
+            c,
+            a,
+            b_pre,
+            a_scales_pre_view,
+            b_scales_pre,
+            host_args=(compute_fn,),
+            grid_dim=(N // BN, ceildiv(M, BM)),
+            block_dim=BlockScaledMatmulAMD_PreB[
+                BM=BM,
+                BN=BN,
+                BK_ELEMS=BK_ELEMS,
+                WN=WN,
+                matrix_format=matrix_format,
+            ].num_threads,
+        )
+    else:
+        comptime kernel = _preb_grid_kernel[
+            BM,
+            BN,
+            BK_ELEMS,
+            WN,
+            matrix_format,
+            out_dtype,
+            type_of(c).LayoutType,
+            type_of(a).LayoutType,
+            type_of(b_pre).LayoutType,
+            type_of(a_scales_pre_view).LayoutType,
+            type_of(b_scales_pre).LayoutType,
+            type_of(c).Engine,
+            type_of(a).Engine,
+            type_of(b_pre).Engine,
+            type_of(a_scales_pre_view).Engine,
+            type_of(b_scales_pre).Engine,
+            N,
+            K_BYTES,
+        ]
+        ctx.enqueue_function[kernel](
+            c,
+            a,
+            b_pre,
+            a_scales_pre_view,
+            b_scales_pre,
+            grid_dim=(N // BN, ceildiv(M, BM)),
+            block_dim=BlockScaledMatmulAMD_PreB[
+                BM=BM,
+                BN=BN,
+                BK_ELEMS=BK_ELEMS,
+                WN=WN,
+                matrix_format=matrix_format,
+            ].num_threads,
+        )
     _ = a_scales_pre_d^
 
 
@@ -2522,7 +3399,6 @@ def mxfp6_block_scaled_matmul_amd[
     fp6_format: CDNA4F8F6F4MatrixFormat = CDNA4F8F6F4MatrixFormat.FLOAT6_E2M3,
     num_splits: Int = 1,
     preshuffled_b: Bool = False,
-    elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
     allow_lds_pingpong: Bool = True,
 ](
     c: TileTensor[mut=True, ...],
@@ -2567,11 +3443,8 @@ def mxfp6_block_scaled_matmul_amd[
             to the row-major dispatch) when `M <= DECODE_M_MAX`, where the
             existing split-K tile already performs well and preshuffling has
             not been validated. Incompatible with `num_splits > 1`.
-        elementwise_lambda_fn: Optional epilogue applied to each output
-            element in registers instead of storing it. The fused QKV ops
-            use it to scatter K/V into the paged cache.
         allow_lds_pingpong: Whether the depth-2 LDS ping-pong tile may be
-            selected. Callers whose `elementwise_lambda_fn` is expensive pass
+            selected. Callers whose epilogue is expensive pass
             False: the tile was measured with a plain store epilogue, and a
             heavier one spills past the GPU stack-frame limit at BM=128.
 
@@ -2585,6 +3458,129 @@ def mxfp6_block_scaled_matmul_amd[
             preshuffled when `preshuffled_b=True`.
         ctx: Device context for kernel launch.
     """
+    _mxfp6_block_scaled_matmul_amd_impl[
+        fp6_format=fp6_format,
+        num_splits=num_splits,
+        preshuffled_b=preshuffled_b,
+        allow_lds_pingpong=allow_lds_pingpong,
+        has_epilogue_fn=False,
+        has_compute_fn=False,
+    ](c, a, b, a_scales, b_scales, no_epilogue_fn, no_compute_fn, ctx)
+
+
+def mxfp6_block_scaled_matmul_amd[
+    EpilogueFnType: ElementwiseEpilogueFn,
+    //,
+    fp6_format: CDNA4F8F6F4MatrixFormat = CDNA4F8F6F4MatrixFormat.FLOAT6_E2M3,
+    num_splits: Int = 1,
+    preshuffled_b: Bool = False,
+    allow_lds_pingpong: Bool = True,
+](
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[mut=False, .uint8, ...],
+    b: TileTensor[mut=False, .uint8, ...],
+    a_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    b_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    epilogue_fn: EpilogueFnType,
+    ctx: DeviceContext,
+) raises:
+    """Launches native MXFP6 block-scaled matmul on AMD CDNA4, delivering
+    each output fragment to an epilogue closure instead of writing `c`.
+
+    Parameters:
+        EpilogueFnType: Type of `epilogue_fn`.
+        fp6_format: FP6 encoding of both operands (see the other overload).
+        num_splits: Inter-block split-K factor.
+        preshuffled_b: Whether `b` and `b_scales` are preshuffled.
+        allow_lds_pingpong: Whether the depth-2 LDS ping-pong tile may be
+            selected.
+
+    Args:
+        c: Output `[M, N]`. Only its shape is read.
+        a: Packed A operand.
+        b: Packed, transposed B operand.
+        a_scales: A scales `[M, K // 32]` float8_e8m0fnu.
+        b_scales: B scales `[N, K // 32]` float8_e8m0fnu.
+        epilogue_fn: Stores each output chunk at its global `(m, n)`.
+        ctx: Device context for kernel launch.
+    """
+    _mxfp6_block_scaled_matmul_amd_impl[
+        fp6_format=fp6_format,
+        num_splits=num_splits,
+        preshuffled_b=preshuffled_b,
+        allow_lds_pingpong=allow_lds_pingpong,
+        has_epilogue_fn=True,
+        has_compute_fn=False,
+    ](c, a, b, a_scales, b_scales, epilogue_fn, no_compute_fn, ctx)
+
+
+def mxfp6_block_scaled_matmul_amd[
+    ComputeFnType: ElementwiseComputeFn,
+    //,
+    fp6_format: CDNA4F8F6F4MatrixFormat = CDNA4F8F6F4MatrixFormat.FLOAT6_E2M3,
+    num_splits: Int = 1,
+    preshuffled_b: Bool = False,
+    allow_lds_pingpong: Bool = True,
+](
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[mut=False, .uint8, ...],
+    b: TileTensor[mut=False, .uint8, ...],
+    a_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    b_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    compute_fn: ComputeFnType,
+    ctx: DeviceContext,
+) raises:
+    """Launches native MXFP6 block-scaled matmul on AMD CDNA4, storing
+    `compute_fn(idx, value)` into `c`.
+
+    Parameters:
+        ComputeFnType: Type of `compute_fn`.
+        fp6_format: FP6 encoding of both operands (see the other overload).
+        num_splits: Inter-block split-K factor.
+        preshuffled_b: Whether `b` and `b_scales` are preshuffled.
+        allow_lds_pingpong: Whether the depth-2 LDS ping-pong tile may be
+            selected.
+
+    Args:
+        c: Output `[M, N]`.
+        a: Packed A operand.
+        b: Packed, transposed B operand.
+        a_scales: A scales `[M, K // 32]` float8_e8m0fnu.
+        b_scales: B scales `[N, K // 32]` float8_e8m0fnu.
+        compute_fn: Maps each output index and chunk to the value to store.
+        ctx: Device context for kernel launch.
+    """
+    _mxfp6_block_scaled_matmul_amd_impl[
+        fp6_format=fp6_format,
+        num_splits=num_splits,
+        preshuffled_b=preshuffled_b,
+        allow_lds_pingpong=allow_lds_pingpong,
+        has_epilogue_fn=False,
+        has_compute_fn=True,
+    ](c, a, b, a_scales, b_scales, no_epilogue_fn, compute_fn, ctx)
+
+
+def _mxfp6_block_scaled_matmul_amd_impl[
+    EpilogueFnType: ElementwiseEpilogueFn,
+    ComputeFnType: ElementwiseComputeFn,
+    //,
+    *,
+    fp6_format: CDNA4F8F6F4MatrixFormat,
+    num_splits: Int,
+    preshuffled_b: Bool,
+    allow_lds_pingpong: Bool,
+    has_epilogue_fn: Bool,
+    has_compute_fn: Bool,
+](
+    c: TileTensor[mut=True, ...],
+    a: TileTensor[mut=False, .uint8, ...],
+    b: TileTensor[mut=False, .uint8, ...],
+    a_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    b_scales: TileTensor[mut=False, .float8_e8m0fnu, ...],
+    epilogue_fn: EpilogueFnType,
+    compute_fn: ComputeFnType,
+    ctx: DeviceContext,
+) raises:
     comptime assert (
         fp6_format.bits_per_element() == 6
     ), "mxfp6_block_scaled_matmul_amd requires an FP6 matrix format"
@@ -2618,7 +3614,7 @@ def mxfp6_block_scaled_matmul_amd[
             " matmul; a column overhang wraps into the next row and corrupts it"
         )
         comptime if T_NUM_SPLITS > 1:
-            _launch_block_scaled_split_k[
+            _launch_block_scaled_split_k_impl[
                 BM=T_BM,
                 BN=T_BN,
                 BK_ELEMS=T_BK_ELEMS,
@@ -2626,18 +3622,20 @@ def mxfp6_block_scaled_matmul_amd[
                 WN=T_WN,
                 num_splits=T_NUM_SPLITS,
                 matrix_format=fp6_format,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
         else:
-            _launch_block_scaled[
+            _launch_block_scaled_impl[
                 BM=T_BM,
                 BN=T_BN,
                 BK_ELEMS=T_BK_ELEMS,
                 WM=T_WM,
                 WN=T_WN,
                 matrix_format=fp6_format,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
         return
 
     comptime BM = 96
@@ -2696,7 +3694,7 @@ def mxfp6_block_scaled_matmul_amd[
 
     comptime if _narrow_ok:
         if M <= NARROW_M_MAX:
-            _launch_block_scaled_split_k[
+            _launch_block_scaled_split_k_impl[
                 BM=W_BM,
                 BN=W_BN,
                 BK_ELEMS=W_BK_ELEMS,
@@ -2704,8 +3702,9 @@ def mxfp6_block_scaled_matmul_amd[
                 WN=W_WN,
                 num_splits=W_SPLITS,
                 matrix_format=fp6_format,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
             return
 
     # === Decode tile (M <= DECODE_M_MAX) ===
@@ -2748,7 +3747,7 @@ def mxfp6_block_scaled_matmul_amd[
 
     comptime if _decode_ok:
         if M <= DECODE_M_MAX:
-            _launch_block_scaled_split_k[
+            _launch_block_scaled_split_k_impl[
                 BM=D_BM,
                 BN=D_BN,
                 BK_ELEMS=D_BK_ELEMS,
@@ -2756,8 +3755,9 @@ def mxfp6_block_scaled_matmul_amd[
                 WN=D_WN,
                 num_splits=_decode_splits,
                 matrix_format=fp6_format,
-                elementwise_lambda_fn=elementwise_lambda_fn,
-            ](c, a, b, a_scales, b_scales, M, ctx)
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
             return
 
     # Preshuffled-B path: M > DECODE_M_MAX is exactly the regime with no
@@ -2802,27 +3802,29 @@ def mxfp6_block_scaled_matmul_amd[
         ), "preshuffled_b requires N a multiple of 32 (mn_pack=2) and of BN=64"
         comptime if P_N_TILES >= 8:
             if M >= P_LARGE_M_THRESHOLD:
-                _launch_block_scaled_preb[
+                _launch_block_scaled_preb_impl[
                     BM=32,
                     BN=P_BN,
                     BK_ELEMS=P_BK_ELEMS,
                     WN=P_WN,
                     matrix_format=fp6_format,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                ](c, a, b, a_scales, b_scales, M, ctx)
+                    has_epilogue_fn=has_epilogue_fn,
+                    has_compute_fn=has_compute_fn,
+                ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
                 return
-        _launch_block_scaled_preb[
+        _launch_block_scaled_preb_impl[
             BM=16,
             BN=P_BN,
             BK_ELEMS=P_BK_ELEMS,
             WN=P_WN,
             matrix_format=fp6_format,
-            elementwise_lambda_fn=elementwise_lambda_fn,
-        ](c, a, b, a_scales, b_scales, M, ctx)
+            has_epilogue_fn=has_epilogue_fn,
+            has_compute_fn=has_compute_fn,
+        ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
         return
 
     comptime if num_splits > 1:
-        _launch_block_scaled_split_k[
+        _launch_block_scaled_split_k_impl[
             BM=BM,
             BN=BN,
             BK_ELEMS=BK_ELEMS,
@@ -2830,8 +3832,9 @@ def mxfp6_block_scaled_matmul_amd[
             WN=WN,
             num_splits=num_splits,
             matrix_format=fp6_format,
-            elementwise_lambda_fn=elementwise_lambda_fn,
-        ](c, a, b, a_scales, b_scales, M, ctx)
+            has_epilogue_fn=has_epilogue_fn,
+            has_compute_fn=has_compute_fn,
+        ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
         return
 
     # Depth-2 LDS ping-pong tile. `_launch_block_scaled` turns the pipeline on
@@ -2866,23 +3869,25 @@ def mxfp6_block_scaled_matmul_amd[
         and _p2_k_tiles % 2 == 0
     )
     comptime if _pingpong_ok:
-        _launch_block_scaled[
+        _launch_block_scaled_impl[
             BM=P2_BM,
             BN=P2_BN,
             BK_ELEMS=128,
             WM=P2_WM,
             WN=P2_WN,
             matrix_format=fp6_format,
-            elementwise_lambda_fn=elementwise_lambda_fn,
-        ](c, a, b, a_scales, b_scales, M, ctx)
+            has_epilogue_fn=has_epilogue_fn,
+            has_compute_fn=has_compute_fn,
+        ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
         return
 
-    _launch_block_scaled[
+    _launch_block_scaled_impl[
         BM=BM,
         BN=BN,
         BK_ELEMS=BK_ELEMS,
         WM=WM,
         WN=WN,
         matrix_format=fp6_format,
-        elementwise_lambda_fn=elementwise_lambda_fn,
-    ](c, a, b, a_scales, b_scales, M, ctx)
+        has_epilogue_fn=has_epilogue_fn,
+        has_compute_fn=has_compute_fn,
+    ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)

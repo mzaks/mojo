@@ -59,7 +59,6 @@ If FP8 fails -> K loader / mma_QK chain is wrong. The mismatch pattern
 from max.gpu import lane_id, thread_idx
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
-from std.memory import AddressSpace
 from std.testing import assert_true
 
 from layout.tile_layout import row_major
@@ -152,7 +151,7 @@ def kernel_qk_chain[
 
     # ---- K SMEM allocation + cooperative fill from gmem image -------------
     var k_smem = tt_stack_allocation[T, address_space=.SHARED](smem_layout_k)
-    var tid = Int(thread_idx.x)
+    var tid = thread_idx.x
     comptime _smem_total = _K_SLOT_ROWS * _K_SUB_COLS
     var i = tid
     while i < _smem_total:
@@ -238,7 +237,7 @@ def _dequantize_to_f32[T: DType](v: Scalar[T]) -> Float32:
 
 
 def test_qk_chain[T: DType](ctx: DeviceContext) raises -> Bool:
-    var dtype_name = "BF16" if T == DType.bfloat16 else "FP8"
+    var dtype_name = "BF16" if T == .bfloat16 else "FP8"
     print("--- test_qk_chain[", dtype_name, "] ---")
 
     comptime CFG = MhaConfigV2(
@@ -275,7 +274,7 @@ def test_qk_chain[T: DType](ctx: DeviceContext) raises -> Bool:
         for i in range(_SMEM_SIZE):
             host_k[i] = _quantize_to_K[T](Float32(0.0))
 
-        comptime _T_size = 1 if T == DType.float8_e4m3fn else 2  # bytes/elt
+        comptime _T_size = 1 if T == .float8_e4m3fn else 2  # bytes/elt
         var sub_elts = _K_SUB_ROWS * _K_SUB_COLS  # elements per sub-block
         for m_kv in range(KV_BLOCK):
             for d in range(DEPTH):

@@ -81,8 +81,9 @@ class DeepSeekV2MoEGate(MoEGate):
             their routing weights, each of shape
             ``(seq_len, num_experts_per_token)``.
         """
-        logits = self.gate_score(hidden_states.cast(DType.float32))
-        scores = F.softmax(logits.cast(DType.float32))
+        weight = self.gate_score.weight.cast(DType.float32)
+        logits = hidden_states.cast(DType.float32) @ weight.T
+        scores = F.softmax(logits)
 
         if self.topk_method == "greedy":
             topk_weight, topk_idx = F.top_k(
@@ -118,7 +119,7 @@ class DeepSeekV2MoEGate(MoEGate):
         tmp_scores = F.where(
             score_mask.cast(DType.bool),
             scores,
-            F.constant(0, dtype=scores.dtype, device=scores.device),
+            0.0,
         )  # [n, e]
 
         topk_weight, topk_idx = F.top_k(

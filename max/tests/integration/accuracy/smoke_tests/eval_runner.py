@@ -65,6 +65,7 @@ _COMPLETION_TOKEN_METRICS = (
     "maxserve_num_output_tokens_total",  # max / max-ci
     "vllm:generation_tokens_total",  # vllm
     "sglang:generation_tokens_total",  # sglang
+    "mach_request_output_tokens_total",  # mach-ci
 )
 
 _SPEC_DECODE_ACCEPTANCE_LENGTH_METRIC = (
@@ -76,29 +77,27 @@ def _inside_bazel() -> bool:
     return os.getenv("BUILD_WORKSPACE_DIRECTORY") is not None
 
 
-def validate_hf_token() -> None:
-    if os.getenv("HF_TOKEN") is None:
-        raise ValueError(
-            "Environment variable `HF_TOKEN` must be set. "
-            "See https://www.notion.so/modularai/HuggingFace-Access-Token-29d1044d37bb809fbe70e37428faf9da"
-        )
-
-
 def resolve_canonical_repo_id(repo_id: str) -> str:
     """HF disk cache is case-sensitive, so do what we can to avoid issues"""
     if os.environ.get("HF_HUB_OFFLINE") == "1":
         return repo_id
-    try:
-        r = requests.get(
-            f"https://huggingface.co/api/models/{repo_id}",
-            headers={"Authorization": f"Bearer {os.environ['HF_TOKEN']}"},
-            timeout=(5, 10),
-        )
-        r.raise_for_status()
-        return r.json()["id"]
-    except Exception as e:
-        logger.warning("Failed repo id lookup for %s: %s", repo_id, e)
-        return repo_id
+    url = f"https://huggingface.co/api/models/{repo_id}"
+    # Private repos need a token; public ones resolve without one, so only
+    # fall back to authenticating when the anonymous lookup fails.
+    token = os.environ.get("HF_TOKEN")
+    attempts: list[dict[str, str]] = [{}]
+    if token:
+        attempts.append({"Authorization": f"Bearer {token}"})
+    error: Exception | None = None
+    for headers in attempts:
+        try:
+            r = requests.get(url, headers=headers, timeout=(5, 10))
+            r.raise_for_status()
+            return r.json()["id"]
+        except Exception as e:
+            error = e
+    logger.warning("Failed repo id lookup for %s: %s", repo_id, error)
+    return repo_id
 
 
 @cache
@@ -174,35 +173,10 @@ def call_eval(
     num_questions: int,
     disable_timeouts: bool,
     metrics_url: str | None = None,
-    model_alias: str | None = None,
+    metrics_delay_s: float = 0,
     lm_eval_metadata: str | None = None,
 ) -> tuple[EvalResults, EvalSamples]:
-    extra_gen_kwargs = ""
-    # model_alias carries the original recipe key (e.g. "nvidia/Kimi-K2.5-NVFP4__internal")
-    # when model is a local path that doesn't contain the model name keywords.
-    check_name = (model_alias or model).casefold()
-    is_reasoning_model = any(
-        kw in check_name
-        for kw in (
-            "academic-ds",
-            "deepseek-r1",
-            "deepseek-v3",
-            "gemma-4",
-            "gpt-oss",
-            "inkling",
-            "internvl3_5",
-            "qwen3",
-            "kimi-k2",
-            "minimax-m2",
-            "minimax-m3",
-            "nemotron",
-            "step-3.5",
-            "glm-5",
-        )
-    )
-    # Reasoning models needs extra tokens for .. reasoning
-    if is_reasoning_model:
-        extra_gen_kwargs = ",max_gen_toks=4096"
+    extra_gen_kwargs = ",max_gen_toks=4096"
 
     # GPT-OSS sometimes gets stuck in a reasoning loop. To ensure consistency
     # in CI, we add a repetition penalty which helps prevent the loop
@@ -236,6 +210,14 @@ def call_eval(
             "--fewshot_as_multiturn",
         ]
 
+        # Hy4 thinks by default and its reasoning parser moves the think span
+        # out of `content`, so a span longer than max_gen_toks leaves no answer
+        # to score. lm-eval merges repeated --gen_kwargs.
+        if "hy4" in model.casefold():
+            eval_cmd.append(
+                '--gen_kwargs={"chat_template_kwargs": {"reasoning_effort": "no_think"}}'
+            )
+
         # Passed verbatim to lm-eval; merged into each task's config metadata to
         # parameterize it at runtime (e.g. babilong context length).
         if lm_eval_metadata is not None:
@@ -244,6 +226,7 @@ def call_eval(
         args = [interpreter, "-m", *eval_cmd]
         logger.info(f"Running eval with:\n {' '.join(args)}")
         eval_timeout = None if disable_timeouts else 600
+        time.sleep(metrics_delay_s)
         tokens_before = (
             get_num_tokens_generated(metrics_url) if metrics_url else None
         )
@@ -259,6 +242,7 @@ def call_eval(
                 f"Evals did not finish within the expected timeout={eval_timeout}s. "
                 "You can pass --disable-timeouts to opt-out of this."
             ) from None
+        time.sleep(metrics_delay_s)
         tokens_after = (
             get_num_tokens_generated(metrics_url) if metrics_url else None
         )

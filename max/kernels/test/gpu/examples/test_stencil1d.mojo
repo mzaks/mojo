@@ -17,7 +17,8 @@ from max.gpu import global_idx, thread_idx
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
 from std.memory import unsafe_stack_allocation
-from layout import TileTensor, Coord, Idx, row_major
+from std.memory.alloc import unsafe_alloc
+from layout import TileTensor, row_major
 
 comptime BLOCK_DIM = 8
 
@@ -37,15 +38,15 @@ def stencil1d(
     var coeff2 = Int(coeff2_dev)
     var tid = global_idx.x
 
-    var a = TileTensor(a_ptr, row_major(Coord(Int(arr_size))))
-    var b = TileTensor(b_ptr, row_major(Coord(Int(arr_size))))
+    var a = TileTensor(a_ptr, row_major(arr_size))
+    var b = TileTensor(b_ptr, row_major(arr_size))
 
     if 0 < tid < arr_size - 1:
         b.store(
-            Coord(tid),
-            Float32(coeff0) * a.load[width=1](Coord(tid - 1))
-            + Float32(coeff1) * a.load[width=1](Coord(tid))
-            + Float32(coeff2) * a.load[width=1](Coord(tid + 1)),
+            (tid,),
+            Float32(coeff0) * a[tid - 1]
+            + Float32(coeff1) * a[tid]
+            + Float32(coeff2) * a[tid + 1],
         )
 
 
@@ -65,29 +66,25 @@ def stencil1d_smem(
     var tid = global_idx.x
     var lindex = thread_idx.x + 1
 
-    var a = TileTensor(a_ptr, row_major(Coord(Int(arr_size))))
-    var b = TileTensor(b_ptr, row_major(Coord(Int(arr_size))))
+    var a = TileTensor(a_ptr, row_major(arr_size))
+    var b = TileTensor(b_ptr, row_major(arr_size))
 
     var a_shared = unsafe_stack_allocation[
         BLOCK_DIM + 2, DType.float32, address_space=.SHARED
     ]()
 
-    a_shared[lindex] = a.load[width=1](Coord(tid))
+    a_shared[lindex] = a[tid]
     if thread_idx.x == 0:
-        a_shared[lindex - 1] = (
-            a.load[width=1](Coord(tid - 1)) if 0 <= tid - 1 < arr_size else 0
-        )
+        a_shared[lindex - 1] = a[tid - 1] if 0 <= tid - 1 < arr_size else 0
 
         var idx = tid + Int(BLOCK_DIM)
-        a_shared[lindex + BLOCK_DIM] = (
-            a.load[width=1](Coord(idx)) if idx < arr_size else 0
-        )
+        a_shared[lindex + BLOCK_DIM] = a[idx] if idx < arr_size else 0
 
     barrier()
 
     if 0 < tid < arr_size - 1:
         b.store(
-            Coord(tid),
+            (tid,),
             Float32(coeff0) * a_shared[lindex - 1]
             + Float32(coeff1) * a_shared[lindex]
             + Float32(coeff2) * a_shared[lindex + 1],
@@ -104,8 +101,8 @@ def run_stencil1d[smem: Bool](ctx: DeviceContext) raises:
     comptime coeff2 = 4
     comptime iterations = 4
 
-    var a_host = alloc[Float32](m)
-    var b_host = alloc[Float32](m)
+    var a_host = unsafe_alloc[Float32](m)
+    var b_host = unsafe_alloc[Float32](m)
 
     for i in range(m):
         a_host[i] = Float32(i)

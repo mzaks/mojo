@@ -48,32 +48,21 @@ from std.collections.string.string import (
     _calc_initial_buffer_size_int64,
     _calc_initial_buffer_size,
 )
-from std.hashlib.hasher import Hasher
+from std.hash.hasher import Hasher
 from std.math import Ceilable, CeilDivable, Floorable, Truncable
-from std.math.math import _call_ptx_intrinsic, trunc
+from std.math.math import trunc
+from std._plugin import CurrentPlugin
 from std.sys import (
     CompilationTarget,
+    Endian,
     _RegisterPackType,
     align_of,
     bit_width_of,
-    is_amd_gpu,
-    is_apple_gpu,
-    is_big_endian,
     is_gpu,
-    is_nvidia_gpu,
     llvm_intrinsic,
-    simd_width_of,
     size_of,
 )
-from std.sys._assembly import inlined_assembly
-from std.sys.info import (
-    _cdna_4_or_newer,
-    _is_amd_mi300x,
-    _is_sm_9x_or_newer,
-    _is_sm_100x_or_newer,
-    _is_sm_120x_or_newer,
-    is_32bit,
-)
+from std.sys.info import is_32bit
 
 from std.bit import bit_width, byte_swap, pop_count
 from std.builtin._format_float import _write_float
@@ -83,6 +72,7 @@ from std.builtin.simd_length import SIMDLength
 from std.builtin.int import _FromInt
 from std.math import DivModable, Powable
 from std.memory import bitcast, unsafe_memcpy, pack_bits
+from std.os import abort
 from std.python import (
     ConvertibleToPython,
     ConvertibleFromPython,
@@ -300,17 +290,16 @@ def _has_native_bf16_support() -> Bool:
 
 @inline(.nodebug)
 def _has_native_f8_support() -> Bool:
-    return _is_sm_9x_or_newer() or is_nvidia_gpu["sm_89"]() or is_amd_gpu()
+    return CurrentPlugin.has_native_float8
 
 
-# Apple's Metal AIR backend has no `llvm.vector.splice` lowering;
-# `SIMD.{rotate,shift}_{left,right}` use `shufflevector` masks instead.
+# Shuffle masks for `SIMD.{rotate,shift}_{left,right}` on backends that do
+# not lower `llvm.vector.splice`.
 
 
 @inline(.nodebug)
-def _apple_rotate_mask[size: Int, shift: Int]() -> IndexList[size]:
-    """Mask for `SIMD.rotate_left[shift]()` on Apple GPU; any sign of `shift`.
-    """
+def _rotate_mask[size: Int, shift: Int]() -> IndexList[size]:
+    """Mask for `SIMD.rotate_left[shift]()`; any sign of `shift`."""
     var res = IndexList[size]()
     comptime for i in range(size):
         res[i] = (i + shift + size) % size
@@ -318,8 +307,8 @@ def _apple_rotate_mask[size: Int, shift: Int]() -> IndexList[size]:
 
 
 @inline(.nodebug)
-def _apple_shift_mask[size: Int, shift: Int]() -> IndexList[size]:
-    """Mask for `SIMD.shift_{left,right}[shift]()` on Apple GPU.
+def _shift_mask[size: Int, shift: Int]() -> IndexList[size]:
+    """Mask for `SIMD.shift_{left,right}[shift]()`.
 
     Sign of `shift` selects direction (positive=left, negative=right);
     out-of-range lanes index `other`, which callers pass as zero.
@@ -340,7 +329,7 @@ def _apple_shift_mask[size: Int, shift: Int]() -> IndexList[size]:
 
 
 @fieldwise_init
-struct FastMathFlag(Equatable, ImplicitlyCopyable, RegisterPassable):
+struct FastMathFlag(EnumLike, Equatable, ImplicitlyCopyable, RegisterPassable):
     """Flags for controlling fast-math optimizations in floating-point operations.
 
     FastMathFlag provides compile-time controls for various floating-point math
@@ -400,6 +389,34 @@ struct FastMathFlag(Equatable, ImplicitlyCopyable, RegisterPassable):
 
     comptime FAST = Self(8)
     """Enable all fast-math optimizations."""
+
+    comptime _enum_case_names = ParameterList.of[
+        "NONE".value,
+        "NNAN".value,
+        "NINF".value,
+        "NSZ".value,
+        "ARCP".value,
+        "CONTRACT".value,
+        "AFN".value,
+        "REASSOC".value,
+        "FAST".value,
+    ].values
+
+    comptime _enum_case_types = TypeList.splat[
+        ParameterList[Self._enum_case_names].length, NoneType
+    ].values
+
+    @inline(.always)
+    def _get_enum_discriminant(self) -> Int:
+        return Int(self._value)
+
+    @inline(.always)
+    def _unsafe_get_enum_payload[
+        id: Int
+    ](ref self) -> ref[self] TypeList[Trait=AnyType, Self._enum_case_types]()[
+        id
+    ]:
+        comptime assert False, "FastMathFlag has no payload"
 
     def __eq__(self, other: Self) -> Bool:
         """Compares two FastMathFlag values for identity.
@@ -1222,8 +1239,7 @@ struct SIMD[dtype: DType, length: SIMDLength](
         var mod = self - div * denominator
         var mask = (denominator.lt(0) ^ self.lt(0)) & mod.ne(0)
 
-        if any(mask):
-            div = div - mask.cast[Self.dtype]()
+        div = div - mask.cast[Self.dtype]()
 
         var div_res = is_zero_mask.select(Self(0), div)
         var mod_res = mod + mask.select(denominator, Self(0))
@@ -1232,6 +1248,12 @@ struct SIMD[dtype: DType, length: SIMDLength](
     @inline(.nodebug)
     def __pow__(self, exp: SIMD[_, _]) -> Self:
         """Computes the vector raised to the power of the input integer value.
+
+        For an integral vector, a negative exponent aborts.
+
+        Constraints:
+            The SIMD dtype must be numeric. An integral vector requires an
+            integral exponent.
 
         Args:
             exp: The exponent value.
@@ -1281,6 +1303,11 @@ struct SIMD[dtype: DType, length: SIMDLength](
     @inline(.nodebug)
     def __pow__(self, exp: Self) -> Self:
         """Computes the vector raised elementwise to the right hand side power.
+
+        For an integral vector, a negative exponent aborts.
+
+        Constraints:
+            The SIMD dtype must be numeric.
 
         Args:
             exp: The exponent value.
@@ -2303,11 +2330,11 @@ struct SIMD[dtype: DType, length: SIMDLength](
         comptime if Self.dtype == target:
             return self._refine[target]()
 
-        comptime if is_nvidia_gpu():
-            comptime if Self.dtype == DType.bfloat16 and target == DType.float64:
-                # Convert to F64 via a Float32 pathway. This would allow us to
-                # use the optimizations defined above.
-                return self.cast[DType.float32]().cast[target]()
+        if not __is_run_in_comptime_interpreter:
+            comptime if case .Some(f) = CurrentPlugin.cast_fn[
+                Self.dtype, target
+            ]:
+                return f(self)
 
         comptime if target in (
             DType.float8_e4m3fn,
@@ -2319,7 +2346,7 @@ struct SIMD[dtype: DType, length: SIMDLength](
             return _convert_f32_to_float8[target](self.cast[DType.float32]())
 
         comptime if target == DType.float8_e8m0fnu:
-            return _convert_f32_to_float8_ue8m0[target, rounding_mode="rp"](
+            return _convert_f32_to_float8_ue8m0[target](
                 self.cast[DType.float32]()
             )
 
@@ -2357,11 +2384,6 @@ struct SIMD[dtype: DType, length: SIMDLength](
             return self.select[target](1, 0)
         elif target == DType.bool:
             return self.ne(0)._refine[target]()
-
-        comptime if Self.dtype == DType.bfloat16 and is_amd_gpu():
-            return _bfloat16_to_f32(
-                self._refine[DType.bfloat16](),
-            ).cast[target]()
 
         comptime if Self.dtype in (DType._uint1, DType._uint2, DType._uint4):
             # `pop.cast` doesn't support some conversions from `ui1`, `ui2`, or `ui4`
@@ -2525,53 +2547,120 @@ struct SIMD[dtype: DType, length: SIMDLength](
     @staticmethod
     def from_bytes[
         *,
-        big_endian: Bool = is_big_endian(),
+        endian: Endian = .native(),
     ](bytes: Array[Byte, _]) -> SIMD[Self.dtype, Self.length]:
         """Converts a byte array to a vector.
+
+        Parameters:
+            endian: The byte order of `bytes`.
 
         Args:
             bytes: The byte array to convert.
 
-        Parameters:
-            big_endian: Whether the byte array is big-endian.
-
         Returns:
-            The integer value.
+            The vector stored in `bytes`.
+
+        Example:
+
+        ```mojo
+        var port = UInt16.from_bytes[endian=.big]([0x1F, 0x90])  # 8080
+        ```
         """
         comptime assert bytes.length == size_of[Self]()
-        var ptr = bytes.unsafe_ptr().unsafe_bitcast[Self]()
-        var value = ptr[]
 
-        comptime if is_big_endian() != big_endian:
+        var value = Pointer(to=bytes).unsafe_bitcast[Self]()[]
+
+        comptime if endian != .native():
             return byte_swap(value)
 
         return value
 
     def as_bytes[
         *,
-        big_endian: Bool = is_big_endian(),
-    ](self) -> Array[Byte, size_of[Self]()]:
-        """Convert the vector to a byte array.
+        endian: Endian = .native(),
+    ](self, out result: Array[Byte, size_of[Self]()]):
+        """Converts the vector to a byte array.
 
         Parameters:
-            big_endian: Whether the byte array should be big-endian.
+            endian: The byte order of the returned bytes.
 
         Returns:
-            The byte array.
+            The vector's bytes, in `endian` byte order.
+
+        Example:
+
+        ```mojo
+        var bytes = UInt16(8080).as_bytes[endian=.big]()  # [0x1F, 0x90]
+        ```
         """
         var value = self
 
-        comptime if is_big_endian() != big_endian:
+        comptime if endian != .native():
             value = byte_swap(value)
 
-        var ptr = Pointer(to=value)
-        var array = Array[Byte, size_of[Self]()](uninitialized=True)
-        unsafe_memcpy(
-            dest=array.unsafe_ptr(),
-            src=ptr.unsafe_bitcast[Byte](),
-            count=size_of[Self](),
+        result = (
+            Pointer(to=value)
+            .unsafe_bitcast[type_of(result)]()
+            .unsafe_take_pointee()
         )
-        return array^
+
+    def to_endian[endian: Endian](self) -> Self:
+        """Returns the value whose in-memory bytes are `self` encoded in
+        `endian` byte order.
+
+        Parameters:
+            endian: The byte order to encode in.
+
+        Returns:
+            The value whose bytes in memory are `self` in `endian` order.
+
+        Constraints:
+            The element type must be integral.
+
+        Examples:
+
+        ```mojo
+        var wire = UInt16(8080).to_endian[.big]()
+        print(wire.as_bytes())  # [31, 144], that is [0x1F, 0x90]
+        ```
+        """
+        comptime assert (
+            Self.dtype.is_integral()
+        ), "SIMD.to/from_endian requires an integral type"
+
+        comptime if endian != .native():
+            return byte_swap(self)
+        return self
+
+    @staticmethod
+    def from_endian[endian: Endian](value: Self) -> Self:
+        """Returns the value encoded in `endian` byte order by the in-memory
+        bytes of `value`.
+
+        The inverse of `to_endian()`: each element's bytes are reversed when
+        `endian` differs from the target's byte order and left unchanged
+        otherwise.
+
+        Parameters:
+            endian: The byte order `value` is encoded in.
+
+        Args:
+            value: A value whose bytes in memory hold an `endian` encoding.
+
+        Returns:
+            The decoded value.
+
+        Constraints:
+            The element type must be integral.
+
+        Examples:
+
+        ```mojo
+        var wire = UInt16.from_bytes([0x1F, 0x90])  # big-endian 8080
+        print(UInt16.from_endian[.big](wire))  # 8080
+        ```
+        """
+        return value.to_endian[endian]()
 
     def clamp(self, lower_bound: Self, upper_bound: Self) -> Self:
         """Clamps the values in a SIMD vector to be in a certain range.
@@ -2640,7 +2729,7 @@ struct SIMD[dtype: DType, length: SIMDLength](
         """
 
         comptime assert (
-            output_size == mask.size
+            output_size == mask.length
         ), "size of the mask must match the output SIMD size"
 
         # FIXME: Support parameters on initializers better, removing __init__.
@@ -2844,8 +2933,7 @@ struct SIMD[dtype: DType, length: SIMDLength](
         ), "output width must be a positive integer less than simd size"
 
         @inline(.always)
-        @__parameter
-        def slice_body() -> SIMD[Self.dtype, output_width]:
+        def slice_body() {imm} -> SIMD[Self.dtype, output_width]:
             var tmp = SIMD[Self.dtype, output_width]()
 
             comptime for i in range(output_width):
@@ -2854,13 +2942,15 @@ struct SIMD[dtype: DType, length: SIMDLength](
 
         comptime if output_width == 1:
             return self[offset]
-        elif offset % simd_width_of[Self.dtype]():
+        elif offset % output_width:
+            # `llvm.vector.extract` wants an index that is a multiple of the
+            # result element count, which is what `insert` asserts as well.
             return slice_body()
 
         if __is_run_in_comptime_interpreter:
             return slice_body()
 
-        comptime if is_apple_gpu():
+        comptime if not CurrentPlugin.lowers_subvector_intrinsics:
             return slice_body()
 
         return llvm_intrinsic[
@@ -2899,6 +2989,16 @@ struct SIMD[dtype: DType, length: SIMDLength](
                 input_width == 1
             ), "the input width must be 1 if the size is 1"
             return value[0]
+
+        # `llvm.vector.insert` needs a vector as its subvector operand, but a
+        # width-1 `SIMD` lowers to a scalar.
+        comptime if (
+            input_width == 1 or not CurrentPlugin.lowers_subvector_intrinsics
+        ):
+            var result = self
+            comptime for i in range(input_width):
+                result[offset + i] = value[i]
+            return result
 
         return llvm_intrinsic[
             "llvm.vector.insert", Self, has_side_effect=False
@@ -3021,89 +3121,48 @@ struct SIMD[dtype: DType, length: SIMDLength](
         """
 
         @inline(.always)
-        @__parameter
         def body[
             width: SIMDLength
         ](lhs: Self._T[width], rhs: Self._T[width]) -> Self._T[width]:
             return func[width](lhs, rhs)
 
-        return self.reduce[body, size_out]()
+        return self.reduce[size_out](body)
 
-    # TODO: remove when non-capturing can be converted to capturing.
     @inline(.always)
     def reduce[
-        func: def[width: SIMDLength](
-            Self._T[width], Self._T[width]
-        ) thin -> Self._T[width],
+        FuncType: ImplicitlyCopyable
+        & RegisterPassable
+        & def[width: SIMDLength](Self._T[width], Self._T[width]) -> Self._T[
+            width
+        ],
+        //,
         size_out: Int = 1,
-    ](self) -> Self._T[size_out]:
-        """Reduces the vector using a provided reduce operator.
+    ](self, func: FuncType) -> Self._T[size_out]:
+        """Reduces the vector using a provided reduce closure.
 
         Parameters:
-            func: The reduce function to apply to elements in this SIMD.
+            FuncType: The type of the reduce closure.
             size_out: The width of the reduction.
+
+        Args:
+            func: The reduce function to apply to elements in this SIMD.
 
         Constraints:
             `size_out` must not exceed width of the vector.
 
         Returns:
             A new scalar which is the reduction of all vector elements.
-        """
 
-        @inline(.always)
-        @__parameter
-        def body[w: Int](lhs: Self._T[w], rhs: Self._T[w]) -> Self._T[w]:
-            return func(lhs, rhs)
+        Example:
 
-        return self.reduce[body, size_out]()
+        ```mojo
+        def add[width: SIMDLength](
+            lhs: SIMD[DType.int32, width], rhs: SIMD[DType.int32, width]
+        ) -> SIMD[DType.int32, width]:
+            return lhs + rhs
 
-    @inline(.always)
-    def reduce[
-        func: def[width: Int](
-            Self._T[width], Self._T[width]
-        ) capturing -> Self._T[width],
-        size_out: Int = 1,
-    ](self) -> Self._T[size_out]:
-        """Reduces the vector using a provided reduce operator.
-
-        Parameters:
-            func: The reduce function to apply to elements in this SIMD.
-            size_out: The width of the reduction.
-
-        Constraints:
-            `size_out` must not exceed width of the vector.
-
-        Returns:
-            A new scalar which is the reduction of all vector elements.
-        """
-
-        @inline(.always)
-        @__parameter
-        def body[
-            width: SIMDLength
-        ](lhs: Self._T[width], rhs: Self._T[width]) -> Self._T[width]:
-            return func[width=width](lhs, rhs)
-
-        return self.reduce[body, size_out]()
-
-    @inline(.always)
-    def reduce[
-        func: def[width: SIMDLength](
-            Self._T[width], Self._T[width]
-        ) capturing -> Self._T[width],
-        size_out: Int = 1,
-    ](self) -> Self._T[size_out]:
-        """Reduces the vector using a provided reduce operator.
-
-        Parameters:
-            func: The reduce function to apply to elements in this SIMD.
-            size_out: The width of the reduction.
-
-        Constraints:
-            `size_out` must not exceed width of the vector.
-
-        Returns:
-            A new scalar which is the reduction of all vector elements.
+        var total = SIMD[DType.int32, 4](1, 2, 3, 4).reduce(add)  # 10
+        ```
         """
         comptime assert (
             size_out <= Self.length
@@ -3113,7 +3172,7 @@ struct SIMD[dtype: DType, length: SIMDLength](
             return self._refine[new_size=size_out]()
         else:
             var lhs, rhs = self.split()
-            return func(lhs, rhs).reduce[func, size_out]()
+            return func(lhs, rhs).reduce[size_out](func)
 
     @inline(.nodebug)
     def reduce_max[size_out: Int = 1](self) -> Self._T[size_out]:
@@ -3134,7 +3193,13 @@ struct SIMD[dtype: DType, length: SIMDLength](
             return self[0]
 
         comptime if CompilationTarget.is_x86() or size_out > 1:
-            return self.reduce[max[dtype=Self.dtype], size_out]()
+
+            def max_fn[
+                width: SIMDLength
+            ](lhs: Self._T[width], rhs: Self._T[width]) -> Self._T[width]:
+                return max(lhs, rhs)
+
+            return self.reduce[size_out](max_fn)
 
         comptime if Self.dtype.is_unsigned():
             return llvm_intrinsic[
@@ -3174,7 +3239,13 @@ struct SIMD[dtype: DType, length: SIMDLength](
             return self[0]
 
         comptime if CompilationTarget.is_x86() or size_out > 1:
-            return self.reduce[min[dtype=Self.dtype], size_out]()
+
+            def min_fn[
+                width: SIMDLength
+            ](lhs: Self._T[width], rhs: Self._T[width]) -> Self._T[width]:
+                return min(lhs, rhs)
+
+            return self.reduce[size_out](min_fn)
 
         comptime if Self.dtype.is_unsigned():
             return llvm_intrinsic[
@@ -3209,7 +3280,13 @@ struct SIMD[dtype: DType, length: SIMDLength](
             The sum of all vector elements.
 
         """
-        return self.reduce[Self._T.__add__, size_out]()
+
+        def add_fn[
+            width: SIMDLength
+        ](lhs: Self._T[width], rhs: Self._T[width]) -> Self._T[width]:
+            return lhs + rhs
+
+        return self.reduce[size_out](add_fn)
 
     @inline(.always)
     def reduce_mul[size_out: Int = 1](self) -> SIMD[Self.dtype, size_out]:
@@ -3225,7 +3302,13 @@ struct SIMD[dtype: DType, length: SIMDLength](
         Returns:
             The product of all vector elements.
         """
-        return self.reduce[Self._T.__mul__, size_out]()
+
+        def mul_fn[
+            width: SIMDLength
+        ](lhs: Self._T[width], rhs: Self._T[width]) -> Self._T[width]:
+            return lhs * rhs
+
+        return self.reduce[size_out](mul_fn)
 
     @inline(.always)
     def reduce_and[size_out: Int = 1](self) -> SIMD[Self.dtype, size_out]:
@@ -3249,7 +3332,13 @@ struct SIMD[dtype: DType, length: SIMDLength](
         ), "The element type of the vector must be integer or boolean."
 
         comptime if size_out > 1:
-            return self.reduce[Self._T.__and__, size_out]()
+
+            def and_fn[
+                width: SIMDLength
+            ](lhs: Self._T[width], rhs: Self._T[width]) -> Self._T[width]:
+                return lhs & rhs
+
+            return self.reduce[size_out](and_fn)
 
         comptime if Self.length == 1:
             return self[0]
@@ -3282,7 +3371,13 @@ struct SIMD[dtype: DType, length: SIMDLength](
         ), "The element type of the vector must be integer or boolean."
 
         comptime if size_out > 1:
-            return self.reduce[Self._T.__or__, size_out]()
+
+            def or_fn[
+                width: SIMDLength
+            ](lhs: Self._T[width], rhs: Self._T[width]) -> Self._T[width]:
+                return lhs | rhs
+
+            return self.reduce[size_out](or_fn)
 
         comptime if Self.length == 1:
             return self[0]
@@ -3386,8 +3481,8 @@ struct SIMD[dtype: DType, length: SIMDLength](
             comptime assert shift == 0, "for scalars the shift must be 0"
             return self
 
-        comptime if is_apple_gpu():
-            return self.shuffle[mask=_apple_rotate_mask[Self.length, shift]()]()
+        comptime if not CurrentPlugin.lowers_subvector_intrinsics:
+            return self.shuffle[mask=_rotate_mask[Self.length, shift]()]()
 
         comptime if shift >= 0:
             return llvm_intrinsic[
@@ -3455,10 +3550,8 @@ struct SIMD[dtype: DType, length: SIMDLength](
         elif shift == Self.length:
             return 0
 
-        comptime if is_apple_gpu():
-            return self.shuffle[mask=_apple_shift_mask[Self.length, shift]()](
-                Self()
-            )
+        comptime if not CurrentPlugin.lowers_subvector_intrinsics:
+            return self.shuffle[mask=_shift_mask[Self.length, shift]()](Self())
 
         return llvm_intrinsic[
             "llvm.vector.splice.left", Self, has_side_effect=False
@@ -3494,10 +3587,8 @@ struct SIMD[dtype: DType, length: SIMDLength](
         elif shift == Self.length:
             return 0
 
-        comptime if is_apple_gpu():
-            return self.shuffle[mask=_apple_shift_mask[Self.length, -shift]()](
-                Self()
-            )
+        comptime if not CurrentPlugin.lowers_subvector_intrinsics:
+            return self.shuffle[mask=_shift_mask[Self.length, -shift]()](Self())
 
         return llvm_intrinsic[
             "llvm.vector.splice.right", Self, has_side_effect=False
@@ -3661,22 +3752,13 @@ def _pow[
     """
 
     comptime if exp.dtype.is_floating_point() and base.dtype == exp.dtype:
-        comptime if is_apple_gpu():
-            # AIR has no bf16 overload of `air.pow`; Metal rejects it, so
-            # evaluate in f32 and narrow the result back.
-            comptime if base.dtype == .bfloat16:
-                return _pow(base.cast[.float32](), exp.cast[.float32]()).cast[
-                    base.dtype
-                ]()
-            return llvm_intrinsic[
-                "llvm.air.pow",
-                type_of(base),
-                type_of(base),
-                type_of(exp),
-                has_side_effect=False,
-            ](base, exp)
-        else:
+        if __is_run_in_comptime_interpreter:
             return _powf(base, exp)
+
+        comptime hook = CurrentPlugin.binary_math_fn[.pow, base.dtype, width]
+        comptime if hook:
+            return comptime (hook.value())(base, rebind[type_of(base)](exp))
+        return _powf(base, exp)
     elif exp.dtype.is_integral():
         # Common cases
         if all(exp.eq(2)):
@@ -3688,6 +3770,11 @@ def _pow[
 
         comptime for i in range(width):
             result[i] = _powi(base[i], exp[i].cast[DType.int32]())
+    elif base.dtype.is_integral() and exp.dtype.is_floating_point():
+        comptime assert False, (
+            "an integer cannot be raised to a floating point power; use a"
+            " floating point base, e.g. 'Float64(x) ** n'"
+        )
     else:
         comptime assert False, "unsupported type combination"
 
@@ -3703,7 +3790,17 @@ def _powf_scalar(
     var integral, fractional = _modf_scalar(exponent)
 
     if integral == exponent:
-        return _powi(base, integral.cast[DType.int32]())
+        if abs(integral) < 2147483648.0:
+            return _powi(base, integral.cast[DType.int32]())
+        # Too large for `_powi`: |base| ** exponent, with the sign of `base`
+        # for odd ones (so `-0.0` keeps its sign too).
+        var mag = abs(base)
+        if mag != 1 and not _isnan(mag):
+            mag = std.math.exp(exponent.cast[base.dtype]() * std.math.log(mag))
+        var half = integral * 0.5
+        if _floor(half) != half:
+            return std.math.copysign(mag, base)
+        return mag
 
     if fractional and base < 0:
         return _nan[base.dtype]()
@@ -3729,16 +3826,14 @@ def _powf[
 
 @inline(.always)
 def _powi(base: Scalar, exp: Int32) -> type_of(base):
-    if base.dtype.is_integral() and exp < 0:
-        if base == 1:
-            return 1
-        if base == -1:
-            # (-1) ** n is 1 for even n, -1 for odd n.
-            return Scalar[base.dtype](1 if (-exp) & 1 == 0 else -1)
-        # For |base| > 1, this is the integer truncation of
-        # 1 / base^|exp|. Note: 0 ** negative is mathematically
-        # undefined, but we return 0 here for now.
-        return 0
+    comptime if base.dtype.is_integral():
+        if exp < 0:
+            # Trap rather than return a truncated result, the way NumPy rejects
+            # integers to negative powers.
+            abort(
+                "an integer cannot be raised to a negative power; use a"
+                " floating point base, e.g. 'Float64(x) ** n'"
+            )
 
     var a = base
     var b = abs(exp) if base.dtype.is_floating_point() else exp
@@ -3753,6 +3848,12 @@ def _powi(base: Scalar, exp: Int32) -> type_of(base):
         if exp < 0:
             return 1.0 / res
     return res
+
+
+comptime _CastPluginHookFnType[target: DType] = def[
+    dtype: DType, width: SIMDLength, //
+](SIMD[dtype, width]) thin -> SIMD[target, width]
+"""Plugin-hook signature for `PluginHooks.cast_fn`."""
 
 
 # ===----------------------------------------------------------------------=== #
@@ -3826,31 +3927,14 @@ def _convert_float8_to_f32[
     dtype: DType,
     size: SIMDLength,
 ](val: SIMD[dtype, size]) -> SIMD[.float32, size]:
-    comptime if _is_sm_9x_or_newer() and not _is_sm_120x_or_newer() and dtype in (
-        DType.float8_e4m3fn,
-        DType.float8_e5m2,
-    ):
-        return _convert_float8_to_f16(val).cast[DType.float32]()
-
-    elif (
-        _is_amd_mi300x()
-        and dtype
-        in (
-            DType.float8_e4m3fnuz,
-            DType.float8_e5m2fnuz,
-        )
-    ) or (
-        _cdna_4_or_newer()
-        and dtype
-        in (
-            DType.float8_e4m3fn,
-            DType.float8_e5m2,
-        )
-    ):
+    comptime if CurrentPlugin.native_float8_cast[dtype, DType.float32]:
         var res = __mlir_op.`pop.cast`[_type=SIMD[.float32, size]._mlir_type](
             val._mlir_value
         )
         return SIMD[.float32, size](mlir_value=res)
+
+    elif CurrentPlugin.native_float8_cast[dtype, DType.float16]:
+        return _convert_float8_to_f16(val).cast[DType.float32]()
 
     else:
 
@@ -3868,10 +3952,7 @@ def _convert_float8_to_f16[
     dtype: DType,
     size: SIMDLength,
 ](val: SIMD[dtype, size]) -> SIMD[.float16, size]:
-    comptime if _is_sm_9x_or_newer() and not _is_sm_120x_or_newer() and dtype in (
-        DType.float8_e4m3fn,
-        DType.float8_e5m2,
-    ):
+    comptime if CurrentPlugin.native_float8_cast[dtype, DType.float16]:
         # do not call `SIMD.cast` here; the inliner will diverge
         var res = __mlir_op.`pop.cast`[_type=SIMD[.float16, size]._mlir_type](
             val._mlir_value
@@ -3888,21 +3969,8 @@ def _convert_f32_to_float8[
     //,
     target: DType,
 ](val: SIMD[dtype, size]) -> SIMD[target, size]:
-    comptime if (
-        _is_sm_9x_or_newer() or _cdna_4_or_newer()
-    ) and not _is_sm_120x_or_newer() and target in (
-        DType.float8_e4m3fn,
-        DType.float8_e5m2,
-    ):
+    comptime if CurrentPlugin.native_float8_cast[dtype, target]:
         # do not call `SIMD.cast` here; the inliner will diverge
-        var res = __mlir_op.`pop.cast`[_type=SIMD[target, size]._mlir_type](
-            val._mlir_value
-        )
-        return SIMD(mlir_value=res)
-    elif _is_amd_mi300x() and target in (
-        DType.float8_e4m3fnuz,
-        DType.float8_e5m2fnuz,
-    ):
         var res = __mlir_op.`pop.cast`[_type=SIMD[target, size]._mlir_type](
             val._mlir_value
         )
@@ -3926,7 +3994,6 @@ def _convert_f32_to_float8_scalar[
 ](x: Scalar[dtype]) -> Scalar[target]:
     # software implementation rounds toward nearest even
 
-    @__parameter
     def max_finite_byte() -> UInt8:
         comptime if target == DType.float8_e4m3fn:
             return UInt8(0x7E)
@@ -4031,25 +4098,12 @@ def _convert_f32_to_float8_ue8m0_scalar[
     dtype: DType,
     //,
     target: DType,
-    *,
-    satfinite: Bool = False,
-    rounding_mode: String = "rp",
 ](x: Scalar[dtype]) -> Scalar[target]:
     """Convert float32 to float8_e8m0fnu (UE8M0).
 
-    This follows CUTLASS and uses `rounding_mode="rp"` (round toward +infinity)
-    when mapping float32 to a biased exponent byte. Other rounding modes are
-    currently unsupported in the CPU fallback.
+    This follows CUTLASS and rounds toward +infinity when mapping float32 to a
+    biased exponent byte.
     """
-    comptime assert not satfinite, (
-        "satfinite is not implemented for CPU path. Extend this function to"
-        " support it."
-    )
-    comptime assert rounding_mode == "rp", (
-        "Only rounding mode 'rp' is supported for CPU path. Extend this"
-        " function to support other rounding modes."
-    )
-
     if _isnan(x) or _isinf(x):
         return bitcast[target, 1](UInt8(0xFF))
 
@@ -4071,57 +4125,28 @@ def _convert_f32_to_float8_ue8m0[
     size: SIMDLength,
     //,
     target: DType,
-    *,
-    satfinite: Bool = False,
-    rounding_mode: String = "rp",
 ](val: SIMD[dtype, size],) -> SIMD[target, size]:
     """Convert float32 to float8_e8m0fnu (UE8M0).
 
-    The default rounding mode is `rounding_mode="rp"` (round toward +infinity),
-    matching CUTLASS. On SM100+ this lowers to `cvt.rp[.satfinite].ue8m0x2.f32`.
+    Rounds toward +infinity, matching CUTLASS.
     """
     comptime assert dtype == DType.float32 and target == DType.float8_e8m0fnu, (
         "this conversion is only supported for float32 -> float8_e8m0fnu."
         " Exnted it if you need bfloat16 -> float8_e8m0fnu."
     )
 
-    comptime if is_nvidia_gpu() and _is_sm_100x_or_newer():
-        comptime satfinite_suffix = ".satfinite" if satfinite else ""
-        comptime asm_prefix = "cvt." + rounding_mode + satfinite_suffix + ".ue8m0x2.f32"
+    # Kernels call this directly rather than through `SIMD.cast`.
+    if not __is_run_in_comptime_interpreter:
+        comptime if case .Some(f) = CurrentPlugin.cast_fn[dtype, target]:
+            return f(val)
 
-        comptime if size > 1:
-            var res = SIMD[target, size]()
+    @inline(.always)
+    def wrapper_fn[
+        input_dtype: DType, result_dtype: DType
+    ](val: Scalar[input_dtype]) -> Scalar[result_dtype]:
+        return _convert_f32_to_float8_ue8m0_scalar[result_dtype](val)
 
-            comptime for i in range(0, size, 2):
-                var f8x2_f32x2 = inlined_assembly[
-                    asm_prefix + " $0, $1, $2;",
-                    UInt16,
-                    constraints="=h,f,f",
-                    has_side_effect=False,
-                ](val[i + 1], val[i])
-                var ui8x2 = bitcast[target, 2](f8x2_f32x2)
-                res = res.insert[offset=i](ui8x2)
-            return res
-        else:
-            var f8x2_f32x2 = inlined_assembly[
-                asm_prefix + " $0, $1, $2;",
-                UInt16,
-                constraints="=h,f,f",
-                has_side_effect=False,
-            ](Float32(0.0), val[0])
-            var ui8x2 = bitcast[target, 2](f8x2_f32x2)
-            return ui8x2[0]
-    else:
-
-        @inline(.always)
-        def wrapper_fn[
-            input_dtype: DType, result_dtype: DType
-        ](val: Scalar[input_dtype]) -> Scalar[result_dtype]:
-            return _convert_f32_to_float8_ue8m0_scalar[
-                result_dtype, satfinite=satfinite, rounding_mode=rounding_mode
-            ](val)
-
-        return _simd_apply[wrapper_fn, result_dtype=target](val)
+    return _simd_apply[wrapper_fn, result_dtype=target](val)
 
 
 @inline(.always)
@@ -4144,88 +4169,20 @@ def _convert_float8_ue8m0_to_f32[
         dtype == DType.float8_e8m0fnu and target == DType.float32
     ), "this conversion is only supported for float8_e8m0fnu -> float32."
 
-    comptime if is_nvidia_gpu() and _is_sm_100x_or_newer():
-        comptime asm_prefix = "cvt.rn.bf16x2.ue8m0x2"
+    # `SIMD.cast` converts to other dtypes through this helper.
+    if not __is_run_in_comptime_interpreter:
+        comptime if case .Some(f) = CurrentPlugin.cast_fn[dtype, target]:
+            return f(val)
 
-        comptime if size > 1:
-            var res = SIMD[target, size]()
+    var exp = val.to_bits[DType.uint8]()
+    var f32_bits = exp.cast[DType.uint32]() << 23
 
-            comptime for i in range(0, size, 2):
-                var ue8m0x2 = SIMD[.uint8, 2](
-                    bitcast[DType.uint8, 1](val[i]),
-                    bitcast[DType.uint8, 1](val[i + 1]),
-                )
-                var bf16x2 = inlined_assembly[
-                    asm_prefix + " $0, $1;",
-                    UInt32,
-                    constraints="=r,h",
-                    has_side_effect=False,
-                ](bitcast[DType.uint16, 1](ue8m0x2))
-                var f32x2 = bitcast[DType.bfloat16, 2](bf16x2).cast[target]()
-                res = res.insert[offset=i](f32x2)
-            return res
-        else:
-            var ue8m0x2 = SIMD[.uint8, 2](
-                bitcast[DType.uint8, 1](val[0]), UInt8(0)
-            )
-            var bf16x2 = inlined_assembly[
-                asm_prefix + " $0, $1;",
-                UInt32,
-                constraints="=r,h",
-                has_side_effect=False,
-            ](bitcast[DType.uint16, 1](ue8m0x2))
-            var f32x2 = bitcast[DType.bfloat16, 2](bf16x2).cast[target]()
-            return f32x2[0]
+    # 0x00 represents 2**-127, which is a float32 subnormal.
+    f32_bits = exp.eq(0).select(SIMD[.uint32, size](0x00400000), f32_bits)
+    # 0xFF is NaN for this format; avoid creating +inf in float32.
+    f32_bits = exp.eq(0xFF).select(SIMD[.uint32, size](0x7FFFFFFF), f32_bits)
 
-    else:
-        var exp = val.to_bits[DType.uint8]()
-        var f32_bits = exp.cast[DType.uint32]() << 23
-
-        # 0x00 represents 2**-127, which is a float32 subnormal.
-        f32_bits = exp.eq(0).select(SIMD[.uint32, size](0x00400000), f32_bits)
-        # 0xFF is NaN for this format; avoid creating +inf in float32.
-        f32_bits = exp.eq(0xFF).select(
-            SIMD[.uint32, size](0x7FFFFFFF), f32_bits
-        )
-
-        return SIMD[target, size](from_bits=f32_bits)
-
-
-# ===----------------------------------------------------------------------=== #
-# bfloat16
-# ===----------------------------------------------------------------------=== #
-
-
-@inline(.always)
-def _bfloat16_to_f32_scalar(
-    val: BFloat16,
-) -> Float32:
-    # For bfloat16, we can just do an unsafe_memcpy to perform the cast to
-    # float32.
-    comptime if is_nvidia_gpu():
-        return inlined_assembly[
-            "cvt.f32.bf16 $0, $1;" if _is_sm_9x_or_newer() else "mov.b32 $0, {0, $1};",
-            Float32,
-            constraints="=f,h",
-            has_side_effect=False,
-        ](bitcast[DType.int16](val))
-
-    return bitcast[DType.float32, 1](SIMD[.bfloat16, 2](0, val))
-
-
-@inline(.always)
-def _bfloat16_to_f32[
-    size: SIMDLength
-](val: SIMD[.bfloat16, size]) -> SIMD[.float32, size]:
-    @inline(.always)
-    def wrapper_fn[
-        input_dtype: DType, result_dtype: DType
-    ](val: Scalar[input_dtype]) -> Scalar[result_dtype]:
-        return _bfloat16_to_f32_scalar(
-            val._refine[DType.bfloat16](),
-        )._refine[result_dtype]()
-
-    return _simd_apply[wrapper_fn, result_dtype=DType.float32](val)
+    return SIMD[target, size](from_bits=f32_bits)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -4391,61 +4348,62 @@ def _scalar_repr_alias[dtype: DType]() -> Optional[StaticString]:
         The scalar type alias name for `dtype`, or `None` when the `dtype` has
         no scalar alias.
     """
-    comptime if dtype == DType.int:
-        return StaticString("Int")
-    elif dtype == DType.uint:
-        return StaticString("UInt")
-    elif dtype == DType.int8:
-        return StaticString("Int8")
-    elif dtype == DType.uint8:
-        return StaticString("UInt8")
-    elif dtype == DType.int16:
-        return StaticString("Int16")
-    elif dtype == DType.uint16:
-        return StaticString("UInt16")
-    elif dtype == DType.int32:
-        return StaticString("Int32")
-    elif dtype == DType.uint32:
-        return StaticString("UInt32")
-    elif dtype == DType.int64:
-        return StaticString("Int64")
-    elif dtype == DType.uint64:
-        return StaticString("UInt64")
-    elif dtype == DType.int128:
-        return StaticString("Int128")
-    elif dtype == DType.uint128:
-        return StaticString("UInt128")
-    elif dtype == DType.int256:
-        return StaticString("Int256")
-    elif dtype == DType.uint256:
-        return StaticString("UInt256")
-    elif dtype == DType.float4_e2m1fn:
-        return StaticString("Float4_e2m1fn")
-    elif dtype == DType.float8_e5m2:
-        return StaticString("Float8_e5m2")
-    elif dtype == DType.float8_e5m2fnuz:
-        return StaticString("Float8_e5m2fnuz")
-    elif dtype == DType.float8_e4m3fn:
-        return StaticString("Float8_e4m3fn")
-    elif dtype == DType.float8_e4m3fnuz:
-        return StaticString("Float8_e4m3fnuz")
-    elif dtype == DType.float8_e8m0fnu:
-        return StaticString("Float8_e8m0fnu")
-    elif dtype == DType.bfloat16:
-        return StaticString("BFloat16")
-    elif dtype == DType.float16:
-        return StaticString("Float16")
-    elif dtype == DType.float32:
-        return StaticString("Float32")
-    elif dtype == DType.float64:
-        return StaticString("Float64")
-    elif dtype == DType.bool or dtype == DType.float8_e3m4:
-        return None
-    else:
-        comptime assert False, (
-            "unhandled dtype in `_scalar_repr_alias`: add a `Scalar` alias"
-            " branch or an explicit `None` case"
-        )
+    comptime match dtype:
+        case .int:
+            return StaticString("Int")
+        case .uint:
+            return StaticString("UInt")
+        case .int8:
+            return StaticString("Int8")
+        case .uint8:
+            return StaticString("UInt8")
+        case .int16:
+            return StaticString("Int16")
+        case .uint16:
+            return StaticString("UInt16")
+        case .int32:
+            return StaticString("Int32")
+        case .uint32:
+            return StaticString("UInt32")
+        case .int64:
+            return StaticString("Int64")
+        case .uint64:
+            return StaticString("UInt64")
+        case .int128:
+            return StaticString("Int128")
+        case .uint128:
+            return StaticString("UInt128")
+        case .int256:
+            return StaticString("Int256")
+        case .uint256:
+            return StaticString("UInt256")
+        case .float4_e2m1fn:
+            return StaticString("Float4_e2m1fn")
+        case .float8_e5m2:
+            return StaticString("Float8_e5m2")
+        case .float8_e5m2fnuz:
+            return StaticString("Float8_e5m2fnuz")
+        case .float8_e4m3fn:
+            return StaticString("Float8_e4m3fn")
+        case .float8_e4m3fnuz:
+            return StaticString("Float8_e4m3fnuz")
+        case .float8_e8m0fnu:
+            return StaticString("Float8_e8m0fnu")
+        case .bfloat16:
+            return StaticString("BFloat16")
+        case .float16:
+            return StaticString("Float16")
+        case .float32:
+            return StaticString("Float32")
+        case .float64:
+            return StaticString("Float64")
+        case .bool | .float8_e3m4:
+            return None
+        case _:
+            comptime assert False, (
+                "unhandled dtype in `_scalar_repr_alias`: add a `Scalar` alias"
+                " branch or an explicit `None` case"
+            )
 
 
 def _write_scalar[
@@ -4458,17 +4416,6 @@ def _write_scalar[
             writer.write_string("True")
         else:
             writer.write_string("False")
-
-    elif dtype.is_half_float():
-        # `_write_float` widens everything but `float64` and the `float8`
-        # variants to `Float32` before running dragonbox, so a half float and
-        # its `Float32` widening already format to identical text. Widening here
-        # instead lets `float16` and `bfloat16` share one `_write_float`
-        # instantiation with `float32` rather than each getting their own copy of
-        # the formatter, which dominates the compile cost of printing SIMD
-        # values. `test_simd.test_write_half_float_matches_float32` pins the
-        # equivalence.
-        _write_float(writer, value.cast[DType.float32]())
 
     elif dtype.is_half_float():
         # `_write_float` widens everything but `float64` and the `float8`

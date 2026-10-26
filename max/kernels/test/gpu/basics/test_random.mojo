@@ -15,15 +15,13 @@ from std.sys import simd_width_of
 
 from max.algorithm.functional import elementwise
 from max.gpu import *
-from max.gpu.host import DeviceContext, get_gpu_target
+from max.gpu.host import DeviceContext
 from std.random import NormalRandom, Random
 from std.testing import *
-from std.sys import has_apple_gpu_accelerator
 
 from std.utils.coord import Coord
-from std.utils.index import Index, IndexList
 
-from layout import TileTensor, Idx, row_major
+from layout import TileTensor, row_major
 
 
 def run_elementwise[
@@ -31,7 +29,7 @@ def run_elementwise[
 ](ctx: DeviceContext) raises:
     comptime length = 256
 
-    comptime pack_size = simd_width_of[dtype, target=get_gpu_target()]()
+    comptime pack_size = simd_width_of[dtype, target=ctx.target]()
 
     var out_stack = Array[Scalar[dtype], length](fill={})
     var out_host = TileTensor(out_stack, row_major[length]())
@@ -49,9 +47,7 @@ def run_elementwise[
             out_buffer[idx0[0].value()] = rng[0].cast[dtype]()
         else:
             comptime for i in range(simd_width):
-                out_buffer[Int(idx0[0].value()) + i] = rng[i % len(rng)].cast[
-                    dtype
-                ]()
+                out_buffer[Int(idx0[0]) + i] = rng[i % len(rng)].cast[dtype]()
 
     @inline(.always)
     def func_normal[simd_width: Int, alignment: Int = 1](idx0: Coord) {var}:
@@ -63,9 +59,7 @@ def run_elementwise[
             out_buffer[idx0[0].value()] = rng[0].cast[dtype]()
         else:
             comptime for i in range(simd_width):
-                out_buffer[Int(idx0[0].value()) + i] = rng[i % len(rng)].cast[
-                    dtype
-                ]()
+                out_buffer[Int(idx0[0]) + i] = rng[i % len(rng)].cast[dtype]()
 
     comptime if distribution == "uniform":
         elementwise[4, target="gpu"](func_uniform, Coord(length), ctx)
@@ -86,7 +80,7 @@ def main() raises:
         run_elementwise[.float32](ctx)
         run_elementwise[.float16, "normal"](ctx)
         run_elementwise[.float32, "normal"](ctx)
-        comptime if not has_apple_gpu_accelerator():
+        comptime if not ctx.target.is_apple_gpu():
             # Metal does not support DType.float64
             run_elementwise[.float64](ctx)
             run_elementwise[.float64, "normal"](ctx)

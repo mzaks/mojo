@@ -62,11 +62,9 @@ modular_py_test(
     name = "tests-pure-cpu",
     srcs = [
         "conftest.py",
-        "test_bfloat16_utils.py",
         "test_config_vision_budgets.py",
         "test_context.py",
         "test_dtype.py",
-        "test_host_memory.py",
         "test_logits_processor.py",
         "test_memory_estimation.py",
         "test_speculative_config.py",
@@ -148,15 +146,22 @@ modular_py_test(
     ],
 )
 
-# These tests can use live HF: presubmit runs them offline (network tests
-# skip); the HF workflow runs the full set online.
+# Spec-decode routing imports a target's architecture package to see whether
+# it builds a module, so the tests that route a target need its package.
+_SPEC_TARGET_ARCHITECTURES = [
+    "//max/python/max/pipelines/architectures/gemma4",
+    "//max/python/max/pipelines/architectures/kimik2_5",
+    "//max/python/max/pipelines/architectures/llama3",
+    "//max/python/max/pipelines/architectures/nemotron_h",
+    "//max/python/max/pipelines/architectures/nemotron_h_modulev3",
+]
+
 modular_py_test(
     name = "tests-pure-hf",
     size = "large",
     srcs = [
         "conftest.py",
         "test_config_pure.py",
-        "test_prefer_module_v3.py",
     ],
     data = [
         "//max/tests/integration/Inputs:inputs",
@@ -169,7 +174,7 @@ modular_py_test(
     },
     env_inherit = ["HF_TOKEN"],
     exec_properties = {
-        "test.resources:gpu-memory": "20",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = [
         "//:has_gpu",
@@ -177,16 +182,11 @@ modular_py_test(
         "//:apple_gpu": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),  # FIXME: MOCO-2411
-    per_test_tags = {
-        "test_prefer_module_v3.py": ["manual"],
-    },  # FIXME: QUA-845
+    ignore_extra_deps = _SPEC_TARGET_ARCHITECTURES,
     tags = [
         "gpu",
         "no-sandbox",
         "requires-network",
-        # Presubmit runs these tests offline; the tests that need live HF
-        # skip there and run in the HF workflow instead.
-        "run-in-hf-workflow",
     ],
     deps = [
         "//max/python/max/_entrypoints",
@@ -199,13 +199,14 @@ modular_py_test(
         "//max/python/max/pipelines/kv_cache",
         "//max/python/max/pipelines/lib",
         "//max/python/max/pipelines/modeling",
+        "//max/python/max/pipelines/sampling",
         "//max/python/max/pipelines/speculative",
         "//max/tests/integration/test_common:mocks",
         "//max/tests/integration/test_common:pipeline_model_dummy",
         "//max/tests/integration/test_common:registry",
         requirement("huggingface-hub"),
         requirement("transformers"),
-    ],
+    ] + _SPEC_TARGET_ARCHITECTURES,
 )
 
 # Common configuration for sampling tests (GPU required)
@@ -278,9 +279,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "9",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -305,9 +307,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -331,9 +334,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -341,6 +345,8 @@ modular_py_test(
     deps = _SAMPLING_BASE_DEPS + [
         "//max/python/max/pipelines/context",
         "//max/python/max/pipelines/lib",
+        "//max/python/max/pipelines/request",
+        "//max/python/max/pipelines/sampling",
     ],
 )
 
@@ -356,9 +362,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -380,9 +387,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "9",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -428,7 +436,7 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
     tags = [
@@ -458,9 +466,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "9",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -484,9 +493,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "9",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -509,9 +519,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "9",
+        "test.resources:gpu-memory": "3",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -534,9 +545,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -560,9 +572,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -585,9 +598,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -610,9 +624,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -635,9 +650,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -661,9 +677,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -686,9 +703,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -714,9 +732,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -742,9 +761,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -771,9 +791,10 @@ modular_py_test(
         "MODULAR_PATH": ".",
     },
     exec_properties = {
-        "test.resources:gpu-memory": "8",
+        "test.resources:gpu-memory": "2",
     },
     gpu_constraints = _SAMPLING_GPU_CONSTRAINTS,
+    precompile_mefs = True,
     tags = [
         "gpu",
         "no-sandbox",
@@ -781,42 +802,6 @@ modular_py_test(
     deps = _SAMPLING_BASE_DEPS + [
         "//max/python/max/pipelines/lib",
         requirement("torch"),
-    ],
-)
-
-modular_py_test(
-    name = "tests-hf",
-    size = "large",
-    srcs = [
-        "conftest.py",
-        "test_config.py",
-    ],
-    data = [
-        # TODO(MAXPLAT-86): Find a shared place for these tools
-        "//max/tests/integration/Inputs:inputs",
-        "//max/tests/integration/Inputs:pytest_inputs",
-    ],
-    env = {"MODULAR_PATH": "."},
-    env_inherit = ["HF_TOKEN"],
-    gpu_constraints = ["//:has_gpu"] + select({
-        "//:apple_gpu": ["@platforms//:incompatible"],
-        "//conditions:default": [],
-    }),  # FIXME: MOCO-2411
-    tags = [
-        "gpu",
-        "manual",  # TODO(AITLIB-293): Remove this once we have a way to run these tests on CI.
-        "no-sandbox",
-        "requires-network",
-        "run-in-hf-workflow",
-    ],
-    deps = [
-        "//max/python/max/driver",
-        "//max/python/max/engine",
-        "//max/python/max/pipelines",
-        "//max/python/max/pipelines/lib",
-        "//max/tests/integration/test_common:mocks",
-        "//max/tests/integration/test_common:pipeline_model_dummy",
-        "//max/tests/integration/test_common:registry",
     ],
 )
 

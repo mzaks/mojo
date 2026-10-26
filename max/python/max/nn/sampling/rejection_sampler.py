@@ -26,6 +26,7 @@ from max.nn.kernels import (
     topk_topp_masked_probs,
 )
 from max.nn.layer import Module
+from max.nn.sampling.penalties import LogitPenalties
 
 logger = logging.getLogger("max.pipelines")
 
@@ -119,9 +120,7 @@ def _set_domain_seed(seed: TensorValue, domain: int) -> None:
     per-row seed contributes only its row-0 value.
     """
     scalar = seed[0] if seed.rank == 1 else seed
-    ops.random.set_seed(
-        scalar + ops.constant(domain, DType.uint64, scalar.device)
-    )
+    ops.random.set_seed(scalar + domain)
 
 
 def _multinomial(
@@ -130,12 +129,7 @@ def _multinomial(
     """Samples from a categorical distribution using the Gumbel-max trick."""
     if residual_rand is not None:
         eps = float(np.finfo(probs.dtype.to_numpy()).eps)
-        clamped_uniform = ops.max(
-            residual_rand,
-            ops.constant(
-                eps, dtype=residual_rand.dtype, device=residual_rand.device
-            ),
-        )
+        clamped_uniform = ops.max(residual_rand, eps)
         q = -ops.log(clamped_uniform)
     else:
         eps = float(np.finfo(probs.dtype.to_numpy()).eps)
@@ -174,9 +168,10 @@ def repeat_per_draft_step(
 
 def _gamma_iota(count: Dim, device: DeviceRef) -> TensorValue:
     """Returns ``[0, gamma, 2 * gamma, ...]``, ``count`` entries long."""
-    return ops.range(
-        0, count, 1, out_dim=count, device=device, dtype=DType.uint64
-    ) * ops.constant(_SEED_GOLDEN_GAMMA, DType.uint64, device)
+    return (
+        ops.range(0, count, 1, out_dim=count, device=device, dtype=DType.uint64)
+        * _SEED_GOLDEN_GAMMA
+    )
 
 
 def _is_shared_seed(seed: TensorValue) -> bool:
@@ -206,12 +201,11 @@ def _keyed_seed_rows(
     the same token, since the sampling kernel's RNG counter no longer varies
     with the slot.
     """
-    tag = ops.constant(domain, DType.uint64, device)
     if _is_shared_seed(seed):
-        return _shared_scalar(seed) + tag + _gamma_iota(rows, device)
+        return _shared_scalar(seed) + domain + _gamma_iota(rows, device)
     # The caller's seed input may carry a static or differently-named batch
     # dim; rebind so it unifies with everything else derived from ``rows``.
-    return ops.rebind(seed, [rows]) + tag
+    return ops.rebind(seed, [rows]) + domain
 
 
 def _keyed_step_seeds(
@@ -229,10 +223,9 @@ def _keyed_step_seeds(
     request rather than with its slot -- while a shared seed spaces them by
     the flattened row, the only index it has.
     """
-    tag = ops.constant(domain, DType.uint64, device)
     flat_rows = batch_size * num_steps
     if _is_shared_seed(seed):
-        return _shared_scalar(seed) + tag + _gamma_iota(flat_rows, device)
+        return _shared_scalar(seed) + domain + _gamma_iota(flat_rows, device)
     per_row = repeat_per_draft_step(
         ops.rebind(seed, [batch_size]), batch_size, num_steps
     )
@@ -243,7 +236,7 @@ def _keyed_step_seeds(
         ),
         [flat_rows],
     )
-    return per_row + tag + step_offsets
+    return per_row + domain + step_offsets
 
 
 def _bonus_seed_rows(
@@ -304,7 +297,7 @@ def _recovery_seed_rows(
 
 
 def _find_first_rejected(
-    rejected: TensorValue, device: DeviceRef
+    rejected: TensorValue, device: DeviceRef, rows: str = "batch_size"
 ) -> TensorValue:
     """Finds the index of the first True in each row of a boolean mask.
 
@@ -317,12 +310,12 @@ def _find_first_rejected(
                 rejected,
                 ops.broadcast_to(
                     ops.constant(True, dtype=DType.bool, device=device),
-                    shape=[Dim("batch_size"), 1],
+                    shape=[Dim(rows), 1],
                 ),
             ],
             axis=1,
         ),
-        shape=[Dim("batch_size"), Dim("total_num_steps")],
+        shape=[Dim(rows), Dim("total_num_steps")],
     )
     int_mask = with_sentinel.cast(DType.int32)
     weights = ops.range(
@@ -439,17 +432,19 @@ class RejectionSampler(Module):
         return first_rejected_token, sampled_target_tokens
 
 
-def _reshape_target_logits(target_logits: TensorValue) -> TensorValue:
+def _reshape_target_logits(
+    target_logits: TensorValue, rows: str = "batch_size"
+) -> TensorValue:
     """Reshapes flat target logits to [batch, num_steps+1, vocab]."""
     return ops.reshape(
         ops.rebind(
             target_logits,
             shape=[
-                Dim("batch_size") * (Dim("num_steps") + 1),
+                Dim(rows) * (Dim("num_steps") + 1),
                 Dim("vocab_size"),
             ],
         ),
-        shape=[Dim("batch_size"), Dim("num_steps") + 1, Dim("vocab_size")],
+        shape=[Dim(rows), Dim("num_steps") + 1, Dim("vocab_size")],
     )
 
 
@@ -599,10 +594,7 @@ def synthetic_acceptance_sampler(
     )
     random_values = ops.random.uniform(like=float_type, range=(0.0, 1.0))
 
-    threshold = ops.constant(
-        base_acceptance_rate, dtype=DType.float32, device=device
-    )
-    synthetic_rejected = random_values >= threshold
+    synthetic_rejected = random_values >= float(base_acceptance_rate)
     first_rejected_idx = ops.squeeze(
         _find_first_rejected(synthetic_rejected, device), axis=-1
     )
@@ -722,11 +714,7 @@ class AcceptanceSampler:
 
     @property
     def acceptance_rule(self) -> Literal["synthetic", "stochastic", "greedy"]:
-        """The rule :meth:`__call__` dispatches to, in its precedence order.
-
-        This is the only place the acceptance rule in effect is decided:
-        ``SpeculativeConfig.rejection_sampling_strategy`` is read by nothing.
-        """
+        """The rule :meth:`__call__` dispatches to, in its precedence order."""
         if self._base_rate is not None:
             return "synthetic"
         if self._use_stochastic:
@@ -747,6 +735,8 @@ class AcceptanceSampler:
         in_thinking_phase: TensorValue | None = None,
         token_bitmasks: TensorValue | None = None,
         draft_probs_full: TensorValue | None = None,
+        penalties: LogitPenalties | None = None,
+        rows: str = "batch_size",
     ) -> tuple[TensorValue, TensorValue, TensorValue]:
         """Returns ``(first_rejected_idx, recovered_tokens, bonus_tokens)``.
 
@@ -781,7 +771,25 @@ class AcceptanceSampler:
             draft_probs_full: ``[batch, num_steps, vocab_size]`` distributions
                 the draft sampled from. Required when the sampler was built
                 with ``draft_proposal="sampled"``; forbidden otherwise.
+            penalties: Presence/frequency penalties, one CSR row per row of
+                ``target_logits``, subtracted before anything is sampled.
+            rows: The name of the batch dimension, for a caller that verifies
+                a slice of the batch (the stochastic path only).
         """
+        if rows != "batch_size" and not (
+            self._use_stochastic and self._base_rate is None
+        ):
+            raise ValueError(
+                "a named row dimension needs stochastic acceptance"
+            )
+        if penalties is not None and (
+            not self._use_stochastic
+            or self._base_rate is not None
+            or token_bitmasks is None
+        ):
+            # Only the stochastic path's mask pass can carry them for free.
+            target_logits = penalties.apply(target_logits)
+            penalties = None
         if self._base_rate is not None:
             assert seed is not None, "synthetic acceptance requires a seed"
             return synthetic_acceptance_sampler(
@@ -819,6 +827,8 @@ class AcceptanceSampler:
                 draft_proposal=self._draft_proposal,
                 draft_probs_full=draft_probs_full,
                 vocab_size=self._vocab_size,
+                penalties=penalties,
+                rows=rows,
             )
         return greedy_acceptance_sampler(
             draft_tokens, target_logits, token_bitmasks
@@ -837,6 +847,7 @@ def _sampled_draft_verdict(
     batch_size: Dim,
     num_steps: Dim,
     device: DeviceRef,
+    rows: str = "batch_size",
 ) -> tuple[TensorValue, TensorValue]:
     """Judges sampled draft proposals with the exact rejection-sampling test.
 
@@ -853,13 +864,13 @@ def _sampled_draft_verdict(
                 0,
                 batch_size,
                 1,
-                out_dim=Dim("batch_size"),
+                out_dim=Dim(rows),
                 device=device,
                 dtype=DType.int64,
             ),
-            shape=[Dim("batch_size"), 1],
+            shape=[Dim(rows), 1],
         ),
-        shape=[Dim("batch_size"), Dim("num_steps")],
+        shape=[Dim(rows), Dim("num_steps")],
     )
     step_indices = ops.broadcast_to(
         ops.reshape(
@@ -873,14 +884,14 @@ def _sampled_draft_verdict(
             ),
             shape=[1, Dim("num_steps")],
         ),
-        shape=[Dim("batch_size"), Dim("num_steps")],
+        shape=[Dim(rows), Dim("num_steps")],
     )
     gather_indices = ops.stack(
         [batch_indices, step_indices, token_indices], axis=2
     )
-    bk_shape = [Dim("batch_size"), Dim("num_steps")]
+    bk_shape = [Dim(rows), Dim("num_steps")]
     bkv_shape: list[Dim] = [
-        Dim("batch_size"),
+        Dim(rows),
         Dim("num_steps"),
         Dim(vocab_size),
     ]
@@ -1078,13 +1089,8 @@ def _relaxed_thinking_verdict(
     )
 
     # Threshold = top1_prob - delta (broadcast over the N dim).
-    delta_const = ops.constant(
-        relaxed_delta,
-        dtype=target_probs_relaxed.dtype,
-        device=target_probs_relaxed.device,
-    )
     top1_prob = top_probs[:, :, 0:1]  # [B, K, 1]
-    threshold = top1_prob - delta_const
+    threshold = top1_prob - float(relaxed_delta)
     valid = top_probs >= threshold  # [B, K, N] bool
 
     # Compare each top-N index against the draft token at that slot.
@@ -1122,6 +1128,8 @@ def stochastic_acceptance_sampler(
     draft_proposal: Literal["argmax", "sampled"] = "argmax",
     draft_probs_full: TensorValue | None = None,
     vocab_size: int | None = None,
+    penalties: LogitPenalties | None = None,
+    rows: str = "batch_size",
 ) -> tuple[TensorValue, TensorValue, TensorValue]:
     """Verifies speculative draft tokens against the target model.
 
@@ -1159,7 +1167,13 @@ def stochastic_acceptance_sampler(
 
     When ``token_bitmasks`` is provided, grammar constraints mask the
     target logits before anything is sampled, so recovered and bonus tokens
-    always satisfy structured-output constraints.
+    always satisfy structured-output constraints. ``penalties`` are
+    subtracted from the target logits before sampling too, in the mask's
+    pass when there is one.
+
+    ``rows`` names the batch dimension of every per-row argument. A caller
+    verifying one data-parallel replica's slice passes that replica's own
+    name, so the slice is never asserted to equal the whole batch.
 
     Returns:
         Tuple of ``(first_rejected_idx, recovered_tokens, bonus_tokens)``:
@@ -1199,18 +1213,25 @@ def stochastic_acceptance_sampler(
 
     device = draft_tokens.device
 
-    is_greedy_row = temperature < ops.constant(
-        _GREEDY_TEMPERATURE_EPS,
-        dtype=temperature.dtype,
-        device=temperature.device,
-    )
+    is_greedy_row = temperature < _GREEDY_TEMPERATURE_EPS
 
-    temperature = ops.max(
-        temperature,
-        ops.constant(1e-6, dtype=temperature.dtype, device=temperature.device),
-    )
+    # On GPU the argmax-proposal verdict samples greedy rows with top_k == 1,
+    # which the fused sampling kernel answers with the row's first argmax (the
+    # token ``ops.argmax`` picks: lowest index on ties, NaN never wins) and
+    # without running its sampling search. Its verdict and bonus for those
+    # rows already are the greedy ones, so no separate full-row argmax runs.
+    # Sampled rows keep their own ``top_k`` and draw exactly as before.
+    greedy_in_kernel = draft_proposal == "argmax" and device != DeviceRef.CPU()
+    if greedy_in_kernel:
+        top_k = ops.where(
+            is_greedy_row,
+            ops.constant(1, top_k.dtype, device=top_k.device),
+            top_k,
+        )
 
-    target_logits_3d = _reshape_target_logits(target_logits)
+    temperature = ops.max(temperature, 1e-6)
+
+    target_logits_3d = _reshape_target_logits(target_logits, rows)
 
     # Apply grammar mask if provided
     if token_bitmasks is not None:
@@ -1220,7 +1241,7 @@ def stochastic_acceptance_sampler(
         bitmask_rebound = ops.rebind(
             token_bitmasks,
             shape=[
-                Dim("batch_size"),
+                Dim(rows),
                 Dim("num_steps") + 1,
                 Dim("packed_vocab_size"),
             ],
@@ -1228,8 +1249,17 @@ def stochastic_acceptance_sampler(
         # The fill is finite so a fully-masked row degrades to a uniform draw
         # instead of NaN; ``apply_packed_bitmask`` carries the model's own -inf
         # positions through it, so masking can only ever narrow the support.
-        target_logits_3d = apply_packed_bitmask(
-            target_logits_3d, bitmask_rebound, fill_val=_MASKED_LOGIT_VALUE
+        if penalties is not None:
+            target_logits_3d = penalties.apply_with_bitmask(
+                target_logits_3d, bitmask_rebound, _MASKED_LOGIT_VALUE
+            )
+        else:
+            target_logits_3d = apply_packed_bitmask(
+                target_logits_3d, bitmask_rebound, fill_val=_MASKED_LOGIT_VALUE
+            )
+    elif penalties is not None:
+        target_logits_3d = ops.reshape(
+            penalties.apply(target_logits), target_logits_3d.shape
         )
 
     draft_verification_logits = target_logits_3d[:, :-1]
@@ -1237,9 +1267,7 @@ def stochastic_acceptance_sampler(
     batch_size = draft_tokens.shape[0]
     num_steps = draft_tokens.shape[1]
 
-    token_indices = ops.rebind(
-        draft_tokens, [Dim("batch_size"), Dim("num_steps")]
-    )
+    token_indices = ops.rebind(draft_tokens, [Dim(rows), Dim("num_steps")])
 
     sampled_bonus: TensorValue | None = None
     if draft_proposal == "sampled":
@@ -1257,6 +1285,7 @@ def stochastic_acceptance_sampler(
             batch_size,
             num_steps,
             device,
+            rows,
         )
     else:
         rejected_strict, recovered_strict, sampled_bonus = (
@@ -1273,17 +1302,22 @@ def stochastic_acceptance_sampler(
             )
         )
 
-    all_target_argmax = ops.squeeze(
-        ops.argmax(target_logits_3d, axis=-1), axis=-1
-    )
-    target_argmax_draft = ops.rebind(
-        all_target_argmax[:, :-1], [Dim("batch_size"), Dim("num_steps")]
-    )
-    bonus_argmax = all_target_argmax[:, -1:]
-    rejected_greedy = ops.not_equal(
-        token_indices, target_argmax_draft.cast(token_indices.dtype)
-    )
-    recovered_greedy = target_argmax_draft.cast(recovered_strict.dtype)
+    bonus_argmax: TensorValue | None = None
+    if greedy_in_kernel:
+        rejected_greedy = rejected_strict
+        recovered_greedy = recovered_strict
+    else:
+        all_target_argmax = ops.squeeze(
+            ops.argmax(target_logits_3d, axis=-1), axis=-1
+        )
+        target_argmax_draft = ops.rebind(
+            all_target_argmax[:, :-1], [Dim(rows), Dim("num_steps")]
+        )
+        bonus_argmax = all_target_argmax[:, -1:]
+        rejected_greedy = ops.not_equal(
+            token_indices, target_argmax_draft.cast(token_indices.dtype)
+        )
+        recovered_greedy = target_argmax_draft.cast(recovered_strict.dtype)
 
     use_relaxed = (
         in_thinking_phase is not None
@@ -1307,7 +1341,7 @@ def stochastic_acceptance_sampler(
         # Per-row select: rows in thinking use relaxed; others use strict.
         in_thinking_bk = ops.broadcast_to(
             ops.unsqueeze(in_thinking_phase, axis=-1),
-            shape=[Dim("batch_size"), Dim("num_steps")],
+            shape=[Dim(rows), Dim("num_steps")],
         )
         rejected = ops.where(in_thinking_bk, rejected_relaxed, rejected_strict)
         recovered_token_ids = ops.where(
@@ -1317,14 +1351,17 @@ def stochastic_acceptance_sampler(
         rejected = rejected_strict
         recovered_token_ids = recovered_strict
 
-    is_greedy_bk = ops.broadcast_to(
-        ops.unsqueeze(is_greedy_row, axis=-1),
-        shape=[Dim("batch_size"), Dim("num_steps")],
-    )
-    rejected = ops.where(is_greedy_bk, rejected_greedy, rejected)
-    recovered_token_ids = ops.where(
-        is_greedy_bk, recovered_greedy, recovered_token_ids
-    )
+    # With the greedy verdict from the kernel, only relaxed thinking rows can
+    # differ from it.
+    if not greedy_in_kernel or use_relaxed:
+        is_greedy_bk = ops.broadcast_to(
+            ops.unsqueeze(is_greedy_row, axis=-1),
+            shape=[Dim(rows), Dim("num_steps")],
+        )
+        rejected = ops.where(is_greedy_bk, rejected_greedy, rejected)
+        recovered_token_ids = ops.where(
+            is_greedy_bk, recovered_greedy, recovered_token_ids
+        )
 
     if draft_proposal == "sampled":
         # Commit the draft token where accepted so ``recovered`` is the
@@ -1339,17 +1376,17 @@ def stochastic_acceptance_sampler(
         )
 
     first_rejected_idx = ops.squeeze(
-        _find_first_rejected(rejected, device), axis=-1
+        _find_first_rejected(rejected, device, rows), axis=-1
     )
 
     if sampled_bonus is not None:
-        bonus_token_tensor = ops.rebind(sampled_bonus, [Dim("batch_size"), 1])
+        bonus_token_tensor = ops.rebind(sampled_bonus, [Dim(rows), 1])
     else:
         # Sampled mode covers only the draft verification slots above, so
         # the bonus slot samples separately.
         bonus_logits = ops.rebind(
             target_logits_3d[:, -1],
-            shape=[Dim("batch_size"), Dim("vocab_size")],
+            shape=[Dim(rows), Dim("vocab_size")],
         )
         # Tagged so the draw cannot share a key with the next sampled draft
         # proposal, whose step 0 uses the bare seed, and spaced by row so
@@ -1364,16 +1401,17 @@ def stochastic_acceptance_sampler(
             min_top_p=min_top_p,
             seed=seed_per_batch,
         ).tensor
-    is_greedy_b = ops.broadcast_to(
-        ops.unsqueeze(is_greedy_row, axis=-1), shape=[Dim("batch_size"), 1]
-    )
-    bonus_token_tensor = ops.where(
-        is_greedy_b,
-        ops.rebind(bonus_argmax, [Dim("batch_size"), 1]).cast(
-            bonus_token_tensor.dtype
-        ),
-        bonus_token_tensor,
-    )
+    if bonus_argmax is not None:
+        is_greedy_b = ops.broadcast_to(
+            ops.unsqueeze(is_greedy_row, axis=-1), shape=[Dim(rows), 1]
+        )
+        bonus_token_tensor = ops.where(
+            is_greedy_b,
+            ops.rebind(bonus_argmax, [Dim(rows), 1]).cast(
+                bonus_token_tensor.dtype
+            ),
+            bonus_token_tensor,
+        )
 
     return first_rejected_idx, recovered_token_ids, bonus_token_tensor
 
@@ -1517,12 +1555,7 @@ class RejectionSamplerWithResiduals(Module):
     ) -> TensorValue:
         difference = target_probs - draft_probs
         float_tiny = float(np.finfo(difference.dtype.to_numpy()).tiny)
-        f = ops.max(
-            difference,
-            ops.constant(
-                float_tiny, dtype=difference.dtype, device=self.device
-            ),
-        )
+        f = ops.max(difference, float_tiny)
 
         recovered_probs = f / ops.reshape(
             ops.sum(f), shape=[-1, Dim("num_steps"), 1]

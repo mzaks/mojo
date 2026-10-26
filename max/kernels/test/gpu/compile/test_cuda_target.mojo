@@ -35,7 +35,6 @@ from std.memory import unsafe_memset_zero, unsafe_stack_allocation
 from std.testing import *
 
 from std.utils.coord import Coord
-from std.utils.index import IndexList
 
 # ===-----------------------------------------------------------------------===#
 # Check parameterization
@@ -126,7 +125,7 @@ def erf_elementwise(
 
     @inline(.always)
     def func[simd_width: Int, alignment: Int = 1](idx: Coord) {var}:
-        var offset = tid + Int(idx[0].value())
+        var offset = tid + Int(idx[0])
         if offset >= len:
             return
         buf[offset] = erf(buf[offset])
@@ -277,18 +276,15 @@ def gemm(
 
     # Utilities for accessing flattened matrices.
     @inline(.always)
-    @__parameter
-    def get_a(row: Int, col: Int) -> Float32:
-        return a.load(row + m * col)
+    def get_a(row: Int, col: Int) {imm} -> Float32:
+        return a.unsafe_load(row + m * col)
 
     @inline(.always)
-    @__parameter
-    def get_b(row: Int, col: Int) -> Float32:
-        return b.load(row * n + col)
+    def get_b(row: Int, col: Int) {imm} -> Float32:
+        return b.unsafe_load(row * n + col)
 
     @inline(.always)
-    @__parameter
-    def set_c(row: Int, col: Int, val: Float32):
+    def set_c(row: Int, col: Int, val: Float32) {imm}:
         c[row + col * m] = val
 
     # Allocate B array into shared memory for tiling.
@@ -341,7 +337,7 @@ def gemm(
     # Store the values into the output matrix.
     for out_idx in range(TILE_SZ_B):
         if row < m and col + out_idx < n:
-            set_c(row, col + out_idx, c_reg.load(out_idx))
+            set_c(row, col + out_idx, c_reg.unsafe_load(out_idx))
 
 
 def _verify_gemm(asm: StringSlice) raises:
@@ -479,7 +475,7 @@ def block_reduce(val: Float32) -> Float32:
     barrier()
 
     return warp_sum_reduce(
-        shared.load(lane) if thread_idx.x
+        shared.unsafe_load(lane) if thread_idx.x
         < ufloordiv(block_dim.x, WARP_SIZE) else 0
     )
 

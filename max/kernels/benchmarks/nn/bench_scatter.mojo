@@ -16,7 +16,7 @@ from std.random import rand, randint
 from std.benchmark import *
 from max.gpu.host import DeviceContext
 from std.memory import alloc, dealloc
-from nn.gather_scatter import scatter_elements
+from nn.gather_scatter import _atomic_reduce, scatter_elements
 from extensibility import DynamicTensor
 
 from std.utils.index import Index
@@ -42,7 +42,7 @@ def bench_scatter(mut bencher: Bencher, spec: ScatterSpec) raises:
     var indices_shape = Index(spec.n1, spec.n2)
 
     var data_alloc = alloc[Float32](
-        {count = input_shape.flattened_length()}
+        {length = input_shape.flattened_length()}
     ).into_managed()
     rand(data_alloc.unsafe_span())
     var data_tensor = DynamicTensor[.float32, 2](
@@ -50,7 +50,7 @@ def bench_scatter(mut bencher: Bencher, spec: ScatterSpec) raises:
     )
 
     var indices_alloc = alloc[Int32](
-        {count = indices_shape.flattened_length()}
+        {length = indices_shape.flattened_length()}
     ).into_managed()
     randint(
         indices_alloc.unsafe_span(),
@@ -62,7 +62,7 @@ def bench_scatter(mut bencher: Bencher, spec: ScatterSpec) raises:
     )
 
     var updates_alloc = alloc[Float32](
-        {count = indices_shape.flattened_length()}
+        {length = indices_shape.flattened_length()}
     ).into_managed()
     rand(updates_alloc.unsafe_span())
     var updates_tensor = DynamicTensor[.float32, 2](
@@ -70,7 +70,7 @@ def bench_scatter(mut bencher: Bencher, spec: ScatterSpec) raises:
     )
 
     var output_alloc = alloc[Float32](
-        {count = input_shape.flattened_length()}
+        {length = input_shape.flattened_length()}
     ).into_managed()
     var output_tensor = DynamicTensor[.float32, 2](
         output_alloc.unsafe_ptr(), input_shape
@@ -86,7 +86,7 @@ def bench_scatter(mut bencher: Bencher, spec: ScatterSpec) raises:
         ) -> SIMD[_dtype, width]:
             return input_val + update_val
 
-        scatter_elements[reduce_fn=reduce_fn](
+        scatter_elements[atomic_update_fn=_atomic_reduce[reduce_fn]](
             data_tensor,
             indices_tensor,
             updates_tensor,

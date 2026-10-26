@@ -12,7 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 """Unit tests for the Apple M5 weight-only FP8 (W8A16) grouped (MoE) matmul.
 
-Target: Apple M5 (`compute_capability() == 5`, Metal 4). The grouped analog of
+Target: Apple M5 (`compute_capability() >= 5`, Metal 4). The grouped analog of
 `test_fp8_gemv.mojo`: `bf16` activation x `float8_e4m3fn` expert-weight stack ->
 `bf16`, one expert group per `block_idx.z`, produced RAW (the per-expert
 `weight_scale` is a graph-level post-matmul fold, not part of the kernel -- see
@@ -35,8 +35,6 @@ c32-decode-like many-tiny-group pattern, and the real Nemotron-3-Nano-30B-A3B
 MoE expert dims (up-proj N=1856/K=2688, down-proj N=2688/K=1856) at a reduced
 expert count.
 """
-
-from std.collections import Optional
 
 from max.gpu.host import DeviceContext
 from layout import Coord, Idx, TileTensor, row_major
@@ -110,6 +108,7 @@ def _run_case[
     var c_disp_host_ptr = ctx.enqueue_create_host_buffer[out_type](c_size)
     var c_direct_host_ptr = ctx.enqueue_create_host_buffer[out_type](c_size)
     var c_ref_host_ptr = ctx.enqueue_create_host_buffer[out_type](c_size)
+    var c_epi_host_ptr = ctx.enqueue_create_host_buffer[out_type](c_size)
     var a_offsets_host_ptr = ctx.enqueue_create_host_buffer[.uint32](
         num_experts + 1
     )
@@ -117,12 +116,8 @@ def _run_case[
         num_experts
     )
 
-    var a_host = TileTensor(
-        a_host_ptr, row_major(Coord(total_num_tokens, Idx[K]))
-    )
-    var b_host = TileTensor(
-        b_host_ptr, row_major(Coord(num_experts, Idx[N], Idx[K]))
-    )
+    var a_host = TileTensor(a_host_ptr, row_major(total_num_tokens, Idx[K]))
+    var b_host = TileTensor(b_host_ptr, row_major(num_experts, Idx[N], Idx[K]))
     random(a_host)
     random(b_host)
 
@@ -142,30 +137,27 @@ def _run_case[
     var c_disp_dev_buf = ctx.enqueue_create_buffer[out_type](c_size)
     var c_direct_dev_buf = ctx.enqueue_create_buffer[out_type](c_size)
     var c_ref_dev_buf = ctx.enqueue_create_buffer[out_type](c_size)
+    var c_epi_dev_buf = ctx.enqueue_create_buffer[out_type](c_size)
     var off_dev_buf = ctx.enqueue_create_buffer[.uint32](num_experts + 1)
     var eid_dev_buf = ctx.enqueue_create_buffer[.int32](num_experts)
 
     var a_dev = TileTensor[in_type](
-        a_dev_buf, row_major(Coord(total_num_tokens, Idx[K]))
+        a_dev_buf, row_major(total_num_tokens, Idx[K])
     )
     var b_dev = TileTensor[weight_type](
         b_dev_buf, row_major[num_experts, N, K]()
     )
     var c_disp_dev = TileTensor[out_type](
-        c_disp_dev_buf, row_major(Coord(total_num_tokens, Idx[N]))
+        c_disp_dev_buf, row_major(total_num_tokens, Idx[N])
     )
     var c_direct_dev = TileTensor[out_type](
-        c_direct_dev_buf, row_major(Coord(total_num_tokens, Idx[N]))
+        c_direct_dev_buf, row_major(total_num_tokens, Idx[N])
     )
     var c_ref_dev = TileTensor[out_type](
-        c_ref_dev_buf, row_major(Coord(total_num_tokens, Idx[N]))
+        c_ref_dev_buf, row_major(total_num_tokens, Idx[N])
     )
-    var off_dev = TileTensor[.uint32](
-        off_dev_buf, row_major(Coord(num_experts + 1))
-    )
-    var eid_dev = TileTensor[.int32](
-        eid_dev_buf, row_major(Coord(Idx[num_experts]))
-    )
+    var off_dev = TileTensor[.uint32](off_dev_buf, row_major(num_experts + 1))
+    var eid_dev = TileTensor[.int32](eid_dev_buf, row_major(Idx[num_experts]))
 
     ctx.enqueue_copy(a_dev_buf, a_host_ptr)
     ctx.enqueue_copy(b_dev_buf, b_host_ptr)
@@ -208,11 +200,41 @@ def _run_case[
         num_active_experts,
         ctx,
     )
+
+    # A fused epilogue must see each output at its row in the whole ragged
+    # output, not within its expert group. It writes `2 * x + 1` to its own
+    # buffer.
+    var c_epi_ptr = c_epi_dev_buf.unsafe_ptr()
+
+    @inline(.always)
+    def epilogue_fn[
+        dtype: DType, width: SIMDLength, *, alignment: Int
+    ](idx: Coord, val: SIMD[dtype, width]) {var c_epi_ptr}:
+        comptime assert idx.rank == 2, "the matmul epilogue contract is rank 2"
+        # Store at element alignment, which holds whatever `alignment` the
+        # dispatch reports.
+        var out = val.cast[.float32]() * 2 + 1
+        c_epi_ptr.unsafe_store[width=width](
+            Int(idx[0]) * N + Int(idx[1]), out.cast[out_type]()
+        )
+
+    grouped_matmul[has_epilogue_fn=True](
+        c_disp_dev,
+        a_dev,
+        b_dev,
+        off_dev,
+        eid_dev,
+        max_num_tokens_by_expert,
+        num_active_experts,
+        ctx,
+        epilogue_fn,
+    )
     ctx.synchronize()
 
     ctx.enqueue_copy(c_ref_host_ptr, c_ref_dev_buf)
     ctx.enqueue_copy(c_disp_host_ptr, c_disp_dev_buf)
     ctx.enqueue_copy(c_direct_host_ptr, c_direct_dev_buf)
+    ctx.enqueue_copy(c_epi_host_ptr, c_epi_dev_buf)
     ctx.synchronize()
 
     for m, n in std.itertools.product(range(total_num_tokens), range(N)):
@@ -229,12 +251,19 @@ def _run_case[
             msg=String(t"direct m: {m} n: {n}"),
             rtol=rtol,
         )
+        assert_almost_equal(
+            c_epi_host_ptr[m * N + n],
+            (expect.cast[.float32]() * 2 + 1).cast[out_type](),
+            msg=String(t"dispatch epilogue m: {m} n: {n}"),
+            rtol=rtol,
+        )
 
     _ = a_dev_buf^
     _ = b_dev_buf^
     _ = c_disp_dev_buf^
     _ = c_direct_dev_buf^
     _ = c_ref_dev_buf^
+    _ = c_epi_dev_buf^
     _ = off_dev_buf^
     _ = eid_dev_buf^
     print("PASS")
@@ -244,8 +273,11 @@ def main() raises:
     with DeviceContext() as ctx:
         # Apple M5 only (the native fp8-operand simdgroup MMA); skip elsewhere so
         # the target stays runnable on non-M5 Apple CI without a hard failure.
-        if ctx.compute_capability() != 5:
-            print("skip: grouped W8A16 tiled matmul requires Apple M5 (cc==5)")
+        if ctx.compute_capability() < 5:
+            print(
+                "skip: grouped W8A16 tiled matmul requires Apple M5 or newer"
+                " (cc>=5)"
+            )
             return
 
         comptime BF16 = DType.bfloat16

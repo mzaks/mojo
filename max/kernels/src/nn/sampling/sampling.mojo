@@ -16,6 +16,7 @@ from std.math import ceildiv, iota
 from std.sys.info import simd_width_of
 
 from std.math import isfinite
+from std.utils.numerics import neg_inf
 import max.gpu.primitives.block as block
 from max.algorithm.functional import elementwise
 from max.gpu import block_idx, thread_idx
@@ -24,8 +25,7 @@ from max.gpu.host.info import is_gpu
 from layout import TensorEngine, TensorLayout, TileTensor
 from nn._ragged_utils import get_batch_from_row_offsets
 
-from std.utils import IndexList
-from std.utils.coord import Coord, coord_to_index_list
+from std.utils.coord import Coord
 
 
 def apply_penalties_to_logits[
@@ -93,7 +93,7 @@ def apply_penalties_to_logits[
         comptime assert idx.rank == 1, "apply_penalties_fn: rank must be 1"
 
         var batch_id = get_batch_from_row_offsets(
-            frequency_offsets, Int(idx[0].value())
+            frequency_offsets, Int(idx[0])
         )
         var token = Int(compressed_frequency_data[idx[0], 0])
 
@@ -136,6 +136,82 @@ def apply_penalties_to_logits[
         target=target,
         _trace_description="apply_penalties_to_logits",
     ](apply_penalties_fn, dispatch_shape, ctx)
+
+
+def apply_masked_penalties_to_logits[
+    logit_type: DType,
+    penalty_type: DType,
+    //,
+    target: StaticString,
+](
+    logits: TileTensor[mut=True, logit_type, ...],
+    packed: TileTensor[mut=False, .int32, ...],
+    compressed_frequency_data: TileTensor[mut=False, .int32, ...],
+    frequency_offsets: TileTensor[mut=False, .uint32, ...],
+    frequency_penalty: TileTensor[mut=False, penalty_type, ...],
+    presence_penalty: TileTensor[mut=False, penalty_type, ...],
+    ctx: DeviceContext,
+) raises:
+    """Subtracts presence/frequency penalties from grammar-allowed logits.
+
+    Runs on logits a packed grammar bitmask was already applied to, so it
+    skips every token whose bit is clear and every `-inf` logit: a negative
+    penalty must not lift a masked-out token back above its fill value.
+    Otherwise matches `apply_penalties_to_logits` with no repetition penalty:
+    `logit -= frequency * count + presence` for each `[token, count]` entry.
+
+    Parameters:
+        logit_type: Element type of `logits` (inferred).
+        penalty_type: Element type of the per-row penalty tensors (inferred).
+        target: Target device to dispatch the elementwise kernel to.
+
+    Args:
+        logits: Masked logits, shape `[rows, vocab]`, updated in place.
+        packed: Packed `int32` bitmask the logits were masked with, shape
+            `[rows, ceil(vocab / 32)]`; a set bit means the token is allowed.
+        compressed_frequency_data: CSR `[entries, 2]` of `[token, count]`; a
+            negative token is padding.
+        frequency_offsets: `[rows + 1]` start of each row's entries.
+        frequency_penalty: Per-row scalar multiplied by the count.
+        presence_penalty: Per-row scalar subtracted once per seen token.
+        ctx: Device context used to dispatch the kernel.
+    """
+    comptime assert logits.flat_rank == 2
+    comptime assert packed.flat_rank == 2
+    comptime assert compressed_frequency_data.flat_rank == 2
+    comptime assert frequency_offsets.flat_rank == 1
+    comptime assert frequency_penalty.flat_rank == 1
+    comptime assert presence_penalty.flat_rank == 1
+
+    @inline(.always)
+    def apply_masked_penalties_fn[
+        width: Int, alignment: Int = 1
+    ](idx: Coord) {var}:
+        comptime assert idx.rank == 1, "apply_masked_penalties_fn: rank 1"
+
+        var token = Int(compressed_frequency_data[idx[0], 0])
+        if token < 0:
+            return
+        var row = get_batch_from_row_offsets(frequency_offsets, Int(idx[0]))
+        var word = packed[row, token >> 5][0]
+        if ((word >> Int32(token & 31)) & 1) == 0:
+            return
+        var logit = logits[row, token][0]
+        if logit == neg_inf[logit_type]():
+            return
+        var count = compressed_frequency_data[idx[0], 1][0].cast[logit_type]()
+        logit -= (
+            frequency_penalty[row][0].cast[logit_type]() * count
+            + presence_penalty[row][0].cast[logit_type]()
+        )
+        logits[row, token] = logit
+
+    var dispatch_shape = Coord(Int(compressed_frequency_data.dim[0]()))
+    elementwise[
+        simd_width=1,
+        target=target,
+        _trace_description="apply_masked_penalties_to_logits",
+    ](apply_masked_penalties_fn, dispatch_shape, ctx)
 
 
 @__name(t"update_frequency_data_{token_type}")
@@ -215,9 +291,9 @@ def update_frequency_data_kernel[
     var tid = thread_idx.x
     var batch_id = block_idx.x
 
-    var tok_start = Int(frequency_offsets.load[width=1](Coord(batch_id)))
-    var tok_end = Int(frequency_offsets.load[width=1](Coord(batch_id + 1)))
-    var new_token = new_tokens.load[width=1](Coord(batch_id)).cast[.int32]()
+    var tok_start = Int(frequency_offsets.load[width=1]((batch_id,)))
+    var tok_end = Int(frequency_offsets.load[width=1]((batch_id + 1,)))
+    var new_token = new_tokens.load[width=1]((batch_id,)).cast[.int32]()
 
     var num_scans = ceildiv(tok_end - tok_start, block_size * simd_width)
 
@@ -229,9 +305,7 @@ def update_frequency_data_kernel[
 
         comptime for i in range(simd_width):
             if tok_idx + i < tok_end:
-                val[i] = compressed_frequency_data.load[width=1](
-                    Coord(tok_idx + i, 0)
-                )[0]
+                val[i] = compressed_frequency_data[tok_idx + i, 0][0]
             else:
                 val[i] = Int32.MAX_FINITE
 
@@ -260,8 +334,8 @@ def update_frequency_data_kernel[
             # we don't find the target token, but we found a padding token
             if tid == 0:
                 var tidx = Int(padding_token_idx)
-                compressed_frequency_data.store[width=1](
-                    Coord(tidx, 0), SIMD[new_token.dtype, 1](new_token)
+                compressed_frequency_data.store(
+                    (tidx, 0), SIMD[new_token.dtype, 1](new_token)
                 )
                 compressed_frequency_data[Int(padding_token_idx), 1] = 1
             return
@@ -341,23 +415,17 @@ def update_frequency_data[
                 idx.rank == 1
             ), "update_frequency_data_fn: rank must be 1"
 
-            var tok_start = Int(frequency_offsets.load[width=1](idx)[0])
-            var tok_end = Int(
-                frequency_offsets.load[width=1](Coord(idx[0].value() + 1))[0]
-            )
+            var tok_start = Int(frequency_offsets[idx][0])
+            var tok_end = Int(frequency_offsets[idx[0].value() + 1][0])
 
-            var new_token = new_tokens.load[width=1](idx)[0].cast[.int32]()
+            var new_token = new_tokens[idx][0].cast[.int32]()
 
             for tok_id in range(tok_start, tok_end):
-                var cur_tok = compressed_frequency_data.load[width=1](
-                    Coord(tok_id, 0)
-                )[0]
+                var cur_tok = compressed_frequency_data[tok_id, 0][0]
                 if cur_tok == new_token:
-                    var cur_count = compressed_frequency_data.load[width=1](
-                        Coord(tok_id, 1)
-                    )[0]
-                    compressed_frequency_data.store[width=1](
-                        Coord(tok_id, 1),
+                    var cur_count = compressed_frequency_data[tok_id, 1][0]
+                    compressed_frequency_data.store(
+                        (tok_id, 1),
                         SIMD[.int32, 1](Int32(cur_count) + 1),
                     )
                     break
@@ -365,11 +433,11 @@ def update_frequency_data[
                 # if we encounter a padding token, add the new token to the
                 # occurrences tensor
                 elif cur_tok == Int32(-1):
-                    compressed_frequency_data.store[width=1](
-                        Coord(tok_id, 0), SIMD[.int32, 1](new_token)
+                    compressed_frequency_data.store(
+                        (tok_id, 0), SIMD[.int32, 1](new_token)
                     )
-                    compressed_frequency_data.store[width=1](
-                        Coord(tok_id, 1), SIMD[.int32, 1](Int32(1))
+                    compressed_frequency_data.store(
+                        (tok_id, 1), SIMD[.int32, 1](Int32(1))
                     )
                     break
 

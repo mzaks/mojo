@@ -13,14 +13,15 @@
 """TMA load warp logic for FA4 (SM100 Flash Attention)."""
 
 from std.math import ceildiv
-from std.sys import size_of
-from max.gpu.memory import CacheEviction
-from layout.tma_async import SharedMemBarrier
-from layout import TileTensor
+from std.sys import align_of, size_of
+from max.gpu import thread_idx
+from max.gpu.memory import CacheEviction, fence_async_view_proxy
+from max.gpu.sync import syncwarp
+from layout.tma_async import SharedMemBarrier, TMATensorTile
+from layout import Coord, TileTensor
 from layout.tile_layout import row_major as tt_row_major
 from nn.attention.gpu.nvidia.sm100.attention import (
     FA4Config,
-    ExplicitTMEMCrossP,
 )
 from nn.attention.gpu.nvidia.sm100.attention_utils import (
     SharedMemPointer,
@@ -41,7 +42,6 @@ from nn.attention.gpu.nvidia.common import (
     KVTMATile,
     MHAPosition,
     OptionalPointer,
-    QTMATile,
 )
 from nn.attention.mha_mask import MHAMask, TileMaskStatus
 from nn.attention.mha_operand import MHAOperand
@@ -54,6 +54,8 @@ from .smem import SM100AttentionSMem
 
 @inline(.always)
 def fa4_load[
+    q_tile_shape: Coord,
+    q_desc_shape: Coord,
     KVLUTType: MHAOperand,
     MaxSeqLenType: OptionallyStaticInt,
     MaskType: MHAMask,
@@ -80,16 +82,7 @@ def fa4_load[
     seq_info: SeqInfo,
     max_seq_len: MaxSeqLenType,
     mask: MaskType,
-    q_tma_op: QTMATile[
-        KVLUTType.dtype,
-        config.swizzle_mode,
-        BM=config.BM // config.num_q,
-        depth=config.qk_depth,
-        group=config.group,
-        decoding=False,
-        fuse_gqa=config.fuse_gqa,
-        num_qk_stages=config.num_qk_stages,
-    ],
+    q_tma_op: TMATensorTile[KVLUTType.dtype, q_tile_shape, q_desc_shape],
     k_tma_op: KVTMATile[
         KVLUTType.dtype,
         config.swizzle_mode,
@@ -269,7 +262,20 @@ def fa4_load[
     var q_smem = rebind[SharedMemPointer[Scalar[KVLUTType.dtype]]](
         smem.q_smem()
     )
-    comptime q_bytes = size_of[qkv_type]() * q_elements
+    # A packed GQA tile (group does not divide BM) loads only the real rows;
+    # the pad rows are zero-filled by `q_async_copy` and carry no TMA bytes.
+    comptime q_pad_rows = config.gqa_pad_rows()
+    comptime q_bytes = size_of[qkv_type]() * (
+        q_elements - q_pad_rows * config.BK0
+    )
+    # `q_elements` is per TMA call, so in 2Q each half would subtract the whole
+    # tile's pad and under-expect, and the zero-fill only covers the second
+    # half's tail. This holds for any non-dividing fused group, whichever
+    # route admits it.
+    comptime assert q_pad_rows == 0 or num_q == 1, (
+        "a non-dividing fused group is only wired for the 1Q route; the 2Q"
+        " Q1 barriers still expect the full `q_bytes`"
+    )
 
     var q_gmem_row: UInt32 = PositionType.get_q_gmem_row[ragged=ragged](
         seq_info, max_seq_len
@@ -293,7 +299,6 @@ def fa4_load[
         CacheEviction.EVICT_NORMAL if pair_cta else CacheEviction.EVICT_FIRST
     )
 
-    @__parameter
     @inline(.always)
     def q_async_copy[
         eviction_policy: CacheEviction = q_default_eviction,
@@ -301,11 +306,45 @@ def fa4_load[
         smem_dst: QType,
         ref[AddressSpace.SHARED] mbar: SharedMemBarrier,
         depth_idx: UInt32 = 0,
-    ):
+    ) {imm}:
         """Issue Q TMA elect-predicated on `e`. Caller no longer needs
         `if e != 0:` around the call; the TMA fires only on the elected
         lane via the PTX predicate inside `_elect`."""
-        comptime if fuse_gqa:
+        comptime if fuse_gqa and q_pad_rows > 0:
+            comptime gran = config.swizzle_mode.bytes() // size_of[qkv_type]()
+            comptime nblk = config.BK0 // gran
+            comptime chunk = 16 // size_of[qkv_type]()
+            comptime chunks_per_blk = q_pad_rows * gran // chunk
+            var lane = thread_idx.x % 32
+            for c in range(lane, nblk * chunks_per_blk, 32):
+                var off = (
+                    (c // chunks_per_blk) * BM * gran
+                    + (BM - q_pad_rows) * gran
+                    + (c % chunks_per_blk) * chunk
+                )
+                smem_dst.store[alignment=align_of[qkv_type]()](
+                    Coord(off), SIMD[qkv_type, chunk](0)
+                )
+            fence_async_view_proxy()
+            syncwarp()
+            comptime for blk in range(nblk):
+                q_tma_op.async_copy_elect[
+                    cta_group=cta_group, eviction_policy=eviction_policy
+                ](
+                    QType(
+                        smem_dst.ptr.unsafe_offset(blk * BM * gran),
+                        tt_row_major[q_elements](),
+                    ),
+                    mbar,
+                    StaticTuple[UInt32, 4](
+                        depth_idx + UInt32(blk * gran),
+                        0,
+                        kv_head_idx,
+                        q_gmem_row,
+                    ),
+                    e,
+                )
+        elif fuse_gqa:
             q_tma_op.async_copy_elect[
                 cta_group=cta_group, eviction_policy=eviction_policy
             ](
@@ -386,9 +425,8 @@ def fa4_load[
         row_major=v_row_major,
     ]()
 
-    @__parameter
     @inline(.always)
-    def _k_num_valid_pages(current_kv_row: UInt32) -> UInt32:
+    def _k_num_valid_pages(current_kv_row: UInt32) {imm} -> UInt32:
         """Valid K sub-tile pages at `current_kv_row` (per-CTA range)."""
         if current_kv_row >= num_keys:
             return UInt32(0)
@@ -399,9 +437,8 @@ def fa4_load[
             ),
         )
 
-    @__parameter
     @inline(.always)
-    def _v_num_valid_pages(current_kv_row: UInt32) -> UInt32:
+    def _v_num_valid_pages(current_kv_row: UInt32) {imm} -> UInt32:
         """Valid V sub-tile pages at `current_kv_row` (full BN range)."""
         return min(
             UInt32(KVPagedRows.num_pages),
@@ -508,7 +545,6 @@ def fa4_load[
     # `k_nvp_peer`, `kv_head_idx`, `v_col_offset`, `k_tma_op`,
     # `v_tma_op`, `config`. Caller owns `populate`, `smem_ptr`, and the
     # producer-pipeline acquire/step lifecycle.
-    @__parameter
     @inline(.always)
     def _produce_k[
         partial: Bool,
@@ -519,7 +555,7 @@ def fa4_load[
         smem_ptr: SharedMemPointer[Scalar[qkv_type]],
         mbar: SharedMemPointer[SharedMemBarrier],
         k_num_valid_pages: UInt32,
-    ):
+    ) {imm}:
         comptime d_idx = qk_stage * config.BK0
         comptime if is_leader:
             comptime q_term = (cta_group * q_bytes if with_q else 0)
@@ -535,7 +571,7 @@ def fa4_load[
             # Elect-predicated in-PTX by q_async_copy; no if-guard here.
             q_async_copy(
                 QType(
-                    q_smem + q_elements * qk_stage,
+                    q_smem.unsafe_offset(q_elements * qk_stage),
                     tt_row_major[q_elements](),
                 ),
                 mbar[],
@@ -556,7 +592,6 @@ def fa4_load[
             depth_offset=UInt32(d_idx),
         )
 
-    @__parameter
     @inline(.always)
     def _produce_v[
         partial: Bool,
@@ -566,7 +601,7 @@ def fa4_load[
         smem_ptr: SharedMemPointer[Scalar[qkv_type]],
         mbar: SharedMemPointer[SharedMemBarrier],
         v_num_valid_pages: UInt32,
-    ):
+    ) {imm}:
         # Shared-key uses `_produce_v_sk` instead; assert the prune rather than
         # trust it, so an instantiation here is a build error, not a rank-3
         # coord handed to a rank-4 descriptor.
@@ -667,7 +702,6 @@ def fa4_load[
     comptime v_e_rows_per_page = config.v_tma_box_rows(page_size)
     comptime v_e_pages_per_chunk = config.v_e_chunk_rows() // v_e_rows_per_page
 
-    @__parameter
     @inline(.always)
     def _produce_v_e[
         partial: Bool,
@@ -677,7 +711,7 @@ def fa4_load[
         kv_row_base: UInt32,
         smem_ptr: SharedMemPointer[Scalar[qkv_type]],
         mbar: SharedMemPointer[SharedMemBarrier],
-    ):
+    ) {imm}:
         # `_produce_v_e` is Layout-E-only (m_pack==2 => use_ws), so the non-WS
         # per-page byte count `_produce_v` carries never applies: V bytes are
         # always the full `v_expect_bytes`, and OOB-fill reduces to `partial`.
@@ -711,7 +745,9 @@ def fa4_load[
                 oob_fill_pages=v_oob_fill,
             ](
                 v_tma_op,
-                smem_ptr + UInt32(p) * UInt32(partition_region_elems),
+                smem_ptr.unsafe_offset(
+                    UInt32(p) * UInt32(partition_region_elems)
+                ),
                 mbar[],
                 kv_head_idx=kv_head_idx,
                 elect=e,
@@ -747,7 +783,6 @@ def fa4_load[
         is_leader=True,
     ]
 
-    @__parameter
     @inline(.always)
     def _produce_v_sk[
         partial: Bool,
@@ -757,7 +792,7 @@ def fa4_load[
         smem_ptr: SharedMemPointer[Scalar[qkv_type]],
         mbar: SharedMemPointer[SharedMemBarrier],
         chunk_valid_pages: UInt32,
-    ):
+    ) {imm}:
         # Always the FULL slot: a chunk that reaches here is live, and at the
         # production page sizes `v_sk_pages_per_chunk == 1`, so one issue
         # delivers the whole box. The dead chunks contribute no bytes because
@@ -833,13 +868,12 @@ def fa4_load[
         # first peeled K slot passes `acquire=False` (initial phase=1).
         # The caller still owns `populate` (K computes `rows`, V reuses it)
         # and any interleaved Q TMA.
-        @__parameter
         @inline(.always)
         def _emit_k[
             partial: Bool,
             with_q: Bool = False,
             acquire: Bool = True,
-        ](rows: KVPagedRows, k_num_valid_pages: UInt32):
+        ](rows: KVPagedRows, k_num_valid_pages: UInt32) {mut kv_pipeline, imm}:
             # WS shared sub-tile ring: emit num_qk_stages K depth-half sub-tiles
             # (each a 32768-B ring slot with its own barrier); Q (when with_q)
             # rides every K sub-tile (q_elements is per-sub-tile). Folds to one
@@ -850,15 +884,14 @@ def fa4_load[
                 comptime if acquire or qk_stage != 0:
                     kv_pipeline.producer_acquire()
                 var mbar = kv_pipeline.producer_mbar()
-                var smem_ptr = kv_smem + kv_pipeline.state.index() * UInt32(
-                    kv_stage_elems
+                var smem_ptr = kv_smem.unsafe_offset(
+                    kv_pipeline.state.index() * UInt32(kv_stage_elems)
                 )
                 _produce_k[partial=partial, qk_stage=qk_stage, with_q=with_q](
                     rows, smem_ptr, mbar, k_num_valid_pages
                 )
                 kv_pipeline.state.step()
 
-        @__parameter
         @inline(.always)
         def _emit_v[
             partial: Bool, acquire: Bool = True
@@ -870,7 +903,7 @@ def fa4_load[
             # (dead) for Layout-G / non-WS / 2Q -- default keeps every
             # existing (2-arg) call site byte-identical.
             kv_row_base: UInt32 = 0,
-        ):
+        ) {mut kv_pipeline, imm}:
             # WS shared sub-tile ring: emit num_qk_stages V sub-tiles (each a
             # 32768-B ring slot with its own barrier). Folds to one slot for
             # non-WS shared (num_qk_stages==1). The ring scaffolding
@@ -954,8 +987,8 @@ def fa4_load[
                     comptime for t in range(config.num_o_tiles()):
                         kv_pipeline.producer_acquire()
                         var mbar_sk = kv_pipeline.producer_mbar()
-                        var smem_sk = kv_smem + kv_pipeline.state.index() * (
-                            UInt32(kv_stage_elems)
+                        var smem_sk = kv_smem.unsafe_offset(
+                            kv_pipeline.state.index() * (UInt32(kv_stage_elems))
                         )
                         _produce_v_sk[partial=partial, t=t](
                             chunk_rows, smem_sk, mbar_sk, chunk_nvp
@@ -967,8 +1000,8 @@ def fa4_load[
                 comptime if acquire or stage != 0:
                     kv_pipeline.producer_acquire()
                 var mbar = kv_pipeline.producer_mbar()
-                var smem_ptr = kv_smem + kv_pipeline.state.index() * UInt32(
-                    kv_stage_elems
+                var smem_ptr = kv_smem.unsafe_offset(
+                    kv_pipeline.state.index() * UInt32(kv_stage_elems)
                 )
                 comptime if config.m_pack == 2:
                     # No `v_num_valid_pages`: Layout-E derives its own count
@@ -1210,12 +1243,15 @@ def fa4_load[
                 comptime check_mask_crossp = mask.nonfull_sets[BM_mask, BN]()[
                     0
                 ] == TileMaskStatus.UNKNOWN_MASK
-                comptime assert not (
-                    ExplicitTMEMCrossP and (needs_partial or check_mask_crossp)
-                ), (
-                    "FA4_TMEM_CROSS_P=true was requested but the K-ahead load"
-                    " is implemented for the headline regime only (no partial"
-                    " pages, no mid-range FULL_MASK skip)"
+                # Headline regime only, by construction: `CrossPEffective`
+                # (kernel.mojo) requires `crossp_on()`, whose full-pages
+                # conjunct is the negation of `needs_partial`, and excludes
+                # UNKNOWN_MASK -- the two conditions this producer cannot
+                # handle.
+                comptime assert not (needs_partial or check_mask_crossp), (
+                    "the cross-stage-P K-ahead load is implemented for the"
+                    " headline regime only (no partial pages, no mid-range"
+                    " FULL_MASK skip)"
                 )
                 # NT = total K-tiles (== total V-tiles). iter_count is the last
                 # masked set end minus one; for the dense contiguous regime that is
@@ -1240,7 +1276,10 @@ def fa4_load[
                     expect_bytes_pred(q1_mbar, Int32(cta_group * q_bytes), e)
                 comptime q1_smem_offset = q_elements * 1  # num_qk_stages=1
                 q_async_copy(
-                    QType(q_smem + q1_smem_offset, tt_row_major[q_elements]()),
+                    QType(
+                        q_smem.unsafe_offset(q1_smem_offset),
+                        tt_row_major[q_elements](),
+                    ),
                     q1_mbar[0],
                 )
 
@@ -1309,7 +1348,10 @@ def fa4_load[
                 # Elect-predicated in-PTX by q_async_copy; no if-guard here.
                 comptime q1_smem_offset = q_elements * 1  # num_qk_stages=1
                 q_async_copy(
-                    QType(q_smem + q1_smem_offset, tt_row_major[q_elements]()),
+                    QType(
+                        q_smem.unsafe_offset(q1_smem_offset),
+                        tt_row_major[q_elements](),
+                    ),
                     q1_mbar[0],
                 )
 
@@ -1441,11 +1483,16 @@ def fa4_load[
                 comptime d_idx = qk_stage * config.BK0
                 comptime if is_leader:
                     expect_bytes_pred(
-                        q1_mbar + qk_stage, Int32(cta_group * q_bytes), e
+                        q1_mbar.unsafe_offset(qk_stage),
+                        Int32(cta_group * q_bytes),
+                        e,
                     )
                 # Elect-predicated in-PTX by q_async_copy; no if-guard here.
                 q_async_copy(
-                    QType(q_smem + q_smem_offset, tt_row_major[q_elements]()),
+                    QType(
+                        q_smem.unsafe_offset(q_smem_offset),
+                        tt_row_major[q_elements](),
+                    ),
                     q1_mbar[qk_stage],
                     depth_idx=UInt32(d_idx),
                 )

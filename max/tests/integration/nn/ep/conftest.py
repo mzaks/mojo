@@ -31,7 +31,12 @@ from max.graph import (
 )
 from max.nn import Signals
 from max.nn.comm.ep import EPBatchManager, EPCommInitializer, EPConfig
-from max.nn.moe import MoE, MoEGate, make_concatenated_gated_activation_fn
+from max.nn.moe import (
+    GatedActivation,
+    MoE,
+    MoEGate,
+    make_concatenated_gated_activation_fn,
+)
 from max.nn.moe.expert_parallel import forward_moe_sharded_layers
 
 """
@@ -514,6 +519,16 @@ def moe_weights_mxfp8() -> dict[str, torch.Tensor]:
 @pytest.fixture(scope="module")
 def moe_weights() -> dict[str, torch.Tensor]:
     """Generate random BF16 weights on GPU for fast random number generation."""
+    return generate_moe_weights()
+
+
+def generate_moe_weights() -> dict[str, torch.Tensor]:
+    """Returns the BF16 weight set the EP fixtures load.
+
+    Exposed as a plain function so out-of-pytest drivers (the side-stream
+    trace worker) build the same model the fixtures do, rather than keeping
+    a second copy of the shapes that can drift.
+    """
     torch.manual_seed(42)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -565,15 +580,15 @@ def moe_weights() -> dict[str, torch.Tensor]:
 def _build_compiled_ep_models(
     moe_weights: dict[str, torch.Tensor],
     swiglu_limit: float = 0.0,
+    n_devices: int = N_DEVICES,
 ) -> CompiledEPModels | None:
     """Compile MoE and MoEGate graphs once.
 
     Returns None when hardware requirements are not met.
     """
-    if accelerator_count() < N_DEVICES:
+    if accelerator_count() < n_devices:
         return None
 
-    n_devices = N_DEVICES
     max_tokens_per_rank = 128
     dtype = DType.bfloat16
 
@@ -605,12 +620,13 @@ def _build_compiled_ep_models(
         shared_experts_dim=MOE_DIM,
         ep_size=n_devices,
         dtype=dtype,
-        apply_router_weight_first=False,
-        gated_activation_fn=make_concatenated_gated_activation_fn(
-            ops.silu, swiglu_limit
-        )
-        if swiglu_limit > 0
-        else None,
+        activation=GatedActivation(
+            gated_activation_fn=make_concatenated_gated_activation_fn(
+                ops.silu, swiglu_limit
+            )
+            if swiglu_limit > 0
+            else None
+        ),
         ep_batch_manager=ep_batch_manager,
     )
     moe.sharding_strategy = ShardingStrategy.expert_parallel(n_devices)
@@ -639,7 +655,7 @@ def _build_compiled_ep_models(
         inputs_tensors = [x.tensor for x in graph.inputs[:n_devices]]
         ep_batch_manager.fetch_buffers(graph.inputs[n_devices:])
         outputs = forward_moe_sharded_layers(moe_shards, inputs_tensors)
-        graph.output(*outputs)
+        graph.output(outputs)
 
     moe_model = session.load(graph, weights_registry=moe.state_dict())
 
@@ -754,7 +770,6 @@ def _build_compiled_allreduce_ep_models(
         shared_experts_dim=MOE_DIM,
         ep_size=n_devices,
         dtype=dtype,
-        apply_router_weight_first=False,
         ep_batch_manager=ep_batch_manager,
     )
     moe.sharding_strategy = ShardingStrategy.expert_parallel(n_devices)

@@ -257,7 +257,8 @@ def initialize_in_addrspace(
 ):
 
     # Get !lit.ref in addr space #1
-    # CHECK-NEXT: [[PTRREF:%.*]] = lit.call{{.*}}@Pointer::@"__getitem__{{.*}}(%ptr)
+    # CHECK-NEXT: [[PTR:%[0-9]+]] = kgen.rebind %ptr
+    # CHECK-NEXT: [[PTRREF:%.*]] = lit.call{{.*}}@Pointer::@"__getitem__{{.*}}([[PTR]])
 
     # CHECK-NEXT: [[REGVAL:%.*]] = lit.call {{.*}}@ExampleRegPassable::@"__init__{{.*}}()
 
@@ -284,7 +285,8 @@ def mutate_in_addrspace(
     ptr: UnsafePointer[ExampleRegPassable, AnyOrigin[mut=True], address_space=AddressSpace(1)],
 ):
     # Get !lit.ref in addr space #1
-    # CHECK-NEXT: [[PTRREF:%.*]] = lit.call {{.*}}@Pointer::@"__getitem__{{.*}}(%ptr)
+    # CHECK-NEXT: [[PTR:%[0-9]+]] = kgen.rebind %ptr
+    # CHECK-NEXT: [[PTRREF:%.*]] = lit.call {{.*}}@Pointer::@"__getitem__{{.*}}([[PTR]])
 
     # Use a temporary to get an MLValue in the default address space.
     # CHECK-NEXT: [[REGVAL:%.*]] = lit.ref.load [[PTRREF]] : <!ExampleRegPassable, mut #lit.any.origin, 1>
@@ -398,13 +400,11 @@ def test_byref_slot_with_references():
 
 # CHECK-LABEL: lit.fn @"test_byref_slot_closure_capture
 def test_byref_slot_closure_capture(var x: String):
-    # CHECK: lit.fn *"capture
-    @__parameter
-    def capture() -> String:
+    def capture() {imm} -> String:
         return x
 
-    # CHECK: %__call_result_tmp__
-    # CHECK-NEXT: lit.call[{{.*}}: *"capture{{.*}}(%__call_result_tmp__)
+    # CHECK: %__call_result_tmp__ = lit.var.decl
+    # CHECK-NEXT: lit.call {{.*}}capture::__storage"::@"__call__{{.*}}(%{{.*}}, %__call_result_tmp__)
     x = capture()
     # CHECK-NEXT: lit.call {{.*}}@String::@"__init__{{.*}}"{{.*}}(%__call_result_tmp__, %x){{.*}}*, "move"
 
@@ -677,3 +677,26 @@ def test():
     # CHECK-NEXT: [[X2:%.*]] = lit.ref.immut %x
     # CHECK-NEXT: lit.call {{.*}}@"no_exclusivity_violation{{.*}}[muttoimm *"x`"]<:!Bool {:scalar<bool> false}{{.*}}([[X1]], [[X2]])
     no_exclusivity_violation[mut = False](x, x)
+
+
+@fieldwise_init
+struct Color(ImplicitlyCopyable):
+    var r: Int
+
+    @staticmethod
+    def gray(level: Int) -> Self:
+        return Self(level)
+
+
+def paint(c: Color):
+    pass
+
+
+# CHECK-LABEL: lit.fn @"test_inferred_member_runtime_arg
+def test_inferred_member_runtime_arg(level: Int):
+    # `.gray` resolves against `paint`'s parameter type even when its argument
+    # is a runtime value rather than a literal.
+    # CHECK: lit.call @call_emission::@Color::@"gray({{.*}})"{{.*}}(%level, %[[TMP:[a-z_]+]])
+    # CHECK: %[[C:[0-9]+]] = lit.ref.immut %[[TMP]]
+    # CHECK: lit.call @call_emission::@"paint(call_emission::Color)"{{.*}}(%[[C]])
+    paint(.gray(level))

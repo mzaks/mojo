@@ -40,22 +40,32 @@ Causality is enforced twice, and the two are not the same rule:
 
 1. Before the top-k, entries that had not closed yet are ``-inf``'d so they
    cannot be selected.
-2. After the top-k, any index that still points at a not-yet-closed entry
-   becomes ``-1``. This fires when fewer than ``k`` entries are available: the
-   top-k has to return ``k`` indices, so it pads out of the ``-inf`` region, and
-   those picks are dropped here instead. ``-1`` is what ``sparse_attention``
-   reads as "no such position".
+2. After the top-k, any slot without a finite score becomes ``-1``. The
+   top-k asks each query for no more picks than it has closed entries and
+   pads the rest of its ``k`` slots with ``-1`` itself, so this only drops a
+   pick whose score was not finite. ``-1`` is what ``sparse_attention`` reads
+   as "no such position".
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from max.dtype import DType
-from max.graph import DeviceRef, TensorValue, ops
+from max.graph import (
+    BufferValue,
+    DeviceRef,
+    ShardingStrategy,
+    TensorValue,
+    ops,
+)
+from max.nn.kernels import indexer_score_ragged, top_k_per_row
 from max.nn.layer import Module
 from max.nn.linear import Linear
 
 from ..model_config import DeepseekV4Config
 from .compressor import DeepseekV4Compressor
+from .csa import CompressedStream
 from .hadamard import hadamard_rotate
 from .quantization import fp4_qat_quantize, linear_for
 from .rope import apply_rope_tail
@@ -78,20 +88,60 @@ class DeepseekV4Indexer(Module):
         self.index_topk = config.index_topk
         # Note this is the *indexer's* head width, 128, not the block's 512.
         self.softmax_scale = self.head_dim**-0.5
+        # Both softmax scales the reference folds into the head weights. The
+        # head count is the full one even when this device scores only its
+        # share of the heads: the reference divides by ``args.index_n_heads``.
+        self.weights_scale = self.softmax_scale * self.n_heads**-0.5
 
         self.wq_b = linear_for(
             config, config.q_lora_rank, self.n_heads * self.head_dim, device
         )
         # The reference pins this one to bf16 explicitly
         # (``dtype=torch.bfloat16`` on the ColumnParallelLinear), which for this
-        # checkpoint is what ``config.dtype`` already is; ``wo_a`` in the block
-        # is declared the same way and followed the config there too.
+        # checkpoint is what ``config.dtype`` already is.
         self.weights_proj = Linear(
             config.hidden_size, self.n_heads, config.dtype, device
         )
         self.compressor = DeepseekV4Compressor(
             config, compress_ratio, self.head_dim, device, rotate=True
         )
+
+    def shard_heads(self, num_devices: int) -> None:
+        """Declares the reference's tensor-parallel split: ``wq_b`` and
+        ``weights_proj`` per head. The compressor is shared and stays whole.
+        """
+        if self.n_heads % num_devices:
+            raise ValueError(
+                f"{self.n_heads} indexer heads do not split across "
+                f"{num_devices} devices"
+            )
+        self.wq_b.sharding_strategy = ShardingStrategy.rowwise(num_devices)
+        self.weights_proj.sharding_strategy = ShardingStrategy.rowwise(
+            num_devices
+        )
+
+    def keep_local_heads(self, num_devices: int) -> None:
+        """Makes this replica score only its share of :meth:`shard_heads`."""
+        self.n_heads //= num_devices
+
+    @staticmethod
+    def select_tensor_parallel(
+        indexers: Sequence[DeepseekV4Indexer],
+        scores: Sequence[TensorValue],
+        valid: Sequence[TensorValue],
+        signal_buffers: Sequence[BufferValue],
+    ) -> list[TensorValue]:
+        """:meth:`select` on every device over the all-reduced scores.
+
+        Each device's :meth:`score` covers its share of the heads; the sum
+        over heads is completed before the top-k, so every device ranks the
+        same scores and picks the same entries.
+        """
+        reduced = ops.allreduce.sum(list(scores), signal_buffers)
+        return [
+            indexer.select(score, v)
+            for indexer, score, v in zip(indexers, reduced, valid, strict=True)
+        ]
 
     def __call__(
         self,
@@ -102,6 +152,8 @@ class DeepseekV4Indexer(Module):
         valid: TensorValue,
     ) -> TensorValue:
         """Select compressed entries for every query in a ragged batch.
+
+        :meth:`score` then :meth:`select`.
 
         Args:
             x: ``[T, hidden_size]``, the block input the main attention also
@@ -122,9 +174,71 @@ class DeepseekV4Indexer(Module):
             ``[T, k]`` int32 candidate numbers (rows of ``candidates``), with
             ``-1`` in unusable slots. ``k = min(index_topk, n)``.
         """
-        device = x.device
+        return self.select(self.score(x, qr, freqs_cis, candidates), valid)
+
+    def score(
+        self,
+        x: TensorValue,
+        qr: TensorValue,
+        freqs_cis: TensorValue,
+        candidates: TensorValue,
+    ) -> TensorValue:
+        """``[T, n]`` float32 scores, summed over this module's heads.
+
+        The arguments are :meth:`__call__`'s. Nothing is masked yet.
+        """
+        q, weights = self._query(x, qr, freqs_cis)
+        q32 = ops.cast(q, DType.float32)
+        # "thd,tnd->thn": one rank-3 batched matmul with the tokens as the
+        # batch. Rank 3 also keeps this off the batched-matmul path whose
+        # fused epilogue (the relu) cannot instantiate for rank-4 outputs once
+        # n is a multiple of 128 (ISSUES.md Issue 32).
+        kv_t = ops.transpose(ops.cast(candidates, DType.float32), -1, -2)
+        scores = ops.relu(ops.matmul(q32, kv_t))
+        return ops.squeeze(
+            ops.sum(scores * ops.unsqueeze(weights, -1), axis=1), axis=1
+        )
+
+    def score_cached(
+        self,
+        x: TensorValue,
+        qr: TensorValue,
+        freqs_cis: TensorValue,
+        stream: CompressedStream,
+        cutoff: TensorValue,
+    ) -> TensorValue:
+        """:meth:`score` over ``stream``'s zone leaf, in candidate order.
+
+        The fused kernel reads each live entry out of the leaf, so the
+        ``[T, n, head_dim]`` candidate table :meth:`score` takes is never
+        built. Columns ``valid`` rules out are 0 rather than a score.
+
+        Args:
+            x: As in :meth:`__call__`.
+            qr: As in :meth:`__call__`.
+            freqs_cis: As in :meth:`__call__`.
+            stream: The indexer's compressed stream; its fresh entries are
+                already stored in its zone leaf.
+            cutoff: ``[T]`` int32, ``(position + 1) // ratio`` per query.
+        """
+        assert stream.zone_leaf is not None
+        q, weights = self._query(x, qr, freqs_cis)
+        return indexer_score_ragged(
+            q,
+            weights,
+            stream.rows.offsets,
+            stream.windows.base,
+            cutoff,
+            stream.zone_leaf.values,
+            stream.layer,
+            num_candidates=stream.n_cand,
+        )
+
+    def _query(
+        self, x: TensorValue, qr: TensorValue, freqs_cis: TensorValue
+    ) -> tuple[TensorValue, TensorValue]:
+        """``[T, heads, head_dim]`` queries and ``[T, heads]`` float32 weights."""
         t = x.shape[0]
-        n = int(candidates.shape[1])
 
         # ``apply_rope_tail`` wants the sequence on axis 1.
         q = ops.reshape(self.wq_b(qr), [1, t, self.n_heads, self.head_dim])
@@ -132,41 +246,45 @@ class DeepseekV4Indexer(Module):
         # Rotate first, then quantize: the rotation is there to make the FP4
         # grid tolerable, so the order is not interchangeable.
         q = fp4_qat_quantize(hadamard_rotate(q))
-
-        q32 = ops.reshape(
-            ops.cast(q, DType.float32), [t, self.n_heads, self.head_dim]
-        )
-        # "thd,tnd->thn": one rank-3 batched matmul with the tokens as the
-        # batch. Rank 3 also keeps this off the batched-matmul path whose
-        # fused epilogue (the relu) cannot instantiate for rank-4 outputs once
-        # n is a multiple of 128 (ISSUES.md Issue 32).
-        kv_t = ops.transpose(ops.cast(candidates, DType.float32), -1, -2)
-        scores = ops.relu(ops.matmul(q32, kv_t))
+        q = ops.reshape(q, [t, self.n_heads, self.head_dim])
 
         # One learned weight per head per query, folded with both softmax
         # scales the reference applies here rather than to the scores.
-        weights = ops.cast(self.weights_proj(x), DType.float32) * (
-            self.softmax_scale * self.n_heads**-0.5
+        weights = (
+            ops.cast(self.weights_proj(x), DType.float32) * self.weights_scale
         )
-        index_score = ops.squeeze(
-            ops.sum(scores * ops.unsqueeze(weights, -1), axis=1), axis=1
-        )
+        return q, weights
+
+    def select(
+        self, index_score: TensorValue, valid: TensorValue
+    ) -> TensorValue:
+        """The top-k of :meth:`score`'s ``[T, n]`` under ``valid``.
+
+        Returns what :meth:`__call__` returns.
+        """
+        n = int(index_score.shape[1])
 
         # Rule 1: an entry that had not closed by the query cannot be selected.
+        # Neither can a NaN score, which the top-k does not accept.
         index_score = ops.where(
-            valid,
+            valid & ~ops.is_nan(index_score),
             index_score,
-            ops.constant(float("-inf"), DType.float32, device),
+            float("-inf"),
         )
 
         k = min(self.index_topk, n)
-        topk_scores, topk_idxs = ops.top_k(index_score, k, axis=-1)
+        # Until more than ``k`` entries have closed a query selects all of
+        # them, so it asks for no more picks than it has candidates.
+        live = ops.squeeze(
+            ops.sum(ops.cast(valid, DType.int64), axis=-1), axis=-1
+        )
+        picks = ops.min(live, k)
+        topk_scores, topk_idxs = top_k_per_row(index_score, picks, k)
         topk_idxs = ops.cast(topk_idxs, DType.int32)
 
-        # Rule 2: drop the padding picks the top-k had to make out of the -inf
-        # region.
+        # Rule 2: drop any pick whose score was not finite.
         return ops.where(
-            topk_scores > ops.constant(float("-inf"), DType.float32, device),
+            topk_scores > float("-inf"),
             topk_idxs,
-            ops.constant(-1, DType.int32, device),
+            -1,
         )

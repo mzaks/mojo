@@ -21,7 +21,7 @@ from std.math.uutils import umod, ufloordiv
 
 
 trait CoordLike(
-    Defaultable, ImplicitlyCopyable, TrivialRegisterPassable, Writable
+    Defaultable, ImplicitlyCopyable, Intable, TrivialRegisterPassable, Writable
 ):
     """Trait for unified layout handling of compile-time and runtime indices."""
 
@@ -84,8 +84,17 @@ trait CoordLike(
         """
         ...
 
+    @inline(.always)
+    def __int__(self) -> Int:
+        """Convert this coordinate to an `Int`.
 
-struct ComptimeInt[val: Int](CoordLike, TrivialRegisterPassable):
+        Returns:
+            The coordinate's scalar value as an `Int`.
+        """
+        return Int(self.value())
+
+
+struct ComptimeInt[val: Int](CoordLike):
     """Compile-time known index value.
 
     Parameters:
@@ -432,7 +441,7 @@ struct Coord[*element_types: CoordLike](
                 if Coord(self[i]) != Coord(other[i]):
                     return False
             elif T.is_value and U.is_value:
-                if Int(self[i].value()) != Int(other[i].value()):
+                if Int(self[i]) != Int(other[i]):
                     return False
             else:
                 comptime assert False, String(
@@ -644,6 +653,54 @@ struct Coord[*element_types: CoordLike](
 
         return result
 
+    @inline(.always)
+    def replace_dynamic[
+        dtype: DType, //, at: Int
+    ](mut self, value: Scalar[dtype]):
+        """Assign a runtime `value` to an already-dynamic element, in place.
+
+        `value` must already have the element's own dtype, so the assignment
+        cannot truncate or wrap; convert at the call site to narrow.
+
+        Parameters:
+            dtype: The dtype of `value`, which must match the element's.
+            at: The index of the element to assign to.
+
+        Args:
+            value: The runtime value to store.
+
+        Constraints:
+            - `at` must be a valid element index.
+            - The `Coord` must be flat. A nested element reports `DType.int`
+              and is not static, so the other checks would not reject it.
+            - The element at `at` must not be statically known; use `replace`
+              to overwrite a static element, which yields a new `Coord` type.
+            - `dtype` must equal the dtype of the element at `at`.
+
+        Examples:
+            ```mojo
+            from std.utils.coord import Coord, ComptimeInt
+            var c = Coord(ComptimeInt[3](), Int64(0))
+            c.replace_dynamic[1](Int64(7))
+            # c is Coord(ComptimeInt[3](), Int64(7))
+            ```
+        """
+        comptime assert (
+            0 <= at < Self.__len__()
+        ), "`at` must be a valid element index"
+        comptime assert (
+            Self.is_flat
+        ), "`Coord.replace_dynamic` only supports flat `Coord`s"
+        comptime ElemT = Self.element_types[at]
+        comptime assert not ElemT.is_static_value, (
+            "cannot assign a runtime value to a statically known element; use"
+            " `replace` to overwrite it with a value of a different type"
+        )
+        comptime assert (
+            dtype == ElemT.DTYPE
+        ), "`value` must have the dtype of the element at `at`"
+        self[at] = rebind[ElemT](value)
+
     def write_to(self, mut w: Some[Writer]):
         """Write this `Coord` to a `Writer`.
 
@@ -796,7 +853,6 @@ def _crd2idx_flat[
     return result
 
 
-# Implementation based off runtime_tuple.mojo's crd2idx.
 def crd2idx[
     Index: CoordLike,
     Shape: CoordLike,
@@ -806,9 +862,10 @@ def crd2idx[
     """Calculate the linear index from a coordinate tuple.
 
     The dot product is computed at `out_type` precision (each `coord * stride`
-    term is evaluated after narrowing both operands to `out_type`). Callers
-    that pick a narrow `out_type` (e.g. `uint32`) are responsible for ensuring
-    every per-dim product and their sum fit in that type. The default
+    term is evaluated after narrowing both operands to `out_type`), and so is
+    splitting a scalar coordinate across a mode's sub-modes. Callers that pick
+    a narrow `out_type` (e.g. `uint32`) are responsible for ensuring the
+    coordinate, every per-dim product and their sum fit in that type. The default
     `DType.int64` is wide enough for realistic layouts. See `_crd2idx_flat`.
 
     Parameters:
@@ -852,25 +909,29 @@ def crd2idx[
 
             return result
         else:  # "int" tuple tuple
-            var crd_int: Int
+            # Split in `out_type`, like the dot product: an `Int` divide would
+            # widen every narrow index to 64 bits.
+            var crd_val: Scalar[out_type]
 
             comptime if Index.is_tuple:
-                crd_int = 0 if crd_len == 0 else Int(crd.tuple()[0].value())
+                crd_val = 0 if crd_len == 0 else Scalar[out_type](
+                    crd.tuple()[0].value()
+                )
             else:
-                crd_int = 0 if crd_len == 0 else Int(crd.value())
+                crd_val = 0 if crd_len == 0 else Scalar[out_type](crd.value())
 
             comptime last_elem_idx = shape_len - 1
 
             comptime for i in range(last_elem_idx):
                 var quotient, remainder = divmod(
-                    crd_int, Int(shape_t[i].product())
+                    crd_val, Scalar[out_type](shape_t[i].product())
                 )
                 result += crd2idx[out_type=out_type](
                     remainder, shape_t[i], stride_t[i]
                 )
-                crd_int = quotient
+                crd_val = quotient
             return result + crd2idx[out_type=out_type](
-                crd_int, shape_t[last_elem_idx], stride_t[last_elem_idx]
+                crd_val, shape_t[last_elem_idx], stride_t[last_elem_idx]
             )
     else:
         comptime if crd_len > 1:
@@ -980,8 +1041,8 @@ def idx2crd[
                     rebind[ResultTypes[i]](ComptimeInt[0]())
                 )
             else:
-                var stride_val = Int(stride_t[i].value())
-                var shape_val = Int(shape_t[i].value())
+                var stride_val = Int(stride_t[i])
+                var shape_val = Int(shape_t[i])
                 var coord_val = _linear_idx_to_coord(idx, stride_val, shape_val)
 
                 Pointer(to=result[i]).write(
@@ -993,9 +1054,7 @@ def idx2crd[
                 rebind[ResultTypes[0]](ComptimeInt[0]())
             )
         else:
-            var coord_val = _linear_idx_to_coord(
-                idx, Int(stride.value()), Int(shape.value())
-            )
+            var coord_val = _linear_idx_to_coord(idx, Int(stride), Int(shape))
 
             comptime for i in range(shape_len):
                 Pointer(to=result[i]).write(
@@ -1065,7 +1124,7 @@ def idx2crd[
             comptime if Shape.ParamListType[i].is_tuple:
                 # Nested shape: recurse into sub-shape/sub-stride.
                 var nested = idx2crd[out_dtype=out_dtype](
-                    Int(idx.value()), shape_t[i], stride_t[i]
+                    Int(idx), shape_t[i], stride_t[i]
                 )
                 Pointer(to=result[i]).write(rebind[ResultTypes[i]](nested))
             elif (
@@ -1083,10 +1142,10 @@ def idx2crd[
                 # All static: result is ComptimeInt, already default-initialized.
                 pass
             else:
-                var stride_val = Int(stride_t[i].value())
-                var shape_val = Int(shape_t[i].value())
+                var stride_val = Int(stride_t[i])
+                var shape_val = Int(shape_t[i])
                 var coord_val = _linear_idx_to_coord(
-                    Int(idx.value()), stride_val, shape_val
+                    Int(idx), stride_val, shape_val
                 )
                 Pointer(to=result[i]).write(
                     rebind[ResultTypes[i]](Scalar[out_dtype](coord_val))
@@ -1105,7 +1164,7 @@ def idx2crd[
             pass
         else:
             var coord_val = _linear_idx_to_coord(
-                Int(idx.value()), Int(stride.value()), Int(shape.value())
+                Int(idx), Int(stride), Int(shape)
             )
 
             comptime for i in range(shape_len):
@@ -1134,7 +1193,7 @@ def coord_to_index_list[
     var result = IndexList[value.rank]()
 
     comptime for i in range(type_of(value).__len__()):
-        result[i] = Int(value[i].value())
+        result[i] = Int(value[i])
 
     return result
 
@@ -1267,7 +1326,7 @@ def _get_flattened_helper[
             ](tuple)
     else:
         comptime if flat_idx == current_offset:
-            return Int(tuple[i].value())
+            return Int(tuple[i])
         else:
             return _get_flattened_helper[flat_idx, current_offset + 1, i + 1](
                 tuple
@@ -1620,11 +1679,10 @@ struct _RegTuple[*element_types: CoordLike](
         )
 
         # Move each element into the tuple storage.
-        @__parameter
-        def init_elt[idx: Int](var elt: Self.element_types[idx]):
+        def init_elt[idx: Int](var elt: Self.element_types[idx]) {mut self}:
             Pointer(to=self[idx]).write(elt)
 
-        args^.consume_elements[init_elt]()
+        args^.consume_elements(init_elt)
 
     @always_inline("builtin")
     @staticmethod

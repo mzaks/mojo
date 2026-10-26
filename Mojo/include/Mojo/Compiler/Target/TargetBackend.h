@@ -60,6 +60,8 @@ namespace M::KGEN {
 // Forward-declared for `OffloadEmitContext`'s non-owning pointer, so the
 // pass-manager headers stay out of this widely-included header.
 struct PassManagerConfigOptions;
+class GeneratorOp;
+class SymbolConstantAttr;
 } // namespace M::KGEN
 
 namespace M::Cache {
@@ -128,6 +130,8 @@ struct EmitContext {
 struct OffloadEmitContext {
   const CompilationOptions &options;
   mlir::Location loc;
+  /// The kind this call should produce.
+  EmitAs kind;
   /// Pass-manager config (`--mlir-print-ir-{before,after}*`, etc.) forwarded to
   /// the offload lowering pipeline the backend runs internally. Non-owning.
   PassManagerConfigOptions *pmOptions = nullptr;
@@ -166,6 +170,14 @@ public:
   virtual const TargetBackend *resolve(const llvm::Triple &triple) const {
     return matches(triple) ? this : nullptr;
   }
+
+  /// Rewrite the standalone module sliced for a kernel before it is
+  /// elaborated. `source` is the generator the kernel was requested from; its
+  /// `sourceFuncTypeGenerator` still carries the signature the offload ABI
+  /// erased. The default does nothing.
+  virtual void preprocessGenerator(GeneratorOp entry, GeneratorOp source,
+                                   SymbolConstantAttr symbol,
+                                   mlir::ModuleOp module) const;
 
   virtual SplitStrategy
   splitStrategy(const CompilationOptions &options) const = 0;
@@ -302,9 +314,9 @@ public:
   /// LLVM codegen); the LLVM-Module emit hooks below are then unreachable.
   virtual bool ownsOffloadLowering() const { return false; }
 
-  /// Lowers and emits `module`, returning the device artifact. The target
-  /// arch is `ctx.options.targetCpu`. Only called when `ownsOffloadLowering()`
-  /// is true.
+  /// Lowers and emits `module` as `ctx.kind`, returning the device artifact.
+  /// The target arch is `ctx.options.targetCpu`. Only called when
+  /// `ownsOffloadLowering()` is true.
   virtual ErrorOr<std::unique_ptr<llvm::MemoryBuffer>>
   lowerAndEmitOffload(mlir::Operation *module,
                       const OffloadEmitContext &ctx) const {

@@ -16,16 +16,12 @@ from std.sys import size_of, simd_width_of
 from std.itertools import product
 from std.utils.coord import _coerce_dynamic
 
-from layout import Coord, Idx, TileTensor, row_major
+from layout import Coord, TileTensor, row_major
 from layout.coord import DynamicCoord
 from std.collections import Optional
 from comm import Signal, MAX_GPUS
 from comm.sync import enable_p2p, init_signal_buffer
-from comm.reducescatter import (
-    reducescatter,
-    ReduceScatterConfig,
-    elementwise_epilogue_type,
-)
+from comm.reducescatter import reducescatter, ReduceScatterConfig
 from internal_utils._testing import test_value_for_gpu_element
 from max.gpu.host import (
     DeviceBuffer,
@@ -122,11 +118,11 @@ def reducescatter_test[
         axis_size = num_elements // simd_width
         unit_numel = simd_width
     elif axis == 0:
-        axis_size = Int(shape[0].value())
-        unit_numel = Int(shape[1].value())
+        axis_size = Int(shape[0])
+        unit_numel = Int(shape[1])
     else:
-        axis_size = Int(shape[1].value()) // simd_width
-        unit_numel = Int(shape[0].value()) * simd_width
+        axis_size = Int(shape[1]) // simd_width
+        unit_numel = Int(shape[0]) * simd_width
     var config = ReduceScatterConfig[dtype, ngpus](axis_size, unit_numel, 0)
 
     # Allocate and initialize buffers (shared across all axis values).
@@ -231,11 +227,11 @@ def reducescatter_test[
                 ](config.rank_units(i))
                 runtime_shape[1] = _coerce_dynamic[
                     runtime_shape.element_types[1]
-                ](Int(shape[1].value()))
+                ](Int(shape[1]))
             else:
                 runtime_shape[0] = _coerce_dynamic[
                     runtime_shape.element_types[0]
-                ](Int(shape[0].value()))
+                ](Int(shape[0]))
                 runtime_shape[1] = _coerce_dynamic[
                     runtime_shape.element_types[1]
                 ](config.rank_units(i) * simd_width)
@@ -245,44 +241,49 @@ def reducescatter_test[
             row_major(runtime_shape),
         )
 
-    @inline(.always)
-    @__parameter
-    @__copy_capture(out_bufs)
-    def outputs_lambda[
-        input_index: Int,
-        _dtype: DType,
-        _width: SIMDLength,
-        *,
-        _alignment: Int,
-    ](coords: Coord, val: SIMD[_dtype, _width]) -> None:
-        var out_buf = out_bufs[input_index]
-        out_buf.store[width=_width, alignment=_alignment](
-            coords,
-            rebind[SIMD[dtype, _width]](-val),
-        )
-
-    # `reducescatter`'s output is a world-view `Array`, not a `StaticTuple`;
-    # convert once (the actual write goes through `outputs_lambda` above,
-    # which still reads the `StaticTuple` directly).
+    # `reducescatter`'s outputs are world-view `Array`s, not a `StaticTuple`;
+    # convert once (`outputs_lambda` below still reads the `StaticTuple`
+    # directly).
     var out_bufs_arr = Array[OutputTileType, ngpus](
         fill_with=lambda (k: Int) -> OutputTileType: out_bufs[k]
     )
+    comptime OutputLayoutType = type_of(out_bufs[0].layout)
+    var out_layouts = Array[OutputLayoutType, ngpus](
+        fill_with=lambda (k: Int) -> OutputLayoutType: out_bufs[k].layout
+    )
 
     comptime for i in range(ngpus):
-        reducescatter[
-            ngpus=ngpus,
-            output_lambda=Optional[elementwise_epilogue_type](
-                outputs_lambda[input_index=i, ...]
-            ) if use_custom_epilogue else None,
-            axis=axis,
-            use_multimem=use_multimem,
-        ](
-            in_bufs,
-            out_bufs_arr,
-            rank_sigs,
-            list_of_ctx[i],
-            my_rank=Optional[Int](i),
-        )
+        comptime if use_custom_epilogue:
+
+            @inline(.always)
+            def outputs_lambda[
+                _dtype: DType,
+                _width: SIMDLength,
+                *,
+                alignment: Int,
+            ](coords: Coord, val: SIMD[_dtype, _width]) {var out_bufs} -> None:
+                var out_buf = out_bufs[i]
+                out_buf.store[alignment=alignment](
+                    coords,
+                    rebind[SIMD[dtype, _width]](-val),
+                )
+
+            reducescatter[ngpus=ngpus, axis=axis, use_multimem=use_multimem](
+                in_bufs,
+                out_layouts,
+                outputs_lambda,
+                rank_sigs,
+                list_of_ctx[i],
+                my_rank=Optional[Int](i),
+            )
+        else:
+            reducescatter[ngpus=ngpus, axis=axis, use_multimem=use_multimem](
+                in_bufs,
+                out_bufs_arr,
+                rank_sigs,
+                list_of_ctx[i],
+                my_rank=Optional[Int](i),
+            )
 
     comptime for i in range(ngpus):
         list_of_ctx[i].synchronize()
@@ -346,10 +347,8 @@ def reducescatter_test[
                 var row_start = config.rank_unit_start(gpu_idx)
                 var my_rows = config.rank_units(gpu_idx)
                 for r in range(my_rows):
-                    for c in range(Int(shape[1].value())):
-                        var global_flat = (row_start + r) * Int(
-                            shape[1].value()
-                        ) + c
+                    for c in range(Int(shape[1])):
+                        var global_flat = (row_start + r) * Int(shape[1]) + c
                         comptime accum_t = get_accum_type[dtype]()
                         var accum = Scalar[accum_t](0)
                         comptime for k in range(ngpus):
@@ -363,7 +362,7 @@ def reducescatter_test[
                             -expected_sum if use_custom_epilogue else expected_sum
                         )
                         assert_almost_equal(
-                            result_host[r * Int(shape[1].value()) + c],
+                            result_host[r * Int(shape[1]) + c],
                             expected,
                             msg=String(
                                 "GPU ",
@@ -378,11 +377,9 @@ def reducescatter_test[
             else:
                 var col_start = config.rank_unit_start(gpu_idx) * simd_width
                 var my_cols = config.rank_units(gpu_idx) * simd_width
-                for r in range(Int(shape[0].value())):
+                for r in range(Int(shape[0])):
                     for c in range(my_cols):
-                        var global_flat = r * Int(shape[1].value()) + (
-                            col_start + c
-                        )
+                        var global_flat = r * Int(shape[1]) + (col_start + c)
                         comptime accum_t = get_accum_type[dtype]()
                         var accum = Scalar[accum_t](0)
                         comptime for k in range(ngpus):
@@ -659,7 +656,6 @@ def grouped_reducescatter_test[
     _ = res_bufs_list^
 
 
-@__parameter
 def run_reducescatter_sweep[use_multimem: Bool]() raises:
     """Run reduce-scatter tests across 1D and 2D configurations."""
     var list_of_ctx = List[DeviceContext](capacity=MAX_GPUS)
@@ -673,9 +669,9 @@ def run_reducescatter_sweep[use_multimem: Bool]() raises:
         range(len(test_1d_lengths)),
         range(2),
     ):
-        comptime dtype = rebind[DType](test_dtypes[dtype_idx])
-        comptime ngpus = rebind[Int](test_gpu_counts[ngpus_idx])
-        comptime length = rebind[Int](test_1d_lengths[length_idx])
+        comptime dtype = test_dtypes[dtype_idx]
+        comptime ngpus = test_gpu_counts[ngpus_idx]
+        comptime length = test_1d_lengths[length_idx]
         comptime use_custom_epilogue = epilogue_idx == 1
 
         if DeviceContext.number_of_devices() < ngpus:
@@ -709,14 +705,10 @@ def run_reducescatter_sweep[use_multimem: Bool]() raises:
         range(len(test_2d_shapes)),
         range(2),
     ):
-        comptime dtype = rebind[DType](test_dtypes[dtype_idx])
-        comptime ngpus = rebind[Int](test_gpu_counts[ngpus_idx])
-        comptime M = rebind[type_of(test_2d_shapes[0])](
-            test_2d_shapes[shape_idx]
-        )[0]
-        comptime D = rebind[type_of(test_2d_shapes[0])](
-            test_2d_shapes[shape_idx]
-        )[1]
+        comptime dtype = test_dtypes[dtype_idx]
+        comptime ngpus = test_gpu_counts[ngpus_idx]
+        comptime M = test_2d_shapes[shape_idx][0]
+        comptime D = test_2d_shapes[shape_idx][1]
         comptime use_custom_epilogue = epilogue_idx == 1
 
         if DeviceContext.number_of_devices() < ngpus:

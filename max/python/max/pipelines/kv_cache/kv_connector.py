@@ -50,6 +50,20 @@ class KVLoadRefused(Exception):
         """The hash that went missing, when one is to blame."""
 
 
+class KVLoadFailed(Exception):
+    """A :meth:`KVConnector.load` copy failed, so its blocks hold no valid KV.
+
+    Raised by ``load`` when posting the copy fails, and by the
+    :class:`KVTransfer` it returned once a posted copy fails. Either way
+    nothing is still writing into the destination blocks by the time it is
+    raised, so the caller may free them. The cache manager frees them without
+    committing and recomputes the request's prefix without the connector.
+
+    A transport fault, where :class:`KVLoadRefused` is the connector declining
+    before it moves anything.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class BlockCount:
     """A point-in-time snapshot of a block pool's occupancy.
@@ -71,7 +85,7 @@ class BlockCount:
     def used_pct(self) -> float:
         """Returns the percentage of blocks currently in use, in ``[0, 100]``.
 
-        ``0`` when ``total`` is ``0`` (e.g. a tier with no configured
+        ``0`` when ``total`` is ``0`` (such as a tier with no configured
         capacity), rather than dividing by zero.
         """
         return 100 * self.used / self.total if self.total else 0.0
@@ -108,7 +122,7 @@ class ByteCount:
     def used_pct(self) -> float:
         """Returns the percentage of bytes currently in use, in ``[0, 100]``.
 
-        ``0`` when ``total`` is ``0`` (e.g. a tier with no configured
+        ``0`` when ``total`` is ``0`` (such as a tier with no configured
         capacity), rather than dividing by zero.
         """
         return 100 * self.used / self.total if self.total else 0.0
@@ -133,26 +147,35 @@ class KVTransfer(Protocol):
     them and knows which they are; :class:`KVConnectorTransfer` adds that
     reporting for an offload, where the connector chooses.
 
-    Two completion models cross this handle:
+    Connectors (``rust_tiered``, dKV) issue their copies off the forward stream
+    and return a handle whose ``is_complete`` flips only once the copy lands.
+    The manager pins the blocks, defers committing an onloaded prefix, and
+    cordons the request out of the batch until then -- so the GPU runs other
+    ready work while the copy is in flight.
 
-    * Synchronous / stream-ordered connectors (dKV) issue their copies on -- or
-      GPU-ordered ahead of -- the forward stream and return
-      :class:`CompletedTransfer`. ``is_complete`` is immediately ``True``, so the
-      manager commits the reused prefix at once and never holds the request out
-      of a batch.
-    * Asynchronous connectors (the Rust ``rust_tiered`` connector) issue their
-      copies on a separate copy engine and return a handle whose
-      ``is_complete`` flips only once the copy lands. The manager pins the blocks,
-      defers committing an onloaded prefix, and cordons the request out of the
-      batch until then -- so the GPU runs other ready work while the copy is in
-      flight.
+    A call that moved nothing returns :class:`CompletedTransfer` instead, whose
+    ``is_complete`` is immediately ``True``: the manager commits the reused
+    prefix at once and never holds the request out of a batch.
 
-    ``is_complete`` must be a cheap, side-effect-free poll (a plain atomic /
-    ``cudaEventQuery``-style check), safe to call every scheduler iteration.
+    ``is_complete`` must be cheap enough to call every scheduler iteration: a
+    plain atomic or ``cudaEventQuery``-style check while the copy is in flight.
+    It need not be side-effect-free. The one poll that observes the copy land
+    may settle the transfer, which for dKV means the RPC that hands its reader
+    lease back -- the work its pre-forward barrier used to do on this same
+    thread. That inline settle is the one permitted cost: a poll must not wait
+    on the copy itself, and it must stay correct when polled again after it has
+    returned ``True`` or raised.
     """
 
     def is_complete(self) -> bool:
-        """Returns whether the transfer has completed. Never blocks."""
+        """Returns whether the transfer has completed. Never blocks.
+
+        Raising :class:`KVLoadFailed` is how a connector reports a load that
+        failed terminally rather than completed: the destination blocks then
+        hold no valid KV, so reading ``True`` would publish garbage. The
+        manager unpins that transfer's blocks without committing them and
+        rolls the request's prefix back at its next ``alloc``.
+        """
         ...
 
     def synchronize(self) -> None:
@@ -178,10 +201,9 @@ class KVConnectorTransfer(KVTransfer, Protocol):
 class CompletedTransfer:
     """An already-complete :class:`KVConnectorTransfer`.
 
-    Returned by synchronous / stream-ordered connectors (dKV): their copies
-    ride the forward stream or are GPU-ordered ahead of it, so from the
-    manager's perspective the transfer is already done -- no pinning, no
-    deferred commit, no cordoning.
+    Returned by a call that left nothing in flight, so from the manager's
+    perspective the transfer is already done -- no pinning, no deferred commit,
+    no cordoning.
     """
 
     def __init__(
@@ -210,40 +232,70 @@ class CompletedTransfer:
 
 
 @runtime_checkable
+class KVLookup(Protocol):
+    """Handle for one :meth:`KVConnector.start_lookup`, polled by the manager.
+
+    The manager holds the request out of the batch until :meth:`is_complete`
+    reads ``True``, then reads :meth:`masks` once and either loads through
+    :meth:`KVConnector.load_lookup` or hands the handle back through
+    :meth:`KVConnector.abandon_lookup`. A connector that answers at once
+    returns :class:`CompletedLookup` instead.
+    """
+
+    def is_complete(self) -> bool:
+        """Returns whether the connector has answered. Never blocks."""
+        ...
+
+    def masks(self) -> Mapping[str, Sequence[bool]]:
+        """Returns the masks :meth:`KVConnector.lookup` would have returned.
+
+        Raises:
+            RuntimeError: If the connector has not answered yet.
+        """
+        ...
+
+
+class CompletedLookup:
+    """An already-answered :class:`KVLookup` carrying a lookup's masks."""
+
+    def __init__(self, masks: Mapping[str, Sequence[bool]]) -> None:
+        self._masks = masks
+
+    def is_complete(self) -> bool:
+        """Returns ``True`` because the answer is already here."""
+        return True
+
+    def masks(self) -> Mapping[str, Sequence[bool]]:
+        """Returns the masks the lookup answered with."""
+        return self._masks
+
+
+@runtime_checkable
 class KVConnector(Protocol):
     """Protocol for KV cache connectors managing external (non-device) tiers.
 
     The manager owns device tensors, block allocation, and device-side prefix
-    cache. Connectors handle external tier operations (e.g., host memory)
+    cache. Connectors handle external tier operations (such as host memory)
     via load/offload methods.
 
     All block hashes crossing this Protocol are in canonical bytes form:
-    8 big-endian bytes for ahash64-family algos (including ``sha256_64``),
+    8 big-endian bytes for ``ahash64``,
     32 bytes for full SHA-256 digests. The block hasher produces this
     canonical form directly, so callers pass the hashes through unchanged;
-    a connector that needs a narrower wire encoding (e.g. dKV's 64-bit key)
+    a connector that needs a narrower wire encoding (such as dKV's 64-bit key)
     validates and converts at its own boundary.
 
     Required call ordering per inference step:
-      1. connector.load()            # post loads on the main stream
-      2. connector.wait_for_loads()  # order loads before the forward pass
-      3. connector.offload()         # kick off this step's offloads
-      4. [model executes]
-      5. connector.wait_for_offloads()  # settle offloads posted this step
+      1. connector.load()       # post this step's onloads
+      2. connector.offload()    # kick off this step's offloads
+      3. [model executes]
 
-    ``wait_for_loads`` guarantees the forward pass reads loaded data, but not
-    necessarily by blocking the host until it lands. A stream-ordered connector
-    may instead enqueue a cross-stream wait so the compute stream is GPU-ordered
-    after the loads and return without a host sync (the data can still be in
-    flight on return, ordered ahead of the forward pass on the device). A
-    host-polled connector blocks until the data has landed. Either way the model
-    in step 4 sees the loaded KV.
-
-    ``wait_for_offloads`` likewise need not block the host. A stream-ordered
-    connector may defer marking each block readable until its copy lands, polled
-    without a host sync, so a block offloaded this step can become readable on a
-    later step. Correctness holds: a block is never published before its bytes
-    are written.
+    No barrier orders any of it. Each call hands back a :class:`KVTransfer`,
+    and what depends on the copy waits on that: the manager defers committing
+    an onloaded prefix and holds the request out of the batch, and a connector
+    publishes an offloaded block only once its bytes are written. So the model
+    in step 3 never reads KV that has not landed, and the host is free to build
+    the next batch while a copy is in flight.
     """
 
     @property
@@ -266,7 +318,7 @@ class KVConnector(Protocol):
 
         What that presence is worth is the manager's to decide, since it
         depends on how far each leaf's attention reads back. The manager
-        reconciles the masks with :mod:`~max.pipelines.kv_cache.prefix_hit`,
+        reconciles the masks with :mod:`max._kv_core`'s prefix-hit rules,
         the same rules it runs over the device pools, so a connector needs no
         notion of attention shape, window widths or null blocks.
 
@@ -335,39 +387,126 @@ class KVConnector(Protocol):
                 costs a cache miss and nothing else.
 
         Returns:
-            A :class:`KVTransfer` for the H2D copy. Synchronous connectors
-            return a :class:`CompletedTransfer`; asynchronous ones return a
-            handle the manager polls before reading the loaded KV.
+            A :class:`KVTransfer` for the H2D copy, which the manager polls
+            before reading the loaded KV. A load that moved nothing returns a
+            :class:`CompletedTransfer`.
 
         Raises:
             KVLoadRefused: If it cannot move every block it was asked for.
                 Loading less is not an option -- see :class:`KVLoadRefused`.
+            KVLoadFailed: If posting the copy failed. A copy that fails after
+                it was posted raises from the returned transfer instead.
         """
         ...
+
+    def start_lookup(
+        self,
+        block_hashes: Sequence[bytes],
+        replica_idx: int = 0,
+        hint: bytes | None = None,
+    ) -> KVLookup:
+        """Starts a :meth:`lookup` and returns at once.
+
+        Same arguments and same answer as :meth:`lookup`, read off the handle
+        once it completes. The manager holds the request out of the batch
+        meanwhile, so a connector whose lookup is a round trip keeps it off
+        the scheduler thread. A handle the manager does not load from goes
+        back through :meth:`abandon_lookup`.
+
+        By default the lookup runs here and comes back already answered,
+        which is right for a connector that answers from local memory.
+        """
+        return CompletedLookup(
+            self.lookup(block_hashes, replica_idx=replica_idx, hint=hint)
+        )
+
+    def defers_lookup(self, replica_idx: int = 0) -> bool:
+        """Returns whether :meth:`start_lookup` can return before it answers.
+
+        Only such a lookup holds a request out of the batch, so only it
+        counts against the scheduler's bound on unanswered lookups, and a
+        connector that answers in place is asked in place about the gap a
+        short device hit leaves. ``False`` by default, matching the default
+        :meth:`start_lookup`.
+        """
+        return False
+
+    def load_lookup(
+        self,
+        lookup: KVLookup,
+        block_ids: Mapping[str, Sequence[int]],
+        block_hashes: Mapping[str, Sequence[bytes]],
+        replica_idx: int = 0,
+        hint: bytes | None = None,
+    ) -> KVTransfer:
+        """Loads as :meth:`load` does, reading out of what ``lookup`` found.
+
+        ``lookup`` is complete and was started with the same ``replica_idx``
+        and ``hint``, and the hashes are a contiguous run of the ones it was
+        asked about, starting wherever the device hit ends. Consumes the
+        handle however it exits, so no :meth:`abandon_lookup` is owed
+        afterwards. By default the handle carries no state and this is a
+        plain :meth:`load`.
+        """
+        return self.load(
+            block_ids, block_hashes, replica_idx=replica_idx, hint=hint
+        )
+
+    def abandon_lookup(self, lookup: KVLookup) -> None:
+        """Hands back a :meth:`start_lookup` the manager will not load from.
+
+        Returns at once and never raises into the caller. Safe on a handle
+        that has not answered yet, that was already loaded from, or that
+        found nothing. No-op by default, since a lookup that holds nothing
+        has nothing to hand back.
+        """
+        return
+
+    def probe(
+        self,
+        block_hashes: Sequence[bytes],
+        replica_idxs: Sequence[int],
+        hint: bytes | None = None,
+    ) -> Sequence[Mapping[str, Sequence[bool]]] | None:
+        """Reports what each replica could load of ``block_hashes``, for pricing.
+
+        One answer per entry of ``replica_idxs``, each shaped as a
+        :meth:`lookup` answer, read without taking whatever a lookup takes.
+        Called once per arriving request to weigh the replicas against each
+        other, so a connector whose lookup leases or stages anything answers
+        this from an index instead. An answer may cover fewer leaves than
+        :attr:`leaves` names when one is representative, and the manager
+        reconciles the leaves it covers. Answers may share one mapping, so a
+        caller reads them and never changes them. ``None`` means the
+        connector has no such answer, and the manager prices each replica
+        with a :meth:`lookup`. No-op by default.
+        """
+        return None
 
     def offload(
         self,
         block_ids: Mapping[str, Sequence[int]],
-        block_hashes: Sequence[bytes],
+        block_hashes: Mapping[str, Sequence[bytes]],
         replica_idx: int = 0,
     ) -> KVConnectorTransfer:
-        """Offload the device blocks to the external cache.
+        """Offloads each leaf's blocks under that leaf's hashes.
 
-        The blocks form one ordered sequence. Every connector keys blocks
-        purely by hash, so the order carries no parentage.
+        ``block_ids[leaf_id][i]`` is written under the hash
+        ``block_hashes[leaf_id][i]``. Leaves may differ in length, since a
+        recurrent leaf publishes only at its checkpoint boundaries.
 
         Args:
-            block_ids: Device block IDs to offload per leaf.
-            block_hashes: Hashes for the blocks being offloaded, in prefix
-                order. Canonical bytes form (8 big-endian bytes for
-                ahash64-family, 32 bytes for SHA-256).
+            block_ids: Device block IDs to offload, per leaf.
+            block_hashes: Hashes per leaf, in prefix order. Canonical bytes
+                form (8 big-endian bytes for ahash64-family, 32 for SHA-256).
             replica_idx: DP replica whose device buffers source the offloaded
                 blocks. The external tier itself is replica-agnostic.
 
         Returns:
             A :class:`KVConnectorTransfer` for the D2H copy; ``g0_blocks_per_leaf`` are
             the device source blocks the manager keeps pinned until it lands.
-            Synchronous connectors return a :class:`CompletedTransfer`.
+            An offload that moved nothing returns a :class:`CompletedTransfer`
+            and is pinned nowhere.
         """
         ...
 
@@ -404,44 +543,14 @@ class KVConnector(Protocol):
         """
         return
 
-    def wait_for_loads(self) -> None:
-        """Order all posted loads before the forward pass.
+    def poll_transfers(self) -> None:
+        """Let the connector reclaim what its settled transfers left behind.
 
-        .. deprecated::
-            Superseded by the :class:`KVConnectorTransfer` model: asynchronous
-            connectors report load completion through
-            :meth:`KVConnectorTransfer.is_complete` (the manager's
-            ``poll_transfers`` loop plus the scheduler's cordon), so the forward
-            never reads KV that has not landed without any pre-forward barrier.
-            Retained only for the dKV connector, which still posts its READs in
-            :meth:`load` and orders them here; a no-op for every other connector.
-
-        Called before the forward pass. Connectors that report completion
-        through :class:`KVConnectorTransfer` need no work here. The dKV connector
-        does one of two things by transport: for a co-located (same-host) load it
-        enqueues a cross-stream CUDA event wait so the compute stream is
-        GPU-ordered after the H2D copies and returns without a host sync (the
-        copy may still be draining, ordered ahead of the forward pass); for a
-        remote NIXL load it host-polls the off-stream RDMA to completion. No-op
-        by default.
-        """
-        return
-
-    def wait_for_offloads(self) -> None:
-        """Settle offloads posted since the last call.
-
-        .. deprecated::
-            The post-forward counterpart of :meth:`wait_for_loads`; see its note.
-            Asynchronous connectors settle offloads through
-            :meth:`KVConnectorTransfer.is_complete` / ``poll_transfers``. Retained
-            only for the dKV connector; a no-op for every other connector.
-
-        Called after the forward pass. No-op by default. For a co-located
-        (same-host) offload the dKV connector defers marking the block readable
-        until its D2H copy lands, polled without a host sync, so the block can
-        become readable on a later step; for a remote NIXL offload it host-polls
-        the RDMA to completion and marks the block readable inline. A block is
-        never marked readable before its bytes land.
+        Called every time the manager drains its in-flight transfers, before it
+        polls them. A connector whose transfers settle themselves still has
+        work no poll covers: a transfer dropped before it completed, and
+        book-keeping a settled one recorded off to the side. Cheap,
+        non-blocking, and never raises into the scheduler. No-op by default.
         """
         return
 

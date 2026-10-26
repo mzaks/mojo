@@ -34,6 +34,7 @@ from max.benchmark.benchmark_shared.serving_metrics import (
     build_text_generation_result,
     calculate_metrics,
     calculate_pixel_generation_metrics,
+    compute_output_len,
 )
 from max.profiler.cpu import CPUMetrics
 from max.profiler.gpu import GPUStats, MemoryStats, UtilizationStats
@@ -50,6 +51,17 @@ def _gpu_stats(*, util: int, used_mib: int, free_mib: int) -> GPUStats:
             used_bytes=used_mib * _MIB,
             reserved_bytes=None,
         ),
+        utilization=UtilizationStats(
+            gpu_usage_percent=util, memory_activity_percent=None
+        ),
+        clocks=None,
+    )
+
+
+def _gpu_stats_no_memory(*, util: int) -> GPUStats:
+    """A GPUStats with no memory info, as from a driver that lacks it."""
+    return GPUStats(
+        memory=None,
         utilization=UtilizationStats(
             gpu_usage_percent=util, memory_activity_percent=None
         ),
@@ -170,6 +182,54 @@ def test_tpot_both_definitions() -> None:
     assert math.isclose(
         metrics.text_data.step_tpot_ms.mean, 125.0, rel_tol=1e-6
     )
+
+
+def test_output_len_prefers_server_completion_tokens() -> None:
+    """The server's completion count drives TPOT, not the re-tokenized text.
+
+    With ``ignore_eos``, tokens past EOS can stream no text, so the text
+    re-tokenizes to fewer tokens than the server generated.
+    """
+    # 10 generated tokens whose text re-tokenizes to 4, latency 1.0s, ttft
+    # 0.1s -> tpot = 0.9 / 9 = 0.1 s.
+    output = RequestFuncOutput(
+        success=True,
+        latency=1.0,
+        ttft=0.1,
+        prompt_len=10,
+        generated_text="four tok",
+        itl=[0.1] * 9,
+        tpot=[0.1] * 9,
+        server_token_stats=ServerTokenStats(completion_tokens=10),
+    )
+    tokenizer = _make_mock_tokenizer({"four tok": 4})
+
+    metrics = calculate_metrics(
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=tokenizer,
+        gpu_metrics=None,
+        cpu_metrics=_EMPTY_CPU_METRICS,
+        skip_first_n_requests=0,
+        skip_last_n_requests=0,
+        max_concurrency=None,
+        max_concurrent_conversations=None,
+        collect_gpu_stats=False,
+        kv_block_size=128,
+    )
+
+    assert metrics.text_data is not None
+    assert metrics.text_data.total_output == 10
+    assert metrics.text_data.tpot_ms is not None
+    assert math.isclose(metrics.text_data.tpot_ms.mean, 100.0, rel_tol=1e-6)
+
+
+def test_output_len_falls_back_to_text_without_usage() -> None:
+    """A server that reports no usage is counted from its text."""
+    output = RequestFuncOutput(success=True, generated_text="four tok")
+    tokenizer = _make_mock_tokenizer({"four tok": 4})
+
+    assert compute_output_len(tokenizer, output) == 4
 
 
 def test_tpot_zero_decode_tokens() -> None:
@@ -1175,6 +1235,66 @@ def test_build_text_generation_result_not_detected_falls_back_to_trim() -> None:
     assert result.text_data.completed == 3
 
 
+def _outputs_with_completion_tokens(
+    counts: list[int],
+) -> list[RequestFuncOutput]:
+    outputs = []
+    for count in counts:
+        output = _make_request_func_output()
+        output.server_token_stats = ServerTokenStats(completion_tokens=count)
+        outputs.append(output)
+    return outputs
+
+
+def test_build_text_generation_result_attaches_aggregate_server_stats() -> None:
+    """Without sessions, server stats are attached flat in output order."""
+    outputs = _outputs_with_completion_tokens([3, 1, 2])
+    result = build_text_generation_result(
+        outputs=outputs,
+        benchmark_duration=1.0,
+        tokenizer=_make_tokenizer_mock(),
+        gpu_metrics=None,
+        cpu_metrics=None,
+        skip_first_n_requests=0,
+        skip_last_n_requests=0,
+        max_concurrency=None,
+        max_concurrent_conversations=None,
+        collect_gpu_stats=False,
+    )
+
+    assert result.session_server_stats is None
+    assert result.aggregate_server_stats == [
+        o.server_token_stats for o in outputs
+    ]
+
+
+def test_build_text_generation_result_attaches_session_server_stats() -> None:
+    """With sessions, server stats are grouped per session."""
+    a, b, c, d = _outputs_with_completion_tokens([1, 2, 3, 4])
+    by_session = {"10": [a], "anon": [b], "2": [c, d]}
+    result = build_text_generation_result(
+        outputs=[a, b, c, d],
+        benchmark_duration=1.0,
+        tokenizer=_make_tokenizer_mock(),
+        gpu_metrics=None,
+        cpu_metrics=None,
+        skip_first_n_requests=0,
+        skip_last_n_requests=0,
+        max_concurrency=None,
+        max_concurrent_conversations=None,
+        collect_gpu_stats=False,
+        outputs_by_session=by_session,
+    )
+
+    assert result.aggregate_server_stats is None
+    assert result.session_server_stats is not None
+    assert list(result.session_server_stats) == ["2", "10", "anon"]
+    assert result.session_server_stats["2"] == [
+        c.server_token_stats,
+        d.server_token_stats,
+    ]
+
+
 def test_build_text_generation_result_all_failed_suppresses_ss_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1857,8 +1977,9 @@ def test_constrained_split_reaches_result_groups() -> None:
     assert latency is not None
     assert latency.ttft_ms_constrained is not None
     assert latency.tpot_ms_unconstrained is not None
-    summary = metrics.result_groups.summary  # type: ignore[attr-defined]
-    assert summary.constrained_request_rate == 0.5
+    mix = metrics.result_groups.request_mix  # type: ignore[attr-defined]
+    assert mix is not None
+    assert mix.constrained_request_rate == 0.5
 
 
 def test_constrained_split_reaches_the_flat_result_dict() -> None:
@@ -1869,22 +1990,90 @@ def test_constrained_split_reaches_the_flat_result_dict() -> None:
     assert d["constrained_request_rate"] == 0.5
 
 
+def test_conformance_rate_counts_only_judged_constrained_requests() -> None:
+    """A constrained request that was never judged must not be counted as a
+    failure; an unconstrained run reports no rate at all."""
+    conforming = RequestFuncOutput(
+        success=True,
+        latency=1.1,
+        ttft=0.3,
+        prompt_len=10,
+        generated_text="five tokens here now",
+        response_format_constrained=True,
+        response_format_conformed=True,
+    )
+    failing = RequestFuncOutput(
+        success=True,
+        latency=1.1,
+        ttft=0.3,
+        prompt_len=10,
+        generated_text="five tokens here now",
+        response_format_constrained=True,
+        response_format_conformed=False,
+    )
+    unjudged = RequestFuncOutput(
+        success=True,
+        latency=1.1,
+        ttft=0.3,
+        prompt_len=10,
+        generated_text="five tokens here now",
+        response_format_constrained=True,
+    )
+    text = _calculate_for([conforming, failing, unjudged]).text_data  # type: ignore[attr-defined]
+    assert text is not None
+    # 1 of the 2 judged, not 1 of the 3 constrained.
+    assert text.constrained_conformance_rate == 0.5
+    assert text.constrained_request_rate == 1.0
+
+
+def test_no_conformance_rate_without_constrained_requests() -> None:
+    outputs = [
+        o
+        for o in _constrained_split_outputs()
+        if not o.response_format_constrained
+    ]
+    text = _calculate_for(outputs).text_data  # type: ignore[attr-defined]
+    assert text is not None
+    assert text.constrained_conformance_rate is None
+
+
+def test_conformance_rate_reaches_the_summary_group() -> None:
+    metrics = _calculate_for(
+        [
+            RequestFuncOutput(
+                success=True,
+                latency=1.1,
+                ttft=0.3,
+                prompt_len=10,
+                generated_text="five tokens here now",
+                response_format_constrained=True,
+                response_format_conformed=False,
+            )
+        ]
+    )
+    mix = metrics.result_groups.request_mix  # type: ignore[attr-defined]
+    assert mix is not None
+    assert mix.constrained_conformance_rate == 0.0
+
+
 def test_aggregate_gpu_stats_disabled_or_empty() -> None:
     """Collection off, no snapshots, or all-empty snapshots yield nothing."""
     assert _aggregate_gpu_stats(collect_gpu_stats=False, gpu_metrics=[]) == (
         [],
         [],
         [],
+        {},
     )
     assert _aggregate_gpu_stats(collect_gpu_stats=True, gpu_metrics=None) == (
         [],
         [],
         [],
+        {},
     )
     # Snapshots with no devices report nothing rather than raising.
     assert _aggregate_gpu_stats(
         collect_gpu_stats=True, gpu_metrics=[{}, {}]
-    ) == ([], [], [])
+    ) == ([], [], [], {})
 
 
 def test_aggregate_gpu_stats_single_device_across_snapshots() -> None:
@@ -1893,7 +2082,7 @@ def test_aggregate_gpu_stats_single_device_across_snapshots() -> None:
         {"n:gpu0": _gpu_stats(util=80, used_mib=100, free_mib=900)},
         {"n:gpu0": _gpu_stats(util=90, used_mib=300, free_mib=700)},
     ]
-    peak, avail, util = _aggregate_gpu_stats(
+    peak, avail, util, _ = _aggregate_gpu_stats(
         collect_gpu_stats=True, gpu_metrics=snapshots
     )
     assert peak == [300.0]
@@ -1924,7 +2113,7 @@ def test_aggregate_gpu_stats_tolerates_changing_device_set() -> None:
         },
     ]
 
-    peak, avail, util = _aggregate_gpu_stats(
+    peak, avail, util, _ = _aggregate_gpu_stats(
         collect_gpu_stats=True, gpu_metrics=snapshots
     )
 
@@ -1936,3 +2125,124 @@ def test_aggregate_gpu_stats_tolerates_changing_device_set() -> None:
     assert util == [75.0, 50.0]
     # Reported mean GPU util is the mean across all engine devices seen.
     assert statistics.mean(util) == 62.5
+
+
+def test_aggregate_gpu_stats_without_memory_info() -> None:
+    """No memory info yields empty memory series; utilization is unaffected."""
+    snapshots = [
+        {"n:gpu0": _gpu_stats_no_memory(util=70)},
+        {"n:gpu0": _gpu_stats_no_memory(util=90)},
+    ]
+    peak, avail, util, _ = _aggregate_gpu_stats(
+        collect_gpu_stats=True, gpu_metrics=snapshots
+    )
+    assert peak == []
+    assert avail == []
+    assert util == [80.0]
+
+
+def test_aggregate_gpu_stats_mixed_memory_availability() -> None:
+    """Devices without memory info drop out of the memory series only."""
+    snapshots = [
+        {
+            "n:gpu0": _gpu_stats(util=50, used_mib=100, free_mib=900),
+            "n:gpu1": _gpu_stats_no_memory(util=60),
+        },
+    ]
+    peak, avail, util, _ = _aggregate_gpu_stats(
+        collect_gpu_stats=True, gpu_metrics=snapshots
+    )
+    # Only gpu0 reported memory; gpu1 contributes utilization alone.
+    assert peak == [100.0]
+    assert avail == [900.0]
+    assert util == [50.0, 60.0]
+
+
+def test_aggregate_gpu_stats_splits_utilization_by_group() -> None:
+    """Each group gets its devices' utilization, in the mapping's order.
+
+    A device with no group still counts toward the overall list, and a
+    grouped device absent from every snapshot adds nothing.
+    """
+    snapshot = {
+        "GPU-a": _gpu_stats(util=96, used_mib=100, free_mib=900),
+        "GPU-b": _gpu_stats(util=94, used_mib=100, free_mib=900),
+        "GPU-c": _gpu_stats(util=38, used_mib=100, free_mib=900),
+        "GPU-d": _gpu_stats(util=50, used_mib=100, free_mib=900),
+    }
+    _, _, util, by_group = _aggregate_gpu_stats(
+        collect_gpu_stats=True,
+        gpu_metrics=[snapshot],
+        gpu_device_groups={
+            "GPU-c": "decode",
+            "GPU-a": "prefill",
+            "GPU-b": "prefill",
+            "GPU-z": "decode",
+        },
+    )
+    assert util == [96.0, 94.0, 38.0, 50.0]
+    assert by_group == {"decode": [38.0], "prefill": [96.0, 94.0]}
+    assert list(by_group) == ["decode", "prefill"]
+
+
+def test_tool_rates_count_offers_and_calls_separately() -> None:
+    """The request rate is over every measured request; the call rate only
+    over the ones that offered tools, as production's two counters are."""
+    outputs = _constrained_split_outputs(pairs=4)
+    for o in outputs:
+        o.response_format_constrained = False
+    for i, o in enumerate(outputs[:4]):
+        o.tools_offered = True
+        o.tool_call_returned = i < 3
+    text = _calculate_for(outputs).text_data  # type: ignore[attr-defined]
+    assert text is not None
+    assert text.tool_request_rate == 4 / len(outputs)
+    assert text.tool_call_response_rate == 0.75
+
+
+def test_tool_rates_reach_result_groups_and_the_flat_result_dict() -> None:
+    """The console and stored JSON read ``result_groups`` and the flat dict,
+    not the aggregates."""
+    outputs = _constrained_split_outputs()
+    for o in outputs:
+        o.tools_offered = True
+    outputs[0].tool_call_returned = True
+    metrics = _calculate_for(outputs)
+    mix = metrics.result_groups.request_mix  # type: ignore[attr-defined]
+    assert mix is not None
+    assert mix.tool_request_rate == 1.0
+    assert mix.tool_call_response_rate == 0.25
+    d = metrics.text_data.to_result_dict()  # type: ignore[attr-defined]
+    assert d["tool_request_rate"] == 1.0
+    assert d["tool_call_response_rate"] == 0.25
+
+
+def test_tool_call_rate_is_none_without_tool_requests() -> None:
+    outputs = [
+        o
+        for o in _constrained_split_outputs()
+        if not o.response_format_constrained
+    ]
+    text = _calculate_for(outputs).text_data  # type: ignore[attr-defined]
+    assert text is not None
+    assert text.tool_request_rate == 0.0
+    assert text.tool_call_response_rate is None
+
+
+def test_image_and_lora_rates_count_over_measured_requests() -> None:
+    outputs = _constrained_split_outputs(pairs=4)
+    for i, o in enumerate(outputs):
+        o.carries_image = i < 2
+        o.lora_id = "adapter-a" if i < 6 else None
+    metrics = _calculate_for(outputs)
+    text = metrics.text_data  # type: ignore[attr-defined]
+    assert text is not None
+    assert text.image_request_rate == 2 / len(outputs)
+    assert text.lora_request_rate == 6 / len(outputs)
+    mix = metrics.result_groups.request_mix  # type: ignore[attr-defined]
+    assert mix is not None
+    assert mix.image_request_rate == text.image_request_rate
+    assert mix.lora_request_rate == text.lora_request_rate
+    d = text.to_result_dict()
+    assert d["image_request_rate"] == text.image_request_rate
+    assert d["lora_request_rate"] == text.lora_request_rate

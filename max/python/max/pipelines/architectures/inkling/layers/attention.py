@@ -40,7 +40,6 @@ from ..model_config import InklingTextConfig
 from .short_convolution import (
     ShortConvolution,
     fused_qk_rms_norm_short_conv_ragged,
-    short_conv_ring_commit_kv,
 )
 
 _TAU_DTYPE = DType.float32
@@ -57,8 +56,8 @@ def log_scaling_tau(
 class InklingAttention(Module, Shardable):
     """One decoder layer's attention block.
 
-    The prologue (K/V short conv, Q/K norms, KV-cache stores) is one fused
-    launch for any chunk length plus one launch committing the conv rings.
+    The prologue (K/V short conv with its ring commit, Q/K norms, KV-cache
+    stores) is one fused launch for any chunk length.
     """
 
     def __init__(
@@ -167,9 +166,11 @@ class InklingAttention(Module, Shardable):
         positions: TensorValue,
         log_scaling: TensorValue,
         k_conv_ring: BufferValue,
-        k_conv_row: TensorValue,
+        k_conv_rows: TensorValue,
+        k_layer_row: TensorValue,
         v_conv_ring: BufferValue,
-        v_conv_row: TensorValue,
+        v_conv_rows: TensorValue,
+        v_layer_row: TensorValue,
         cache_layer_idx: TensorValue,
     ) -> TensorValue:
         """Runs the block over one ragged batch. ``cache_layer_idx`` is an
@@ -192,26 +193,18 @@ class InklingAttention(Module, Shardable):
             self.v_sconv.taps,
             k_conv_ring,
             v_conv_ring,
-            k_conv_row,
-            v_conv_row,
+            k_conv_rows,
+            v_conv_rows,
+            k_layer_row,
+            v_layer_row,
             log_scaling,
             self.q_norm.eps,
             cache_layer_idx,
             q_num_heads=self.num_heads,
             apply_log_scaling=self.applies_log_scaling,
+            commit=self.commit_conv_state,
             multiply_before_cast=self.q_norm.multiply_before_cast,
         )
-        if self.commit_conv_state:
-            short_conv_ring_commit_kv(
-                qkvr,
-                k_conv_ring,
-                v_conv_ring,
-                input_row_offsets,
-                positions,
-                k_conv_row,
-                v_conv_row,
-                k_col=q_dim,
-            )
         bias = self._relative_bias(r)
         if self.applies_log_scaling:
             bias = _scale_rows(bias, log_scaling)

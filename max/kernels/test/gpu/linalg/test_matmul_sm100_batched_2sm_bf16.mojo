@@ -16,11 +16,9 @@ from std.sys import argv, size_of
 import linalg.matmul.vendor.blas as vendor_blas
 from max.gpu.host import DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.memory import alloc
 from internal_utils import assert_almost_equal
 from std.random import rand
 from layout import (
-    Coord,
     CoordLike,
     Idx,
     TileTensor,
@@ -34,6 +32,7 @@ from linalg.matmul.gpu.sm100_structured.structured_kernels.config import (
     GEMMKind,
 )
 
+from std.utils.coord import DynamicCoord
 from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
 
@@ -55,7 +54,7 @@ def test_blackwell_batched_matmul_tma_umma_warp_specialized[
     b_type: DType,
     c_type: DType,
     block_tile_shape: IndexList[3],
-    mma_shape: IndexList[3],
+    mma_shape: DynamicCoord[.int, 3],
     cluster_shape: StaticTuple[Int32, 3],
     cta_group: Int,
     transpose_b: Bool = True,
@@ -66,10 +65,10 @@ def test_blackwell_batched_matmul_tma_umma_warp_specialized[
     swapAB: Bool = False,
     k_group_size: Int = 1,
 ](ctx: DeviceContext, batch: BatchType, m: MType, n: NType, k: KType) raises:
-    var B = Int(batch.value())
-    var M = Int(m.value())
-    var N = Int(n.value())
-    var K = Int(k.value())
+    var B = Int(batch)
+    var M = Int(m)
+    var N = Int(n)
+    var K = Int(k)
 
     print(
         t"in/out dtypes=({a_type}, {b_type}, {c_type})  problem shape=({B},"
@@ -79,19 +78,17 @@ def test_blackwell_batched_matmul_tma_umma_warp_specialized[
         t" swapAB={swapAB} k_group_size={k_group_size}"
     )
 
-    var a_shape = row_major(Coord(batch, m, Idx[KType.static_value]))
+    var a_shape = row_major(batch, m, Idx[KType.static_value])
     var b_shape = row_major(
-        Coord(
-            batch,
-            Idx[NType.static_value if transpose_b else KType.static_value],
-            Idx[KType.static_value if transpose_b else NType.static_value],
-        )
+        batch,
+        Idx[NType.static_value if transpose_b else KType.static_value],
+        Idx[KType.static_value if transpose_b else NType.static_value],
     )
-    var c_shape = row_major(Coord(batch, m, Idx[NType.static_value]))
+    var c_shape = row_major(batch, m, Idx[NType.static_value])
 
-    var a_size = Int(batch.value()) * Int(m.value()) * Int(k.value())
-    var b_size = Int(batch.value()) * Int(n.value()) * Int(k.value())
-    var c_size = Int(batch.value()) * Int(m.value()) * Int(n.value())
+    var a_size = Int(batch) * Int(m) * Int(k)
+    var b_size = Int(batch) * Int(n) * Int(k)
+    var c_size = Int(batch) * Int(m) * Int(n)
 
     var a_host_ptr = ctx.enqueue_create_host_buffer[a_type](a_size)
     var a_host = TileTensor(a_host_ptr, a_shape)
@@ -153,15 +150,15 @@ def test_blackwell_batched_matmul_tma_umma_warp_specialized[
     # Reference: per-batch vendor_blas.matmul
     for b in range(B):
         var a_2d = TileTensor(
-            a_tensor._storage + b * M * K,
+            a_tensor._storage.unsafe_offset(b * M * K),
             row_major((M, K)),
         )
         var b_2d = TileTensor(
-            b_tensor._storage + b * N * K,
+            b_tensor._storage.unsafe_offset(b * N * K),
             row_major((N, K)),
         )
         var c_ref_2d = TileTensor(
-            c_ref_tensor._storage + b * M * N,
+            c_ref_tensor._storage.unsafe_offset(b * M * N),
             row_major((M, N)),
         )
 
@@ -206,10 +203,8 @@ def main() raises:
         # 256x256x16 MMA, 2x1x1 cluster
         comptime for bm in [128]:
             comptime for bn in [64, 128]:
-                comptime block_tile_shape = Index(bm, bn, BK)
-                comptime umma_shape = Index(
-                    cta_group * bm, cta_group * bn, MMA_K
-                )
+                comptime block_tile_shape = (bm, bn, BK)
+                comptime umma_shape = (cta_group * bm, cta_group * bn, MMA_K)
 
                 # Basic: small batch, small shape
                 test_blackwell_batched_matmul_tma_umma_warp_specialized[
@@ -301,8 +296,8 @@ def main() raises:
 
         # swapAB tests (2SM)
         comptime for bn in [64, 128]:
-            comptime block_tile_shape = Index(128, bn, BK)
-            comptime umma_shape = Index(cta_group * 128, cta_group * bn, MMA_K)
+            comptime block_tile_shape = (128, bn, BK)
+            comptime umma_shape = (cta_group * 128, cta_group * bn, MMA_K)
 
             test_blackwell_batched_matmul_tma_umma_warp_specialized[
                 dtype,

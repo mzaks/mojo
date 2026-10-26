@@ -136,7 +136,9 @@ def _assume(cond: Bool):
 @inline(.nodebug)
 def _same_elements[
     T: AnyType
-](dst: Pointer[T, _], src: Pointer[T, _], count: Int) -> Bool:
+](
+    dst: Pointer[mut=False, T, _], src: Pointer[mut=False, T, _], count: Int
+) -> Bool:
     """States, in a postcondition, that the `count` elements at `dst` on exit
     are the elements that were at `src` on entry.
 

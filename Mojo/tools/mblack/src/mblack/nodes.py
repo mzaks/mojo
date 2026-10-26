@@ -104,6 +104,7 @@ VARARGS_PARENTS: Final = {
     syms.metaparams,
     syms.trailer,  # single argument to call
     syms.typedargslist,
+    syms.typeconv,
     syms.varargslist,  # lambdas
 }
 UNPACKING_PARENTS: Final = {
@@ -307,6 +308,14 @@ def whitespace(
             # `*expr` is always unary unpacking, no space after `*`.
             return NO
 
+        elif (
+            prevp.type == token.EQEQUAL
+            and prevp.parent
+            and prevp.parent.type == syms.factor
+        ):
+            # Explicit value patterns use `== value`.
+            return SPACE
+
         elif prevp.type in VARARGS_SPECIALS:
             if is_vararg(prevp, within=VARARGS_PARENTS | UNPACKING_PARENTS):
                 return NO
@@ -398,6 +407,10 @@ def whitespace(
                 )
             return NO
 
+    elif p.type == syms.typeconv:
+        if prev and prev.type in STARS:
+            return NO
+
     elif p.type in TYPED_NAMES:
         # type names
         if not prev:
@@ -452,7 +465,7 @@ def whitespace(
         if not prevp or prevp.type == token.AT or prevp.type == token.DOT:
             return NO
 
-    elif p.type == syms.classdef:
+    elif p.type in {syms.classdef, syms.enum_case_stmt}:
         if t == token.LPAR:
             return NO
 
@@ -517,6 +530,10 @@ def whitespace(
                 prevp.type == token.EQUAL and prevp_parent.type == syms.argument
             ):
                 return NO
+
+        elif prev and prev.type == token.EQEQUAL:
+            # Explicit value patterns use `== value`.
+            return SPACE
 
         elif t in {token.NAME, token.NUMBER, token.STRING}:
             return NO

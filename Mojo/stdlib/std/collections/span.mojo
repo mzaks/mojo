@@ -20,19 +20,12 @@ from std.collections import Span
 ```
 """
 from std.builtin.builtin_slice import ContiguousSlice
-from std.reflection import call_location, reflect
+from std.reflection import reflect
 from std.bit.mask import splat
-from std.bit import pop_count
-from std.memory import (
-    pack_bits,
-    unsafe_uninit_copy_n,
-    unsafe_memcpy,
-    MaybeUninit,
-)
+from std.memory import unsafe_uninit_copy_n, unsafe_memcpy, MaybeUninit
 from std.collections import check_bounds, check_slice_bounds
 from std.builtin.rebind import downcast
 from std.builtin._verification import _assume, _index_in_bounds
-from std.sys import align_of
 from std.sys.info import simd_width_of
 from std.traits import (
     IsTriviallyCopyable,
@@ -41,8 +34,13 @@ from std.traits import (
 )
 
 from std.algorithm import vectorize
-from std.hashlib import Hasher
+from std.hash import Hasher
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
+from std.utils._nicheable import (
+    NicheIndex,
+    UnsafeNicheable,
+    _NonNegativeScalarNiche,
+)
 import std.format._utils as fmt
 
 
@@ -185,6 +183,7 @@ struct Span[
     IterableOwned where conforms_to(T, Copyable) and address_space == .GENERIC,
     Sized,
     TrivialRegisterPassable,
+    UnsafeNicheable,
     Writable where conforms_to(T, Writable) and address_space == .GENERIC,
 ):
     """A non-owning view of contiguous data.
@@ -298,7 +297,7 @@ struct Span[
 
         Args:
             unsafe_ptr: The underlying pointer of the span.
-            length: The length of the view.
+            length: The length of the view, must be non-negative.
         """
         self._data = unsafe_ptr
         self._len = length
@@ -621,6 +620,26 @@ struct Span[
         for i in range(len(this)):
             this[i].__hash__(hasher)
 
+    comptime _Niche = _NonNegativeScalarNiche[Self, "_len"]
+
+    @staticmethod
+    @inline(.always)
+    @doc_hidden
+    def niche_count() -> Int:
+        return Self._Niche.niche_count()
+
+    @staticmethod
+    @inline(.always)
+    @doc_hidden
+    def write_niche[index: Int](memory: MutPointer[MaybeUninit[Self], _]):
+        Self._Niche.write_niche[index](memory)
+
+    @staticmethod
+    @inline(.always)
+    @doc_hidden
+    def classify_niche(memory: ImmPointer[MaybeUninit[Self], _]) -> NicheIndex:
+        return Self._Niche.classify_niche(memory)
+
     # ===------------------------------------------------------------------===#
     # Methods
     # ===------------------------------------------------------------------===#
@@ -703,17 +722,13 @@ struct Span[
             Self.T
         ]:
             unsafe_uninit_copy_n[overlapping=False](
-                # TODO(MOCO-4220) once fixed remove the unsafe_mut_cast
-                dest=self.unsafe_ptr().unsafe_mut_cast[True](),
+                dest=self.unsafe_ptr(),
                 src=other.unsafe_ptr(),
                 count=len(self),
             )
         else:
             for i in range(len(self)):
-                # TODO(MOCO-4220) once fixed this is self[i] = other[i].copy()
-                self.unsafe_ptr().unsafe_mut_cast[True]()[
-                    unsafe_offset=i
-                ] = other[i].copy()
+                self[i] = other[i].copy()
 
     def __bool__(self) -> Bool:
         """Check if a span is non-empty.
@@ -824,8 +839,7 @@ struct Span[
             "Index `b` out of bounds: ",
             b,
         )
-        # TODO(MOCO-4220) once fixed remove unsafe_mut_cast
-        var ptr = self.unsafe_ptr().unsafe_mut_cast[True]()
+        var ptr = self.unsafe_ptr()
 
         # `a` and `b` may be equal, so we cannot use `swap` directly.  The
         # unsafe_origin_cast silence the (correct) exclusivity error.
@@ -903,7 +917,7 @@ struct Span[
         var processed = 0
 
         comptime for i in range(len(widths)):
-            comptime w = rebind[Int](widths[i])
+            comptime w = widths[i]
 
             comptime if simd_width_of[dtype]() >= w:
                 for _ in range((middle - processed) // w):
@@ -947,7 +961,7 @@ struct Span[
         var processed = 0
 
         comptime for i in range(len(widths)):
-            comptime w = rebind[Int](widths[i])
+            comptime w = widths[i]
 
             comptime if simd_width_of[dtype]() >= w:
                 for _ in range((length - processed) // w):
@@ -987,7 +1001,7 @@ struct Span[
         var processed = 0
 
         comptime for i in range(len(widths)):
-            comptime w = rebind[Int](widths[i])
+            comptime w = widths[i]
 
             comptime if simd_width_of[dtype]() >= w:
                 for _ in range((length - processed) // w):
@@ -1117,8 +1131,8 @@ struct Span[
                     return 0
 
             var index = span.binary_search_by[cmp]()
-            if index:
-                print("Found at index: ", index.value())
+            if case .Some(i) = index:
+                print("Found at index: ", i)
             else:
                 print("Not found")
             ```
@@ -1170,8 +1184,8 @@ struct Span[
                         return 0
 
                 var index = span.binary_search_by(cmp)
-                if index:
-                    print("Found at index: ", index.value())
+                if case .Some(i) = index:
+                    print("Found at index: ", i)
                 else:
                     print("Not found")
             ```
@@ -1223,6 +1237,38 @@ struct Span[
                 self._data.unsafe_offset(i).unsafe_deinit_pointee()
 
     @inline(.always)
+    @__allow_legacy_custom_self_type
+    def unsafe_deinit_elements_with[
+        U: AnyType
+    ](self: MutSpan[U, _], f: Some[def(var U)], /):
+        """Destroys every element by passing it to `f`, leaving the memory
+        uninitialized.
+
+        This is the `Deinitable`-free counterpart to `unsafe_deinit_elements`:
+        each element is handed to `f` as an owned value, in index order, so a
+        span of elements that have no destructor of their own can still be
+        torn down. `U` is unconstrained, so this works for element types that
+        are neither `Deinitable` nor `Movable`.
+
+        Parameters:
+            U: The span's element type.
+
+        Args:
+            f: The function that consumes, and is responsible for disposing
+                of, each element.
+
+        Safety:
+
+        - Every element must hold a live `U`. Deinitializing an element that
+          was never initialized, or that was already deinitialized, is
+          undefined behavior.
+        - The elements are left uninitialized. Reading them, or deinitializing
+          them a second time, is undefined behavior.
+        """
+        for i in range(len(self)):
+            self._data.unsafe_offset(i).unsafe_deinit_pointee_with(f)
+
+    @inline(.always)
     def _unsafe_bitcast_span[
         To: AnyType
     ](self) -> Span[To, Self.origin, address_space=Self.address_space]:
@@ -1262,7 +1308,16 @@ struct Span[
         print(uninit.unsafe_assume_init()) # [1, 2, 3]
         ```
         """
-        return self._unsafe_bitcast_span[U]()
+        # Not `_unsafe_bitcast_span`: `U` is unconstrained, and instantiating
+        # a call against the `MaybeUninit[U]` element type makes the compiler
+        # evaluate `IsTriviallyMovable[U]`, whose `downcast[U, Movable]` is
+        # not guarded by the `conforms_to` beside it and so hard-errors for a
+        # non-`Movable` `U`. TODO(MOCO-4525): drop the workaround once
+        # `IsTriviallyMovable` no longer uses `downcast`.
+        return {
+            unsafe_ptr = self._data.unsafe_bitcast[U](),
+            length = len(self),
+        }
 
     @inline(.always)
     @__allow_legacy_custom_self_type
@@ -1303,11 +1358,14 @@ struct Span[
         print(squares) # [0, 1, 4, 9, 16]
         ```
         """
+        # `Pointer[U]`, not the `MaybeUninit[U]` elements: see the note in
+        # `unsafe_assume_init`.
+        var data = self._data.unsafe_bitcast[U]()
         for i in range(len(self)):
-            self._data.unsafe_offset(i)[].unsafe_write(
+            data.unsafe_offset(i).unsafe_write(
                 init_with=lambda () {ref} -> U: f(i)
             )
-        return self._unsafe_bitcast_span[U]()
+        return {unsafe_ptr = data, length = len(self)}
 
     @inline(.always)
     @__allow_legacy_custom_self_type

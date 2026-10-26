@@ -21,6 +21,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, TypeVar
 
 import click
@@ -161,7 +162,7 @@ def _handle_import_error(
 
     Args:
         e: The raised error
-        subcommand: The subcommand that was run (i.e. "serve" for `max serve`)
+        subcommand: The subcommand that was run (that is, "serve" for `max serve`)
         suggestion: Which package to install, first item is when using conda, second is for wheels.
     """
 
@@ -195,12 +196,18 @@ def _handle_import_error(
 )
 @click.pass_context
 def main(ctx: click.Context, log_level: str = "INFO") -> None:
+    from max._entrypoints.allocator import reexec_with_jemalloc
     from max._entrypoints.cli.entrypoint import configure_cli_logging
 
     # Configure logging first, before any other initialization
     configure_cli_logging(
         level=log_level, log_prefix=os.getenv("MAX_SERVE_LOG_PREFIX")
     )
+
+    # Swapping the allocator restarts the process, so it has to happen before
+    # anything with a side effect. Logging is set up first only so that the
+    # decision is visible at debug level.
+    reexec_with_jemalloc()
 
     # Some subcommands opt out of telemetry.
     if ctx.invoked_subcommand not in _TELEMETRY_OPT_OUT_COMMANDS:
@@ -210,10 +217,8 @@ def main(ctx: click.Context, log_level: str = "INFO") -> None:
 def configure_telemetry(subcommand: str) -> None:
     try:
         from max.serve.config import Settings
-        from max.serve.telemetry.common import (
-            configure_metrics,
-            configure_tracing,
-        )
+        from max.serve.telemetry._tracing import configure_tracing
+        from max.serve.telemetry.common import configure_metrics
     except ImportError as e:
         # Note: most commands import main(), and thus run this, so this catches most subcommands.
         _handle_import_error(
@@ -400,7 +405,9 @@ def click_option_requires(
     default=None,
     help=(
         "[--cascade] Number of local GPU worker subprocesses. When unset, "
-        "auto-sized from ``--devices`` (one per distinct GPU set)."
+        "auto-sized from ``--devices`` (one per distinct GPU set). With "
+        "``--cascade-local-cpu-workers 0`` and no remote CPU workers, every "
+        "worker runs in the server process and this must be unset or 0."
     ),
 )
 @click_option_requires("cascade")(
@@ -483,6 +490,12 @@ def cli_serve(
         setting_kwargs["MAX_SERVE_MAX_PENDING_REQUESTS"] = max_pending_requests
 
     settings = Settings(**setting_kwargs)
+
+    if (
+        click.get_current_context().get_parameter_source("cascade")
+        is click.core.ParameterSource.DEFAULT
+    ):
+        config_kwargs.pop("cascade", None)
 
     # Initialize config, and serve.
     # Load tokenizer & pipeline.
@@ -570,6 +583,286 @@ def cli_serve(
     help=(
         "Images to include along with prompt, specified as URLs."
         " The images are ignored if the model does not support"
+        " image inputs. An image generation model takes one input"
+        " image, if it reads one."
+    ),
+)
+@click.option(
+    "--num-warmups",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Number of warmup iterations to run before the final timed run.",
+)
+@click.option(
+    "--profile",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help=(
+        "Capture a rudimentary profile of the timed run. If Nsight Systems "
+        "(`nsys`) and an NVIDIA GPU are available, captures the GPU kernel "
+        "trace into an .nsys-rep file and prints the top kernels. Always "
+        "captures a Python/CPU profile via cProfile."
+    ),
+)
+@click.option(
+    "--profile-output",
+    type=str,
+    default=None,
+    help=(
+        "Path for the .nsys-rep file when `--profile` is on. Default: "
+        "$BUILD_WORKSPACE_DIRECTORY/max-profile.nsys-rep, or "
+        "./max-profile.nsys-rep."
+    ),
+)
+@click.option(
+    "--profile-top-n",
+    type=int,
+    default=15,
+    show_default=True,
+    help="Number of rows to show in the GPU kernel and Python profile tables.",
+)
+@click.option(
+    "--negative-prompt",
+    type=str,
+    default=None,
+    help="For an image model, what to steer the image away from.",
+)
+@click.option(
+    "--height",
+    type=int,
+    default=None,
+    help="For an image model, the image height in pixels.",
+)
+@click.option(
+    "--width",
+    type=int,
+    default=None,
+    help="For an image model, the image width in pixels.",
+)
+@click.option(
+    "--num-inference-steps",
+    type=click.IntRange(min=1),
+    default=None,
+    help="For an image model, the number of denoising steps.",
+)
+@click.option(
+    "--guidance-scale",
+    type=float,
+    default=None,
+    help="For an image model, the guidance scale.",
+)
+@click.option(
+    "--true-cfg-scale",
+    type=float,
+    default=None,
+    help=(
+        "For an image model, the true classifier-free guidance scale. "
+        "Models that use it need it above 1 and --negative-prompt."
+    ),
+)
+@click.option(
+    "--strength",
+    type=float,
+    default=None,
+    help=(
+        "For an image model, how far the input image is noised, in (0, 1]. "
+        "Z-Image reads it, and FLUX.2 ignores it."
+    ),
+)
+@click.option(
+    "--num-images-per-prompt",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="For an image model, the number of images to generate.",
+)
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path),
+    default=Path("image.png"),
+    show_default=True,
+    help=(
+        "For an image model, where to save the image. The suffix picks the "
+        "format, several images get -0, -1 and so on, and a path without a "
+        "suffix is a directory, created with its parents if missing."
+    ),
+)
+def cli_pipeline(
+    prompt: str,
+    image_url: list[str],
+    num_warmups: int,
+    profile: bool,
+    profile_output: str | None,
+    profile_top_n: int,
+    negative_prompt: str | None,
+    height: int | None,
+    width: int | None,
+    num_inference_steps: int | None,
+    guidance_scale: float | None,
+    true_cfg_scale: float | None,
+    strength: float | None,
+    num_images_per_prompt: int,
+    output: Path,
+    top_k: int,
+    top_p: float,
+    min_p: float,
+    temperature: float,
+    frequency_penalty: float,
+    presence_penalty: float,
+    repetition_penalty: float,
+    max_new_tokens: int,
+    min_new_tokens: int,
+    ignore_eos: bool,
+    stop: list[str],
+    stop_token_ids: list[int],
+    detokenize: bool,
+    seed: int,
+    **config_kwargs: Any,
+) -> None:
+    """Generate text or images using the specified model.
+
+    This command runs text generation using the loaded model, optionally
+    accepting image inputs for multimodal models. For an image generation
+    model, it saves the generated images, and --image_url gives the input
+    image.
+    """
+    from max._entrypoints.cli.generate import (
+        check_flags_fit_model,
+        generate_images_for_pipeline,
+        generate_text_for_pipeline,
+        is_image_generation_model,
+    )
+    from max.pipelines import PipelineArgs
+    from max.pipelines.context import SamplingParams, SamplingParamsInput
+    from max.profiler import maybe_reexec_under_nsys
+
+    ctx = click.get_current_context()
+    # A boolean pair is named by both spellings, since either may be the one
+    # the user passed.
+    set_flags = {
+        param.name: "/".join(param.opts + param.secondary_opts)
+        for param in ctx.command.params
+        if param.name is not None
+        and ctx.get_parameter_source(param.name)
+        not in (None, click.core.ParameterSource.DEFAULT)
+    }
+    # When --profile is set and we have a usable nsys + NVIDIA GPU, re-exec
+    # under nsys *before* loading any model state. The child process picks
+    # up the same argv, detects it is running under nsys, and runs normally.
+    # This keeps the parent process's wasted work to ~zero.
+    if profile:
+        # An image model would fail under nsys and hide the error behind
+        # nsys's own, so the flags are checked before the re-exec.
+        args = PipelineArgs.from_flat_kwargs(**config_kwargs)
+        check_flags_fit_model(
+            set_flags, is_image_generation_model(args), args.model_path
+        )
+        maybe_reexec_under_nsys(profile_output, top_n=profile_top_n)
+
+    params = SamplingParamsInput(
+        top_k=top_k,
+        top_p=top_p,
+        min_p=min_p,
+        temperature=temperature,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
+        # Limit generate default max_new_tokens to 100.
+        max_new_tokens=max_new_tokens or 100,
+        min_new_tokens=min_new_tokens,
+        ignore_eos=ignore_eos,
+        stop=stop,
+        stop_token_ids=stop_token_ids,
+        detokenize=detokenize,
+        seed=seed,
+    )
+
+    # Load tokenizer & pipeline.
+    from max.pipelines.lib import MAXModelConfig
+
+    # Leaves the field unset unless the user passed the flag, so the AMD
+    # default in _with_debug_defaults can apply.
+    if (
+        click.get_current_context().get_parameter_source(
+            "disable_vendor_blas_fallback"
+        )
+        is click.core.ParameterSource.DEFAULT
+    ):
+        config_kwargs.pop("disable_vendor_blas_fallback", None)
+
+    pipeline_args = PipelineArgs.from_flat_kwargs(**config_kwargs)
+    image_model = is_image_generation_model(pipeline_args)
+    check_flags_fit_model(set_flags, image_model, pipeline_args.model_path)
+    if image_model:
+        generate_images_for_pipeline(
+            pipeline_args,
+            prompt,
+            image_url,
+            output,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            true_cfg_scale=true_cfg_scale,
+            strength=strength,
+            num_images_per_prompt=num_images_per_prompt,
+            seed=seed if seed is not None else 0,
+        )
+        return
+    model_config = MAXModelConfig.from_pipeline_args(pipeline_args)
+    generate_text_for_pipeline(
+        pipeline_args,
+        sampling_params=SamplingParams.from_input_and_generation_config(
+            params,
+            sampling_params_defaults=model_config.sampling_params_defaults,
+        ),
+        prompt=prompt,
+        image_urls=image_url,
+        num_warmups=num_warmups,
+        profile=profile,
+        profile_top_n=profile_top_n,
+    )
+
+
+@main.command(name="quantize", cls=WithLazySamplingAndPipelineOptions)
+@click.option(
+    "--targets",
+    default=[
+        r"^language_model\.layers\.\d+\.mlp\.down_proj$",
+        r"^language_model\.layers\.\d+\.self_attn\.o_proj$",
+    ],
+    type=str,
+    multiple=True,
+    help="Tensor-name regex to quantize (repeatable)",
+)
+@click.option(
+    "--quantization-format",
+    type=str,
+    default="nvfp4",
+    show_default=True,
+    help=(
+        "Format the targeted weights are quantized into on load. Only"
+        " formats that can be produced on the fly are accepted; the error"
+        " lists them."
+    ),
+)
+@click.option(
+    "--prompt",
+    type=str,
+    default="I believe the meaning of life is",
+    help="The text prompt to use for further generation.",
+)
+@click.option(
+    "--image_url",
+    type=str,
+    multiple=True,
+    default=[],
+    help=(
+        "Images to include along with prompt, specified as URLs."
+        " The images are ignored if the model does not support"
         " image inputs."
     ),
 )
@@ -609,7 +902,9 @@ def cli_serve(
     show_default=True,
     help="Number of rows to show in the GPU kernel and Python profile tables.",
 )
-def cli_pipeline(
+def quantize(
+    targets: list[str],
+    quantization_format: str,
     prompt: str,
     image_url: list[str],
     num_warmups: int,
@@ -632,12 +927,12 @@ def cli_pipeline(
     seed: int,
     **config_kwargs: Any,
 ) -> None:
-    """Generate text using the specified model.
+    """Quantize the specified model.
 
     This command runs text generation using the loaded model, optionally
     accepting image inputs for multimodal models.
     """
-    from max._entrypoints.cli.generate import generate_text_for_pipeline
+    from max._entrypoints.cli.quantize import quantize_pipeline
     from max.pipelines.context import SamplingParams, SamplingParamsInput
     from max.profiler import maybe_reexec_under_nsys
 
@@ -672,13 +967,15 @@ def cli_pipeline(
 
     pipeline_args = PipelineArgs.from_flat_kwargs(**config_kwargs)
     model_config = MAXModelConfig.from_pipeline_args(pipeline_args)
-    generate_text_for_pipeline(
+    quantize_pipeline(
         pipeline_args,
         sampling_params=SamplingParams.from_input_and_generation_config(
             params,
             sampling_params_defaults=model_config.sampling_params_defaults,
         ),
+        targets=targets,
         prompt=prompt,
+        quantization_format=quantization_format,
         image_urls=image_url,
         num_warmups=num_warmups,
         profile=profile,
@@ -755,6 +1052,37 @@ def cli_warm_cache(target: str | None, **config_kwargs) -> None:
         # `pre-jit` asked for the emitted Mojo and nothing more; the
         # pipeline has nothing left to warm.
         logging.info(str(stopped))
+
+
+@main.command(name="export", cls=WithLazyPipelineOptions)
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path),
+    required=True,
+    help=(
+        "Where to write the pipeline artifact directory. ``.m`` is appended"
+        " if missing. The path must not exist."
+    ),
+)
+def cli_export(output: Path, **config_kwargs: Any) -> None:
+    """Build the pipeline and export it as a ``.m`` pipeline artifact.
+
+    Takes the same pipeline options as ``serve`` and ``generate`` and builds
+    the pipeline the same way, so the artifact holds the graphs a served
+    pipeline compiles, keyed by role.
+    """
+    from max._artifact import ArtifactError
+    from max._artifact.export import export_pipeline
+    from max.pipelines import PipelineArgs, PipelineConfig
+
+    pipeline_config = PipelineConfig.from_args(
+        PipelineArgs.from_flat_kwargs(**config_kwargs)
+    )
+    try:
+        dest = export_pipeline(pipeline_config, output)
+    except ArtifactError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(f"Exported pipeline artifact to {dest}")
 
 
 def _render_warm_progress(

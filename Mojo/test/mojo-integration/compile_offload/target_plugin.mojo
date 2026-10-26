@@ -34,10 +34,42 @@ comptime ParametricTargetWithTypeListPlugin[
     `> : !kgen.target`,
 ]
 
-# Plugin getter that expects a TypeList of AnyType as the payload.
-comptime GetTargetPlugin[T: AnyType, Target: _TargetType]: T = __mlir_attr[
-    `#kgen.get_target_plugin<`, Target, `> : `, +T
+# Plugin getter that expects a TypeList of AnyType as the payload. The fallback
+# is never selected here because every target carries a payload.
+comptime GetTargetPlugin[
+    T: AnyType, Target: _TargetType, Fallback: T
+]: T = __mlir_attr[
+    `#kgen.get_target_plugin<`, Target, `, :`, +T, ` `, Fallback, `> : `, +T
 ]
+
+
+trait Hooks:
+    pass
+
+
+struct PluginOnly(Hooks):
+    pass
+
+
+struct NotHooks:
+    pass
+
+
+# `PluginOnly` is not a parameter of this kernel, so the target's payload is the
+# only path that brings its generator into the sliced module. `NotHooks` does not
+# conform, so an unresolved payload would fold the other way rather than agree.
+def check_plugin_conforms(ptr: Pointer[Int, MutAnyOrigin]):
+    comptime actual = GetTargetPlugin[
+        _MLIR.KGENParamListType[AnyType],
+        _current_target(),
+        TypeList.of[NotHooks]().values,
+    ]
+    var x: Int
+    comptime if conforms_to(actual, Hooks):
+        x = 1
+    else:
+        x = 0
+    ptr[] = x
 
 
 # `_current_target()` inside an offloaded function is the target
@@ -47,7 +79,11 @@ def check_plugin[
     Expected: TypeList[Trait=AnyType, ...]
 ](ptr: Pointer[Int, MutAnyOrigin]):
     comptime actual = TypeList[
-        GetTargetPlugin[_MLIR.KGENParamListType[AnyType], _current_target()]
+        GetTargetPlugin[
+            _MLIR.KGENParamListType[AnyType],
+            _current_target(),
+            TypeList.of[Float32]().values,
+        ]
     ]()
     comptime assert actual.length == Expected.length, "plugin length mismatch"
 
@@ -86,6 +122,20 @@ def main():
             check_plugin[Us],
             target=CompilationTarget[
                 _mlir_value=ParametricTargetWithTypeListPlugin[Us]
+            ](),
+            emission_kind="llvm",
+        ]().asm
+    )
+
+    comptime Ps = TypeList.of[PluginOnly]()
+    # CHECK: target triple = "aarch64-unknown-linux-gnu"
+    # CHECK: define {{.*}}check_plugin_conforms
+    # CHECK: store i64 1
+    print(
+        compile_info[
+            check_plugin_conforms,
+            target=CompilationTarget[
+                _mlir_value=ParametricTargetWithTypeListPlugin[Ps]
             ](),
             emission_kind="llvm",
         ]().asm

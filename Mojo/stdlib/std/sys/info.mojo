@@ -21,10 +21,14 @@ print(CompilationTarget.is_x86())
 ```
 """
 
+from std.builtin.rebind import downcast
+from std.builtin.variadics import _MLIR
 from std.collections.string.string_span import _get_kgen_string
 from std.ffi import _external_call_const, external_call
 
-from std._gpu.host.info import GPUInfo, get_gpu_target, TargetAccelerator
+from std._plugin.selector import TargetPluginSelector
+from std._plugin import StdPlugin, PluginHooks, TargetDeviceKind
+from std._plugin._triple_default import _default_std_plugin
 
 comptime _TargetType = __mlir_type.`!kgen.target`
 
@@ -32,6 +36,59 @@ comptime _TargetType = __mlir_type.`!kgen.target`
 @inline(.nodebug)
 def _current_target() -> _TargetType:
     return __mlir_attr.`#kgen.param.expr<current_target> : !kgen.target`
+
+
+def current_accelerator() -> type_of(CompilationTarget.current()):
+    """Get the current compilation target, which must be an accelerator.
+
+    This function returns a value identical to `CompilationTarget.current()`,
+    but will error during compilation if the current target is not an
+    accelerator.
+
+    This function is expected to only be called within an offload compilation
+    (`compile_info`).
+
+    Prefer this function over `default_accelerator()` when used in Mojo code
+    intended only for use on an accelerators, such as kernel implementations.
+    Code that may run in host elaboration context should avoid this function.
+
+    Constraints:
+        The compilation target of the current compilation context must be an
+        accelerator target.
+
+    Returns:
+        A value representing the current accelerator target.
+    """
+    comptime target = CompilationTarget.current()
+
+    comptime assert target.is_accelerator(), String(
+        __get_current_function_name(),
+        "() requires an accelerator compilation target,",
+        " but the current compilation target is '",
+        StaticString(target.__triple()),
+        "' (arch: '",
+        StaticString(target.__arch()),
+        "'). This function is only valid in code compiled for an accelerator,",
+        " such as a GPU kernel or a function passed to `compile_info` with an",
+        " accelerator `target`. To get the accelerator configured for this",
+        " build from host code, use `default_accelerator()` instead.",
+    )
+
+    return target
+
+
+comptime _ANY = "<any>"
+
+comptime _empty_target = __mlir_attr[
+    `#kgen.target<triple = "", `,
+    `arch = "", `,
+    `features = "", `,
+    `data_layout="",`,
+    `index_bit_width = 0,`,
+    `simd_bit_width = 0`,
+    `> : !kgen.target`,
+]
+"""Empty target configuration for when no GPU is available."""
 
 
 struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
@@ -47,62 +104,48 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
         _mlir_value: The raw target architecture to query. Defaults to the current target.
     """
 
+    # FIXME(MOCO-5023):
+    #   The comptime interpreter will incorrectly optimize out side effects from
+    #   calls to functions that return empty structs, so use a dummy field to
+    #   make this struct non-empty.
+    #
+    #   This ensures that in a call like `current_accelerator().is_amd_gpu()`,
+    #   any assertions inside of `current_accelerator()` can still fire when
+    #   that condition is being evaluated by the comptime interpreter.
+    var _dummy: Int
+
+    @always_inline("builtin")
     def __init__(out self):
         """Initialize a `CompilationTarget` with the default target."""
-        pass
+        self._dummy = 0
 
-    @staticmethod
-    @inline(.nodebug)
-    def current() -> CompilationTarget[_mlir_value=_current_target()]:
-        """Get the current compilation target.
+    # ===-------------------------------------------------------------------===#
+    # Factory methods
+    # ===-------------------------------------------------------------------===#
 
-        This can vary within a single Mojo compiler invocation, depending on
-        the compilation context of a given piece of Mojo code:
+    comptime current = CompilationTarget[_mlir_value=_current_target()]
+    """Get the current compilation target.
 
-        * Typically, this is the host compilation target, configured by the
-          [target options](https://mojolang.org/docs/cli/build/#target-options),
-          such as `--target-triple`, `--target-cpu`, and `--target-features`.
+    This can vary within a single Mojo compiler invocation, depending on
+    the compilation context of a given piece of Mojo code:
 
-        * Within an accelerator "offload" compilation, this is the accelerator
-          target, equivalent to `CompilationTarget.current_accelerator()`.
+    * Typically, this is the host compilation target, configured by the
+        [target options](https://mojolang.org/docs/cli/build/#target-options),
+        such as `--target-triple`, `--target-cpu`, and `--target-features`.
 
-        Returns:
-            A value representing the current compilation target.
-        """
-        return {}
+    * Within an accelerator "offload" compilation, this is the accelerator
+        target, typically equivalent to `max.gpu.host.default_accelerator()`.
 
-    @staticmethod
-    @inline(.nodebug)
-    def current_accelerator() -> type_of(get_gpu_target()):
-        """Get the accelerator target.
+    Returns:
+        A value representing the current compilation target.
+    """
 
-        This value is derived from the `--target-accelerator` command line flag.
+    comptime _unknown = CompilationTarget[_mlir_value=_empty_target]
+    """Get an empty target configuration representing an unknown target."""
 
-        Constraints:
-            An accelerator target must be configured.
-
-        Returns:
-            A value representing the current accelerator target.
-        """
-        return {}
-
-    @doc_hidden
-    @staticmethod
-    @inline(.nodebug)
-    def from[
-        info: GPUInfo
-    ]() -> CompilationTarget[
-        _mlir_value=TargetAccelerator.from_gpu_name[info.name].mlir_target
-    ]:
-        return {}
-
-    @doc_hidden
-    @staticmethod
-    @inline(.nodebug)
-    def from_gpu_arch[
-        target_arch: StaticString
-    ]() -> type_of(get_gpu_target[target_arch]()):
-        return {}
+    # ===-------------------------------------------------------------------===#
+    # Methods
+    # ===-------------------------------------------------------------------===#
 
     @inline(.nodebug)
     @staticmethod
@@ -120,12 +163,26 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
             note: Optional additional note to print.
         """
 
-        comptime note_text = String(" Note: ", note.value() if note else "")
+        comptime note_text = String(" Note: ", note.or_else(""))
         comptime msg = "Current compilation target does not support"
         comptime op_text = String(
             " operation: ", operation.value(), "."
         ) if operation else " this operation."
         comptime assert False, String(msg, op_text, note_text)
+
+    @inline(.nodebug)
+    @staticmethod
+    def is_triple[name: StringLiteral]() -> Bool:
+        """Returns True if the triple of this target matches the input and
+        False otherwise.
+
+        Parameters:
+            name: The name of the triple value.
+
+        Returns:
+            True if the triple matches and False otherwise.
+        """
+        return StringLiteral[Self.__triple()]()._is_identical(name)
 
     @inline(.nodebug)
     @staticmethod
@@ -145,6 +202,10 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
             _get_kgen_string[name](),
             `> : i1`,
         ]
+
+    # ===----------------------------------------------------------------------=== #
+    # Target attribute getters
+    # ===----------------------------------------------------------------------=== #
 
     @inline(.nodebug)
     @staticmethod
@@ -184,13 +245,9 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
             True if the target processor is the same as the given name, False
             otherwise.
         """
-        return __mlir_attr[
-            `#kgen.param.identical<`,
-            Self.__arch(),
-            `, `,
-            _get_kgen_string[name](),
-            `> : !kgen.scalar<bool>`,
-        ]
+        return StringLiteral[Self.__arch()]()._is_identical(
+            StringLiteral._from[name]()
+        )
 
     @inline(.nodebug)
     @staticmethod
@@ -206,6 +263,16 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
             `#kgen.param.expr<target_get_field,`,
             Self._mlir_value,
             `, "triple_arch" : !kgen.string`,
+            `> : !kgen.string`,
+        ]
+
+    @inline(.nodebug)
+    @staticmethod
+    def __triple() -> __mlir_type.`!kgen.string`:
+        return __mlir_attr[
+            `#kgen.param.expr<target_get_field,`,
+            Self._mlir_value,
+            `, "triple" : !kgen.string`,
             `> : !kgen.string`,
         ]
 
@@ -225,13 +292,29 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
             True if the target's architecture is the same as the given name,
             False otherwise.
         """
-        return __mlir_attr[
-            `#kgen.param.identical<`,
-            Self.__triple_arch(),
-            `, `,
-            _get_kgen_string[name](),
-            `> : !kgen.scalar<bool>`,
-        ]
+        return StringLiteral[Self.__triple_arch()]()._is_identical(
+            StringLiteral._from[name]()
+        )
+
+    @staticmethod
+    def _eq_triple_and_arch[other: CompilationTarget]() -> Bool:
+        """Checks whether this target and `other` have the same triple and
+        processor architecture.
+
+        Other target properties, such as features, are not compared.
+
+        Parameters:
+            other: The target to compare against.
+
+        Returns:
+            True if both the triple and the processor architecture are the same
+            as those of `other`, False otherwise.
+        """
+        return StringLiteral[Self.__triple()]()._is_identical(
+            StringLiteral[other.__triple()]()
+        ) and StringLiteral[Self.__arch()]()._is_identical(
+            StringLiteral[other.__arch()]()
+        )
 
     @inline(.nodebug)
     @staticmethod
@@ -244,6 +327,41 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
         ]
         return StaticString(res)
 
+    # ===----------------------------------------------------------------------=== #
+    # Plugin attribute access
+    # ===----------------------------------------------------------------------=== #
+
+    comptime _first_conforming_plugin[
+        Trait: type_of(AnyType), *, default: Trait
+    ] = TargetPluginSelector[
+        Self(),
+        default,
+    ].selected
+    """The first conforming plugin implementing `Trait` set on this target, or
+    `default` if no such plugin is set.
+
+    Parameters:
+        Trait: The plugin trait to look for.
+        default: The default implementation of `Trait` to use if no conforming plugin is set.
+    """
+
+    comptime _std_plugin: StdPlugin = Self._first_conforming_plugin[
+        StdPlugin, default=_default_std_plugin[Self()]
+    ]
+    """The stdlib plugin selected for this target, before specialization.
+
+    A plugin registry whose plugin the target's payload doesn't name falls back
+    to matching this plugin's `name`, so every registry agrees on a target's
+    vendor.
+    """
+
+    comptime stdlib_plugin: PluginHooks = Self._std_plugin.HookFor[Self()]
+    """The stdlib plugin to use for this target."""
+
+    # ===----------------------------------------------------------------------=== #
+    # Predicates
+    # ===----------------------------------------------------------------------=== #
+
     @inline(.nodebug)
     @staticmethod
     def default_compile_options() -> StaticString:
@@ -253,7 +371,7 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
             The string of default compile options for the compilation target.
         """
 
-        comptime if is_triple["nvptx64-nvidia-cuda", Self()]():
+        comptime if Self.is_triple["nvptx64-nvidia-cuda"]():
             # TODO: use `is_nvidia_gpu` when moved to into this struct.
             return "target-abi=shortptr"
         else:
@@ -517,6 +635,15 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
         return Self._is_arch["apple-m5"]()
 
     @staticmethod
+    def is_apple_m6() -> Bool:
+        """Check if the target is an Apple M6 system.
+
+        Returns:
+            True if the host system is an Apple M6, False otherwise.
+        """
+        return Self._is_arch["apple-m6"]()
+
+    @staticmethod
     def is_apple_silicon() -> Bool:
         """Check if the host system is an Apple Silicon with AMX support.
 
@@ -530,6 +657,7 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
             or Self.is_apple_m3()
             or Self.is_apple_m4()
             or Self.is_apple_m5()
+            or Self.is_apple_m6()
         )
 
     @staticmethod
@@ -542,7 +670,231 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
         """
         return Self._is_arch["neoverse-n1"]()
 
+    # ===----------------------------------------------------------------------=== #
+    # Accelerators
+    # ===----------------------------------------------------------------------=== #
+
+    # TODO(MOCO-5022): Make these @staticmethod's once side effect bug is fixed
+    @inline(.nodebug)
+    def is_cpu(self) -> Bool:
+        """Returns True if the target is a recognized general-purpose CPU
+        architecture (x86, ARM, or RISC-V), and False otherwise.
+
+        This is a closed list rather than `not self.is_accelerator()` to avoid
+        accidentally classifying unknown non-accelerator targets as CPUs.
+        Targets with an unlisted architecture are neither a CPU nor an
+        accelerator.
+
+        Returns:
+            True if the target is a known CPU target, and False otherwise.
+        """
+        # FIXME(MSTDL-3279): Add other host architectures here if they become
+        # supported platforms.
+        return self.is_x86() or self.is_arm() or self.is_riscv()
+
+    # TODO(MOCO-5022): Make these @staticmethod's once side effect bug is fixed
+    @inline(.nodebug)
+    def device_kind(self) -> TargetDeviceKind:
+        """Returns the kind of device the target is, as its stdlib plugin's
+        hooks declare it.
+
+        Prefer `is_gpu()` and `is_accelerator()` for branching; this is for
+        code that needs the kind itself, such as a diagnostic.
+
+        Returns:
+            The target's device kind.
+        """
+        return Self.stdlib_plugin.device_kind
+
+    # TODO(MOCO-5022): Make these @staticmethod's once side effect bug is fixed
+    @inline(.nodebug)
+    def is_accelerator(self) -> Bool:
+        """Returns True if the target is an accelerator, and False otherwise.
+
+        The target's stdlib plugin decides: a GPU is an accelerator, and an
+        `other` device kind says whether it is one.
+
+        Returns:
+            True if the target is an accelerator and False otherwise.
+        """
+        comptime match Self.stdlib_plugin.device_kind:
+            case .cpu:
+                return False
+            case .gpu:
+                return True
+            case .other(other):
+                # The payload is the device's name and whether it accelerates.
+                return other[1]
+
+    # TODO(MOCO-5022): Make these @staticmethod's once side effect bug is fixed
+    @inline(.nodebug)
+    def is_gpu(self) -> Bool:
+        """Returns True if the target is a SIMT GPU and False otherwise.
+
+        The target's stdlib plugin decides, so a GPU from a vendor the stdlib
+        doesn't name is still a GPU once its plugin says so.
+
+        Returns:
+            True if the target is a GPU and False otherwise.
+        """
+        comptime match Self.stdlib_plugin.device_kind:
+            case .cpu:
+                return False
+            case .gpu:
+                return True
+            case .other(_):
+                return False
+
+    # NOTE: Uses a sentinel instead of Optional to avoid recursive elaboration.
+    # TODO(MOCO-5022): Make these @staticmethod's once side effect bug is fixed
+    @inline(.nodebug)
+    def is_nvidia_gpu[subarch: StaticString = _ANY](self) -> Bool:
+        """Returns True if the target triple is `nvptx64-nvidia-cuda`,
+        and optionally if the target is also the specified sub-architecture, and False otherwise.
+
+        Parameters:
+            subarch: The subarchitecture (e.g. sm_80) (defaults to any).
+
+        Returns:
+            True if the triple target is cuda and False otherwise.
+        """
+        comptime is_nvidia = Self.is_triple["nvptx64-nvidia-cuda"]()
+
+        comptime if not StringLiteral._from[subarch]()._is_identical(_ANY):
+            return is_nvidia and Self._is_arch[subarch]()
+        else:
+            return is_nvidia
+
+    # NOTE: Uses a sentinel instead of Optional to avoid recursive elaboration.
+    # TODO(MOCO-5022): Make these @staticmethod's once side effect bug is fixed
+    @inline(.nodebug)
+    def is_amd_gpu[subarch: StaticString = _ANY](self) -> Bool:
+        """Returns True if the target triple is an AMD GPU triple, and
+        optionally if the target is also the specified sub-architecture,
+        and False otherwise.
+
+        Parameters:
+            subarch: The AMD GPU sub-architecture to check for (e.g., "gfx90a")
+                (defaults to any).
+
+        Returns:
+            True if the triple target is amdgpu and False otherwise.
+        """
+        # Matches on the triple's canonical architecture rather than the whole
+        # triple: AMD names the subarch in the arch field, so there is one triple
+        # spelling per GPU, and LLVM canonicalises all of them -- including the
+        # legacy `amdgcn` -- to `amdgpu`.
+        comptime is_amd = Self._is_triple_arch["amdgpu"]()
+
+        comptime if not StringLiteral._from[subarch]()._is_identical(_ANY):
+            return is_amd and Self._is_arch[subarch]()
+        else:
+            return is_amd
+
+    # NOTE: Uses a sentinel instead of Optional to avoid recursive elaboration.
+    # TODO(MOCO-5022): Make these @staticmethod's once side effect bug is fixed
+    @inline(.nodebug)
+    def is_apple_gpu[subarch: StaticString = _ANY](self) -> Bool:
+        """Returns True if the target triple is for Apple GPU (Metal, `air64-apple-macosx`),
+        and optionally if the target is alos the specified sub-architecture, and False otherwise.
+
+        Parameters:
+            subarch: The subarchitecture (e.g. sm_80) (defaults to any).
+
+        Returns:
+            True if the triple target is Apple GPU and False otherwise.
+        """
+        comptime is_apple = Self.is_triple["air64-apple-macosx"]()
+
+        comptime if not StringLiteral._from[subarch]()._is_identical(_ANY):
+            return is_apple and Self._is_arch[subarch]()
+        else:
+            return is_apple
+
+    # ===----------------------------------------------------------------------=== #
+    # Nvidia Architectures
+    # ===----------------------------------------------------------------------=== #
+
+    @inline(.nodebug)
+    def _is_nvidia_gpu_any[archs: List[StaticString]](self) -> Bool:
+        comptime if not Self().is_nvidia_gpu():
+            return False
+
+        comptime for arch in archs:
+            comptime if Self().is_nvidia_gpu[arch]():
+                return True
+        return False
+
+    @inline(.nodebug)
+    def _is_sm_8x(self) -> Bool:
+        return self._is_nvidia_gpu_any[_SM_80X_ARCHS]()
+
+    @inline(.nodebug)
+    def _is_sm_9x(self) -> Bool:
+        return self._is_nvidia_gpu_any[_SM_90X_ARCHS]()
+
+    @inline(.nodebug)
+    def _has_blackwell_tcgen05(self) -> Bool:
+        return self._is_nvidia_gpu_any[
+            _SM_100X_ARCHS + _SM_101X_ARCHS + _SM_103X_ARCHS
+        ]()
+
+    @inline(.nodebug)
+    def _is_sm_100x(self) -> Bool:
+        return self._is_nvidia_gpu_any[_SM_100X_ARCHS]()
+
+    @inline(.nodebug)
+    def _is_sm_101x(self) -> Bool:
+        return self._is_nvidia_gpu_any[_SM_101X_ARCHS]()
+
+    @inline(.nodebug)
+    def _is_sm_103x(self) -> Bool:
+        return self._is_nvidia_gpu_any[_SM_103X_ARCHS]()
+
+    @inline(.nodebug)
+    def _is_sm_110x(self) -> Bool:
+        return self._is_nvidia_gpu_any[_SM_110X_ARCHS]()
+
+    @inline(.nodebug)
+    def _is_sm_120x(self) -> Bool:
+        return self._is_nvidia_gpu_any[_SM_120X_ARCHS]()
+
+    @inline(.nodebug)
+    def _is_sm_121x(self) -> Bool:
+        return self._is_nvidia_gpu_any[_SM_121X_ARCHS]()
+
+    #
+    # 'or newer' variants
+    #
+
+    @inline(.nodebug)
+    def _is_sm_8x_or_newer(self) -> Bool:
+        return self._is_sm_8x() or self._is_sm_9x_or_newer()
+
+    @inline(.nodebug)
+    def _is_sm_9x_or_newer(self) -> Bool:
+        return self._is_sm_9x() or self._is_sm_100x_or_newer()
+
+    @inline(.nodebug)
+    def _is_sm_100x_or_newer(self) -> Bool:
+        return (
+            self._has_blackwell_tcgen05()
+            or self._is_sm_100x()
+            or self._is_sm_103x()
+            or self._is_sm_110x_or_newer()
+        )
+
+    @inline(.nodebug)
+    def _is_sm_110x_or_newer(self) -> Bool:
+        return self._is_sm_110x() or self._is_sm_120x_or_newer()
+
+    @inline(.nodebug)
+    def _is_sm_120x_or_newer(self) -> Bool:
+        return self._is_sm_120x() or self._is_sm_121x()
+
+    # ===----------------------------------------------------------------------=== #
     # OS
+    # ===----------------------------------------------------------------------=== #
 
     @staticmethod
     def is_linux() -> Bool:
@@ -601,6 +953,33 @@ def platform_map[
         CompilationTarget.unsupported_target_error[operation=operation]()
 
 
+struct _UnsupportedTarget[name: StaticString]:
+    pass
+
+
+comptime platform_type_map[
+    Trait: type_of(AnyType) = AnyType,
+    *,
+    linux: AnyType = _UnsupportedTarget["linux"],
+    macos: AnyType = _UnsupportedTarget["macos"],
+] = downcast[
+    # fmt: off
+    linux if CompilationTarget.is_linux() else
+    macos if CompilationTarget.is_macos() else
+    _UnsupportedTarget[CompilationTarget._os()],
+    # fmt: on
+    Trait,
+]
+"""Selects a type for the current compilation target, the type-level
+counterpart of `platform_map`.
+
+Parameters:
+    Trait: The trait every given type conforms to.
+    linux: The type to use on Linux.
+    macos: The type to use on macOS.
+"""
+
+
 @inline(.nodebug)
 def _accelerator_arch() -> StaticString:
     """Returns the accelerator architecture string for the current target
@@ -617,136 +996,8 @@ def _accelerator_arch() -> StaticString:
     )
 
 
-# ===-----------------------------------------------------------------------===#
-# Vendor
-# ===-----------------------------------------------------------------------===#
-
-
-@fieldwise_init
-struct Vendor(Equatable, TrivialRegisterPassable, Writable):
-    """Represents GPU vendors.
-
-    This struct provides identifiers for different GPU vendors and utility
-    methods for comparison and string representation.
-
-    The struct defines a constant for each vendor the stdlib knows about and a
-    `NO_GPU` option for systems without an accelerator. It provides comparison
-    operators and string conversion methods for vendor identification.
-
-    It classifies the accelerator the compiler is targeting, which is what
-    `has_amd_gpu_accelerator()`, `has_nvidia_gpu_accelerator()` and
-    `has_apple_gpu_accelerator()` report. To identify a specific device, use
-    `GPUInfo.api`.
-    """
-
-    var _value: Int8
-    """The underlying integer value representing the vendor."""
-
-    comptime NO_GPU = Self(0)
-    """Represents no GPU or CPU-only execution."""
-
-    comptime AMD_GPU = Self(1)
-    """Represents AMD GPU vendor."""
-
-    comptime NVIDIA_GPU = Self(2)
-    """Represents NVIDIA GPU vendor."""
-
-    comptime APPLE_GPU = Self(3)
-    """Represents Apple GPU vendor."""
-
-    def __eq__(self, other: Self) -> Bool:
-        """Checks if two `Vendor` instances are equal.
-
-        Args:
-            other: The `Vendor` to compare with.
-
-        Returns:
-            True if vendors are equal, False otherwise.
-        """
-        return self._value == other._value
-
-    def __ne__(self, other: Self) -> Bool:
-        """Checks if two `Vendor` instances are not equal.
-
-        Args:
-            other: The `Vendor` to compare with.
-
-        Returns:
-            True if vendors are not equal, False otherwise.
-        """
-        return not (self == other)
-
-    @inline(.never)
-    def write_to(self, mut writer: Some[Writer]):
-        """Writes vendor information to a writer.
-
-        Args:
-            writer: The writer to output vendor information to.
-        """
-        if self == Vendor.NO_GPU:
-            writer.write("no_gpu")
-            return
-        if self == Vendor.AMD_GPU:
-            writer.write("amd_gpu")
-            return
-        if self == Vendor.APPLE_GPU:
-            writer.write("apple_gpu")
-            return
-        if self == Vendor.NVIDIA_GPU:
-            writer.write("nvidia_gpu")
-            return
-
-        # Unreachable. Can't use `os.abort` here (`std.os` imports `std.sys`,
-        # so it would cycle) nor `assert False` (elided under `-D ASSERT=none`);
-        # trap directly, as `os.abort` itself does.
-        __mlir_op.`llvm.intr.trap`()
-
-
 @inline(.nodebug)
-def _vendor_from_arch[arch: StaticString]() -> Vendor:
-    """Classifies an accelerator architecture string to its GPU `Vendor`.
-
-    This is the single source of truth for arch-string -> vendor mapping. It
-    recognizes bare architectures ("gfx950", "sm_90", "apple-m4"),
-    vendor-prefixed forms ("amdgpu:gfx950", "amd:gfx950", "nvidia:sm_90",
-    "metal:4"), and the generic "cuda" target, mapping each to the same vendor.
-
-    Only vendor-relevant substrings are matched. Unknown or empty arch strings
-    classify to `Vendor.NO_GPU`.
-
-    Parameters:
-        arch: The raw accelerator architecture string (e.g. from
-            `_accelerator_arch()`).
-
-    Returns:
-        The `Vendor` the architecture belongs to, or `Vendor.NO_GPU` if it is
-        empty or unrecognized.
-    """
-    # NOTE: use `in`-substring matching only (never `StaticString.startswith`,
-    # which miscompiles in deep comptime instantiation contexts; see MOCO-4328).
-    comptime if "amd" in arch or "gfx" in arch or "mi" in arch:
-        return Vendor.AMD_GPU
-    elif "nvidia" in arch or "sm" in arch or arch == "cuda":
-        return Vendor.NVIDIA_GPU
-    elif "metal" in arch or "apple" in arch:
-        return Vendor.APPLE_GPU
-    else:
-        return Vendor.NO_GPU
-
-
-@inline(.nodebug)
-def _triple_attr[
-    target: _TargetType = _current_target()
-]() -> __mlir_type.`!kgen.string`:
-    return __mlir_attr[
-        `#kgen.param.expr<target_get_field,`,
-        target,
-        `, "triple" : !kgen.string`,
-        `> : !kgen.string`,
-    ]
-
-
-@inline(.nodebug)
+@deprecated("use CompilationTarget.is_triple instead")
 def is_triple[
     name: StringLiteral, target: CompilationTarget = CompilationTarget.current()
 ]() -> Bool:
@@ -760,198 +1011,47 @@ def is_triple[
     Returns:
         True if the triple matches and False otherwise.
     """
-    return __mlir_attr[
-        `#kgen.param.identical<`,
-        _triple_attr[target._mlir_value](),
-        `, `,
-        name.value,
-        `> : !kgen.scalar<bool>`,
-    ]
-
-
-@inline(.nodebug)
-def _is_nvidia_gpu_any[archs: List[StaticString]]() -> Bool:
-    comptime for arch in archs:
-        comptime if is_nvidia_gpu[arch]():
-            return True
-    return False
-
-
-@inline(.nodebug)
-def _has_nvidia_gpu_any[archs: List[StaticString]]() -> Bool:
-    comptime if not has_nvidia_gpu_accelerator():
-        return False
-
-    comptime for arch in archs:
-        comptime if arch.removeprefix("sm_") in _accelerator_arch():
-            return True
-    return False
+    return target.is_triple[name]()
 
 
 comptime _SM_80X_ARCHS: List[StaticString] = ["sm_80", "sm_86", "sm_89"]
-
-
-@inline(.nodebug)
-def _is_sm_8x() -> Bool:
-    return _is_nvidia_gpu_any[_SM_80X_ARCHS]()
-
-
-@inline(.nodebug)
-def _has_sm_8x() -> Bool:
-    return _has_nvidia_gpu_any[_SM_80X_ARCHS]()
-
-
 comptime _SM_90X_ARCHS: List[StaticString] = ["sm_90", "sm_90a"]
-
-
-@inline(.nodebug)
-def _is_sm_9x() -> Bool:
-    return _is_nvidia_gpu_any[_SM_90X_ARCHS]()
-
-
-@inline(.nodebug)
-def _has_sm_9x() -> Bool:
-    return _has_nvidia_gpu_any[_SM_90X_ARCHS]()
-
-
 comptime _SM_100X_ARCHS: List[StaticString] = ["sm_100", "sm_100a"]
-
-
-@inline(.nodebug)
-def _is_sm_100x() -> Bool:
-    return _is_nvidia_gpu_any[_SM_100X_ARCHS]()
-
-
-@inline(.nodebug)
-def _has_sm_100x() -> Bool:
-    return _has_nvidia_gpu_any[_SM_100X_ARCHS]()
-
-
 comptime _SM_101X_ARCHS: List[StaticString] = ["sm_101", "sm_101a"]
-
-
-@inline(.nodebug)
-def _is_sm_101x() -> Bool:
-    return _is_nvidia_gpu_any[_SM_101X_ARCHS]()
-
-
-@inline(.nodebug)
-def _has_sm_101x() -> Bool:
-    return _has_nvidia_gpu_any[_SM_101X_ARCHS]()
-
-
 comptime _SM_103X_ARCHS: List[StaticString] = ["sm_103", "sm_103a"]
-
-
-@inline(.nodebug)
-def _is_sm_103x() -> Bool:
-    return _is_nvidia_gpu_any[_SM_103X_ARCHS]()
-
-
-@inline(.nodebug)
-def _has_sm_103x() -> Bool:
-    return _has_nvidia_gpu_any[_SM_103X_ARCHS]()
-
-
 comptime _SM_110X_ARCHS: List[StaticString] = ["sm_110", "sm_110a"]
-
-
-@inline(.nodebug)
-def _is_sm_110x() -> Bool:
-    return _is_nvidia_gpu_any[_SM_110X_ARCHS]()
-
-
-@inline(.nodebug)
-def _has_sm_110x() -> Bool:
-    return _has_nvidia_gpu_any[_SM_110X_ARCHS]()
-
-
 comptime _SM_120X_ARCHS: List[StaticString] = ["sm_120", "sm_120a"]
-
-
-@inline(.nodebug)
-def _is_sm_120x() -> Bool:
-    return _is_nvidia_gpu_any[_SM_120X_ARCHS]()
-
-
-@inline(.nodebug)
-def _has_sm_120x() -> Bool:
-    return _has_nvidia_gpu_any[_SM_120X_ARCHS]()
-
-
 comptime _SM_121X_ARCHS: List[StaticString] = ["sm_121", "sm_121a"]
 
 
 @inline(.nodebug)
-def _is_sm_121x() -> Bool:
-    return _is_nvidia_gpu_any[_SM_121X_ARCHS]()
+def _is_sm_9x() -> Bool:
+    return CompilationTarget.current()._is_sm_9x()
 
 
 @inline(.nodebug)
-def _has_sm_121x() -> Bool:
-    return _has_nvidia_gpu_any[_SM_121X_ARCHS]()
+def _is_sm_100x() -> Bool:
+    return CompilationTarget.current()._is_sm_100x()
 
 
 @inline(.nodebug)
-def _has_blackwell_tcgen05() -> Bool:
-    return _has_nvidia_gpu_any[
-        _SM_100X_ARCHS + _SM_101X_ARCHS + _SM_103X_ARCHS
-    ]()
-
-
-@inline(.nodebug)
-def _is_sm_8x_or_newer() -> Bool:
-    return _is_sm_8x() or _is_sm_9x_or_newer()
-
-
-@inline(.nodebug)
-def _has_sm_8x_or_newer() -> Bool:
-    return _has_sm_8x() or _has_sm_9x_or_newer()
+def _is_sm_110x() -> Bool:
+    return CompilationTarget.current()._is_sm_110x()
 
 
 @inline(.nodebug)
 def _is_sm_9x_or_newer() -> Bool:
-    return _is_sm_9x() or _is_sm_100x_or_newer()
-
-
-@inline(.nodebug)
-def _has_sm_9x_or_newer() -> Bool:
-    return _has_sm_9x() or _has_sm_100x_or_newer()
+    return CompilationTarget.current()._is_sm_9x_or_newer()
 
 
 @inline(.nodebug)
 def _is_sm_100x_or_newer() -> Bool:
-    return _is_sm_100x() or _is_sm_103x() or _is_sm_110x_or_newer()
-
-
-@inline(.nodebug)
-def _has_sm_100x_or_newer() -> Bool:
-    return (
-        _has_blackwell_tcgen05()
-        or _has_sm_100x()
-        or _has_sm_103x()
-        or _has_sm_110x_or_newer()
-    )
-
-
-@inline(.nodebug)
-def _is_sm_110x_or_newer() -> Bool:
-    return _is_sm_110x() or _is_sm_120x_or_newer()
-
-
-@inline(.nodebug)
-def _has_sm_110x_or_newer() -> Bool:
-    return _has_sm_110x() or _has_sm_120x_or_newer()
+    return CompilationTarget.current()._is_sm_100x_or_newer()
 
 
 @inline(.nodebug)
 def _is_sm_120x_or_newer() -> Bool:
-    return _is_sm_120x() or _is_sm_121x()
-
-
-@inline(.nodebug)
-def _has_sm_120x_or_newer() -> Bool:
-    return _has_sm_120x() or _has_sm_121x()
+    return CompilationTarget.current()._is_sm_120x_or_newer()
 
 
 @inline(.nodebug)
@@ -965,52 +1065,75 @@ def is_apple_m5() -> Bool:
 
 
 @inline(.nodebug)
-def is_apple_gpu() -> Bool:
-    """Returns True if the target triple is for Apple GPU (Metal) and False otherwise.
+def is_apple_m6() -> Bool:
+    """Returns True if the target is an Apple M6 GPU and False otherwise.
 
     Returns:
-        True if the triple target is Apple GPU and False otherwise.
+        True if the target is Apple M6 and False otherwise.
     """
-    return is_triple["air64-apple-macosx"]()
+    return is_apple_gpu() and CompilationTarget.is_apple_m6()
 
 
 @inline(.nodebug)
-def is_apple_gpu[subarch: StaticString]() -> Bool:
-    """Returns True if the target triple of the compiler is `air64-apple-macosx`
-    and we are compiling for the specified sub-architecture and False otherwise.
+def _is_apple_m5_or_newer() -> Bool:
+    return is_apple_m5() or is_apple_m6()
+
+
+@inline(.nodebug)
+def is_gpu() -> Bool:
+    """Returns True if the current target is a GPU and False otherwise.
+
+    Equivalent to `CompilationTarget.current().is_gpu()`.
+
+    Returns:
+        True if the current compilation target is a GPU.
+    """
+    return CompilationTarget.current().is_gpu()
+
+
+@inline(.nodebug)
+def is_nvidia_gpu[subarch: StaticString = _ANY]() -> Bool:
+    """Checks whether the current compilation target is an NVIDIA GPU.
+
+    Equivalent to `CompilationTarget.current().is_nvidia_gpu[subarch]()`.
 
     Parameters:
-        subarch: The subarchitecture (e.g. sm_80).
+        subarch: The GPU sub-architecture to check for.
 
     Returns:
-        True if the triple target is cuda and False otherwise.
+        True if the current compilation target is an NVIDIA GPU.
     """
-    return is_apple_gpu() and CompilationTarget._is_arch[subarch]()
+    return CompilationTarget.current().is_nvidia_gpu[subarch]()
 
 
 @inline(.nodebug)
-def is_nvidia_gpu() -> Bool:
-    """Returns True if the target triple of the compiler is `nvptx64-nvidia-cuda`
-    False otherwise.
+def is_amd_gpu[subarch: StaticString = _ANY]() -> Bool:
+    """Checks whether the current compilation target is an AMD GPU.
 
-    Returns:
-        True if the triple target is cuda and False otherwise.
-    """
-    return is_triple["nvptx64-nvidia-cuda"]()
-
-
-@inline(.nodebug)
-def is_nvidia_gpu[subarch: StaticString]() -> Bool:
-    """Returns True if the target triple of the compiler is `nvptx64-nvidia-cuda`
-    and we are compiling for the specified sub-architecture and False otherwise.
+    Equivalent to `CompilationTarget.current().is_amd_gpu[subarch]()`.
 
     Parameters:
-        subarch: The subarchitecture (e.g. sm_80).
+        subarch: The GPU sub-architecture to check for.
 
     Returns:
-        True if the triple target is cuda and False otherwise.
+        True if the current compilation target is an AMD GPU.
     """
-    return is_nvidia_gpu() and CompilationTarget._is_arch[subarch]()
+    return CompilationTarget.current().is_amd_gpu[subarch]()
+
+
+@inline(.nodebug)
+def is_apple_gpu[subarch: StaticString = _ANY]() -> Bool:
+    """Checks whether the current compilation target is an Apple GPU.
+
+    Equivalent to `CompilationTarget.current().is_apple_gpu[subarch]()`.
+
+    Parameters:
+        subarch: The GPU sub-architecture to check for.
+
+    Returns:
+        True if the current compilation target is an Apple GPU.
+    """
+    return CompilationTarget.current().is_apple_gpu[subarch]()
 
 
 comptime _AMD_GCN_ARCHS: List[StaticString] = [
@@ -1186,17 +1309,24 @@ def _is_amd_mi355x() -> Bool:
 
 
 @inline(.nodebug)
+def _is_amd_mi455x() -> Bool:
+    return is_amd_gpu["gfx1250"]()
+
+
+@inline(.nodebug)
 def _cdna_version() -> Int:
     comptime assert (
-        _is_amd_mi250x() or _is_amd_mi300x() or _is_amd_mi355x()
+        _is_amd_cdna()
     ), "querying the cdna version is only supported on AMD hardware"
 
     comptime if _is_amd_mi250x():
         return 2
     elif _is_amd_mi300x():
         return 3
-    else:
+    elif _is_amd_mi355x():
         return 4
+    else:
+        return 5
 
 
 @inline(.nodebug)
@@ -1214,49 +1344,23 @@ def _cdna_4_or_newer() -> Bool:
 
 
 @inline(.nodebug)
+def _cdna_5_or_newer() -> Bool:
+    comptime if _is_amd_cdna():
+        return _cdna_version() >= 5
+    return False
+
+
+@inline(.nodebug)
 def _is_amd_cdna() -> Bool:
-    return _is_amd_mi250x() or _is_amd_mi300x() or _is_amd_mi355x()
+    return (
+        _is_amd_mi250x()
+        or _is_amd_mi300x()
+        or _is_amd_mi355x()
+        or _is_amd_mi455x()
+    )
 
 
-@inline(.nodebug)
-def is_amd_gpu() -> Bool:
-    """Returns True if the target triple of the compiler is an AMD GPU triple,
-    False otherwise.
-
-    Returns:
-        True if the triple target is amdgpu and False otherwise.
-    """
-    # Matches on the triple's canonical architecture rather than the whole
-    # triple: AMD names the subarch in the arch field, so there is one triple
-    # spelling per GPU, and LLVM canonicalises all of them -- including the
-    # legacy `amdgcn` -- to `amdgpu`.
-    return CompilationTarget._is_triple_arch["amdgpu"]()
-
-
-@inline(.nodebug)
-def is_amd_gpu[subarch: StaticString]() -> Bool:
-    """Returns True if the target triple of the compiler is an AMD GPU triple
-    and we are compiling for the specified sub-architecture, False otherwise.
-
-    Parameters:
-        subarch: The AMD GPU sub-architecture to check for (e.g., "gfx90a").
-
-    Returns:
-        True if the triple target is amdgpu and False otherwise.
-    """
-    return is_amd_gpu() and CompilationTarget._is_arch[subarch]()
-
-
-@inline(.nodebug)
-def is_gpu() -> Bool:
-    """Returns True if the target triple is GPU and False otherwise.
-
-    Returns:
-        True if the triple target is GPU and False otherwise.
-    """
-    return is_nvidia_gpu() or is_amd_gpu() or is_apple_gpu()
-
-
+@deprecated("Use `Endian.native() == .little` instead.")
 @inline(.nodebug)
 def is_little_endian[
     target: CompilationTarget = CompilationTarget.current()
@@ -1269,20 +1373,10 @@ def is_little_endian[
     Returns:
         True if the target is little endian and False otherwise.
     """
-    return __mlir_attr[
-        `#kgen.param.identical<`,
-        __mlir_attr[
-            `#kgen.param.expr<target_get_field,`,
-            target._mlir_value,
-            `, "endianness" : !kgen.string`,
-            `> : !kgen.string`,
-        ],
-        `,`,
-        `"little" : !kgen.string`,
-        `> : !kgen.scalar<bool>`,
-    ]
+    return Endian.native[target]() == .little
 
 
+@deprecated("Use `Endian.native() == .big` instead.")
 @inline(.nodebug)
 def is_big_endian[
     target: CompilationTarget = CompilationTarget.current()
@@ -1295,18 +1389,84 @@ def is_big_endian[
     Returns:
         True if the target is big endian and False otherwise.
     """
-    return __mlir_attr[
-        `#kgen.param.identical<`,
-        __mlir_attr[
-            `#kgen.param.expr<target_get_field,`,
-            target._mlir_value,
-            `, "endianness" : !kgen.string`,
-            `> : !kgen.string`,
-        ],
-        `,`,
-        `"big" : !kgen.string`,
-        `> : !kgen.scalar<bool>`,
-    ]
+    return Endian.native[target]() == .big
+
+
+struct Endian(EnumLike, Equatable, TrivialRegisterPassable, Writable):
+    """A byte order: the order in which a multi-byte value's bytes are stored.
+
+    `big` stores the most significant byte first, which is also the network
+    byte order, and `little` stores the least significant byte first.
+    `Endian.native()` returns whichever of the two the compilation target
+    uses, so data in that order needs no conversion.
+
+    Example:
+
+    ```mojo
+    var bytes = UInt16(8080).as_bytes[endian=.big]()  # [0x1F, 0x90]
+    ```
+    """
+
+    var _value: Int8
+
+    @doc_hidden
+    @inline(.always)
+    def __init__(out self, *, _value: Int8):
+        self._value = _value
+
+    @staticmethod
+    @inline(.always)
+    def native[
+        target: CompilationTarget = CompilationTarget.current()
+    ]() -> Self:
+        """Returns the byte order of a compilation target.
+
+        Parameters:
+            target: The target whose byte order to return.
+
+        Returns:
+            `Endian.big` or `Endian.little`.
+        """
+        var is_big: Bool = __mlir_attr[
+            `#kgen.param.identical<`,
+            __mlir_attr[
+                `#kgen.param.expr<target_get_field,`,
+                target._mlir_value,
+                `, "endianness" : !kgen.string`,
+                `> : !kgen.string`,
+            ],
+            `,`,
+            `"big" : !kgen.string`,
+            `> : !kgen.scalar<bool>`,
+        ]
+        return .big if is_big else .little
+
+    comptime big = Self(_value=0)
+    """Most significant byte first."""
+
+    comptime little = Self(_value=1)
+    """Least significant byte first."""
+
+    # Case names are listed in `_value` order, so `_value` is the
+    # discriminant.
+    comptime _enum_case_names = ParameterList.of[
+        "big".value, "little".value
+    ].values
+    comptime _enum_case_types: _MLIR.KGENParamListType[
+        AnyType
+    ] = TypeList.splat[2, NoneType].values
+
+    @inline(.always)
+    def _get_enum_discriminant(self) -> Int:
+        return Int(self._value)
+
+    @inline(.always)
+    def _unsafe_get_enum_payload[
+        id: Int
+    ](ref self) -> ref[self] TypeList[Trait=AnyType, Self._enum_case_types]()[
+        id
+    ]:
+        comptime assert False, "Endian does not have a payload"
 
 
 @inline(.nodebug)
@@ -1700,23 +1860,6 @@ def has_accelerator() -> Bool:
 
 
 @inline(.nodebug)
-def has_amd_gpu_accelerator() -> Bool:
-    """Returns True if the host system has an AMD GPU and False otherwise.
-
-    Returns:
-        True if the host system has an AMD GPU.
-    """
-    # `_vendor_from_arch` is the single source of truth for classifying the raw
-    # `--target-accelerator` value, whether it is a bare architecture
-    # ("gfx950", "mi300x") or a vendor-prefixed form ("amdgpu:gfx950",
-    # "amd:gfx950"), so a bare target behaves identically to a prefixed one.
-    return (
-        is_amd_gpu()
-        or _vendor_from_arch[_accelerator_arch()]() == Vendor.AMD_GPU
-    )
-
-
-@inline(.nodebug)
 def has_amd_rdna_gpu_accelerator() -> Bool:
     """Returns True if the host system has an AMD RDNA GPU and False otherwise.
 
@@ -1726,68 +1869,4 @@ def has_amd_rdna_gpu_accelerator() -> Bool:
     var arch = _accelerator_arch()
     return (
         _is_amd_rdna() or "gfx10" in arch or "gfx11" in arch or "gfx12" in arch
-    )
-
-
-@inline(.nodebug)
-def has_nvidia_gpu_accelerator() -> Bool:
-    """Returns True if the host system has an NVIDIA GPU and False otherwise.
-
-    Returns:
-        True if the host system has an NVIDIA GPU.
-    """
-    # `_vendor_from_arch` is the single source of truth for classifying the raw
-    # `--target-accelerator` value, whether it is a bare architecture ("sm_90"),
-    # a vendor-prefixed form ("nvidia:sm_90"), or the generic "cuda", so a bare
-    # target behaves identically to a prefixed one.
-    return (
-        is_nvidia_gpu()
-        or _vendor_from_arch[_accelerator_arch()]() == Vendor.NVIDIA_GPU
-    )
-
-
-@inline(.nodebug)
-def has_nvidia_gpu_accelerator[subarch: String]() -> Bool:
-    """Returns True if the host system has an NVIDIA GPU of the specified
-    sub-architecture and False otherwise.
-
-    Parameters:
-        subarch: The NVIDIA GPU sub-architecture to check for (e.g., "sm_80").
-
-    Returns:
-        True if the host system has an NVIDIA GPU of the specified
-        sub-architecture and False otherwise.
-    """
-    return is_nvidia_gpu[subarch]() or subarch in _accelerator_arch()
-
-
-@inline(.nodebug)
-def has_nvidia_gpu_accelerator[subarchs: List[StaticString]]() -> Bool:
-    """Returns True if the host system has an NVIDIA GPU of the specified
-    sub-architecture and False otherwise.
-
-    Parameters:
-        subarchs: The NVIDIA GPU sub-architectures to check for (e.g., ["sm_80", "sm_86"]).
-
-    Returns:
-        True if the host system has an NVIDIA GPU of the specified
-        sub-architecture and False otherwise.
-    """
-    return _is_nvidia_gpu_any[subarchs]() or _has_nvidia_gpu_any[subarchs]()
-
-
-@inline(.nodebug)
-def has_apple_gpu_accelerator() -> Bool:
-    """Returns True if the host system has a Metal GPU and False otherwise.
-
-    Returns:
-        True if the host system has a Metal GPU.
-    """
-    # `_vendor_from_arch` is the single source of truth for classifying the raw
-    # `--target-accelerator` value, whether it is a bare architecture
-    # ("apple-m4") or a vendor-prefixed form ("metal:4"), so a bare target
-    # behaves identically to a prefixed one.
-    return (
-        is_apple_gpu()
-        or _vendor_from_arch[_accelerator_arch()]() == Vendor.APPLE_GPU
     )

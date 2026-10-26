@@ -25,11 +25,11 @@ cta_group 1) and layout B (cta_group 2).
 test_matmul_sm100_partial_n_tile_epilogue covers the compute-lambda path.
 """
 
-from std.collections import Optional
-from std.sys import align_of, size_of
+from std.sys import size_of
 from max.gpu.host import DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.memory import alloc
+from std.memory.alloc import unsafe_alloc
 from internal_utils import assert_almost_equal
 from std.random import rand, seed
 from layout import TileTensor, Coord, CoordLike, row_major, Idx
@@ -39,8 +39,8 @@ from linalg.matmul.gpu.sm100_structured.default.matmul import (
 from linalg.matmul.gpu.sm100_structured.structured_kernels.config import (
     MatmulConfig,
 )
-from linalg.utils import elementwise_epilogue_type
 import linalg.matmul.vendor.blas as vendor_blas
+from std.utils.coord import DynamicCoord
 from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
 
@@ -54,15 +54,15 @@ def test_transposed_epilogue_row_straddle[
     b_type: DType,
     c_type: DType,
     block_tile_shape: IndexList[3],
-    mma_shape: IndexList[3],
+    mma_shape: DynamicCoord[.int, 3],
     cluster_shape: StaticTuple[Int32, 3],
     cta_group: Int,
     transpose_b: Bool = True,
     swapAB: Bool = True,
 ](ctx: DeviceContext, m: MType, n: NType, k: KType) raises:
-    var M = Int(m.value())
-    var N = Int(n.value())
-    var K = Int(k.value())
+    var M = Int(m)
+    var N = Int(n)
+    var K = Int(k)
 
     print(
         t"in/out=({a_type},{b_type},{c_type}) shape=({M},{N},{K})"
@@ -76,23 +76,21 @@ def test_transposed_epilogue_row_straddle[
         NType.static_value * size_of[c_type]() % 16 == 0
     ), "N must keep C's row stride TMA-aligned"
 
-    var a_shape = row_major(Coord(m, Idx[KType.static_value]))
+    var a_shape = row_major(m, Idx[KType.static_value])
     var b_shape = row_major(
-        Coord(
-            Idx[NType.static_value if transpose_b else KType.static_value],
-            Idx[KType.static_value if transpose_b else NType.static_value],
-        )
+        Idx[NType.static_value if transpose_b else KType.static_value],
+        Idx[KType.static_value if transpose_b else NType.static_value],
     )
-    var c_shape = row_major(Coord(m, Idx[NType.static_value]))
+    var c_shape = row_major(m, Idx[NType.static_value])
 
     var a_size = M * K
     var b_size = N * K if transpose_b else K * N
     var c_size = M * N
 
-    var a_host_ptr = alloc[Scalar[a_type]](a_size)
-    var b_host_ptr = alloc[Scalar[b_type]](b_size)
-    var c_host_ptr = alloc[Scalar[c_type]](c_size)
-    var c_host_ref_ptr = alloc[Scalar[c_type]](c_size)
+    var a_host_ptr = unsafe_alloc[Scalar[a_type]](a_size)
+    var b_host_ptr = unsafe_alloc[Scalar[b_type]](b_size)
+    var c_host_ptr = unsafe_alloc[Scalar[c_type]](c_size)
+    var c_host_ref_ptr = unsafe_alloc[Scalar[c_type]](c_size)
 
     var a_host = TileTensor(a_host_ptr, a_shape)
     var b_host = TileTensor(b_host_ptr, b_shape)
@@ -109,16 +107,11 @@ def test_transposed_epilogue_row_straddle[
     var c_tensor = TileTensor(c_device, c_shape)
     var c_ref_tensor = TileTensor(c_device_ref, c_shape)
 
-    @__parameter
-    @inline(.always)
-    @__copy_capture(c_tensor)
     def store_epilogue[
-        _dtype: DType,
-        width: SIMDLength,
-        *,
-        alignment: Int = align_of[SIMD[_dtype, width]](),
-    ](idx: IndexList[2], val: SIMD[_dtype, width]) capturing -> None:
-        c_tensor.store[width=width](Coord(idx), val.cast[c_type]())
+        _dtype: DType, width: SIMDLength, *, alignment: Int
+    ](idx: Coord, val: SIMD[_dtype, width]) {var c_tensor}:
+        comptime assert idx.rank == 2, "the matmul epilogue contract is rank 2"
+        c_tensor.store(idx, val.cast[c_type]())
 
     seed(1234)
     rand(a_host.as_span())
@@ -144,15 +137,16 @@ def test_transposed_epilogue_row_straddle[
         AB_swapped=swapAB,
     )
 
-    comptime optional_lambda_fn = Optional[elementwise_epilogue_type](
-        store_epilogue
-    )
-
     blackwell_matmul_tma_umma_warp_specialized[
         transpose_b=transpose_b,
         config=matmul_config,
-        elementwise_lambda_fn=optional_lambda_fn,
-    ](c_tensor, a_tensor, b_tensor, ctx)
+    ](
+        IndexList[2](Int(c_tensor.dim[0]()), Int(c_tensor.dim[1]())),
+        a_tensor,
+        b_tensor,
+        store_epilogue,
+        ctx,
+    )
 
     vendor_blas.matmul(
         ctx,
@@ -178,10 +172,10 @@ def test_transposed_epilogue_row_straddle[
 
     print("=== TEST PASSED ===")
 
-    a_host_ptr.free()
-    b_host_ptr.free()
-    c_host_ptr.free()
-    c_host_ref_ptr.free()
+    a_host_ptr.unsafe_free()
+    b_host_ptr.unsafe_free()
+    c_host_ptr.unsafe_free()
+    c_host_ref_ptr.unsafe_free()
     _ = a_device^
     _ = b_device^
     _ = c_device^
@@ -199,8 +193,8 @@ def main() raises:
             dtype,
             dtype,
             dtype,
-            Index(64, 64, BK),
-            Index(64, 64, MMA_K),
+            (64, 64, BK),
+            (64, 64, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](2, 1, 1),
             cta_group=1,
         ](ctx, Int(64), Idx[136], Idx[128])
@@ -211,8 +205,8 @@ def main() raises:
             dtype,
             dtype,
             dtype,
-            Index(128, 64, BK),
-            Index(128, 64, MMA_K),
+            (128, 64, BK),
+            (128, 64, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](2, 1, 1),
             cta_group=1,
         ](ctx, Int(300), Idx[776], Idx[128])
@@ -223,8 +217,8 @@ def main() raises:
             dtype,
             dtype,
             dtype,
-            Index(64, 32, BK),
-            Index(128, 64, MMA_K),
+            (64, 32, BK),
+            (128, 64, MMA_K),
             cluster_shape=StaticTuple[Int32, 3](2, 1, 1),
             cta_group=2,
         ](ctx, Int(300), Idx[776], Idx[128])

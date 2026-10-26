@@ -76,7 +76,8 @@ def StructType : DialectType<(type
   TypedAttr:$elementTypesVariadic,
   TypedAttr:$isMemoryOnly,
   TypedAttr:$minAlignment,
-  Bool:$isParamPack
+  Bool:$isParamPack,
+  EnumAttr<"::M::KGEN::StructDomain">:$domain
 )>;
 
 def StructInstanceType : DialectType<(type
@@ -289,6 +290,10 @@ def FuncPtrBitcastAttr : DialectAttribute<(attr
   ConcreteType<"FuncTypeGeneratorType">:$type
 )>;
 
+def QuoteAttr : DialectAttribute<(attr
+  ConcreteAttribute<"TypedAttr">:$quotedParam
+)>;
+
 def GeneratorAttr : DialectAttribute<(attr
   TypeArray:$inputParamTypes,
   ConcreteAttribute<"TypedAttr">:$body,
@@ -337,7 +342,8 @@ def ExportKindAttr : DialectAttribute<(attr
 
 def StructDefFieldAttr : DialectAttribute<(attr
   StringAttr:$name,
-  TypedAttr:$typeValue
+  TypedAttr:$typeValue,
+  ConcreteAttribute<"ArrayAttr">:$annotations
 )>;
 
 def StructAttr : DialectAttribute<(attr
@@ -381,7 +387,7 @@ def VariantAttr : DialectAttribute<(attr
 }
 
 def LinkDependencyArrayAttr : DialectAttribute<(attr
-  ConcreteAttrArray<"FlatSymbolRefAttr">:$value
+  ConcreteAttrArray<"SymbolRefAttr">:$value
 )>;
 
 def PreservedAttr : DialectAttribute<(attr
@@ -453,12 +459,6 @@ def ExtensionAttr : DialectAttribute<(attr
   TypedAttrArray:$extensions
 )>;
 
-def CompileOffloadClosureAttr : DialectAttribute<(attr
-  TypedAttr:$target,
-  TypedAttr:$func,
-  Type:$type
-)>;
-
 def GetLinkageNameAttr : DialectAttribute<(attr
   TypedAttr:$target,
   TypedAttr:$func,
@@ -510,18 +510,28 @@ def StructFieldNamesAttr : DialectAttribute<(attr
   ConcreteType<"ParamListType">:$type
 )>;
 
-def StructAnnotationTypesAttr : DialectAttribute<(attr
-  TypedAttr:$typeValue,
-  TypedAttr:$fieldIndex,
-  ConcreteType<"ParamListType">:$type
+def AnnotationAttr : DialectAttribute<(attr
+  TypedAttr:$value,
+  TypedAttr:$typeValue
 )>;
 
-def StructAnnotationAttr : DialectAttribute<(attr
-  TypedAttr:$typeValue,
-  TypedAttr:$fieldIndex,
+def GetNumAnnotationsAttr : DialectAttribute<(attr
+  TypedAttr:$structTypeValue,
+  OptionalAttribute<"TypedAttr">:$fieldIndex
+)>;
+
+def GetAnnotationValueAttr : DialectAttribute<(attr
+  TypedAttr:$structTypeValue,
+  Type:$metaType,
   TypedAttr:$index,
-  ConcreteType<"ParamListType">:$annotationListType,
-  Type:$type
+  OptionalAttribute<"TypedAttr">:$fieldIndex
+)>;
+
+def GetAnnotationTypeAttr : DialectAttribute<(attr
+  Type:$type,
+  TypedAttr:$structTypeValue,
+  TypedAttr:$index,
+  OptionalAttribute<"TypedAttr">:$fieldIndex
 )>;
 
 def StructFieldIndexByNameAttr : DialectAttribute<(attr
@@ -622,6 +632,7 @@ def KGENDialectAttributes : DialectAttributes<"kgen"> {
     DTypeConstantAttr,
     SymbolConstantAttr,
     FuncSymbolAttr,
+    QuoteAttr,
     GeneratorAttr,
     TargetParamAttr,
     StructDefFieldAttr,
@@ -648,7 +659,6 @@ def KGENDialectAttributes : DialectAttributes<"kgen"> {
     TypeConformsToTraitAttr,
     DowncastAttr,
     ExtensionAttr,
-    CompileOffloadClosureAttr,
     GetLinkageNameAttr,
     GetSourceNameAttr,
     GetFunctionParameterCountAttr,
@@ -680,8 +690,10 @@ def KGENDialectAttributes : DialectAttributes<"kgen"> {
     FnMetadataAttr,
     TraitSymbolAttr,
     TraitSymbolArrayAttr,
-    StructAnnotationTypesAttr,
-    StructAnnotationAttr
+    AnnotationAttr,
+    GetNumAnnotationsAttr,
+    GetAnnotationValueAttr,
+    GetAnnotationTypeAttr
   ];
 }
 

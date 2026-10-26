@@ -1559,9 +1559,13 @@ public:
     });
     valueOrder = &order;
     llvm::scope_exit reset([] { valueOrder = nullptr; });
+    // Local closures were nested functions declaring a parameter until the
+    // legacy capture ABI went (2026-10-21): a closure is now a struct whose
+    // `__call__` holds the body, so none is found here. Kept for the
+    // struct-closure rework.
     fn.walk([&](LIT::FnOp nested) {
       if (nested != fn)
-        if (auto decl = nested.getParamDeclAttr())
+        if (auto decl = nested->getAttrOfType<ParamDeclAttr>("paramDecl"))
           closures[ParamDeclRefAttr::get(decl)] = nested;
     });
     Block &entry = body.front();
@@ -11190,7 +11194,7 @@ struct VerifyContractsPass
     // (a parameter of another call: `vectorize[f]`, a launch) on its own.
     auto calledOnly = [](LIT::FnOp fn) {
       LIT::FnOp outer = fn->getParentOfType<LIT::FnOp>();
-      auto decl = fn.getParamDeclAttr();
+      auto decl = fn->getAttrOfType<ParamDeclAttr>("paramDecl");
       if (!outer || !decl)
         return false;
       Attribute ref = ParamDeclRefAttr::get(decl);
@@ -11347,7 +11351,7 @@ struct VerifyContractsPass
       for (Operation *op :
            SmallVector<Operation *>(wanted.begin(), wanted.end())) {
         auto closure = cast<LIT::FnOp>(op);
-        auto decl = closure.getParamDeclAttr();
+        auto decl = closure->getAttrOfType<ParamDeclAttr>("paramDecl");
         auto outer = closure->getParentOfType<LIT::FnOp>();
         if (!decl || !outer || !calledOnly(closure))
           continue;

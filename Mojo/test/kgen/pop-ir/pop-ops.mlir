@@ -1,4 +1,5 @@
 // RUN: kgen-opt -verify-parameters %s -allow-unregistered-dialect | FileCheck %s
+// RUN: kgen-opt %s -allow-unregistered-dialect | kgen-opt -verify-parameters -allow-unregistered-dialect | FileCheck %s
 
 // CHECK-LABEL: kgen.generator @pointer_type<dt: dtype>(
 kgen.generator @pointer_type<dt: dtype>
@@ -871,6 +872,9 @@ kgen.generator @call_intrinsic<intrin: string>(%arg0: !kgen.scalar<f32>) {
   %0 = pop.call_llvm_intrinsic "llvm.round", (%arg0) : (!kgen.scalar<f32>) -> !kgen.scalar<f32>
   // CHECK-NEXT: pop.call_llvm_intrinsic intrin, ()
   pop.call_llvm_intrinsic intrin, () : () -> ()
+  // A flag that is constant true prints as the bare keyword, which must parse.
+  // CHECK-NEXT: pop.call_llvm_intrinsic side_effecting "llvm.donothing", ()
+  pop.call_llvm_intrinsic side_effecting "llvm.donothing", () : () -> ()
   hlcf.return
 }
 
@@ -904,16 +908,6 @@ kgen.generator @inline_asm<ty: type, dt: dtype>(
   %6 = pop.inline_asm "bar $0", "=r,r", (%arg3) : (!kgen.scalar<dt>) -> i8
   // CHECK: [[RET:%.*]]:2 = pop.inline_asm "bar $0", "=r,=r,r", (%arg0) : (!kgen.scalar<si32>) -> (i8, i8)
   %7:2 = pop.inline_asm "bar $0", "=r,=r,r", (%arg0) : (!kgen.scalar<si32>) -> (i8, i8)
-  hlcf.return
-}
-
-// CHECK-LABEL: @usesAGlobal
-kgen.func @usesAGlobal() {
-  %zero = index.constant 0
-  // CHECK: pop.compiler.global_load "aGlobal" : index
-  %0 = pop.compiler.global_load "aGlobal" : index
-  // CHECK: pop.compiler.global_store "aGlobal", %idx0 : index
-  pop.compiler.global_store "aGlobal", %zero : index
   hlcf.return
 }
 

@@ -18,19 +18,14 @@ from std.format._utils import (
     TypeNames,
 )
 from std.memory import MaybeUninit
-from std.hashlib.hasher import Hasher
+from std.hash.hasher import Hasher
 from std.reflection import call_location
 from std.traits import (
     IsTriviallyCopyable,
     IsTriviallyDeinitable,
     IsTriviallyMovable,
 )
-from ._nicheable import (
-    UnsafeNicheable,
-    NicheIndex,
-    NicheStorageTraits,
-    UnsafeCustomNicheStorage,
-)
+from ._nicheable import UnsafeNicheable, NicheIndex, UnsafeCustomNicheStorage
 from std.os import abort
 from std.sys import align_of, size_of
 
@@ -65,7 +60,7 @@ trait _VariantStorage(Copyable, Deinitable):
         """Initialize storage with a value of type `U`."""
         ...
 
-    def __init__(out self, *, unsafe_uninitialized: ()):
+    def __init__(out self, *, unsafe_uninitialized: Tuple[]):
         """Create storage whose active-type slot is left uninitialized.
 
         The caller must mark the active type with `unsafe_set_active` and then
@@ -222,7 +217,7 @@ struct _NichedOptionalStorage[
             self = Self()
 
     @inline(.always)
-    def __init__(out self, *, unsafe_uninitialized: ()):
+    def __init__(out self, *, unsafe_uninitialized: Tuple[]):
         self._memory = {}
 
     @inline(.always)
@@ -306,7 +301,7 @@ struct _DefaultVariantStorage[*Ts: AnyType](
     var _impl: Self._mlir_type
 
     @inline(.always)
-    def __init__(out self, *, unsafe_uninitialized: ()):
+    def __init__(out self, *, unsafe_uninitialized: Tuple[]):
         __mlir_op.`lit.ownership.mark_initialized`(__get_mvalue_as_litref(self))
 
     @inline(.always)
@@ -321,6 +316,9 @@ struct _DefaultVariantStorage[*Ts: AnyType](
 
     @inline(.always)
     def __init__(out self, *, copy: Self):
+        comptime if Self.__copy_ctor_is_trivial:
+            self._impl = copy._impl
+            return
         self = Self(unsafe_uninitialized=())
         self.get_discriminant() = copy.get_discriminant()
 
@@ -334,6 +332,9 @@ struct _DefaultVariantStorage[*Ts: AnyType](
 
     @inline(.always)
     def __init__(out self, *, deinit move: Self):
+        comptime if Self.__move_ctor_is_trivial:
+            self._impl = move._impl
+            return
         self = Self(unsafe_uninitialized=())
         self.get_discriminant() = move.get_discriminant()
 
@@ -997,7 +998,7 @@ struct Variant[*Ts: AnyType](
     # `@doc_hidden` because a dunder can't be hidden by an underscore name.
 
     @doc_hidden
-    def __init__(out self, *, unsafe_uninitialized: ()):
+    def __init__(out self, *, unsafe_uninitialized: Tuple[]):
         """Create a variant whose active-type slot is left uninitialized.
 
         Args:

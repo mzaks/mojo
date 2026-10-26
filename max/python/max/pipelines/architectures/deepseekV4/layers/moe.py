@@ -47,18 +47,32 @@ reference takes a plain top-k with no group limiting, and ``n_group`` /
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+from functools import partial
+
 import numpy as np
+from max._core.dialects import kgen
 from max.dtype import DType
-from max.graph import DeviceRef, TensorValue, Weight, ops
+from max.graph import (
+    AlgebraicDim,
+    BufferValue,
+    DeviceRef,
+    ShardingStrategy,
+    TensorValue,
+    Weight,
+    ops,
+)
 from max.nn.kernels import (
+    _is_apple_gpu,
     block_scales_interleave,
     grouped_matmul_block_scaled,
-    moe_create_indices,
+    moe_create_indices_with_slots,
+    moe_router_group_limited,
     quantize_dynamic_scaled_float8,
 )
 from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
-from max.nn.quant_config import QuantConfig
+from max.nn.quant_config import QuantConfig, ceildiv
 
 from ..model_config import DeepseekV4Config
 from .quantization import LINEAR_QUANT_BLOCK, linear_for
@@ -73,13 +87,38 @@ def sqrt_softplus(x: TensorValue) -> TensorValue:
     """``F.softplus(x).sqrt()`` -- ``scoring_func: sqrtsoftplus``.
 
     MAX has no ``softplus``, so it is written in the numerically stable form:
-    ``max(x, 0) + log1p(exp(-|x|))``. The naive ``log(1 + exp(x))`` overflows
-    for large positive scores, which is exactly where a routed expert's score
-    lives.
+    ``max(x, 0) + log(1 + exp(-|x|))``. The naive ``log(1 + exp(x))``
+    overflows for large positive scores, which is exactly where a routed
+    expert's score lives. ``log1p`` would add digits only for very negative
+    ``x``, where the score is near 0, and on GPUs it costs two exact divides
+    an element, more than the rest of the router kernel it fuses into.
     """
     zero = ops.constant(0.0, DType.float32, x.device)
-    softplus = ops.max(x, zero) + ops.log1p(ops.exp(-ops.abs(x)))
+    one = ops.constant(1.0, DType.float32, x.device)
+    softplus = ops.max(x, zero) + ops.log(one + ops.exp(-ops.abs(x)))
     return ops.sqrt(softplus)
+
+
+def _swiglu(
+    gate: TensorValue,
+    up: TensorValue,
+    weights: TensorValue | None,
+    swiglu_limit: float,
+    dtype: DType,
+) -> TensorValue:
+    """``silu(gate) * up`` in float32, clamped and weighted, cast to ``dtype``."""
+    gate = ops.cast(gate, DType.float32)
+    up = ops.cast(up, DType.float32)
+    if swiglu_limit > 0:
+        limit = float(swiglu_limit)
+        # Asymmetric on purpose: the reference clamps ``up`` on both sides
+        # but ``gate`` only from above.
+        up = ops.min(ops.max(up, -limit), limit)
+        gate = ops.min(gate, limit)
+    h = ops.silu(gate) * up
+    if weights is not None:
+        h = weights * h
+    return ops.cast(h, dtype)
 
 
 class DeepseekV4Expert(Module):
@@ -90,42 +129,50 @@ class DeepseekV4Expert(Module):
     arithmetic: the reference multiplies in float32 and casts to the model
     dtype afterwards, so the rounding lands on the scaled value.
 
-    ``fp8`` selects the checkpoint's fp8 projections (the shared expert; the
-    routed experts are fp4 and go through :class:`DeepseekV4RoutedExperts`
-    when the model is quantized). With ``config.quant_config`` unset both
-    forms are the plain ``config.dtype`` linears of the dequantized gates.
+    ``linear`` builds each projection from ``(in_dim, out_dim)``: plain
+    ``config.dtype`` linears for the dense routed experts. The shared expert
+    is :class:`DeepseekV4SharedExpert`, which stacks its fp8 ``w1``/``w3``.
     """
 
     def __init__(
-        self, config: DeepseekV4Config, device: DeviceRef, *, fp8: bool = False
+        self, config: DeepseekV4Config, linear: Callable[[int, int], Linear]
     ) -> None:
         super().__init__()
         self.swiglu_limit = config.swiglu_limit
-
-        def make(in_dim: int, out_dim: int) -> Linear:
-            if fp8:
-                return linear_for(config, in_dim, out_dim, device)
-            return Linear(in_dim, out_dim, config.dtype, device)
-
-        self.w1 = make(config.hidden_size, config.moe_intermediate_size)
-        self.w2 = make(config.moe_intermediate_size, config.hidden_size)
-        self.w3 = make(config.hidden_size, config.moe_intermediate_size)
+        self.w1 = linear(config.hidden_size, config.moe_intermediate_size)
+        self.w2 = linear(config.moe_intermediate_size, config.hidden_size)
+        self.w3 = linear(config.hidden_size, config.moe_intermediate_size)
 
     def __call__(
         self, x: TensorValue, weights: TensorValue | None = None
     ) -> TensorValue:
-        gate = ops.cast(self.w1(x), DType.float32)
-        up = ops.cast(self.w3(x), DType.float32)
-        if self.swiglu_limit > 0:
-            limit = ops.constant(self.swiglu_limit, DType.float32, gate.device)
-            # Asymmetric on purpose: the reference clamps ``up`` on both sides
-            # but ``gate`` only from above.
-            up = ops.min(ops.max(up, -limit), limit)
-            gate = ops.min(gate, limit)
-        h = ops.silu(gate) * up
-        if weights is not None:
-            h = weights * h
-        return self.w2(ops.cast(h, x.dtype))
+        h = _swiglu(self.w1(x), self.w3(x), weights, self.swiglu_limit, x.dtype)
+        return self.w2(h)
+
+
+class DeepseekV4SharedExpert(Module):
+    """The shared expert: :class:`DeepseekV4Expert` on the checkpoint's fp8.
+
+    ``w1`` and ``w3`` read the same input, so the adapter stacks them into
+    ``w13`` (``[w1; w3]`` along N) and one GEMM computes both. With
+    ``config.quant_config`` unset the projections are plain ``config.dtype``
+    linears, as for the dequantized gates.
+    """
+
+    def __init__(self, config: DeepseekV4Config, device: DeviceRef) -> None:
+        super().__init__()
+        self.swiglu_limit = config.swiglu_limit
+        hidden = config.hidden_size
+        self.intermediate = config.moe_intermediate_size
+        self.w13 = linear_for(config, hidden, 2 * self.intermediate, device)
+        self.w2 = linear_for(config, self.intermediate, hidden, device)
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        gate_up = self.w13(x)
+        width = int(gate_up.shape[-1])
+        gate = gate_up[..., : self.intermediate]
+        up = gate_up[..., self.intermediate : width]
+        return self.w2(_swiglu(gate, up, None, self.swiglu_limit, x.dtype))
 
 
 class DeepseekV4Gate(Module):
@@ -169,12 +216,21 @@ class DeepseekV4Gate(Module):
         self, x: TensorValue, token_ids: TensorValue
     ) -> tuple[TensorValue, TensorValue]:
         """``[b, s, d]`` and ``[b, s]`` -> weights and indices, both ``[b, s, k]``."""
-        scores = sqrt_softplus(
-            ops.matmul(
-                ops.cast(x, DType.float32),
-                ops.transpose(ops.cast(self.weight, DType.float32), 0, 1),
-            )
+        logits = ops.matmul(
+            ops.cast(x, DType.float32),
+            ops.transpose(ops.cast(self.weight, DType.float32), 0, 1),
         )
+        # The fused router runs full-size expert counts; the minimized
+        # checkpoint's 8 experts take the graph path, as does Metal, whose
+        # warp top-k is wrong (GEX-3342).
+        if (
+            not self.is_hash_routed
+            and x.device.is_gpu()
+            and not _is_apple_gpu()
+            and self.n_routed_experts % 64 == 0
+        ):
+            return self._fused_topk(logits)
+        scores = sqrt_softplus(logits)
         if self.is_hash_routed:
             indices = ops.gather(self.tid2eid, token_ids, axis=0)
         else:
@@ -188,6 +244,35 @@ class DeepseekV4Gate(Module):
         )
         weights = weights / ops.sum(weights, axis=-1)
         return weights * self.route_scale, indices
+
+    def _fused_topk(
+        self, logits: TensorValue
+    ) -> tuple[TensorValue, TensorValue]:
+        """The scored path of :meth:`__call__` as one router kernel (GPU only).
+
+        The kernel keeps the three details above: bias for selection only,
+        normalization over the gathered weights, scaling after it. The rows
+        are flattened before ``sqrt_softplus`` so that chain can fuse into the
+        kernel's input instead of materializing the scores.
+        """
+        batch, seq = logits.shape[0], logits.shape[1]
+        scores = sqrt_softplus(
+            ops.reshape(logits, [batch * seq, self.n_routed_experts])
+        )
+        indices, weights = moe_router_group_limited(
+            scores,
+            self.bias,
+            n_routed_experts=self.n_routed_experts,
+            n_experts_per_tok=self.topk,
+            n_groups=1,
+            topk_group=1,
+            norm_weights=True,
+            routed_scaling_factor=self.route_scale,
+        )
+        return (
+            ops.reshape(weights, [batch, seq, self.topk]),
+            ops.reshape(indices, [batch, seq, self.topk]),
+        )
 
 
 class _PackedExpertWeight(Module):
@@ -241,7 +326,7 @@ class _PackedExpertWeight(Module):
 
 
 def _quantize_rows_for_w4a8(
-    x: TensorValue, quant_config: QuantConfig
+    x: TensorValue, quant_config: QuantConfig, scale_slot: TensorValue
 ) -> tuple[TensorValue, TensorValue]:
     """``act_quant(x, 128, "ue8m0")`` laid out for the 32-group W4A8 kernel.
 
@@ -251,8 +336,11 @@ def _quantize_rows_for_w4a8(
     kernel the identical activation codes and scales, so the result matches
     the reference bit for bit (PROGRESS-194-QUANT §1, route (a)). Quantizing
     at 32 directly changes 27 % of the codes and cannot be gated exactly.
+
+    ``x`` holds one row per slot, packed by expert. The codes stay packed;
+    only the scales are laid out by ``scale_slot`` (the slot whose scales
+    each scale row holds) into the 128-row-aligned tiles the kernel reads.
     """
-    rows = int(x.shape[0])
     width = int(x.shape[1])
     quantized, scales = quantize_dynamic_scaled_float8(
         ops.cast(x, DType.bfloat16),
@@ -262,15 +350,36 @@ def _quantize_rows_for_w4a8(
         out_type=DType.float8_e4m3fn,
         scales_type=DType.float8_e8m0fnu,
     )
-    # scales: [K/128, rows padded to 16] -> [rows, K/128] -> [rows, K/32].
+    # scales: [K/128, rows padded to 16] -> [rows, K/128] -> scale rows ->
+    # [scale rows, K/32].
     groups = width // LINEAR_QUANT_BLOCK
     repeat = LINEAR_QUANT_BLOCK // FP4_WEIGHT_BLOCK
-    per_row = ops.transpose(scales[:, 0:rows], 0, 1)
+    per_row = ops.transpose(scales[:, 0 : x.shape[0]], 0, 1)
+    per_row = ops.gather(per_row, scale_slot, axis=0)
+    rows = scale_slot.shape[0]
     per_row = ops.reshape(
         ops.broadcast_to(ops.unsqueeze(per_row, -1), [rows, groups, repeat]),
         [rows, groups * repeat],
     )
     return quantized, block_scales_interleave(per_row, FP4_WEIGHT_BLOCK)
+
+
+def local_expert_groups(
+    router_idx: TensorValue, first: int, n_local: int
+) -> tuple[TensorValue, TensorValue]:
+    """Groups slots by the experts ``[first, first + n_local)`` one module holds.
+
+    Returns each slot's group, in ``[0, n_local]``, and whether it is local.
+    Group ``g < n_local`` is expert ``first + g``. Every other id -- another
+    device's expert, or one outside the expert range such as the -1 that GPU
+    ``top_k`` returns for a NaN score row -- goes to the trailing group
+    ``n_local``.
+    """
+    is_local = ops.logical_and(
+        ops.greater_equal(router_idx, first),
+        ops.greater(first + n_local, router_idx),
+    )
+    return ops.where(is_local, router_idx - first, n_local), is_local
 
 
 class DeepseekV4RoutedExperts(Module):
@@ -281,16 +390,17 @@ class DeepseekV4RoutedExperts(Module):
     untouched: the gate still supplies ``(weights, indices)``, hash-routed or
     scored, and this only groups the ``[tokens, k]`` slots.
 
-    Token layout: slots sorted by expert are laid into a buffer where each
-    expert's group starts at a 128-row boundary (the exclusive prefix sum of
-    the group sizes rounded up to 128). The gap rows between a
-    group's last token and the next boundary belong to the group as zero rows
-    -- the kernel takes contiguous groups, so they cost a little work and no
-    correctness -- and the A-scale tiles then need no per-expert offset
-    (``a_scale_offsets = 0``). Up to 127 wasted rows per active expert; fine
-    for bringup, a grouped-quantize variant that writes the tile layout
-    directly is the real fix at 256 experts (DECISIONS D23).
+    Token layout: the activations are the slots sorted by expert, packed,
+    one row each. Only the A-side scales are padded: the kernel reads each
+    group's scales from 128-row tiles of its own, located per group by
+    ``a_scale_offsets`` (``start // 128 + offset`` is the group's first
+    tile, the layout ``ep_comm``'s ``pad_expert_offsets`` builds). So the
+    quantize and the GEMMs touch the slots only, and the padding -- up to
+    127 rows per non-empty group -- costs one scale gather.
     """
+
+    # Where ``slot_weight`` multiplies into the gate/up -> down-proj chain.
+    _weight_after_down_proj = False
 
     def __init__(self, config: DeepseekV4Config, device: DeviceRef) -> None:
         super().__init__()
@@ -308,28 +418,59 @@ class DeepseekV4RoutedExperts(Module):
         self.down_proj = _PackedExpertWeight(
             self.n_experts, self.hidden, self.inter, device
         )
+        # The global id of this module's first expert; with ``n_experts`` it
+        # names the experts it holds. All of them unless expert-parallel.
+        self.expert_offset = 0
+        self.n_global_experts = self.n_experts
+
+    def shard_experts(self, num_devices: int) -> None:
+        """Declares the expert-parallel split: whole experts along axis 0."""
+        for proj in (self.gate_up_proj, self.down_proj):
+            proj.weight.sharding_strategy = ShardingStrategy.axiswise(
+                0, num_devices
+            )
+            proj.weight_scale.sharding_strategy = ShardingStrategy.axiswise(
+                0, num_devices
+            )
+
+    def keep_local_experts(self, num_devices: int, rank: int) -> None:
+        """Makes this replica hold the ``rank``-th run of :meth:`shard_experts`."""
+        local = self.n_global_experts // num_devices
+        self.n_experts = local
+        self.expert_offset = rank * local
+        self.gate_up_proj.n_experts = local
+        self.down_proj.n_experts = local
 
     def _grouped(
         self,
         proj: _PackedExpertWeight,
         x: TensorValue,
         a_offsets: TensorValue,
+        scale_offsets: TensorValue,
+        scale_slot: TensorValue,
         expert_ids: TensorValue,
     ) -> TensorValue:
-        quantized, a_scales = _quantize_rows_for_w4a8(x, self.quant_config)
-        device = x.device
-        zeros_u32 = ops.constant(
-            np.zeros(self.n_experts, np.uint32), DType.uint32, device
+        quantized, a_scales = _quantize_rows_for_w4a8(
+            x, self.quant_config, scale_slot
         )
+        device = x.device
         ones_f32 = ops.constant(
             np.ones(self.n_experts, np.float32), DType.float32, device
         )
         # Host-side usage stats: the kernel only reads the active-expert count
-        # here; the max-tokens slot is an estimate the padded buffer bounds.
-        usage = ops.constant(
-            np.array([int(x.shape[0]), self.n_experts], np.uint32),
-            DType.uint32,
-            DeviceRef.CPU(),
+        # here; the max-tokens slot is an estimate the row count bounds.
+        # Both are host values; the row count is read off the (symbolic)
+        # shape at run time.
+        usage = ops.concat(
+            [
+                ops.cast(ops.shape_to_tensor([x.shape[0]]), DType.uint32),
+                ops.constant(
+                    np.array([self.n_experts], np.uint32),
+                    DType.uint32,
+                    DeviceRef.CPU(),
+                ),
+            ],
+            axis=0,
         )
         return grouped_matmul_block_scaled(
             quantized,
@@ -337,7 +478,7 @@ class DeepseekV4RoutedExperts(Module):
             a_scales,
             proj(device),
             a_offsets,
-            zeros_u32,
+            scale_offsets,
             expert_ids,
             ones_f32,
             usage,
@@ -351,100 +492,144 @@ class DeepseekV4RoutedExperts(Module):
 
         The sum over a token's ``k`` expert outputs, in float32, before the
         shared expert is added (the reference's ``y[idx] += expert(...)``).
+        Only the slots routed to this module's experts contribute; the rest
+        are zero: other devices' experts when expert-parallel, and any id
+        outside the expert range.
         """
-        device = x.device
-        tokens = int(x.shape[0])
-        slots = tokens * self.topk
-        padded = slots + SF_ROWS * self.n_experts
-        i32 = DType.int32
+        slots = x.shape[0] * self.topk
+        router_idx, is_local = local_expert_groups(
+            ops.reshape(indices, [slots]), self.expert_offset, self.n_experts
+        )
+        return self._routed(x, weights, router_idx, is_local)
 
-        router_idx = ops.reshape(indices, [slots])
-        order, start, restore, expert_ids, _usage = moe_create_indices(
-            router_idx, self.n_experts
-        )
-        order = ops.cast(order, i32)
-        restore = ops.cast(restore, i32)
-        start = ops.cast(start, i32)
+    def _activate_and_down(
+        self,
+        gate_up: TensorValue,
+        slot_weight: TensorValue,
+        a_offsets: TensorValue,
+        scale_offsets: TensorValue,
+        scale_slot: TensorValue,
+        expert_ids: TensorValue,
+    ) -> TensorValue:
+        """The clamped SwiGLU over ``gate_up``, then the down projection.
 
-        # Each group's rows begin at a 128-row boundary: aligned_start[g] is
-        # the exclusive prefix sum of the group sizes rounded up to 128, and
-        # group g owns [aligned_start[g], aligned_start[g + 1]) including its
-        # trailing zero rows. This is the layout MAX's grouped quantize kernel
-        # pads to, so the kernel's tile lookup needs no per-group offset.
-        counts = start[1 : self.n_experts + 1] - start[0 : self.n_experts]
-        rows_128 = ops.constant(SF_ROWS, i32, device)
-        aligned_counts = (
-            ops.floor_div(
-                counts + ops.constant(SF_ROWS - 1, i32, device), rows_128
-            )
-            * rows_128
-        )
-        aligned_start = ops.concat(
-            [
-                ops.constant(np.zeros(1, np.int32), i32, device),
-                ops.cumsum(aligned_counts, axis=0),
-            ],
-            axis=0,
-        )
-        a_offsets = ops.cast(aligned_start, DType.uint32)
-
-        # Sorted slot i of group g -> padded row aligned_start[g] + (i - start[g]).
-        slot_expert = ops.gather(router_idx, order, axis=0)
-        slot_rows = ops.range(
-            0, slots, 1, out_dim=slots, dtype=i32, device=device
-        )
-        slot_pad = (
-            slot_rows
-            + ops.gather(aligned_start[0 : self.n_experts], slot_expert, axis=0)
-            - ops.gather(start[0 : self.n_experts], slot_expert, axis=0)
-        )
-
-        # Padded row -> token (``tokens`` = the appended zero row).
-        slot_token = ops.cast(
-            ops.floor_div(order, ops.constant(self.topk, i32, device)), i32
-        )
-        row_token = ops.scatter(
-            ops.constant(np.full(padded, tokens, np.int32), i32, device),
-            slot_token,
-            slot_pad,
-            axis=0,
-        )
-        x_ext = ops.concat(
-            [
-                x,
-                ops.constant(
-                    np.zeros((1, self.hidden), np.float32), x.dtype, device
-                ),
-            ],
-            axis=0,
-        )
-        x_pad = ops.gather(x_ext, row_token, axis=0)
-        slot_weight = ops.gather(ops.reshape(weights, [slots]), order, axis=0)
-        row_weight = ops.scatter(
-            ops.constant(np.zeros(padded, np.float32), DType.float32, device),
-            ops.cast(slot_weight, DType.float32),
-            slot_pad,
-            axis=0,
-        )
-
-        gate_up = self._grouped(self.gate_up_proj, x_pad, a_offsets, expert_ids)
+        Rows stay in sorted-slot order. ``slot_weight`` multiplies in here
+        only when :attr:`_weight_after_down_proj` is False; otherwise the
+        caller weights the returned rows.
+        """
         gate, up = ops.split(gate_up, [self.inter, self.inter], axis=1)
         gate = ops.cast(gate, DType.float32)
         up = ops.cast(up, DType.float32)
         if self.swiglu_limit > 0:
-            limit = ops.constant(self.swiglu_limit, DType.float32, device)
+            limit = float(self.swiglu_limit)
             # Asymmetric on purpose: the reference clamps ``up`` on both sides
             # but ``gate`` only from above.
             up = ops.min(ops.max(up, -limit), limit)
             gate = ops.min(gate, limit)
-        h = ops.silu(gate) * up * ops.unsqueeze(row_weight, -1)
-        down = self._grouped(self.down_proj, h, a_offsets, expert_ids)
-
-        out = ops.gather(ops.gather(down, slot_pad, axis=0), restore, axis=0)
-        out = ops.reshape(
-            ops.cast(out, DType.float32), [tokens, self.topk, self.hidden]
+        h = ops.silu(gate) * up
+        if not self._weight_after_down_proj:
+            h = h * ops.unsqueeze(slot_weight, -1)
+        return self._grouped(
+            self.down_proj, h, a_offsets, scale_offsets, scale_slot, expert_ids
         )
-        return ops.cast(ops.squeeze(ops.sum(out, axis=1), axis=1), x.dtype)
+
+    def _routed(
+        self,
+        x: TensorValue,
+        weights: TensorValue,
+        router_idx: TensorValue,
+        is_local: TensorValue,
+    ) -> TensorValue:
+        """:meth:`__call__` over ``router_idx`` in ``[0, n_experts]``.
+
+        The trailing group ``n_experts`` is not multiplied; ``is_local`` (per
+        slot) masks its rows' output, which the GEMMs leave unwritten.
+        """
+        # ``tokens`` is symbolic in the serving graph (the batch's ragged
+        # row count), so every length below is a shape expression and every
+        # value derived from it is read at run time.
+        tokens = x.shape[0]
+        slots = tokens * self.topk
+        groups = self.n_experts + 1
+        # Scale rows only: every group's scales start on a 128-row tile. Only
+        # non-empty groups take tiles, and there are at most min(groups,
+        # slots) of them, so a decode step lays out a few tiles, not one per
+        # group.
+        padded = SF_ROWS * (
+            ceildiv(slots, SF_ROWS)
+            + AlgebraicDim.apply(kgen.POC.min, groups, slots)
+        )
+
+        # One kernel buckets the slots and lays out what the GEMMs read: the
+        # group CSR (a_offsets), each sorted slot's token row and weight, and
+        # the scale tiles. Group g's scales occupy the 128-row tiles from
+        # aligned_start[g], the exclusive prefix sum of the group sizes
+        # rounded up to 128; the GEMM finds that first tile as start[g] //
+        # 128 plus the group's scale offset. Scale row r of group g holds
+        # sorted slot start[g] + (r - aligned_start[g]) while that is below
+        # start[g + 1]; the rest of the tile is never multiplied into a
+        # stored row and holds slot 0, as do the rows past every group.
+        (
+            _order,
+            a_offsets,
+            restore,
+            expert_ids,
+            _usage,
+            scale_offsets,
+            slot_token,
+            slot_weight,
+            scale_slot,
+        ) = moe_create_indices_with_slots(
+            router_idx,
+            ops.cast(ops.reshape(weights, [slots]), DType.float32),
+            groups,
+            slot_stride=self.topk,
+            scale_rows=padded,
+            # ``local_expert_groups`` already mapped the ids to groups in
+            # ``[0, n_experts]``, so the kernel's own mapping must be the
+            # identity: zero offset, and the trailing id ``n_experts`` falls
+            # through ``local >= local_experts`` unchanged.
+            expert_offset=0,
+            local_experts=self.n_experts,
+        )
+        a_offsets = a_offsets[0 : self.n_experts + 1]
+        scale_offsets = scale_offsets[0 : self.n_experts]
+        expert_ids = expert_ids[0 : self.n_experts]
+
+        x_sorted = ops.gather(x, slot_token, axis=0)
+
+        gate_up = self._grouped(
+            self.gate_up_proj,
+            x_sorted,
+            a_offsets,
+            scale_offsets,
+            scale_slot,
+            expert_ids,
+        )
+        down = self._activate_and_down(
+            gate_up,
+            slot_weight,
+            a_offsets,
+            scale_offsets,
+            scale_slot,
+            expert_ids,
+        )
+        if self._weight_after_down_proj:
+            down = ops.cast(down, DType.float32) * ops.unsqueeze(
+                slot_weight, -1
+            )
+
+        out = ops.gather(down, restore, axis=0)
+        out = ops.cast(out, DType.float32)
+        # ``where``, not a multiply: the masked rows hold whatever the GEMM
+        # left there, NaN included.
+        out = ops.where(ops.unsqueeze(is_local, -1), out, 0.0)
+        out = ops.reshape(out, [tokens, self.topk, self.hidden])
+        routed = ops.squeeze(ops.sum(out, axis=1), axis=1)
+        if self.n_experts != self.n_global_experts:
+            # Kept float32 for the all-reduce, as the reference's ``y``.
+            return routed
+        return ops.cast(routed, x.dtype)
 
 
 class DeepseekV4MoE(Module):
@@ -462,13 +647,113 @@ class DeepseekV4MoE(Module):
         if self.native_experts:
             self.experts = DeepseekV4RoutedExperts(config, device)
         else:
+            dense = partial(Linear, dtype=config.dtype, device=device)
             self.experts = LayerList(
                 [
-                    DeepseekV4Expert(config, device)
+                    DeepseekV4Expert(config, dense)
                     for _ in range(config.n_routed_experts)
                 ]
             )
-        self.shared_experts = DeepseekV4Expert(config, device, fp8=True)
+        self.shared_experts = DeepseekV4SharedExpert(config, device)
+        # Global ids of the routed experts this module computes.
+        self.local_experts = range(config.n_routed_experts)
+
+    def shard_experts(self, num_devices: int) -> None:
+        """Declares the reference's expert-parallel split.
+
+        Each device owns a contiguous run of ``n_routed_experts / n`` whole
+        experts. The gate (``tid2eid`` included) and the shared expert are
+        replicated. The dense experts keep a replicated copy each; a replica
+        just does not compute the ones it does not own.
+        """
+        if self.n_routed_experts % num_devices:
+            raise ValueError(
+                f"{self.n_routed_experts} routed experts do not split across "
+                f"{num_devices} devices"
+            )
+        if self.native_experts:
+            assert isinstance(self.experts, DeepseekV4RoutedExperts)
+            self.experts.shard_experts(num_devices)
+
+    def keep_local_experts(self, num_devices: int, rank: int) -> None:
+        """Makes this replica compute only its run of :meth:`shard_experts`."""
+        local = self.n_routed_experts // num_devices
+        self.local_experts = range(rank * local, (rank + 1) * local)
+        if self.native_experts:
+            assert isinstance(self.experts, DeepseekV4RoutedExperts)
+            self.experts.keep_local_experts(num_devices, rank)
+
+    def routed(self, x: TensorValue, token_ids: TensorValue) -> TensorValue:
+        """``[b, s, hidden]`` -> float32 ``[b, s, hidden]``, the reference's
+        ``y`` before its all-reduce: this module's experts' share only.
+        """
+        weights, indices = self.gate(x, token_ids)
+        hidden = int(x.shape[-1])
+        batch, seq = x.shape[0], x.shape[1]
+        if self.native_experts:
+            assert isinstance(self.experts, DeepseekV4RoutedExperts)
+            routed = self.experts(
+                ops.reshape(x, [batch * seq, hidden]),
+                ops.reshape(weights, [batch * seq, self.experts.topk]),
+                ops.reshape(indices, [batch * seq, self.experts.topk]),
+            )
+            return ops.reshape(
+                ops.cast(routed, DType.float32), [batch, seq, hidden]
+            )
+        assert isinstance(self.experts, LayerList)
+        per_expert = self._per_expert_weights(weights, indices)
+        y: TensorValue | None = None
+        for i in self.local_experts:
+            out = ops.cast(
+                self.experts[i](x, per_expert[..., i : i + 1]), DType.float32
+            )
+            y = out if y is None else y + out
+        assert y is not None
+        return y
+
+    @staticmethod
+    def tensor_parallel(
+        moes: Sequence[DeepseekV4MoE],
+        xs: Sequence[TensorValue],
+        token_ids: Sequence[TensorValue],
+        signal_buffers: Sequence[BufferValue],
+    ) -> list[TensorValue]:
+        """:meth:`__call__` expert-parallel; ``moes`` holds a replica each.
+
+        As ``MoE.forward``: every device sums its own experts' outputs, the
+        sum is all-reduced in float32, and only then is the shared expert
+        added. Adding it before would count it once per device.
+        """
+        partials = [
+            moe.routed(x, tok)
+            for moe, x, tok in zip(moes, xs, token_ids, strict=True)
+        ]
+        reduced = ops.allreduce.sum(partials, signal_buffers)
+        return [
+            ops.cast(
+                y + ops.cast(moe.shared_experts(x), DType.float32), x.dtype
+            )
+            for moe, x, y in zip(moes, xs, reduced, strict=True)
+        ]
+
+    def _per_expert_weights(
+        self, weights: TensorValue, indices: TensorValue
+    ) -> TensorValue:
+        """``[b, s, k]`` slots -> ``[b, s, n_routed_experts]``, zero if unpicked."""
+        experts = ops.range(
+            0,
+            self.n_routed_experts,
+            1,
+            out_dim=self.n_routed_experts,
+            device=indices.device,
+            dtype=DType.int32,
+        )
+        selected = ops.cast(
+            ops.unsqueeze(indices, -1) == experts, DType.float32
+        )
+        return ops.squeeze(
+            ops.sum(ops.unsqueeze(weights, -1) * selected, axis=2), axis=2
+        )
 
     def __call__(self, x: TensorValue, token_ids: TensorValue) -> TensorValue:
         """``[b, s, hidden]`` in, same out.
@@ -500,20 +785,7 @@ class DeepseekV4MoE(Module):
             )
             return ops.cast(y, x.dtype)
         assert isinstance(self.experts, LayerList)
-        experts = ops.range(
-            0,
-            self.n_routed_experts,
-            1,
-            out_dim=self.n_routed_experts,
-            device=indices.device,
-            dtype=DType.int32,
-        )
-        selected = ops.cast(
-            ops.unsqueeze(indices, -1) == experts, DType.float32
-        )
-        per_expert = ops.squeeze(
-            ops.sum(ops.unsqueeze(weights, -1) * selected, axis=2), axis=2
-        )
+        per_expert = self._per_expert_weights(weights, indices)
 
         y = ops.cast(self.shared_experts(x), DType.float32)
         for i, expert in enumerate(self.experts):

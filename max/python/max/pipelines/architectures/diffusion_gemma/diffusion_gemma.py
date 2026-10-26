@@ -44,12 +44,14 @@ from collections.abc import Sequence
 from max.dtype import DType
 from max.graph import BufferValue, DeviceRef, ShardingStrategy, TensorValue, ops
 from max.nn.attention import MHAMaskVariant
+from max.nn.graph_groups import LogitsName
 from max.nn.kernels import flash_attention_ragged, rope_split_store_ragged
 from max.nn.kv_cache import KVCacheParams, MultiKVCacheParams, PagedCacheValues
 from max.nn.layer import LayerList, Module
 from max.nn.linear import MLP, ColumnParallelLinear, Linear
-from max.nn.moe import MoE, MoEQuantized, make_concatenated_gated_activation_fn
+from max.nn.moe import GatedActivation, MoE, MoEQuantized
 from max.nn.rotary_embedding import Llama3RotaryEmbedding
+from max.nn.transformer import DecoderOutputs
 from max.nn.transformer.distributed_transformer import (
     DistributedLogitsPostprocessMixin,
 )
@@ -60,7 +62,10 @@ from max.pipelines.architectures.gemma4.layers.attention import Gemma4Attention
 from max.pipelines.architectures.gemma4.layers.decoder_layer import (
     Gemma4TextDecoderLayer,
 )
-from max.pipelines.architectures.gemma4.layers.moe import Gemma4MoEGate
+from max.pipelines.architectures.gemma4.layers.moe import (
+    Gemma4MoE,
+    Gemma4MoEGate,
+)
 from max.pipelines.architectures.gemma4.layers.rms_norm import Gemma4RMSNorm
 from max.pipelines.architectures.gemma4.layers.rotary_embedding import (
     ProportionalRotaryEmbedding,
@@ -390,9 +395,7 @@ class _DiffusionGemmaTextModelBase(DistributedLogitsPostprocessMixin, Module):
             unquantized_dtype,
             eps=text_config.rms_norm_eps,
         )
-        moe_act = make_concatenated_gated_activation_fn(
-            functools.partial(ops.gelu, approximate="tanh")
-        )
+        moe_act = GatedActivation("gelu_tanh")
         moe_block: MoE
         if is_nvfp4:
             moe_block = MoEQuantized(
@@ -402,20 +405,20 @@ class _DiffusionGemmaTextModelBase(DistributedLogitsPostprocessMixin, Module):
                 num_experts_per_token=text_config.top_k_experts,
                 moe_dim=text_config.moe_intermediate_size,
                 gate_cls=moe_gate_cls,
-                gated_activation_fn=moe_act,
+                activation=moe_act,
                 pre_expert_norm_cls=moe_norm_cls,
                 dtype=config.dtype,
                 quant_config=quant_config,
             )
         else:
-            moe_block = MoE(
+            moe_block = Gemma4MoE(
                 devices=config.devices,
                 hidden_dim=text_config.hidden_size,
                 num_experts=text_config.num_experts,
                 num_experts_per_token=text_config.top_k_experts,
                 moe_dim=text_config.moe_intermediate_size,
                 gate_cls=moe_gate_cls,
-                gated_activation_fn=moe_act,
+                activation=moe_act,
                 pre_expert_norm_cls=moe_norm_cls,
                 dtype=config.dtype,
             )
@@ -523,7 +526,7 @@ class DiffusionGemmaEncoderTextModel(_DiffusionGemmaTextModelBase):
         image_embeddings: Sequence[TensorValue],
         image_token_indices: Sequence[TensorValue],
         **kwargs: object,
-    ) -> tuple[TensorValue, ...]:
+    ) -> DecoderOutputs:
         h = self.embed_tokens(tokens, signal_buffers)
         h = [
             merge_multimodal_embeddings(
@@ -545,11 +548,12 @@ class DiffusionGemmaEncoderTextModel(_DiffusionGemmaTextModelBase):
         outputs = self._postprocess_logits(
             h, input_row_offsets, return_n_logits, signal_buffers
         )
-        # Softcap the logit tensors; the optional third output is offsets.
-        out = list(outputs)
-        for i in range(min(2, len(out))):
-            out[i] = self._softcap(out[i])
-        return tuple(out)
+        logits = outputs.logits
+        names: tuple[LogitsName, ...] = ("next_token_logits", "logits")
+        for name in names:
+            if name in logits:
+                logits[name] = self._softcap(logits[name])
+        return outputs
 
 
 class DiffusionGemmaDecoderTextModel(_DiffusionGemmaTextModelBase):
@@ -605,11 +609,7 @@ class DiffusionGemmaDecoderTextModel(_DiffusionGemmaTextModelBase):
         )
         soft_embeds = (
             soft_embeds
-            * ops.constant(
-                self.embed_tokens.embed_scale,
-                embed_weight.dtype,
-                device=self.devices[0],
-            )
+            * self.embed_tokens.embed_scale
             * ops.cast(sc_enabled, embed_weight.dtype)
         )
         h0 = self.self_conditioning(h[0], soft_embeds)

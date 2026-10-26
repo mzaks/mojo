@@ -14,7 +14,7 @@
 
 from layout import TensorEngine, TensorLayout, TileTensor
 
-from std.utils.coord import dyn_coord
+from std.utils.coord import DynamicCoord, dyn_coord
 from std.utils.index import IndexList
 
 
@@ -154,8 +154,10 @@ struct ImageData[
             return self.dynamic_image_layout
         return Self.static_image_layout
 
-    def _get_index(self, n: Int, c: Int, h: Int, w: Int) -> Int:
-        """Converts the general index to the actual index into the underlying
+    def _get_coord(
+        self, n: Int, c: Int, h: Int, w: Int
+    ) -> DynamicCoord[.int64, 4]:
+        """Reorders the general index into a coordinate of the underlying
         data based on the tensor layout.
 
         Args:
@@ -165,15 +167,15 @@ struct ImageData[
             w: Index on the width dimension.
 
         Returns:
-            A IndexList containing the index based on the underlying
-            data layout.
+            The coordinate into `data`, in the order of the underlying data
+            layout.
         """
         if self.get_image_layout() == Image2DLayout.NCHW:
-            return Int(self.data.layout(dyn_coord[.int64]((n, c, h, w))))
+            return dyn_coord[.int64]((n, c, h, w))
 
         if self.get_image_layout() == Image2DLayout.RSCF:
-            return Int(self.data.layout(dyn_coord[.int64]((h, w, c, n))))
-        return Int(self.data.layout(dyn_coord[.int64]((n, h, w, c))))
+            return dyn_coord[.int64]((h, w, c, n))
+        return dyn_coord[.int64]((n, h, w, c))
 
     def get_flat_index(self, n: Int, c: Int, h: Int, w: Int) -> Int:
         """Converts the dimension index to the flat index of the underlying
@@ -193,9 +195,7 @@ struct ImageData[
         var image_shape = ImageShape(self)
 
         @inline(.always)
-        @__copy_capture(image_shape)
-        @__parameter
-        def _compute_index_nchw() -> Int:
+        def _compute_index_nchw() {var image_shape, imm} -> Int:
             # Index [N,C,H,W]
             var idx = n
             idx = idx * image_shape.C + c
@@ -204,9 +204,7 @@ struct ImageData[
             return idx
 
         @inline(.always)
-        @__copy_capture(image_shape)
-        @__parameter
-        def _compute_index_nhwc() -> Int:
+        def _compute_index_nhwc() {var image_shape, imm} -> Int:
             # Index [N,H,W,C]
             var idx = n
             idx = idx * image_shape.H + h
@@ -236,9 +234,7 @@ struct ImageData[
         var image_shape = ImageShape(self)
 
         @inline(.always)
-        @__copy_capture(image_shape)
-        @__parameter
-        def _compute_index_nchw() -> IndexList[4]:
+        def _compute_index_nchw() {var image_shape, imm} -> IndexList[4]:
             # Index [N,C,H,W]
             var lidx, w_idx = divmod(idx, image_shape.W)
             var lidx2, h_idx = divmod(lidx, image_shape.H)
@@ -246,9 +242,7 @@ struct ImageData[
             return IndexList[4](n_idx, c_idx, h_idx, w_idx)
 
         @inline(.always)
-        @__copy_capture(image_shape)
-        @__parameter
-        def _compute_index_nhwc() -> IndexList[4]:
+        def _compute_index_nhwc() {var image_shape, imm} -> IndexList[4]:
             # Index [N,H,W,C]
             var lidx, c_idx = divmod(idx, image_shape.C)
             var lidx2, w_idx = divmod(lidx, image_shape.W)
@@ -276,7 +270,9 @@ struct ImageData[
         Returns:
             The value stored at the given index position.
         """
-        return self.data.raw_load(self._get_index(n, c, h, w))
+        return rebind[Scalar[Self.dtype]](
+            self.data.load(self._get_coord(n, c, h, w))
+        )
 
     def __setitem__(
         self, n: Int, c: Int, h: Int, w: Int, value: Scalar[Self.dtype]
@@ -291,7 +287,7 @@ struct ImageData[
             w: Index on the width dimension.
             value: The value to store at the given index position.
         """
-        self.data.raw_store(self._get_index(n, c, h, w), value)
+        self.data.store(self._get_coord(n, c, h, w), value)
 
     def num_elements(self) -> Int:
         return self.data.num_elements()

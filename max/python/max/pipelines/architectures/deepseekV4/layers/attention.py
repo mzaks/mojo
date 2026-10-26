@@ -53,7 +53,8 @@ same path (``DeepseekV4.__call__``).
 With a cache, the fused ``latent_sparse_attention_ragged`` kernel reads a
 query's window straight out of the window leaf and its compressed entries out
 of the zone leaf by entry index, once this batch's latents and candidate
-entries have been stored into them. Without a cache (a fresh batch, the
+entries have been stored into them; the indexer scores its own zone leaf the
+same way (``indexer_score_ragged``). Without a cache (a fresh batch, the
 reference for the cache gates) attention is order-invariant over its selected
 rows, so they are laid out in one table -- ``[every token's latent, every
 window's candidate entry]`` -- addressed by absolute row, or ``-1``.
@@ -61,30 +62,47 @@ window's candidate entry]`` -- addressed by absolute row, or ``-1``.
 
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
+
 import numpy as np
 from max.dtype import DType
-from max.graph import DeviceRef, TensorValue, Weight, ops
+from max.graph import DeviceRef, ShardingStrategy, TensorValue, Weight, ops
 from max.nn.kernels import latent_sparse_attention_ragged
 from max.nn.layer import Module
-from max.nn.linear import Linear
 from max.nn.norm.rms_norm import RMSNorm
 
 from ..model_config import DeepseekV4Config
 from .cache import (
     KEY,
-    CacheLeaf,
     DeepseekV4Cache,
+    LayerIndex,
     arange,
-    idiv,
     scalar,
 )
 from .compressor import DeepseekV4Compressor
 from .csa import CompressedStream, compressed_stream
 from .indexer import DeepseekV4Indexer
-from .quantization import fp8_qat_quantize, linear_for
-from .ragged import RaggedRows, WindowRows
+from .quantization import dequantize_fp8_blocks, fp8_qat_quantize, linear_for
+from .ragged import RaggedRows
 from .rope import apply_rope_tail, rope_for_layer
 from .sparse_attention import sparse_attention
+
+# `MAX_DSV4_LATENT_ATTN_SPLIT_K=0` runs the SM100 latent attention route with
+# one CTA per row, so no split-K partial is rounded before the combine. Read
+# once, when the graph is built.
+# TODO(dsv4-attn-core): drop once the split-K vs single-CTA A/B is ruled.
+_LATENT_ATTN_SPLIT_K = (
+    os.environ.get("MAX_DSV4_LATENT_ATTN_SPLIT_K", "1") != "0"
+)
+# `MAX_DSV4_LATENT_ATTN_PORTABLE_P_BF16=1` runs the portable latent attention
+# kernel with the attention weights rounded to bf16 before the value product,
+# isolating that one SM100 rounding. Diagnostic; read at graph build.
+# TODO(dsv4-attn-core): drop with split_k once the numerics ruling tooling is
+# no longer needed.
+_LATENT_ATTN_PORTABLE_P_BF16 = (
+    os.environ.get("MAX_DSV4_LATENT_ATTN_PORTABLE_P_BF16", "0") == "1"
+)
 
 
 def weightless_rms_normalize(x: TensorValue, eps: float) -> TensorValue:
@@ -99,63 +117,22 @@ def weightless_rms_normalize(x: TensorValue, eps: float) -> TensorValue:
     return ops.cast(x32 * scale, x.dtype)
 
 
-def chunk_positions(
-    cache_lengths: TensorValue | None,
-    batch: int,
-    seq_len: int,
-    device: DeviceRef,
-) -> TensorValue:
-    """``[batch, seq_len]`` int32 absolute positions of a chunk's tokens."""
-    if cache_lengths is None:
-        start = ops.broadcast_to(scalar(0, device), [batch])
-    else:
-        # The runtime input carries a symbolic batch dim; the graph is built
-        # for a static one.
-        start = ops.rebind(cache_lengths, [batch])
-    return ops.reshape(start, [batch, 1]) + ops.reshape(
-        arange(seq_len, device), [1, seq_len]
-    )
+@dataclass
+class PendingAttention:
+    """What :meth:`DeepseekV4Attention.begin` hands to ``end``.
 
-
-def window_table(
-    leaf: CacheLeaf | None,
-    layer: int,
-    fresh: TensorValue,
-    positions: TensorValue,
-    window: int,
-) -> tuple[TensorValue, TensorValue]:
-    """The sliding-window rows a chunk attends to, and each query's indices.
-
-    Returns the table ``[b, window - 1 + s, head_dim]`` -- the ``window - 1``
-    positions before the chunk read from ``leaf`` (garbage where they do not
-    exist), then the chunk's own rows -- and ``[b, s, window]`` int32 indices
-    into it: query ``i`` sees rows ``i .. i + window - 1``, i.e. positions
-    ``P + i - window + 1 .. P + i``, with ``-1`` below position 0.
+    ``index_score`` is set, and ``candidates`` not yet, on a layer with an
+    indexer; the caller sets ``candidates`` from the scores' top-k.
     """
-    b, s = int(fresh.shape[0]), int(fresh.shape[1])
-    head_dim = int(fresh.shape[2])
-    device = fresh.device
-    p = ops.reshape(positions[:, 0], [b, 1])
-    back = ops.reshape(
-        arange(window - 1, device) - (window - 1), [1, window - 1]
-    )
-    if leaf is not None:
-        cached = leaf.gather(layer, KEY, ops.max(p + back, scalar(0, device)))
-    else:
-        cached = ops.broadcast_to(
-            ops.constant(0.0, fresh.dtype, device), [b, window - 1, head_dim]
-        )
-    table = ops.concat([cached, fresh], axis=1)
-    rows = ops.reshape(arange(s, device), [s, 1]) + ops.reshape(
-        arange(window, device), [1, window]
-    )
-    attended = ops.reshape(p, [b, 1, 1]) + ops.unsqueeze(rows - (window - 1), 0)
-    idxs = ops.where(
-        attended >= scalar(0, device),
-        ops.broadcast_to(ops.unsqueeze(rows, 0), [b, s, window]),
-        scalar(-1, device),
-    )
-    return table, idxs
+
+    index: LayerIndex
+    q: TensorValue
+    kv: TensorValue
+    freqs_cis: TensorValue
+    stream: CompressedStream | None
+    valid: TensorValue | None
+    index_score: TensorValue | None
+    candidates: TensorValue | None
 
 
 class DeepseekV4Attention(Module):
@@ -196,33 +173,35 @@ class DeepseekV4Attention(Module):
             shape=(self.n_heads,),
             device=device,
         )
-        self.wq_a = linear_for(
-            config, config.hidden_size, config.q_lora_rank, device
+        # ``wq_a`` and ``wkv`` read the same input, so the adapter stacks them
+        # into one projection (``[wq_a; wkv]`` along N): one GEMM, not two.
+        self.q_lora_rank = config.q_lora_rank
+        self.wqa_wkv = linear_for(
+            config,
+            config.hidden_size,
+            config.q_lora_rank + self.head_dim,
+            device,
         )
         self.q_norm = RMSNorm(
-            config.q_lora_rank, config.dtype, config.rms_norm_eps
+            config.q_lora_rank, DType.float32, config.rms_norm_eps
         )
         self.wq_b = linear_for(
             config, config.q_lora_rank, self.n_heads * self.head_dim, device
         )
-        self.wkv = linear_for(config, config.hidden_size, self.head_dim, device)
-        self.kv_norm = RMSNorm(self.head_dim, config.dtype, config.rms_norm_eps)
-        # Not ``linear_for``: the checkpoint stores wo_a fp8, but the reference
-        # declares it ``dtype=torch.bfloat16`` and consumes ``.weight`` raw in
-        # the grouped einsum below, so it never runs the fp8 ``linear()`` path
-        # and its activation is never quantized. The weight adapter
-        # host-dequantizes it for that reason.
-        self.wo_a = Linear(
+        self.kv_norm = RMSNorm(
+            self.head_dim, DType.float32, config.rms_norm_eps
+        )
+        self.wo_a = linear_for(
+            config,
             self.n_heads * self.head_dim // self.o_groups,
             self.o_groups * self.o_lora_rank,
-            config.dtype,
             device,
         )
         self.wo_b = linear_for(
             config, self.o_groups * self.o_lora_rank, config.hidden_size, device
         )
 
-        self.rope = rope_for_layer(config, layer_idx, max_seq_len)
+        self.rope = rope_for_layer(config, layer_idx, max_seq_len, device)
         self.compressor = (
             DeepseekV4Compressor(
                 config, self.compress_ratio, self.head_dim, device
@@ -238,13 +217,49 @@ class DeepseekV4Attention(Module):
             else None
         )
 
+    def shard_heads(self, num_devices: int) -> None:
+        """Declares the reference's tensor-parallel split on this layer's weights.
+
+        The query side is cut along heads: ``wq_b`` and ``attn_sink`` per
+        head, ``wo_a`` along its groups (a group is a run of whole heads), and
+        ``wo_b`` along its input, so each device's output is a partial sum the
+        block all-reduces. The latent side (``wqa_wkv``, ``q_norm``,
+        ``kv_norm``) is shared by every head and stays whole.
+        """
+        if self.n_heads % num_devices or self.o_groups % num_devices:
+            raise ValueError(
+                f"{self.n_heads} heads in {self.o_groups} groups do not split "
+                f"across {num_devices} devices"
+            )
+        self.wq_b.sharding_strategy = ShardingStrategy.rowwise(num_devices)
+        self.attn_sink.sharding_strategy = ShardingStrategy.axiswise(
+            0, num_devices
+        )
+        self.wo_a.sharding_strategy = ShardingStrategy.rowwise(num_devices)
+        self.wo_b.sharding_strategy = ShardingStrategy.columnwise(num_devices)
+        if self.indexer is not None:
+            self.indexer.shard_heads(num_devices)
+
+    def keep_local_heads(self, num_devices: int) -> None:
+        """Makes this replica compute only its share of :meth:`shard_heads`."""
+        self.n_heads //= num_devices
+        self.o_groups //= num_devices
+        if self.indexer is not None:
+            self.indexer.keep_local_heads(num_devices)
+
+    def layer_index(self) -> LayerIndex:
+        """This layer's place in the leaves, as constants."""
+        return LayerIndex.constant(
+            self.swa_layer, self.zone_layer if self.compress_ratio else None
+        )
+
     def _output_projection(self, o: TensorValue) -> TensorValue:
         """``[b, s, heads, head_dim]`` -> ``[b, s, hidden_size]``.
 
         ``o.view(b, s, n_groups, -1)`` then
         ``einsum("bsgd,grd->bsgr", o, wo_a.view(n_groups, o_lora_rank, -1))``
         then ``wo_b(o.flatten(2))``. ``wo_a`` is used as a raw weight here, not
-        called as a Linear.
+        called as a Linear; an fp8 one is dequantized first.
         """
         b, s = o.shape[0], o.shape[1]
         group_width = self.n_heads * self.head_dim // self.o_groups
@@ -257,9 +272,13 @@ class DeepseekV4Attention(Module):
         grouped = ops.transpose(
             ops.reshape(o, [b * s, self.o_groups, group_width]), 0, 1
         )
+        weight = self.wo_a.weight.to(o.device)
+        if self.wo_a.weight_scale is not None:
+            weight = dequantize_fp8_blocks(
+                weight, self.wo_a.weight_scale, o.dtype
+            )
         wo_a = ops.reshape(
-            self.wo_a.weight,
-            [self.o_groups, self.o_lora_rank, group_width],
+            weight, [self.o_groups, self.o_lora_rank, group_width]
         )
         # [g, b*s, d] @ [g, d, r] -> [g, b*s, r]
         projected = ops.matmul(grouped, ops.transpose(wo_a, -1, -2))
@@ -269,10 +288,16 @@ class DeepseekV4Attention(Module):
         )
         return self.wo_b(flattened)
 
-    def latent(self, x: TensorValue, freqs_cis: TensorValue) -> TensorValue:
-        """The shared KV latent for a chunk: normed, rotated, FP8-simulated."""
+    def project(self, x: TensorValue) -> tuple[TensorValue, TensorValue]:
+        """``(wq_a(x), wkv(x))``, sliced out of the one stacked projection."""
+        out = self.wqa_wkv(x)
+        width = int(out.shape[-1])
+        return out[..., : self.q_lora_rank], out[..., self.q_lora_rank : width]
+
+    def latent(self, kv: TensorValue, freqs_cis: TensorValue) -> TensorValue:
+        """The KV latent from ``wkv(x)``: normed, rotated, FP8-simulated."""
         rd = self.rope_head_dim
-        kv = self.kv_norm(self.wkv(x))
+        kv = self.kv_norm(kv)
         kv = apply_rope_tail(kv, freqs_cis, rd)
         # Positive bounds: see the note in rope.py and ISSUES Issue 34. This
         # exact expression, with ``:-rd``, is what produced a latent rolled by
@@ -291,6 +316,7 @@ class DeepseekV4Attention(Module):
         x: TensorValue,
         rows: RaggedRows,
         cache: DeepseekV4Cache | None = None,
+        index: LayerIndex | None = None,
     ) -> TensorValue:
         """Attention for a ragged batch of ``T`` tokens.
 
@@ -301,24 +327,51 @@ class DeepseekV4Attention(Module):
             cache: The paged leaves the chunks are read from and appended to.
                 ``None`` runs fresh sequences from position 0 without storing
                 anything (``rows.starts`` must then be zero).
+            index: Where this layer lives in the leaves; ``None`` is
+                :meth:`layer_index`.
+        """
+        state = self.begin(x, rows, cache, index)
+        if state.index_score is not None:
+            assert self.indexer is not None
+            assert state.valid is not None
+            state.candidates = self.indexer.select(
+                state.index_score, state.valid
+            )
+        return self.end(state, rows, cache)
+
+    def begin(
+        self,
+        x: TensorValue,
+        rows: RaggedRows,
+        cache: DeepseekV4Cache | None = None,
+        index: LayerIndex | None = None,
+    ) -> PendingAttention:
+        """:meth:`__call__` up to the indexer's top-k.
+
+        With an indexer the result carries the indexer's scores and no
+        candidates yet: across devices the scores are partial sums over each
+        device's heads, completed before the top-k.
         """
         t = rows.total
         device = x.device
         rd = self.rope_head_dim
         positions = rows.positions
+        if index is None:
+            index = self.layer_index()
         freqs_table = self.rope.freqs_cis_base()
         freqs_cis = ops.gather(freqs_table, positions, axis=0)
 
         # Query: low-rank, normed, per-head normed again (weightless), rotated.
-        qr = self.q_norm(self.wq_a(x))
+        q_a, kv_a = self.project(x)
+        qr = self.q_norm(q_a)
         q = ops.reshape(self.wq_b(qr), [1, t, self.n_heads, self.head_dim])
         q = weightless_rms_normalize(q, self.eps)
         q = apply_rope_tail(q, freqs_cis, rd)
 
-        kv = self.latent(x, freqs_cis)
+        kv = self.latent(kv_a, freqs_cis)
         if cache is not None:
             cache.swa.store(
-                self.swa_layer,
+                index.swa,
                 KEY,
                 ops.reshape(kv, [t, self.head_dim]),
                 rows.offsets,
@@ -326,10 +379,12 @@ class DeepseekV4Attention(Module):
 
         stream: CompressedStream | None = None
         candidates: TensorValue | None = None
+        valid: TensorValue | None = None
+        index_score: TensorValue | None = None
         if self.compressor is not None:
             ratio = self.compress_ratio
             x32 = ops.cast(ops.reshape(x, [t, x.shape[2]]), DType.float32)
-            windows = WindowRows.build(rows, ratio, self.compressor.coff)
+            windows = rows.windows[ratio]
             stream = compressed_stream(
                 self.compressor,
                 x32,
@@ -339,11 +394,11 @@ class DeepseekV4Attention(Module):
                 self.max_seq_len,
                 cache.state.get(ratio) if cache is not None else None,
                 cache.comp.get(ratio) if cache is not None else None,
-                self.zone_layer,
+                index,
             )
             # Query at position ``p`` sees entries below ``(p + 1) // ratio``:
             # every window that closed strictly before it.
-            cutoff = idiv(positions + scalar(1, device), ratio)
+            cutoff = (positions + scalar(1, device)) // ratio
             valid = stream.valid(cutoff)
             if self.indexer is not None:
                 idx_stream = compressed_stream(
@@ -355,15 +410,18 @@ class DeepseekV4Attention(Module):
                     self.max_seq_len,
                     cache.idx_state if cache is not None else None,
                     cache.idx_comp if cache is not None else None,
-                    self.zone_layer,
+                    index,
                 )
-                candidates = self.indexer(
-                    ops.reshape(x, [t, x.shape[2]]),
-                    ops.reshape(qr, [t, qr.shape[2]]),
-                    freqs_cis,
-                    idx_stream.table,
-                    valid,
-                )
+                x2 = ops.reshape(x, [t, x.shape[2]])
+                qr2 = ops.reshape(qr, [t, qr.shape[2]])
+                if cache is not None:
+                    index_score = self.indexer.score_cached(
+                        x2, qr2, freqs_cis, idx_stream, cutoff
+                    )
+                else:
+                    index_score = self.indexer.score(
+                        x2, qr2, freqs_cis, idx_stream.table
+                    )
             else:
                 n_cand = stream.n_cand
                 candidates = ops.where(
@@ -371,12 +429,27 @@ class DeepseekV4Attention(Module):
                     ops.reshape(arange(n_cand, device), [1, n_cand]),
                     scalar(-1, device),
                 )
+        return PendingAttention(
+            index, q, kv, freqs_cis, stream, valid, index_score, candidates
+        )
 
+    def end(
+        self,
+        state: PendingAttention,
+        rows: RaggedRows,
+        cache: DeepseekV4Cache | None = None,
+    ) -> TensorValue:
+        """:meth:`__call__` from the candidates on; ``state`` has them set."""
+        stream, candidates = state.stream, state.candidates
         if cache is None:
-            o = self._attend_table(q, kv, rows, stream, candidates)
+            o = self._attend_table(state.q, state.kv, rows, stream, candidates)
         else:
-            o = self._attend_leaves(q, rows, cache, stream, candidates)
-        o = apply_rope_tail(o, freqs_cis, rd, inverse=True)
+            o = self._attend_leaves(
+                state.q, rows, cache, state.index, stream, candidates
+            )
+        o = apply_rope_tail(
+            o, state.freqs_cis, self.rope_head_dim, inverse=True
+        )
         return self._output_projection(o)
 
     def _attend_leaves(
@@ -384,6 +457,7 @@ class DeepseekV4Attention(Module):
         q: TensorValue,
         rows: RaggedRows,
         cache: DeepseekV4Cache,
+        index: LayerIndex,
         stream: CompressedStream | None,
         candidates: TensorValue | None,
     ) -> TensorValue:
@@ -401,7 +475,7 @@ class DeepseekV4Attention(Module):
             assert candidates is not None
             comp_leaf = cache.comp[self.compress_ratio]
             entries = stream.entries(candidates)
-            layer_comp = self.zone_layer
+            layer_comp = stream.layer
         else:
             # A window-only layer has no zone leaf; the kernel still takes a
             # compressed operand, so it gets the window leaf and one entry per
@@ -415,7 +489,7 @@ class DeepseekV4Attention(Module):
                 ),
                 [t, 1],
             )
-            layer_comp = self.swa_layer
+            layer_comp = index.swa
         o = latent_sparse_attention_ragged(
             ops.reshape(q, [t, h, d]),
             rows.offsets,
@@ -423,10 +497,12 @@ class DeepseekV4Attention(Module):
             self.attn_sink,
             cache.swa.values,
             comp_leaf.values,
-            ops.constant(self.swa_layer, DType.uint32, DeviceRef.CPU()),
-            ops.constant(layer_comp, DType.uint32, DeviceRef.CPU()),
+            index.swa,
+            layer_comp,
             scale=self.softmax_scale,
             window=self.window,
+            split_k=_LATENT_ATTN_SPLIT_K,
+            portable_p_bf16=_LATENT_ATTN_PORTABLE_P_BF16,
         )
         return ops.reshape(o, [1, t, h, d])
 
@@ -463,7 +539,7 @@ class DeepseekV4Attention(Module):
                     kv,
                     ops.reshape(
                         ops.cast(stream.fresh, kv.dtype),
-                        [1, stream.windows.total, head_dim],
+                        [1, stream.fresh.shape[0], head_dim],
                     ),
                 ],
                 axis=1,

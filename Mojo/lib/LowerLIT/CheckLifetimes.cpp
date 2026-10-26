@@ -216,21 +216,15 @@ struct WholeProgramState {
 WholeProgramState::WholeProgramState(Operation *module,
                                      std::vector<FnOp> &funcList) {
   module->walk([&](Operation *op) {
-    // Collect functions and nested functions.
+    // Collect functions.
     if (auto funcOp = dyn_cast<FnOp>(op)) {
-      if (!funcOp.isOptionalSymbol())
-        funcMap[getFullyResolvedSymbolRef(funcOp)] = funcOp;
+      funcMap[getFullyResolvedSymbolRef(funcOp)] = funcOp;
 
       // We don't process external functions. They don't have a body to check.
       if (funcOp.isExternal())
         return;
 
-      // Only top-level functions are parallel work items. A nested function
-      // (an old closure) reads SSA values from the function it is nested in,
-      // so it is processed within that top-level ancestor's task (see
-      // runOnOperation) rather than concurrently with it.
-      if (!funcOp->getParentOfType<FnOp>())
-        funcList.emplace_back(funcOp);
+      funcList.emplace_back(funcOp);
 
       // Remember the Deinitable.__deinit__ member function.
       if (funcOp.getSpecialFunctionKind() == SpecialFunctionKind::kDeinit &&
@@ -1189,11 +1183,6 @@ ValueSet::ValueSet(PerThreadCache &perThreadCache, FnOp func,
 
   func.getBodyRegion().walk<mlir::WalkOrder::PreOrder>(
       [&](Operation *op) -> WalkResult {
-        // Skip looking at nested functions, they are handled as separate
-        // contexts.
-        if (isa<FnOp>(op))
-          return WalkResult::skip();
-
         // All the ops that define trackable values have a single result.
         if (op->getNumResults() == 1) {
           Value result = op->getResult(0);
@@ -1846,11 +1835,6 @@ InteriorOriginTracker::InteriorOriginTracker(PerThreadCache &perThreadCache,
 
   // Scan the body region to find all the interior origins.
   func.getBodyRegion().walk([&](Operation *op) -> WalkResult {
-    // Skip looking at nested functions, they are handled as separate
-    // contexts.
-    if (isa<FnOp>(op))
-      return WalkResult::skip();
-
     // Interior origins can be found by scanning all the operation results
     // and arguments.  We can ignore any operands because they'll be using
     // the other things.
@@ -2732,19 +2716,6 @@ void UninitializedValueScan::checkInteriorOriginUsage(
   if (valueSet.domInfo.dominates(liftedDefiningOp, liftedOperandPt))
     return;
 
-  // TODO(remove legacy closures): Legacy closures can have operands defined
-  // outside the function that are referenced directly from within it.  For
-  // example:
-  //   ptr = ...
-  //   @__parameter
-  //   def inner():
-  //     use(ptr)
-  // This gets represented as a direct use of the operand but we mark the origin
-  // live on the function itself. This trips up the dominance check, so special
-  // case this.
-  if (isa<FnOp>(definingOp))
-    return;
-
   // Otherwise, it is valid for some other reference but was reinitialized since
   // this reference was formed.
   if (interiorOriginTracker.markErrorEmittedForInteriorOrigin(interiorID))
@@ -3160,8 +3131,15 @@ void UninitializedValueScan::checkTerminatorOp(Operation &op) {
       SmallVector<int32_t> liveValueIds;
       for (unsigned i = 0, e = valueSet.getValueInfos().size(); i != e; ++i) {
         const auto &valueInfo = valueSet.getValueInfo(i);
-        if (valueInfo.getFullValueRef(i).isAllPresent(liveness.tracked))
-          liveValueIds.push_back(i);
+        if (!valueInfo.value ||
+            !valueInfo.getFullValueRef(i).isAllPresent(liveness.tracked))
+          continue;
+        // A value can be fully live here without being in scope. Demanding it
+        // would make the backward pass destroy it where its definition doesn't
+        // dominate.
+        if (!valueSet.domInfo.properlyDominates(valueInfo.value, &op))
+          continue;
+        liveValueIds.push_back(i);
       }
       if (!liveValueIds.empty())
         op.setAttr(liveValueIdsAfterNoReturnCallAttrName,
@@ -4608,6 +4586,9 @@ void DestructorInsertion::checkTerminatorOp(Operation &op) {
     if (!unreachable.getIsAfterUnreachableCall())
       return;
 
+    // Code up to a no-return call executes, so this path is reachable.
+    consumedValues.set(0);
+
     // If this is after a no-return call, then we do mark all the live-out
     // values (e.g. like "read" arguments) as consumed so they don't get
     // destroyed on this path.  This is calculated on the forward pass.
@@ -5612,23 +5593,12 @@ struct CheckLifetimes : impl::CheckLifetimesBase<CheckLifetimes> {
     // that persists across all functions it processes; it is reset between
     // functions.
     PerThreadCache cache(std::move(typeDeclInfo));
-    // `functionVector` holds only top-level functions. Each task walks its
-    // function's nested functions and processes the whole subtree on one
-    // thread. A nested function (an old closure) reads SSA values from the
-    // function it is nested in, so keeping the subtree on a single thread
-    // avoids racing that function's own IR mutation (destructor insertion);
-    // distinct top-level functions are op-disjoint.
-    //
-    // FIXME(MOCO-3942): remove this code once old closures are removed -- every
-    // function is then op-disjoint and this becomes a plain per-function loop.
     M::parallelForEach(
         &getContext(), functionVector,
-        [&](PerThreadCache &cache, FnOp topFunc) {
-          topFunc.walk([&](FnOp func) {
-            if (failed(processFunction(func, cache)))
-              hadError = true;
-            cache.reset();
-          });
+        [&](PerThreadCache &cache, FnOp func) {
+          if (failed(processFunction(func, cache)))
+            hadError = true;
+          cache.reset();
         },
         cache);
 

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+from typing import Literal
 
 from max.config import ConfigFileModel
 from max.pipelines.diffusion.config import (
@@ -28,13 +29,20 @@ from max.pipelines.modeling.config_enums import (
 )
 from pydantic import ConfigDict, Field, PrivateAttr
 
-# Default max batch input tokens for chunked prefill and memory estimation.
+#: Default max batch input tokens for chunked prefill and memory estimation.
 DEFAULT_MAX_BATCH_INPUT_TOKENS = 8192
 
 # Sentinel value users can pass to ``reasoning_parser`` / ``tool_parser`` to
 # explicitly disable the parser, overriding any architecture default. The value
 # is matched case-insensitively (e.g. ``"none"``, ``"None"``, ``"NONE"``).
 DISABLE_PARSER_SENTINEL = "none"
+
+_ENV_FLAG_TRUE = ("1", "true", "on", "yes")
+
+
+def _env_flag(name: str) -> bool:
+    """Returns whether environment variable ``name`` is set to a true value."""
+    return os.environ.get(name, "").strip().lower() in _ENV_FLAG_TRUE
 
 
 class PipelineRuntimeConfig(ConfigFileModel):
@@ -124,6 +132,17 @@ class PipelineRuntimeConfig(ConfigFileModel):
             "from its own epilogue, which drops the local staging tensor for "
             "its output. Unset defaults ON except for a decode-only worker, "
             "since the span it speeds up grows with tokens per expert."
+        ),
+    )
+
+    ep_shared_expert_side_stream: Literal["pre", "post"] | None = Field(
+        default=None,
+        description=(
+            "Run the shared expert of a model that dispatches with per-token "
+            "NVFP4 global scales on a side stream, so it overlaps the "
+            "expert-parallel collectives instead of serializing with the "
+            "dispatch. ``pre`` issues it before the dispatch, ``post`` before "
+            "the combine. Unset keeps it inline."
         ),
     )
 
@@ -242,14 +261,33 @@ class PipelineRuntimeConfig(ConfigFileModel):
         ),
     )
 
-    eplb_replicas_per_gpu: int = Field(
+    eplb_redundant_experts_per_gpu: int = Field(
         default=0,
         description=(
-            "Number of redundant expert replicas to add per GPU when EPLB is "
-            "active. 0 (default) means no replication. k > 0 adds k extras "
-            "per GPU; total redundant slots = k * ep_size (so num_redundant "
-            "is always a multiple of the device count, which the rebalance "
-            "algorithm requires)."
+            "Extra expert slots per GPU that EPLB fills with copies of hot "
+            "experts, on top of the one slot every expert always has. 0 "
+            "(default) adds none, so EPLB only moves experts between GPUs; k "
+            "adds k * ep_size slots in total."
+        ),
+    )
+
+    eplb_fold_router: bool = Field(
+        default=True,
+        description=(
+            "When an EPLB placement only moves experts between GPUs (no "
+            "redundant experts), reorder each router's expert rows to match "
+            "so it emits physical ids and dispatch runs no remap kernel. "
+            "Ignored while routing profiling is on, which needs logical ids."
+        ),
+    )
+
+    eplb_planner: Literal["per_layer", "aggregated"] = Field(
+        default="per_layer",
+        description=(
+            "How EPLB turns a routing snapshot into an expert placement. "
+            "per_layer (default) balances each MoE layer on its own "
+            "histogram; aggregated balances the sum over layers and uses one "
+            "placement for every layer."
         ),
     )
 
@@ -385,15 +423,38 @@ class PipelineRuntimeConfig(ConfigFileModel):
         ),
     )
 
-    enable_overlap_scheduler: bool = Field(
-        default=False,
+    enable_overlap_scheduler: bool | None = Field(
+        default=None,
         description=(
             "Whether to enable the overlap scheduler. This feature allows the scheduler "
             "to run alongside GPU execution. This helps improve GPU utilization. "
             "This is an experimental feature which may crash and burn. "
-            "This feature will be enabled by default for some selected architectures. "
-            "You can forcibly disable this by setting "
-            "``--no-enable-overlap-scheduler --force``."
+            "When unset, the architecture decides, and most turn it on. "
+            "Device graph capture turns it on too. "
+            "You can disable this by setting ``--no-enable-overlap-scheduler``."
+        ),
+    )
+
+    disable_overlap: bool = Field(
+        default_factory=lambda: _env_flag("MAX_DISABLE_OVERLAP"),
+        description=(
+            "Keeps the overlap pipeline but synchronizes after every model "
+            "execution, so CPU work no longer overlaps GPU work and throughput "
+            "drops. Device graph capture runs only in the overlap pipeline, so "
+            "this is how to run capture without overlap when debugging. "
+            "Defaults from the ``MAX_DISABLE_OVERLAP`` environment variable. "
+            "Has no effect when the overlap scheduler is off."
+        ),
+    )
+
+    disable_vendor_blas_fallback: bool = Field(
+        default_factory=lambda: _env_flag("MODULAR_DISABLE_VENDOR_FALLBACK"),
+        description=(
+            "Compiles kernels without the matmul vendor-BLAS fallback by "
+            "passing the ``MODULAR_DISABLE_VENDOR_FALLBACK`` define to the "
+            "kernel compile. Always on for device graph capture on HIP. "
+            "Defaults from the ``MODULAR_DISABLE_VENDOR_FALLBACK`` environment "
+            "variable."
         ),
     )
 
@@ -428,7 +489,9 @@ class PipelineRuntimeConfig(ConfigFileModel):
         description=(
             "Whether a below-threshold CE step with work on 2+ replicas "
             "runs immediately with each replica's chunk size reduced to "
-            "the balance level, deferring only the excess. When False, "
+            "the balance level, deferring only the excess. The balance level "
+            "must be at least ``chunked_prefill_min_chunk_size``, or half of "
+            "``max_batch_input_tokens`` when that is 0. When False, "
             "such steps are held whole until the threshold is met, a "
             "deadline expires, or there is nothing else to run. Only "
             "consulted when ``dp_ce_balance_timeout_ms`` > 0."
@@ -626,9 +689,14 @@ class PipelineRuntimeConfig(ConfigFileModel):
 
         Chunked prefill cuts a CE batch at ``max_batch_input_tokens``, which is
         also what a request has to be allocated for. Without it a prompt is
-        admitted in full, so nothing bounds the allocation.
+        admitted in full, so nothing bounds the allocation. A decode worker
+        encodes no prompt: it receives the whole prompt's KV from prefill in
+        one transfer, so it must hold every page up front.
         """
-        if not self.enable_chunked_prefill:
+        if (
+            not self.enable_chunked_prefill
+            or self.pipeline_role == "decode_only"
+        ):
             return None
         return self.max_batch_input_tokens
 

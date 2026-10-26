@@ -211,6 +211,7 @@ public:
   ///     sub-dependency is still being elaborated); the caller should
   ///     skip/retry.
   ///   - non-null `SymbolConstantAttr`: the fully resolved wrapped callee.
+  ///     Nested thunks are peeled, so this is never itself a thunk.
   std::optional<ErrorTreeOr<SymbolConstantAttr>>
   resolveTransparentThunkCallee(GeneratorOp generator,
                                 SymbolConstantAttr symbol, Location loc);
@@ -233,8 +234,6 @@ protected:
   FailureOr<TypedAttr> evaluateIsStructTypeAttr(IsStructTypeAttr attr);
   FailureOr<TypedAttr> evaluateFnTypeIsCABIAttr(FnTypeIsCABIAttr attr);
   FailureOr<TypedAttr> evaluateGetBaseTypeNameAttr(GetBaseTypeNameAttr attr);
-  FailureOr<TypedAttr> evaluateCompileOffloadClosureAttr(
-      CompileOffloadClosureAttr compileOffloadClosureAttr);
   FailureOr<TypedAttr> evaluateCompileAssemblyAttr(CompileAssemblyAttr attr);
 
   /// Evaluate the mangled name of a function, including evaluating any explicit
@@ -292,6 +291,10 @@ private:
 //===----------------------------------------------------------------------===//
 
 SymbolConstantAttr extractSymbolConstantAttr(TypedAttr attr);
+
+/// Return true if `symbol` binds any of its input parameters directly to
+/// `#kgen.unbound` or `#kgen.unknown`.
+bool hasUnresolvedParamValue(SymbolConstantAttr symbol);
 
 /// Decomposed view of a `compile_offload` op's `func` attribute. Populated by
 /// `extractOffloadFunc` when the func resolves to a fully-bound

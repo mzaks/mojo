@@ -31,6 +31,7 @@ _Tensor = TypeVar("_Tensor", TensorValue, TensorType, Buffer, Tensor)
 _Buffer = TypeVar("_Buffer", BufferValue, BufferType, Buffer, Tensor)
 
 
+@tree.kind("paged_kv")
 @tree.dataclass
 class KVCacheInputsPerDevice(Generic[_Tensor, _Buffer]):
     """Symbolic graph input types for a single device's paged KV cache."""
@@ -126,11 +127,19 @@ class KVCacheInputsPerDevice(Generic[_Tensor, _Buffer]):
     # TODO: FIX THIS HACK!!!
     def flatten_without_attention_dispatch_metadata(
         self,
+        *,
+        include_scales: bool = True,
     ) -> list[_Tensor | _Buffer]:
         """Serializes fields into a flat list, minus the attention dispatch
-        metadata fields."""
+        metadata fields.
+
+        Args:
+            include_scales: Whether to append the quantization scale operands.
+                Pass ``False`` for an op that reads only the cache's lengths
+                and page table, so one registration serves every cache format.
+        """
         scales: tuple[_Tensor | _Buffer, ...] = ()
-        if self.kv_scales is not None:
+        if include_scales and self.kv_scales is not None:
             assert (
                 self.scales_page_stride is not None
                 and self.scales_lookup_table is not None
@@ -151,11 +160,13 @@ class KVCacheInputsPerDevice(Generic[_Tensor, _Buffer]):
             # Tail per-layer buffers (see ``flatten``). Attention dispatch clears
             # this field before calling an op, so this is ``()`` at op sites.
             *(self.kv_blocks_per_layer or ()),
-            *(self.kv_scales_per_layer or ()),
+            *((self.kv_scales_per_layer or ()) if include_scales else ()),
         ]
 
 
 PagedCacheValues = KVCacheInputsPerDevice[TensorValue, BufferValue]
+"""Paged KV cache inputs for one device, with cache blocks and lengths
+as graph values."""
 
 
 # ===--------------------------------------------------------------------=== #
@@ -163,11 +174,14 @@ PagedCacheValues = KVCacheInputsPerDevice[TensorValue, BufferValue]
 # ===--------------------------------------------------------------------=== #
 
 
+@tree.kind("recurrent_leaf")
 @tree.dataclass(frozen=True)
 class RecurrentLeafInputs(Generic[_Tensor, _Buffer]):
     """One state leaf's graph inputs on one device."""
 
     pool: _Buffer
+    """Shared by all layers, so it can exceed 2**32 elements. Kernels must
+    index it with 64-bit offsets."""
     live_row_ids: _Tensor
 
     def live_row_id(self, layer: int) -> TensorValue:
@@ -184,6 +198,7 @@ def _layer_row_ids(ids: Any, layer: int) -> TensorValue:
     return ids[layer]
 
 
+@tree.kind("recurrent_state")
 @tree.dataclass
 class RecurrentStateInputsPerDevice(Generic[_Tensor, _Buffer]):
     """One device's recurrent-state leaves."""
@@ -196,3 +211,7 @@ KVCacheInputs: TypeAlias = Tree[
     KVCacheInputsPerDevice[_Tensor, _Buffer]
     | RecurrentStateInputsPerDevice[_Tensor, _Buffer]
 ]
+"""The KV-cache inputs one model step consumes: a tree with one entry per
+device, holding either that device's paged-cache inputs or its
+recurrent-state leaves.
+"""

@@ -212,6 +212,10 @@ public:
   /// resolved by the parser.
   virtual void onVariableDecl(ASTDecl *decl, llvm::SMLoc identifierLoc);
 
+  /// Notify the listener that a declaration has been replaced with a
+  /// declaration that represents the same source binding.
+  virtual void onDeclReplaced(ASTDecl *oldDecl, ASTDecl *newDecl);
+
   /// Notify the listener that a new reference has been resolved by the parser,
   /// i.e. its declarations are known.
   virtual void onRef(ArrayRef<ASTDecl *> decls, StringRef spelling,
@@ -226,6 +230,13 @@ public:
   virtual void onParameterBinding(ArrayRef<ASTDecl *> decls,
                                   llvm::SMLoc rsquareLoc,
                                   ArrayRef<ExprNode *> parameters);
+
+  /// Notify the listener that the `case` arms of the `match` statement whose
+  /// header spans `matchRange` leave values of its subject uncovered, or that
+  /// it has no arms yet. Inserting `arms` at `insertLoc` appends one arm per
+  /// uncovered value.
+  virtual void onMatchMissingCases(llvm::SMRange matchRange,
+                                   llvm::SMLoc insertLoc, StringRef arms);
 };
 } // namespace M::KGEN::LIT
 

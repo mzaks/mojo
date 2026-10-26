@@ -26,10 +26,7 @@ from max.nn.kv_cache.metrics import KVCacheMetrics
 from max.pipelines.context import TextContext, TokenBuffer
 from max.pipelines.kv_cache import InsufficientBlocksError
 from max.pipelines.kv_cache.kv_connector import BlockCount, KVConnector
-from max.pipelines.kv_cache.paged_kv_cache.block_manager import PrefixCacheHits
-from max.pipelines.kv_cache.paged_kv_cache.block_utils import (
-    LittleKVCacheBlock,
-)
+from max.pipelines.kv_cache.paged_kv_cache._common import PrefixCacheHits
 from max.pipelines.kv_cache.paged_kv_cache.jenga_block_manager import (
     JengaBlockManager,
     KVLeafInfo,
@@ -75,7 +72,12 @@ def make_manager(
     pools = create_pools(leaf_infos, num_huge_blocks, num_replicas)
     return JengaBlockManager(
         pools=pools,
-        groups=create_groups(leaf_infos, pools, block_size),
+        groups=create_groups(
+            leaf_infos,
+            pools,
+            block_size,
+            enable_prefix_caching=enable_prefix_caching,
+        ),
         block_size=block_size,
         enable_prefix_caching=enable_prefix_caching,
         max_num_input_tokens=max_num_input_tokens,
@@ -187,6 +189,69 @@ def uncommit(
     for block in list(pool.prefix_caches[leaf_id].values()):
         if bids is None or block.bid in bids:
             pool.uncommit_block(block)
+
+
+def test_step_consumes_shared_swa_coverage_and_leaves_other_leaves_unchanged() -> (
+    None
+):
+    bm = make_manager(
+        {FULL: full(), SLIDING: sliding(window=5), VALUES: sliding(window=5)},
+        block_size=4,
+        enable_prefix_caching=True,
+    )
+    ctx = make_ctx(24)
+    bm.claim(ctx)
+    bm.alloc(ctx)
+    ctx.update(42)
+    # The producer must intersect all 40 trunk and 3 draft layer writes.
+    layer_writes = [(8, 24)] * 42 + [(13, 24)]
+    ctx.kv_cache_write_ranges[SLIDING] = (
+        max(start for start, _ in layer_writes),
+        min(end for _, end in layer_writes),
+    )
+    bm.step(ctx)
+
+    hashes = bm._compute_hashes_for_request(ctx)
+    pool = bm.pools[0]
+    assert not ctx.kv_cache_write_ranges
+    assert set(pool.prefix_caches[SLIDING]) == set(hashes[4:6])
+    assert set(pool.prefix_caches[FULL]) == set(hashes)
+    assert set(pool.prefix_caches[VALUES]) == set(hashes)
+
+    # A subsequent missing report cannot certify newly appended SWA rows.
+    decode(bm, ctx)
+    decode(bm, ctx)
+    decode(bm, ctx)
+    decode(bm, ctx)
+    hashes = bm._compute_hashes_for_request(ctx)
+    assert hashes[6] not in pool.prefix_caches[SLIDING]
+    assert hashes[6] in pool.prefix_caches[FULL]
+    ctx.kv_cache_write_ranges[SLIDING] = (28, 28)
+    bm.release(ctx)
+    assert not ctx.kv_cache_write_ranges
+
+
+@pytest.mark.parametrize(
+    "leaf_id,write_range", [(FULL, (0, 8)), (SLIDING, (0, 9))]
+)
+def test_step_rejects_invalid_write_metadata_without_replaying_it(
+    leaf_id: str, write_range: tuple[int, int]
+) -> None:
+    bm = make_manager(
+        {FULL: full(), SLIDING: sliding()},
+        block_size=4,
+        enable_prefix_caching=True,
+    )
+    ctx = make_ctx(8)
+    bm.claim(ctx)
+    bm.alloc(ctx)
+    ctx.update(42)
+    ctx.kv_cache_write_ranges[leaf_id] = write_range
+    with pytest.raises(ValueError):
+        bm.step(ctx)
+    assert not ctx.kv_cache_write_ranges
+    assert not bm.pools[0].prefix_caches[FULL]
+    assert not bm.pools[0].prefix_caches[SLIDING]
 
 
 # ===--------------------------------------------------------------------=== #
@@ -556,6 +621,53 @@ def test_swa_frees_the_blocks_it_slid_past_with_block_size_larger_than_1() -> (
     assert bm.huge_block_count().free == 8
 
 
+def test_swa_reserves_every_page_a_decoding_request_holds() -> None:
+    """A window that starts mid-page spans one more page than it fills.
+
+    A window of 12 tokens over pages of 4 is 3 pages wide, but the query at
+    token 12 attends back to token 1, which is still on page 0, while it writes
+    page 3. So a decoding request holds 4 pages, and the reserve has to say so.
+    """
+    bm = make_manager(
+        {SLIDING: sliding(ratio=1, window=12)},
+        block_size=4,
+        num_huge_blocks=10,
+    )
+    ctx = make_ctx(num_tokens=12)
+    bm.claim(ctx)
+    bm.alloc(ctx)
+    ctx.update(42)
+    bm.step(ctx)
+
+    bm.alloc(ctx)
+
+    held = [b for b in bm.get_req_blocks_per_leaf(ctx)[SLIDING] if b != 0]
+    assert len(held) == 4
+    assert bm._blocks_to_reserve(4096)[SLIDING] == len(held)
+
+
+@pytest.mark.parametrize("caching", [True, False])
+def test_swa_reserves_a_replay_window_page_with_prefix_caching(
+    caching: bool,
+) -> None:
+    """With caching, one more page keeps the window ending a page earlier.
+
+    A replay of a page-aligned prompt resumes there, one page short of where
+    the prompt ended.
+    """
+    leaf = PagedKVLeafRegion(
+        leaf_id=SLIDING,
+        group_id=KVCacheGroupId("sliding_window", 12),
+        bytes_per_page=1,
+        page_size=4,
+    )
+
+    assert leaf.blocks_to_reserve(99, enable_prefix_caching=caching) == (
+        5 if caching else 4
+    )
+    assert leaf.blocks_to_reserve(2, enable_prefix_caching=caching) == 2
+
+
 def test_swa_reuses_the_blocks_it_freed() -> None:
     """The window walks forward through a pool far smaller than the sequence.
 
@@ -746,6 +858,45 @@ def test_lru_evicts_the_tail_of_a_released_prefix() -> None:
     bm.alloc(ctxC)
     assert ctxC.tokens.processed_length == 3
     assert bm.get_req_blocks_per_leaf(ctxC)[FULL] == [1, 2, 3, 4]
+
+
+def test_lru_keeps_a_turn_beside_a_live_request() -> None:
+    """Eviction takes an older prefix in a parked huge block before the newer
+    one beside a live request's page."""
+    bm = make_manager(
+        {FULL: full(ratio=4)},
+        block_size=1,
+        num_huge_blocks=3,
+        enable_prefix_caching=True,
+    )
+    old = make_ctx_with_tokens([10, 11, 12, 13])
+    bm.claim(old)
+    decode(bm, old)
+    bm.release(old)
+
+    live = make_ctx_with_tokens([20])
+    bm.claim(live)
+    bm.alloc(live)
+
+    turn1 = make_ctx_with_tokens([30, 31, 32])
+    bm.claim(turn1)
+    decode(bm, turn1)
+    live_huge_block = bm.get_req_blocks_per_leaf(live)[FULL][0] // 4
+    assert {bid // 4 for bid in bm.get_req_blocks_per_leaf(turn1)[FULL]} == {
+        live_huge_block
+    }
+    bm.release(turn1)
+
+    # The pool is full, so these pages evict three commits, the oldest ones.
+    other = make_ctx_with_tokens([40, 41, 42])
+    bm.claim(other)
+    bm.alloc(other)
+    bm.release(other)
+
+    turn2 = make_ctx_with_tokens([30, 31, 32, 42, 50])
+    bm.claim(turn2)
+    bm.alloc(turn2)
+    assert turn2.tokens.processed_length == 3
 
 
 def test_reset_prefix_cache_drops_commits_nobody_holds() -> None:
@@ -1197,30 +1348,32 @@ def test_two_windows_converge_on_prefix_cache_hit() -> None:
 
 
 # ===--------------------------------------------------------------------=== #
-# get_req_blocks
+# num_req_blocks
 # ===--------------------------------------------------------------------=== #
 
 
-def test_get_req_blocks_returns_first_leaf_blocks() -> None:
+def test_num_req_blocks_counts_pages_when_leaf_ids_differ() -> None:
     bm = make_manager(
-        {FULL: full(ratio=1), SLIDING: sliding(ratio=1, window=10)},
+        {VALUES: full(ratio=1), SCALES: full(ratio=10)},
         block_size=1,
+        num_huge_blocks=8,
     )
     ctx = make_ctx(num_tokens=3)
     bm.claim(ctx)
     bm.alloc(ctx)
 
     per_leaf = bm.get_req_blocks_per_leaf(ctx)
-    assert bm.get_req_blocks(ctx) == next(iter(per_leaf.values()))
+    assert per_leaf[VALUES] != per_leaf[SCALES]
+    assert bm.num_req_blocks(ctx) == 3
 
 
-def test_get_req_blocks_empty_when_claimed_not_allocated() -> None:
+def test_num_req_blocks_zero_when_claimed_not_allocated() -> None:
     bm = make_manager({FULL: full(ratio=1)}, block_size=1)
     ctx = make_ctx(num_tokens=3)
     bm.claim(ctx)
 
-    assert bm.get_req_blocks(ctx) == []
-    assert not bm.get_req_blocks(ctx)
+    assert bm.get_req_blocks_per_leaf(ctx) == {FULL: []}
+    assert bm.num_req_blocks(ctx) == 0
 
 
 # ===--------------------------------------------------------------------=== #
@@ -2055,9 +2208,9 @@ def test_copy_prefix_from_peers_skips_leaves_already_present() -> None:
     assert bm.metrics.cross_replica_bytes_copied == 8
 
 
-def test_copy_prefix_from_peers_hands_back_its_pages_when_allocation_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_copy_prefix_from_peers_hands_back_its_pages_when_allocation_fails() -> (
+    None
+):
     """A refused allocation keeps what landed and strands nothing.
 
     A page dropped here would be referenced by nothing and recorded
@@ -2073,23 +2226,16 @@ def test_copy_prefix_from_peers_hands_back_its_pages_when_allocation_fails(
     commit_hashes(bm, [FULL], hashes, replica_idx=1)
 
     pool = bm.pools[0]
-    free_before = pool.num_free_blocks(FULL)
-    real_alloc = pool.alloc_block
-    allocated = 0
-
-    def alloc_then_refuse(leaf_id: str) -> LittleKVCacheBlock:
-        nonlocal allocated
-        allocated += 1
-        if allocated == 2:
-            raise InsufficientBlocksError("no room for the second page")
-        return real_alloc(leaf_id)
-
-    monkeypatch.setattr(pool, "alloc_block", alloc_then_refuse)
+    # Squeeze the pool to one free page, so the second page is refused.
+    squeeze = [
+        pool.alloc_block(FULL) for _ in range(pool.num_free_blocks(FULL) - 1)
+    ]
+    assert pool.num_free_blocks(FULL) == 1
 
     bm._copy_prefix_from_peers(hashes, 0)
 
-    assert allocated == 2
-    assert pool.num_free_blocks(FULL) == free_before
+    assert pool.num_free_blocks(FULL) == 1
+    assert all(block.ref_cnt == 1 for block in squeeze)
     # The first page landed before the refusal, so it is kept rather than
     # thrown away; only the hash whose page never arrived is missing.
     assert set(pool.prefix_caches[FULL]) == {b"a"}
@@ -2212,3 +2358,39 @@ def test_lookup_serves_a_cross_replica_window() -> None:
     assert len(row) == 3
     assert row[0] is bm.pools[0].null_little_blocks[SLIDING]
     assert not any(block.is_null for block in row[1:])
+
+
+def test_occupancy_adds_up_to_the_pool_counts() -> None:
+    bm = make_manager(
+        {VALUES: full(ratio=1), SCALES: full(ratio=4)},
+        num_huge_blocks=16,
+        enable_prefix_caching=True,
+    )
+    # A finished request leaves its prefix committed but unreferenced.
+    finished = make_ctx_with_tokens([1, 2, 3, 4])
+    bm.claim(finished)
+    decode(bm, finished)
+    bm.release(finished)
+    running = make_ctx_with_tokens([9, 8])
+    bm.claim(running)
+    bm.alloc(running)
+
+    occupancy = bm.occupancy()
+    held = bm.get_req_blocks_per_leaf(running)
+    little = bm.little_block_count()
+    pool = bm.pools[0]
+    for leaf_id, leaf in occupancy.leaves.items():
+        assert leaf.used == len(held[leaf_id])
+        assert leaf.evictable == len(pool.prefix_caches[leaf_id]) > 0
+        assert leaf.evictable + leaf.empty == little[leaf_id].free
+        assert leaf.total == little[leaf_id].total
+        assert leaf.pressure_pct == little[leaf_id].used_pct
+
+    huge = bm.huge_block_count()
+    evictable = sum(
+        leaf.evictable_huge_blocks for leaf in occupancy.leaves.values()
+    )
+    used = sum(leaf.used_huge_blocks for leaf in occupancy.leaves.values())
+    assert used > 0 and evictable > 0
+    assert evictable + occupancy.empty_huge_blocks == huge.free
+    assert used + evictable + occupancy.empty_huge_blocks == huge.total

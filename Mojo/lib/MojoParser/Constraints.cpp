@@ -24,7 +24,6 @@
 #include "Mojo/MojoParser/ASTDecl.h"
 #include "Mojo/MojoParser/ASTType.h"
 #include "Mojo/MojoParser/DeclResolver.h"
-#include "Mojo/MojoParser/DeclSignaturePrinter.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace M;
@@ -113,6 +112,16 @@ TriBool LIT::canDischargeConstraintsInScope(
     overallAssumptionOperands.push_back(
         getCanonicalAttr(assumption.getProposition()));
 
+  TypedAttr overallAssumption;
+  if (overallAssumptionOperands.empty())
+    overallAssumption = SIMDAttr::getScalarBool(
+        constraints.front().getProposition().getContext(), true);
+  else if (overallAssumptionOperands.size() == 1)
+    overallAssumption = overallAssumptionOperands.front();
+  else
+    overallAssumption =
+        ParamOperatorAttr::get(POC::And, overallAssumptionOperands);
+
   if (provenConstraints)
     provenConstraints->resize(constraints.size());
 
@@ -126,7 +135,7 @@ TriBool LIT::canDischargeConstraintsInScope(
 
     // If assumptions imply the constraint, skip it; if they contradict it,
     // treat it as violated.
-    TriBool result = isPropositionImplied(canonProp, overallAssumptionOperands);
+    TriBool result = isPropositionImplied(canonProp, overallAssumption);
     if (result.isTrue()) {
       if (provenConstraints)
         provenConstraints->set(idx);

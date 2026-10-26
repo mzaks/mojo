@@ -11,172 +11,12 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-"""Regression tests for per-batch KV connector metric take/reset (MXSERV-203)."""
+"""Tests for KV connector metric accumulation (MXSERV-203)."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-
-from max.nn.kv_cache import KVCacheGroupId
 from max.nn.kv_cache.metrics import KVCacheMetrics
 from max.pipelines.kv_cache.connectors.null_connector import NullConnector
-from max.pipelines.kv_cache.kv_connector import (
-    ByteCount,
-    CompletedTransfer,
-    KVConnectorTransfer,
-    KVTransfer,
-)
-from max.pipelines.kv_cache.paged_kv_cache.block_manager import BlockManager
-
-
-class _CountingConnector:
-    """Minimal connector stub with mutable transfer counters."""
-
-    def __init__(self) -> None:
-        self._h2d_bytes_copied = 0
-        self._d2h_bytes_copied = 0
-        self._disk_bytes_written = 0
-        self._disk_bytes_read = 0
-        # dKV health that mirrors the real connector, so connected and total
-        # are a live level and reconnect_attempts is a lifetime counter that
-        # take_metrics deliberately does not clear.
-        self._connected_clients = 0
-        self._total_clients = 0
-        self._reconnect_attempts = 0
-
-    @property
-    def leaves(self) -> Mapping[str, KVCacheGroupId]:
-        return {"full": KVCacheGroupId.full()}
-
-    @property
-    def name(self) -> str:
-        return "counting"
-
-    def lookup(
-        self,
-        block_hashes: Sequence[bytes],
-        replica_idx: int = 0,
-        hint: bytes | None = None,
-    ) -> Mapping[str, Sequence[bool]]:
-        return {"full": [False] * len(block_hashes)}
-
-    def load(
-        self,
-        block_ids: Mapping[str, Sequence[int]],
-        block_hashes: Mapping[str, Sequence[bytes]],
-        replica_idx: int = 0,
-        hint: bytes | None = None,
-    ) -> KVTransfer:
-        return CompletedTransfer()
-
-    def offload(
-        self,
-        block_ids: Mapping[str, Sequence[int]],
-        block_hashes: Sequence[bytes],
-        replica_idx: int = 0,
-    ) -> KVConnectorTransfer:
-        return CompletedTransfer()
-
-    def touch(
-        self,
-        block_hashes: Sequence[bytes],
-        replica_idx: int = 0,
-    ) -> None: ...
-
-    def wait_for_loads(self) -> None: ...
-    def wait_for_offloads(self) -> None: ...
-    def shutdown(self) -> None: ...
-    def reset_prefix_cache(self) -> None: ...
-
-    @property
-    def host_byte_count(self) -> ByteCount:
-        return ByteCount(free=0, total=0)
-
-    @property
-    def disk_byte_count(self) -> ByteCount:
-        return ByteCount(free=0, total=0)
-
-    @property
-    def metrics(self) -> KVCacheMetrics:
-        return KVCacheMetrics(
-            h2d_bytes_copied=self._h2d_bytes_copied,
-            d2h_bytes_copied=self._d2h_bytes_copied,
-            disk_bytes_written=self._disk_bytes_written,
-            disk_bytes_read=self._disk_bytes_read,
-            dkv_connected_clients=self._connected_clients,
-            dkv_total_clients=self._total_clients,
-            dkv_reconnect_attempts=self._reconnect_attempts,
-        )
-
-    def take_metrics(self) -> KVCacheMetrics:
-        # Reads the current window and clears only the per-batch transfer
-        # counters in one step. The health fields are a live level and a
-        # lifetime counter, so they are intentionally left alone here,
-        # mirroring the real dKV connector.
-        metrics = self.metrics
-        self._h2d_bytes_copied = 0
-        self._d2h_bytes_copied = 0
-        self._disk_bytes_written = 0
-        self._disk_bytes_read = 0
-        return metrics
-
-
-def test_block_manager_take_metrics_clears_connector_counters() -> None:
-    connector = _CountingConnector()
-    connector._d2h_bytes_copied = 5
-    connector._h2d_bytes_copied = 2
-    bm = BlockManager(
-        total_num_blocks=64,
-        block_size=16,
-        enable_prefix_caching=True,
-        connector=connector,
-    )
-
-    # The single call returns the sampled window and clears it.
-    taken = bm.take_metrics()
-    assert taken.d2h_bytes_copied == 5
-    assert taken.h2d_bytes_copied == 2
-
-    # A follow-up read sees zero until new transfers land.
-    assert bm.metrics.d2h_bytes_copied == 0
-    assert bm.metrics.h2d_bytes_copied == 0
-
-    connector._d2h_bytes_copied = 3
-    assert bm.metrics.d2h_bytes_copied == 3
-
-
-def test_scheduler_sampling_cycle_reports_per_batch_deltas() -> None:
-    """Models BatchMetrics.create(): take aggregated metrics per batch.
-
-    Before MXSERV-203, batch 2 would report 8 (5+3 cumulative) because
-    connector counters were never reset. ``take_metrics`` samples and resets
-    in one step, so telemetry emits 5 then 3.
-    """
-    connector = _CountingConnector()
-    bm = BlockManager(
-        total_num_blocks=64,
-        block_size=16,
-        enable_prefix_caching=True,
-        connector=connector,
-    )
-
-    def sample_and_reset(d2h_delta: int, h2d_delta: int) -> KVCacheMetrics:
-        connector._d2h_bytes_copied += d2h_delta
-        connector._h2d_bytes_copied += h2d_delta
-        return bm.take_metrics()
-
-    batch_one = sample_and_reset(d2h_delta=5, h2d_delta=2)
-    batch_two = sample_and_reset(d2h_delta=3, h2d_delta=0)
-
-    assert batch_one.d2h_bytes_copied == 5
-    assert batch_one.h2d_bytes_copied == 2
-    assert batch_two.d2h_bytes_copied == 3
-    assert batch_two.h2d_bytes_copied == 0
-
-    # OTEL counter.add() with these per-batch samples totals 8, not 23.
-    otel_counter_total = batch_one.d2h_bytes_copied + batch_two.d2h_bytes_copied
-    assert otel_counter_total == 8
-    assert otel_counter_total != 5 + 8  # pre-fix cumulative double-count
 
 
 def test_null_connector_take_metrics_is_noop() -> None:
@@ -203,6 +43,36 @@ def test_kv_cache_metrics_add_sums_dkv_health_fields() -> None:
     assert total.dkv_reconnect_attempts == 7
     # one of two clients down, so the aggregate is degraded
     assert total.dkv_degraded
+
+
+def test_kv_cache_metrics_add_folds_the_dkv_settle_fields() -> None:
+    """The settle depth and finished count sum, the age and the halt take the max.
+
+    Two settle workers' oldest jobs are still one job's wait each, so adding
+    them would report a wait neither saw, and two halts are still one flag.
+    """
+    halted = KVCacheMetrics(
+        dkv_settle_queue_depth=3,
+        dkv_settle_queue_oldest_age_ms=250.0,
+        dkv_settle_jobs_finished=10,
+        dkv_owner_releases_halted=1,
+    )
+    draining = KVCacheMetrics(
+        dkv_settle_queue_depth=4,
+        dkv_settle_queue_oldest_age_ms=40.0,
+        dkv_settle_jobs_finished=7,
+        dkv_owner_releases_halted=0,
+    )
+
+    for total in (halted + draining, draining + halted):
+        assert total.dkv_settle_queue_depth == 7
+        assert total.dkv_settle_queue_oldest_age_ms == 250.0
+        assert total.dkv_settle_jobs_finished == 17
+        assert total.dkv_owner_releases_halted == 1
+
+    # two halts up are still one flag, not a count of them
+    assert (halted + halted).dkv_owner_releases_halted == 1
+    assert KVCacheMetrics().dkv_settle_queue_oldest_age_ms == 0.0
 
 
 def test_kv_cache_metrics_add_sums_tier_attribution_fields() -> None:
@@ -277,39 +147,3 @@ def test_kv_cache_metrics_dkv_degraded_predicate() -> None:
     assert KVCacheMetrics(
         dkv_connected_clients=1, dkv_total_clients=2
     ).dkv_degraded
-
-
-def test_dkv_health_persists_across_sample_and_reset() -> None:
-    """dKV health is a level and a cumulative value, not a per-batch delta.
-
-    The connector reports connected and reconnect_attempts live and does not
-    clear them on take_metrics, so every batch reads the current level and the
-    running cumulative total. This is why they export as gauges rather than
-    counters, because a counter fed the cumulative value each batch would
-    double-count.
-    """
-    connector = _CountingConnector()
-    connector._connected_clients = 1
-    connector._total_clients = 2
-    connector._reconnect_attempts = 3
-    bm = BlockManager(
-        total_num_blocks=64,
-        block_size=16,
-        enable_prefix_caching=True,
-        connector=connector,
-    )
-
-    batch_one = bm.take_metrics()
-    batch_two = bm.metrics
-
-    # take_metrics did not clear the health fields, so both samples agree
-    for batch in (batch_one, batch_two):
-        assert batch.dkv_connected_clients == 1
-        assert batch.dkv_total_clients == 2
-        assert batch.dkv_reconnect_attempts == 3
-        assert batch.dkv_degraded
-
-    # a later reconnect bumps the running total, and the next sample reflects
-    # the new cumulative value rather than a per-batch delta of 1
-    connector._reconnect_attempts = 4
-    assert bm.metrics.dkv_reconnect_attempts == 4

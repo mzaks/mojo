@@ -318,7 +318,7 @@ kgen.generator @eq_compare_anything() {
 
 // CHECK-LABEL: @eq_compare_sub_elements
 kgen.generator @eq_compare_sub_elements<a: !kgen.param_list<index>, b: !kgen.param_list<index>, x: index, y: index>() {
-  // CHECK-NEXT: = kgen.param.constant: i1 = <to_builtin(:scalar<bool> and(identical(:scalar<index> from_builtin(#kgen.param_list.size<:param_list<index> a>), 2), identical(:scalar<index> from_builtin(#kgen.param_list.size<:param_list<index> b>), 2)))>
+  // CHECK-NEXT: = kgen.param.constant: i1 = <to_builtin(:scalar<bool> identical(:scalar<index> from_builtin(#kgen.param_list.size<:param_list<index> a>), from_builtin(#kgen.param_list.size<:param_list<index> b>), 2))>
   kgen.param.constant: i1 = <and(
     to_builtin(:scalar<bool> eq(:index #kgen.param_list.size<:!kgen.param_list<index> b>, 2)),
     to_builtin(:scalar<bool> eq(:index #kgen.param_list.size<:!kgen.param_list<index> a>, 2)),
@@ -510,8 +510,6 @@ kgen.generator @datalayout_operators() {
   kgen.param.constant: index = <get_sizeof(index, #target)>
   // CHECK-NEXT: <8>
   kgen.param.constant: index = <get_sizeof(!kgen.generator<() -> ()>, #target)>
-  // CHECK-NEXT: <16>
-  kgen.param.constant: index = <get_sizeof(!kgen.generator<() capturing -> ()>, #target)>
 
   // CHECK-NEXT: <4>
   kgen.param.constant: index = <get_alignof(si32, #target)>
@@ -845,10 +843,7 @@ kgen.generator @indexParamRef<
 }
 
 // CHECK-LABEL: kgen.generator @partial_bind_index
-kgen.generator @partial_bind_index<c>() {
-  kgen.param.declare.region fn = <a, b: type>(%arg0: !pop.array<a, b>) {
-    hlcf.return
-  }
+kgen.generator @partial_bind_index<c, fn: <index, type>(!pop.array<*(0,0), *(0,1)>) -> ()>() {
   kgen.param.declare callable: <index, type>(!pop.array<*(0,0), *(0,1)>) -> () = <fn>
   // CHECK: declare callable: <index, type>(!pop.array<*(0,0), *(0,1)>) -> () = <fn>
   kgen.param.declare partial_bound: <type>(!pop.array<c, *(0,0)>) -> () =
@@ -857,11 +852,7 @@ kgen.generator @partial_bind_index<c>() {
 }
 
 // CHECK-LABEL: @bindParams
-kgen.generator @bindParams<c, d: type>() {
-  kgen.param.declare.region fn = <a, b: type>(%arg0: !pop.array<a, b>) {
-    hlcf.return
-  }
-
+kgen.generator @bindParams<c, d: type, fn: <index, type>(!pop.array<*(0,0), *(0,1)>) -> ()>() {
   // CHECK: declare bind0: <type>(!pop.array<c, *(0,0)>) -> () = <bind_params(:<index, type>(!pop.array<*(0,0), *(0,1)>) -> () fn, c, ?)>
   kgen.param.declare bind0: <type>(!pop.array<c, *(0,0)>) -> () =
     <#kgen.bind_params<:!kgen.generator<<index, type>(!pop.array<*(0,0), *(0,1)>) -> ()> fn, c, ?>>
@@ -1380,5 +1371,14 @@ kgen.generator @param_identical_nested_unknown() {
       #kgen.param_list<#kgen.unknown : !kgen.scalar<si32>> : !kgen.param_list<!kgen.scalar<si32>>,
       #kgen.param_list<#kgen.unknown : !kgen.scalar<si32>> : !kgen.param_list<!kgen.scalar<si32>>>
   } : () -> ()
+  hlcf.return
+}
+
+
+// CHECK-LABEL: @add_simplification
+kgen.generator @add_simplification<p1, p2, p3>()  {
+  // CHECK: = kgen.param.constant = <to_builtin(:scalar<index> add(from_builtin(p1), from_builtin(p2), from_builtin(p3), -3))>
+  %test = kgen.param.constant = <add(add(p1, -1), add(p2, -1), add(p3, -1))>
+
   hlcf.return
 }

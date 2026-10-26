@@ -38,7 +38,12 @@ import linalg.matmul.vendor.blas as vendor_blas
 from max.gpu.host import DeviceContext
 from internal_utils import assert_almost_equal
 from std.random import rand
-from layout import TileTensor, Coord, CoordLike, row_major, Idx
+from layout import (
+    TileTensor,
+    CoordLike,
+    row_major,
+    Idx,
+)
 
 from linalg.matmul.gpu.sm100_structured.fused_swiglu.config import (
     FusedSwiGLUMatmulConfig,
@@ -78,7 +83,9 @@ def swiglu_bias_reference(
                 + bias_ptr[2 * h + 1].cast[.float32]()
             )
             var sigmoid = recip(Float32(1.0) + exp(-gate))
-            ref_ptr.store(m * H + h, (gate * sigmoid * up).cast[.bfloat16]())
+            ref_ptr.unsafe_store(
+                m * H + h, (gate * sigmoid * up).cast[.bfloat16]()
+            )
 
 
 def test_swiglu_bias[
@@ -90,9 +97,9 @@ def test_swiglu_bias[
 ](ctx: DeviceContext, m: MType, n: NType, k: KType) raises:
     comptime dtype = DType.bfloat16
 
-    var M = Int(m.value())
-    var N = Int(n.value())
-    var K = Int(k.value())
+    var M = Int(m)
+    var N = Int(n)
+    var K = Int(k)
     var H = N // 2
 
     print(
@@ -118,13 +125,11 @@ def test_swiglu_bias[
         sep="",
     )
 
-    var a_shape = row_major(Coord(m, Idx[KType.static_value]))
-    var b_shape = row_major(
-        Coord(Idx[NType.static_value], Idx[KType.static_value])
-    )
-    var bias_shape = row_major(Coord(Idx[NType.static_value]))
-    var full_shape = row_major(Coord(m, Idx[NType.static_value]))
-    var c_shape = row_major(Coord(m, Idx[NType.static_value // 2]))
+    var a_shape = row_major(m, Idx[KType.static_value])
+    var b_shape = row_major(Idx[NType.static_value], Idx[KType.static_value])
+    var bias_shape = row_major(Idx[NType.static_value])
+    var full_shape = row_major(m, Idx[NType.static_value])
+    var c_shape = row_major(m, Idx[NType.static_value // 2])
 
     var a_size = M * K
     var b_size = N * K

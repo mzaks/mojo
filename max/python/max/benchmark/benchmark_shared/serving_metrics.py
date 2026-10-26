@@ -37,6 +37,7 @@ from max.benchmark.benchmark_shared.request import (
     BaseRequestFuncOutput,
     PixelGenerationRequestFuncOutput,
     RequestFuncOutput,
+    ServerTokenStats,
     measured_window_duration,
 )
 from max.benchmark.benchmark_shared.steady_state import (
@@ -63,6 +64,24 @@ def compute_output_len(
     tokenizer: PreTrainedTokenizerBase,
     output: RequestFuncOutput,
 ) -> int:
+    """Returns the number of tokens the server generated for ``output``.
+
+    Prefers the server's ``usage.completion_tokens``. Re-tokenizing the
+    streamed text undercounts whenever generated tokens stream no text, such
+    as special tokens past a forced EOS, or merge into fewer tokens on
+    re-encoding; the text count is the fallback for servers that report no
+    usage.
+
+    Args:
+        tokenizer: The tokenizer used to count tokens in the streamed text.
+        output: One request's output.
+
+    Returns:
+        The generated token count.
+    """
+    completion_tokens = output.server_token_stats.completion_tokens
+    if completion_tokens is not None:
+        return completion_tokens
     return len(
         tokenizer.encode(output.generated_text, add_special_tokens=False)
     )
@@ -103,13 +122,26 @@ def _warn_on_request_failures(
 def _aggregate_gpu_stats(
     collect_gpu_stats: bool,
     gpu_metrics: list[dict[str, GPUStats]] | None,
-) -> tuple[list[float], list[float], list[float]]:
+    gpu_device_groups: Mapping[str, str] | None = None,
+) -> tuple[list[float], list[float], list[float], dict[str, list[float]]]:
+    """Reduce GPU snapshots to per-device peak memory, free memory, and use.
+
+    Also splits per-device utilization by ``gpu_device_groups`` (device to
+    group, such as a disaggregated engine's role), keeping each group in the
+    order its first device appears in that mapping.
+    """
     peak_gpu_memory_mib: list[float] = []
     available_gpu_memory_mib: list[float] = []
     gpu_utilization: list[float] = []
+    gpu_utilization_by_group: dict[str, list[float]] = {}
 
     if not collect_gpu_stats or not gpu_metrics:
-        return peak_gpu_memory_mib, available_gpu_memory_mib, gpu_utilization
+        return (
+            peak_gpu_memory_mib,
+            available_gpu_memory_mib,
+            gpu_utilization,
+            gpu_utilization_by_group,
+        )
 
     # The device set can vary across snapshots: a remote DCGM scrape spans
     # several exporter pods, one may miss an interval, and a pod can restart
@@ -120,26 +152,63 @@ def _aggregate_gpu_stats(
     all_devices = sorted(set().union(*(s.keys() for s in gpu_metrics)))
     if not all_devices:
         logger.warning("No GPUs found, so there are no GPU stats to report")
-        return peak_gpu_memory_mib, available_gpu_memory_mib, gpu_utilization
+        return (
+            peak_gpu_memory_mib,
+            available_gpu_memory_mib,
+            gpu_utilization,
+            gpu_utilization_by_group,
+        )
 
     bytes_per_mib = 1024 * 1024
+    saw_memory_stats = False
+    utilization_by_device: dict[str, float] = {}
     for device_name in all_devices:
         present = [s[device_name] for s in gpu_metrics if device_name in s]
-        peak_gpu_memory_mib.append(
-            max(stats.memory.used_bytes for stats in present) / bytes_per_mib
-        )
-        available_gpu_memory_mib.append(
-            min(stats.memory.free_bytes for stats in present) / bytes_per_mib
-        )
-        gpu_utilization.append(
-            statistics.mean(
-                stats.utilization.gpu_usage_percent for stats in present
+        # Some drivers report no memory info (for example, NVML on DGX
+        # Spark), only utilization and clocks. Leave those devices out of
+        # the memory series. Counting them as zero would skew it. As a
+        # result, the memory lists and gpu_utilization aren't index-aligned
+        # by device when only some devices report memory.
+        memory_present = [
+            m for m in (stats.memory for stats in present) if m is not None
+        ]
+        if memory_present:
+            peak_gpu_memory_mib.append(
+                max(m.used_bytes for m in memory_present) / bytes_per_mib
             )
+            available_gpu_memory_mib.append(
+                min(m.free_bytes for m in memory_present) / bytes_per_mib
+            )
+            saw_memory_stats = True
+        utilization = statistics.mean(
+            stats.utilization.gpu_usage_percent for stats in present
+        )
+        gpu_utilization.append(utilization)
+        utilization_by_device[device_name] = utilization
+
+    if not saw_memory_stats:
+        logger.warning(
+            "Skipping GPU memory metrics: this driver doesn't report GPU "
+            "memory info"
         )
 
     # One entry per device, so the reported mean GPU utilization (mean of this
-    # list) is genuinely the mean across every engine device seen this run.
-    return peak_gpu_memory_mib, available_gpu_memory_mib, gpu_utilization
+    # list) is the mean across every device the source reports. A Prometheus
+    # selector narrows that to the engine's own GPUs; a direct DCGM scrape
+    # (--gpu-metrics-host) reports every GPU on the node, so a node whose GPUs
+    # are partly idle reads low there, and the console table's device count is
+    # what shows it (8 devices for a tp4 engine on one node).
+    for device_name, group in (gpu_device_groups or {}).items():
+        if device_name in utilization_by_device:
+            gpu_utilization_by_group.setdefault(group, []).append(
+                utilization_by_device[device_name]
+            )
+    return (
+        peak_gpu_memory_mib,
+        available_gpu_memory_mib,
+        gpu_utilization,
+        gpu_utilization_by_group,
+    )
 
 
 def _per_turn_cache_retentions(
@@ -246,6 +315,7 @@ def calculate_metrics(
     kv_block_size: int,
     metrics_by_endpoint: Mapping[str, ParsedMetrics] | None = None,
     *,
+    gpu_device_groups: Mapping[str, str] | None = None,
     reject_outliers: bool = False,
     record_request_text: bool = False,
     all_outputs: Sequence[RequestFuncOutput] | None = None,
@@ -268,6 +338,12 @@ def calculate_metrics(
     constrained_tpots: list[float] = []
     unconstrained_tpots: list[float] = []
     constrained_requests = 0
+    conforming_constrained_requests = 0
+    judged_constrained_requests = 0
+    tool_requests = 0
+    tool_call_responses = 0
+    image_requests = 0
+    lora_requests = 0
     total_server_cached_tokens: int = 0
     total_server_prompt_tokens: int = 0
 
@@ -347,6 +423,10 @@ def calculate_metrics(
         ttfts.append(o.ttft)
         if o.response_format_constrained:
             constrained_requests += 1
+            if o.response_format_conformed is not None:
+                judged_constrained_requests += 1
+                if o.response_format_conformed:
+                    conforming_constrained_requests += 1
             constrained_ttfts.append(o.ttft)
             if tpot is not None:
                 constrained_tpots.append(tpot)
@@ -354,6 +434,14 @@ def calculate_metrics(
             unconstrained_ttfts.append(o.ttft)
             if tpot is not None:
                 unconstrained_tpots.append(tpot)
+        if o.tools_offered:
+            tool_requests += 1
+            if o.tool_call_returned:
+                tool_call_responses += 1
+        if o.carries_image:
+            image_requests += 1
+        if o.lora_id is not None:
+            lora_requests += 1
         if o.ttft > 0:
             input_throughputs.append(o.prompt_len / o.ttft)
         if (o.latency - o.ttft) > 0:
@@ -454,9 +542,11 @@ def calculate_metrics(
         peak_gpu_memory_mib,
         available_gpu_memory_mib,
         gpu_utilization,
+        gpu_utilization_by_group,
     ) = _aggregate_gpu_stats(
         collect_gpu_stats=collect_gpu_stats,
         gpu_metrics=gpu_metrics,
+        gpu_device_groups=gpu_device_groups,
     )
 
     global_cached_token_rate: float = (
@@ -556,6 +646,19 @@ def calculate_metrics(
         constrained_request_rate=(
             constrained_requests / len(measured) if measured else None
         ),
+        constrained_conformance_rate=(
+            conforming_constrained_requests / judged_constrained_requests
+            if judged_constrained_requests
+            else None
+        ),
+        tool_request_rate=(tool_requests / len(measured) if measured else None),
+        tool_call_response_rate=(
+            tool_call_responses / tool_requests if tool_requests else None
+        ),
+        image_request_rate=(
+            image_requests / len(measured) if measured else None
+        ),
+        lora_request_rate=(lora_requests / len(measured) if measured else None),
         step_tpot_ms=StandardPercentileMetrics(
             step_tpots, scale_factor=1000.0, unit="ms"
         )
@@ -586,6 +689,7 @@ def calculate_metrics(
         peak_gpu_memory_mib=peak_gpu_memory_mib,
         available_gpu_memory_mib=available_gpu_memory_mib,
         gpu_utilization=gpu_utilization,
+        gpu_utilization_by_group=gpu_utilization_by_group,
         cpu_metrics=cpu_metrics,
         metrics_by_endpoint=metrics_by_endpoint or {},
         text_data=text_data,
@@ -600,6 +704,7 @@ def calculate_pixel_generation_metrics(
     max_concurrency: int | None,
     collect_gpu_stats: bool,
     metrics_by_endpoint: Mapping[str, ParsedMetrics] | None = None,
+    gpu_device_groups: Mapping[str, str] | None = None,
 ) -> BenchmarkResult:
     completed = 0
     failures = 0
@@ -630,9 +735,11 @@ def calculate_pixel_generation_metrics(
         peak_gpu_memory_mib,
         available_gpu_memory_mib,
         gpu_utilization,
+        gpu_utilization_by_group,
     ) = _aggregate_gpu_stats(
         collect_gpu_stats=collect_gpu_stats,
         gpu_metrics=gpu_metrics,
+        gpu_device_groups=gpu_device_groups,
     )
 
     # Use the first-submit -> last-complete window so setup/teardown
@@ -664,6 +771,7 @@ def calculate_pixel_generation_metrics(
         peak_gpu_memory_mib=peak_gpu_memory_mib,
         available_gpu_memory_mib=available_gpu_memory_mib,
         gpu_utilization=gpu_utilization,
+        gpu_utilization_by_group=gpu_utilization_by_group,
         cpu_metrics=cpu_metrics,
         metrics_by_endpoint=metrics_by_endpoint or {},
         pixel_data=pixel_data,
@@ -694,6 +802,7 @@ def build_pixel_generation_result(
     max_concurrency: int | None,
     collect_gpu_stats: bool,
     metrics_by_endpoint: Mapping[str, ParsedMetrics] | None = None,
+    gpu_device_groups: Mapping[str, str] | None = None,
 ) -> BenchmarkResult:
     """Compute metrics and build the result dict for pixel-generation tasks."""
     if not _is_pixel_generation_outputs(outputs):
@@ -709,8 +818,17 @@ def build_pixel_generation_result(
         max_concurrency=max_concurrency,
         collect_gpu_stats=collect_gpu_stats,
         metrics_by_endpoint=metrics_by_endpoint,
+        gpu_device_groups=gpu_device_groups,
     )
     return metrics
+
+
+def _session_sort_key(sid: str) -> tuple[int, int, str]:
+    """Sorts numeric session ids first by integer value, then anonymous ids."""
+    try:
+        return (0, int(sid), "")
+    except ValueError:
+        return (1, 0, sid)
 
 
 def build_text_generation_result(
@@ -729,6 +847,8 @@ def build_text_generation_result(
     spec_decode_stats: SpecDecodeStats | None = None,
     kv_block_size: int = 128,
     record_request_text: bool = False,
+    gpu_device_groups: Mapping[str, str] | None = None,
+    outputs_by_session: Mapping[str, Sequence[RequestFuncOutput]] | None = None,
 ) -> BenchmarkResult:
     """Compute metrics and build the result for text-generation tasks.
 
@@ -750,6 +870,10 @@ def build_text_generation_result(
     ``steady_state_warning``, ``num_outliers_rejected``) are attached to
     the returned ``BenchmarkResult`` for observability without duplicating
     the full metric set.
+
+    Per-request server token stats are attached grouped by session (numeric
+    session ids in integer order) when ``outputs_by_session`` is given, else
+    as one flat list in output order.
     """
     if not _is_text_generation_outputs(outputs):
         raise TypeError(
@@ -827,6 +951,7 @@ def build_text_generation_result(
             max_concurrent_conversations=max_concurrent_conversations,
             collect_gpu_stats=collect_gpu_stats,
             metrics_by_endpoint=metrics_by_endpoint,
+            gpu_device_groups=gpu_device_groups,
             kv_block_size=kv_block_size,
             reject_outliers=True,
             record_request_text=record_request_text,
@@ -875,6 +1000,7 @@ def build_text_generation_result(
             max_concurrent_conversations=max_concurrent_conversations,
             collect_gpu_stats=collect_gpu_stats,
             metrics_by_endpoint=metrics_by_endpoint,
+            gpu_device_groups=gpu_device_groups,
             kv_block_size=kv_block_size,
             reject_outliers=False,
             record_request_text=record_request_text,
@@ -883,8 +1009,23 @@ def build_text_generation_result(
     for warn in text_metrics.confidence_warnings():
         logger.warning(f"Confidence: {warn}")
 
+    session_server_stats: dict[str, list[ServerTokenStats]] | None = None
+    aggregate_server_stats: list[ServerTokenStats] | None = None
+    if outputs_by_session is not None:
+        session_server_stats = {
+            sid: [out.server_token_stats for out in outs]
+            for sid, outs in sorted(
+                outputs_by_session.items(),
+                key=lambda kv: _session_sort_key(kv[0]),
+            )
+        }
+    else:
+        aggregate_server_stats = [out.server_token_stats for out in outputs]
+
     return text_metrics.model_copy(
         update={
+            "session_server_stats": session_server_stats,
+            "aggregate_server_stats": aggregate_server_stats,
             "steady_state_detected": steady.detected,
             "steady_state_window_count": steady.steady_state_count,
             "steady_state_mode": mode,

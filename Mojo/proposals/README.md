@@ -83,6 +83,7 @@ These proposals are still being discussed or refined.
 
 | Proposal                                          | Description                                               | Status   |
 |---------------------------------------------------|-----------------------------------------------------------|----------|
+| [async-design](async-design.md)                   | Async programming model, tasks, and runtime               | Draft    |
 | [function-contracts](function-contracts.md)       | `requires` and `ensures` clauses for verification         | Draft    |
 | [edge-case-behaviors](edge-case-behaviors.md)     | Edge case behavior definitions                            | Draft    |
 | [mojo-and-dynamism](mojo-and-dynamism.md)         | Mojo and dynamic features                                 | Proposed |

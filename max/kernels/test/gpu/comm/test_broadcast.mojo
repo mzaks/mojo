@@ -15,11 +15,7 @@ from std.math import ceildiv
 from std.sys import size_of
 from std.itertools import product
 from max.gpu.host import DeviceBuffer, DeviceContext
-from layout import (
-    Idx,
-    TileTensor,
-    row_major,
-)
+from layout import TileTensor, row_major
 from std.testing import assert_true
 
 from comm import Signal
@@ -28,7 +24,6 @@ from comm.sync import enable_p2p, init_signal_buffer
 
 
 @inline(.always)
-@__parameter
 def _input_value[dtype: DType](root: Int, j: Int) -> Scalar[dtype]:
     """Generate position-based input value that includes root rank.
 
@@ -117,7 +112,10 @@ def broadcast_test[
         if root_self_copy and i == root:
             # Special case: root does an in-place copy
             out_dev_list.append(input_dev)
-            out_tiles[i] = OutputTileType(input_dev, row_major(length))
+            out_tiles[i] = OutputTileType(
+                input_dev.unsafe_ptr().as_unsafe_any_origin(),
+                row_major(length),
+            )
             continue
 
         var ctx = list_of_ctxs[i]
@@ -187,7 +185,6 @@ def broadcast_test[
                 )
 
 
-@__parameter
 def run_broadcast_sweep[]() raises:
     # Run tests for each configuration.
     comptime for gpu_idx, dtype_idx, length_idx, root_self_copy in product(
@@ -196,7 +193,7 @@ def run_broadcast_sweep[]() raises:
         range(len(test_lengths)),
         [True, False],
     ):
-        comptime num_gpus = rebind[Int](test_gpu_counts[gpu_idx])
+        comptime num_gpus = test_gpu_counts[gpu_idx]
         if DeviceContext.number_of_devices() < num_gpus:
             continue
 
@@ -205,8 +202,8 @@ def run_broadcast_sweep[]() raises:
         for i in range(num_gpus):
             list_of_ctxs.append(DeviceContext(device_id=i))
 
-        comptime dtype = rebind[DType](test_dtypes[dtype_idx])
-        comptime length = rebind[Int](test_lengths[length_idx])
+        comptime dtype = test_dtypes[dtype_idx]
+        comptime length = test_lengths[length_idx]
 
         # Test with each GPU as root
         for root in range(num_gpus):

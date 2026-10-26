@@ -14,7 +14,7 @@
 
 This module provides two simdgroup_matrix MMA shapes:
 
-- 16x16x16 (`_mma_apple`): Apple M5 only (Metal 4.0 / AIR 2.8.0), float and
+- 16x16x16 (`_mma_apple`): Apple M5 and newer (Metal 4.0 / AIR 2.8.0), float and
   integer-widening.
 - 8x8 (`_mma_apple_8x8`): all Apple GPU generations (M1-M5), float-only.
 
@@ -278,7 +278,16 @@ def _mma_apple_transposable(
         )
 
     else:
-        _unsupported_mma_op(d, a, b, c)
+        _unsupported_mma_op[
+            d.dtype,
+            d.length,
+            a.dtype,
+            a.length,
+            b.dtype,
+            b.length,
+            c.dtype,
+            c.length,
+        ]()
 
 
 @inline(.always)
@@ -325,4 +334,13 @@ def _mma_apple_8x8(mut d: SIMD, a: SIMD, b: SIMD, c: SIMD):
         comptime for s in range(2):
             d[s] = rebind[Scalar[d.dtype]](d_wide[s])
     else:
-        _unsupported_mma_op(d, a, b, c)
+        _unsupported_mma_op[
+            d.dtype,
+            d.length,
+            a.dtype,
+            a.length,
+            b.dtype,
+            b.length,
+            c.dtype,
+            c.length,
+        ]()

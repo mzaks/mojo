@@ -25,7 +25,7 @@ row's `block.sum` runs parallel across blocks, not `ngpus` serial within one.
 
 from std.collections import Array
 from std.math.uutils import ualign_down
-from std.math import ceildiv, rsqrt
+from std.math import rsqrt
 from std.sys import (
     align_of,
     simd_width_of,
@@ -34,12 +34,11 @@ from std.sys import (
 
 from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
-    WARP_SIZE,
     block_idx,
     grid_dim,
     thread_idx,
 )
-from max.gpu.host import DeviceContext, get_gpu_target
+from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
 from layout import Coord, TensorLayout, TileTensor
 from std.utils import StaticTuple
@@ -87,11 +86,10 @@ def _allgather_rmsnorm_kernel[
     ngpus: Int,
     simd_width: Int,
     threads_per_block: Int,
-    quant_epilogue: Optional[
-        def[
-            width: Int
-        ](row: Int, col: Int, val: SIMD[in_dtype, width]) capturing -> None
-    ] = None,
+    has_quant_epilogue: Bool,
+    QuantEpilogueType: ImplicitlyCopyable
+    & RegisterPassable
+    & def[width: Int](row: Int, col: Int, val: SIMD[in_dtype, width]) -> None,
     domain_id: Int = 0,
 ](
     src_ptrs: Array[ImmPointer[Scalar[in_dtype], ImmutAnyOrigin], ngpus],
@@ -104,12 +102,14 @@ def _allgather_rmsnorm_kernel[
     cols_dev: Int32,
     rank_sigs: Array[MutPointer[Signal, MutAnyOrigin], ngpus],
     my_rank_dev: Int32,
+    quant_epilogue: QuantEpilogueType,
 ):
     """Gather every source-GPU row into `[rows, cols]` and RMSNorm it in registers.
 
     `src_ptrs[g]` is peer `g`'s `[in_lengths[g], cols]` shard at global rows
     `[prefix(g), prefix(g)+in_lengths[g])`; `normed_out`/`sum_out` are the full
-    replicated outputs, indexed by GLOBAL row.
+    replicated outputs, indexed by GLOBAL row. `quant_epilogue` is a trailing
+    host-layout argument, called only when `has_quant_epilogue`.
     """
     var cols = Int(cols_dev)
     var my_rank = Int(my_rank_dev)
@@ -120,16 +120,16 @@ def _allgather_rmsnorm_kernel[
     comptime accum_type = get_accum_type[in_dtype]()
     comptime align = align_of[SIMD[in_dtype, simd_width]]()
 
-    var tid = Int(thread_idx.x)
+    var tid = thread_idx.x
     var col_idx = tid * simd_width
     var is_valid = col_idx < cols
-    var num_blocks = Int(grid_dim.x)
+    var num_blocks = grid_dim.x
 
     # Preload gamma in f32 before the barrier (local data, latency-hidden).
     var gamma_vec = SIMD[accum_type, simd_width](0)
     if is_valid:
         gamma_vec = (
-            gamma.load[width=simd_width, alignment=align](Coord(col_idx)).cast[
+            gamma.load[width=simd_width, alignment=align]((col_idx,)).cast[
                 accum_type
             ]()
             + weight_offset.cast[accum_type]()
@@ -147,7 +147,7 @@ def _allgather_rmsnorm_kernel[
         rank_sigs, rank_sigs[my_rank], my_rank
     )
 
-    for grow in range(Int(block_idx.x), rows, num_blocks):
+    for grow in range(block_idx.x, rows, num_blocks):
         # Owning peer = last shard with start <= grow; grow < rows always lands
         # in a non-empty shard (trailing empties skipped).
         var g = 0
@@ -162,12 +162,12 @@ def _allgather_rmsnorm_kernel[
         if is_valid:
             gathered = (
                 src_ptrs[g]
-                .address_space_cast[_target_address_space]()
-                .load[width=simd_width, alignment=align, invariant=True](
+                .unsafe_address_space_cast[_target_address_space]()
+                .unsafe_load[width=simd_width, alignment=align, invariant=True](
                     src_elem
                 )
             )
-            sum_out.store[width=simd_width](Coord(grow, col_idx), gathered)
+            sum_out.store((grow, col_idx), gathered)
 
         var reduced_f = gathered.cast[accum_type]()
         # Divide by `cols` FIRST, add epsilon after (eps outside the division).
@@ -184,12 +184,11 @@ def _allgather_rmsnorm_kernel[
         var normalized = (reduced_f * norm_factor) * gamma_vec
         var normed = normalized.cast[in_dtype]()
         if is_valid:
-            normed_out.store[width=simd_width](Coord(grow, col_idx), normed)
+            normed_out.store((grow, col_idx), normed)
         # Same bf16 a standalone quantize would read back from `normed_out`, so
         # folding one in is byte-identical.
-        comptime if quant_epilogue:
-            comptime epilogue = quant_epilogue.value()
-            epilogue[width=simd_width](grow, col_idx, normed)
+        comptime if has_quant_epilogue:
+            quant_epilogue[width=simd_width](grow, col_idx, normed)
 
     # End barrier: peers P2P-read this rank's shard, so it must not be reused
     # until every peer is done. Deferring to the next collective's start barrier
@@ -207,11 +206,10 @@ def _allgather_rmsnorm_launch[
     in_dtype: DType,
     ngpus: Int,
     threads_per_block: Int,
-    quant_epilogue: Optional[
-        def[
-            width: Int
-        ](row: Int, col: Int, val: SIMD[in_dtype, width]) capturing -> None
-    ] = None,
+    has_quant_epilogue: Bool,
+    QuantEpilogueType: ImplicitlyCopyable
+    & RegisterPassable
+    & def[width: Int](row: Int, col: Int, val: SIMD[in_dtype, width]) -> None,
     domain_id: Int = 0,
 ](
     rows: Int,
@@ -226,6 +224,7 @@ def _allgather_rmsnorm_launch[
     rank_sigs: Array[MutPointer[Signal, MutAnyOrigin], ngpus],
     my_rank: Int,
     ctx: DeviceContext,
+    quant_epilogue: QuantEpilogueType,
 ) raises:
     """Launch the fused all-gather + RMSNorm kernel."""
     # A DP replica can legitimately get an empty batch, and a zero grid is
@@ -262,7 +261,8 @@ def _allgather_rmsnorm_launch[
         ngpus=ngpus,
         simd_width=simd_width,
         threads_per_block=threads_per_block,
-        quant_epilogue=quant_epilogue,
+        has_quant_epilogue=has_quant_epilogue,
+        QuantEpilogueType=QuantEpilogueType,
         domain_id=domain_id,
     ]
     var in_lengths_dev = StaticTuple[Int32, ngpus](0)
@@ -279,6 +279,7 @@ def _allgather_rmsnorm_launch[
         Int32(cols),
         rank_sigs,
         Int32(my_rank),
+        host_args=(quant_epilogue,),
         grid_dim=grid_size,
         block_dim=block_dim,
     )
@@ -332,7 +333,14 @@ def allgather_rmsnorm[
         my_rank: Optional GLOBAL rank of THIS GPU in `[0, ngpus)`.
     """
 
-    _allgather_rmsnorm_impl[group_size=group_size](
+    # Stands in for the epilogue `has_quant_epilogue=False` never calls.
+    @inline(.always)
+    def no_quant_epilogue[
+        width: Int
+    ](row: Int, col: Int, val: SIMD[in_dtype, width]):
+        pass
+
+    _allgather_rmsnorm_impl[has_quant_epilogue=False, group_size=group_size](
         input_buffers,
         normed_out,
         sum_out,
@@ -341,6 +349,7 @@ def allgather_rmsnorm[
         weight_offset,
         rank_sigs,
         ctx,
+        no_quant_epilogue,
         my_rank,
     )
 
@@ -350,12 +359,11 @@ def _allgather_rmsnorm_impl[
     ngpus: Int,
     in_layout: TensorLayout,
     in_origin: Origin,
+    QuantEpilogueType: ImplicitlyCopyable
+    & RegisterPassable
+    & def[width: Int](row: Int, col: Int, val: SIMD[in_dtype, width]) -> None,
     //,
-    quant_epilogue: Optional[
-        def[
-            width: Int
-        ](row: Int, col: Int, val: SIMD[in_dtype, width]) capturing -> None
-    ] = None,
+    has_quant_epilogue: Bool,
     group_size: Int = ngpus,
 ](
     input_buffers: Array[TileTensor[in_dtype, in_layout, in_origin], ngpus],
@@ -366,6 +374,7 @@ def _allgather_rmsnorm_impl[
     weight_offset: Scalar[in_dtype],
     rank_sigs: Array[MutPointer[Signal, MutAnyOrigin], ngpus],
     ctx: DeviceContext,
+    quant_epilogue: QuantEpilogueType,
     my_rank: Optional[Int] = None,
 ) raises:
     """Fused all-gather + RMSNorm (bf16 in/out).
@@ -390,10 +399,9 @@ def _allgather_rmsnorm_impl[
         ngpus: Total number of devices in the world.
         in_layout: Layout of the input shard TileTensors.
         in_origin: Origin of the input shard TileTensors.
-        quant_epilogue: Optional. Receives each normed value already cast
-            to `in_dtype`, so a folded-in quantize is byte-identical. Called on
-            ALL lanes (invalid ones carry 0), so it must guard its own stores.
-            `None` elides it entirely.
+        QuantEpilogueType: The type of `quant_epilogue` (inferred).
+        has_quant_epilogue: Whether the kernel calls `quant_epilogue`; `False`
+            elides it entirely.
         group_size: Number of devices per independent all-gather group. Must
             evenly divide `ngpus`. Defaults to `ngpus`.
 
@@ -410,6 +418,10 @@ def _allgather_rmsnorm_impl[
         rank_sigs: All `ngpus` devices' Signal pointers, indexed by GLOBAL
             device rank.
         ctx: Device context for this GPU.
+        quant_epilogue: Receives each normed value already cast to
+            `in_dtype`, so a folded-in quantize is byte-identical. Called on
+            ALL lanes (invalid ones carry 0), so it must guard its own stores.
+            It runs on the device, so it must copy what it captures.
         my_rank: Optional GLOBAL rank of THIS GPU in `[0, ngpus)`. Defaults to
             the physical device id.
 
@@ -432,7 +444,7 @@ def _allgather_rmsnorm_impl[
     if not is_p2p_enabled():
         raise Error("allgather_rmsnorm requires P2P access between GPUs")
 
-    var global_rank = my_rank.value() if my_rank else Int(ctx.id())
+    var global_rank = my_rank.or_else(Int(ctx.id()))
     if not 0 <= global_rank < ngpus:
         raise Error(
             String(
@@ -470,10 +482,13 @@ def _allgather_rmsnorm_impl[
 
     # Each thread owns `simd_width` cols; H=6144 fits the base width
     # (64*8*16=8192). Assert fit + divisibility below.
-    comptime max_warps_per_block = ctx.default_device_info.max_thread_block_size // WARP_SIZE
-    comptime threads_per_block = max_warps_per_block * WARP_SIZE
-    comptime simd_width = simd_width_of[in_dtype, target=get_gpu_target()]()
-    comptime max_supported_cols = WARP_SIZE * simd_width * max_warps_per_block
+    comptime warp_size = ctx.default_device_info.warp_size
+    comptime max_warps_per_block = (
+        ctx.default_device_info.max_thread_block_size // warp_size
+    )
+    comptime threads_per_block = max_warps_per_block * warp_size
+    comptime simd_width = simd_width_of[in_dtype, target=ctx.target]()
+    comptime max_supported_cols = warp_size * simd_width * max_warps_per_block
     if cols > max_supported_cols:
         raise Error(
             String(
@@ -545,7 +560,7 @@ def _allgather_rmsnorm_impl[
         in_dtype,
         group_size,
         threads_per_block,
-        quant_epilogue=quant_epilogue,
+        has_quant_epilogue=has_quant_epilogue,
         domain_id=domain_id,
     ](
         rows,
@@ -560,6 +575,7 @@ def _allgather_rmsnorm_impl[
         group_sigs,
         loc_rank,
         ctx,
+        quant_epilogue,
     )
 
 
@@ -568,10 +584,10 @@ def allgather_rmsnorm_quant[
     ngpus: Int,
     in_layout: TensorLayout,
     in_origin: Origin,
+    QuantEpilogueType: ImplicitlyCopyable
+    & RegisterPassable
+    & def[width: Int](row: Int, col: Int, val: SIMD[in_dtype, width]) -> None,
     //,
-    quant_epilogue: def[width: Int](
-        row: Int, col: Int, val: SIMD[in_dtype, width]
-    ) capturing -> None,
     group_size: Int = ngpus,
 ](
     input_buffers: Array[TileTensor[in_dtype, in_layout, in_origin], ngpus],
@@ -582,6 +598,7 @@ def allgather_rmsnorm_quant[
     weight_offset: Scalar[in_dtype],
     rank_sigs: Array[MutPointer[Signal, MutAnyOrigin], ngpus],
     ctx: DeviceContext,
+    quant_epilogue: QuantEpilogueType,
     my_rank: Optional[Int] = None,
 ) raises:
     """`allgather_rmsnorm` that also hands each normed value to an epilogue.
@@ -595,7 +612,7 @@ def allgather_rmsnorm_quant[
         ngpus: Total number of devices in the world.
         in_layout: Layout of the input shard TileTensors.
         in_origin: Origin of the input shard TileTensors.
-        quant_epilogue: Normed-value epilogue; see `_allgather_rmsnorm_impl`.
+        QuantEpilogueType: The type of `quant_epilogue` (inferred).
         group_size: Number of devices per independent all-gather group; see
             `_allgather_rmsnorm_impl`.
 
@@ -610,11 +627,10 @@ def allgather_rmsnorm_quant[
         rank_sigs: All `ngpus` devices' Signal pointers, indexed by GLOBAL
             device rank.
         ctx: Device context for this GPU.
+        quant_epilogue: Normed-value epilogue; see `_allgather_rmsnorm_impl`.
         my_rank: Optional GLOBAL rank of THIS GPU in `[0, ngpus)`.
     """
-    _allgather_rmsnorm_impl[
-        quant_epilogue=quant_epilogue, group_size=group_size
-    ](
+    _allgather_rmsnorm_impl[has_quant_epilogue=True, group_size=group_size](
         input_buffers,
         normed_out,
         sum_out,
@@ -623,6 +639,7 @@ def allgather_rmsnorm_quant[
         weight_offset,
         rank_sigs,
         ctx,
+        quant_epilogue,
         my_rank,
     )
 
@@ -721,7 +738,7 @@ def _dispatch_ag_norm[
 
     # Fusing only when every group in the span fuses keeps the threshold's
     # per-group meaning.
-    var global_rank = my_rank.value() if my_rank else Int(ctx.id())
+    var global_rank = my_rank.or_else(Int(ctx.id()))
     comptime gate_groups = 2 if _relay_pairs[ngpus, group_size](
         ctx.default_device_info.version
     ) else 1
@@ -764,10 +781,10 @@ def _dispatch_ag_norm_quant[
     in_layout: TensorLayout,
     in_origin: Origin,
     TwoLaunchFnType: def() raises -> None,
+    QuantEpilogueType: ImplicitlyCopyable
+    & RegisterPassable
+    & def[width: Int](row: Int, col: Int, val: SIMD[in_dtype, width]) -> None,
     //,
-    quant_epilogue: def[width: Int](
-        row: Int, col: Int, val: SIMD[in_dtype, width]
-    ) capturing -> None,
     group_size: Int = ngpus,
 ](
     input_buffers: Array[TileTensor[in_dtype, in_layout, in_origin], ngpus],
@@ -778,6 +795,7 @@ def _dispatch_ag_norm_quant[
     weight_offset: Scalar[in_dtype],
     rank_sigs: Array[MutPointer[Signal, MutAnyOrigin], ngpus],
     ctx: DeviceContext,
+    quant_epilogue: QuantEpilogueType,
     two_launch_with_quant: TwoLaunchFnType,
     threshold: Int = AG_NORM_FUSE_THRESHOLD,
     my_rank: Optional[Int] = None,
@@ -797,8 +815,7 @@ def _dispatch_ag_norm_quant[
         in_layout: Layout of the input shard TileTensors.
         in_origin: Origin of the input shard TileTensors.
         TwoLaunchFnType: Type of the `two_launch_with_quant` value argument.
-        quant_epilogue: Fused-path normed-value epilogue; see
-            `allgather_rmsnorm_quant`.
+        QuantEpilogueType: The type of `quant_epilogue` (inferred).
         group_size: Number of devices per independent all-gather group. Must
             evenly divide `ngpus`. Defaults to `ngpus` (one full-world group,
             byte-identical to the pre-grouping behavior).
@@ -814,6 +831,8 @@ def _dispatch_ag_norm_quant[
         rank_sigs: All `ngpus` devices' Signal pointers, indexed by GLOBAL
             device rank.
         ctx: Device context for this GPU.
+        quant_epilogue: Fused-path normed-value epilogue; see
+            `allgather_rmsnorm_quant`.
         two_launch_with_quant: Standalone all-gather + RMSNorm + quantize
             closure.
         threshold: Full-`[rows, cols]`-bytes fuse threshold; fuse at/below, else
@@ -848,7 +867,7 @@ def _dispatch_ag_norm_quant[
 
     # Fusing only when every group in the span fuses keeps the threshold's
     # per-group meaning.
-    var global_rank = my_rank.value() if my_rank else Int(ctx.id())
+    var global_rank = my_rank.or_else(Int(ctx.id()))
     comptime gate_groups = 2 if _relay_pairs[ngpus, group_size](
         ctx.default_device_info.version
     ) else 1
@@ -870,9 +889,7 @@ def _dispatch_ag_norm_quant[
         # Hand the fused kernel the whole world plus the group width, and
         # let it derive the group-local slice, rank, and barrier domain
         # itself.
-        allgather_rmsnorm_quant[
-            quant_epilogue=quant_epilogue, group_size=group_size
-        ](
+        allgather_rmsnorm_quant[group_size=group_size](
             input_buffers,
             normed_out,
             sum_out,
@@ -881,6 +898,7 @@ def _dispatch_ag_norm_quant[
             weight_offset,
             rank_sigs,
             ctx,
+            quant_epilogue,
             my_rank,
         )
     else:

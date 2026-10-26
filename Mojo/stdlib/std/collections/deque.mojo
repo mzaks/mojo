@@ -26,7 +26,7 @@ from std.builtin._verification import _index_in_bounds, _position_in_bounds
 from std.bit import next_power_of_two
 from std.builtin.rebind import downcast
 import std.format._utils as fmt
-from std.hashlib import Hasher
+from std.hash import Hasher
 from std.collections import check_bounds
 from std.memory.alloc import alloc, dealloc, ThinAllocation, Layout
 
@@ -35,14 +35,13 @@ from std.memory.alloc import alloc, dealloc, ThinAllocation, Layout
 # ===-----------------------------------------------------------------------===#
 
 
-@explicit_destroy(
-    "Use `deinit_with()` to explicitly destroy a `Deque` of"
-    " non-`Deinitable` elements"
-)
 struct Deque[ElementType: Movable](
     Boolable,
     Copyable where conforms_to(ElementType, Copyable),
-    Deinitable where conforms_to(ElementType, Deinitable),
+    Deinitable where conforms_to(ElementType, Deinitable) else (
+        "Use `deinit_with()` to explicitly destroy a `Deque` of"
+        " non-`Deinitable` elements"
+    ),
     Equatable where conforms_to(ElementType, Equatable),
     Hashable where conforms_to(ElementType, Hashable),
     Iterable,
@@ -195,7 +194,7 @@ struct Deque[ElementType: Movable](
 
         self._capacity = deque_capacity
         self._data = alloc(
-            Layout[Self.ElementType](count=deque_capacity)
+            Layout[Self.ElementType](length=deque_capacity)
         ).unsafe_leak()
         self._head = 0
         self._tail = 0
@@ -232,7 +231,7 @@ struct Deque[ElementType: Movable](
         var deque_capacity = next_power_of_two(capacity)
         self._capacity = deque_capacity
         self._data = alloc(
-            Layout[Self.ElementType](count=deque_capacity)
+            Layout[Self.ElementType](length=deque_capacity)
         ).unsafe_leak()
         self._head = 0
         self._tail = 0
@@ -265,7 +264,7 @@ struct Deque[ElementType: Movable](
         # so no renormalization is needed.
         self._capacity = copy._capacity
         self._data = alloc(
-            Layout[Self.ElementType](count=copy._capacity)
+            Layout[Self.ElementType](length=copy._capacity)
         ).unsafe_leak()
         self._head = 0
         self._tail = 0
@@ -287,7 +286,7 @@ struct Deque[ElementType: Movable](
         """
         dealloc(
             ThinAllocation(unsafe_owned_ptr=self._data).unsafe_with_layout(
-                {count = self._capacity}
+                {length = self._capacity}
             )
         )
 
@@ -680,12 +679,12 @@ struct Deque[ElementType: Movable](
             (self._data.unsafe_offset(offset)).unsafe_deinit_pointee()
         dealloc(
             ThinAllocation(unsafe_owned_ptr=self._data).unsafe_with_layout(
-                {count = self._capacity}
+                {length = self._capacity}
             )
         )
         self._capacity = self._min_capacity
         self._data = alloc(
-            Layout[Self.ElementType](count=self._capacity)
+            Layout[Self.ElementType](length=self._capacity)
         ).unsafe_leak()
         self._head = 0
         self._tail = 0
@@ -819,7 +818,7 @@ struct Deque[ElementType: Movable](
         """
         var start_normalized = start
 
-        var stop_normalized = len(self) if stop is None else stop.value()
+        var stop_normalized = stop.or_else(len(self))
 
         if start_normalized < 0:
             start_normalized += len(self)
@@ -1129,7 +1128,7 @@ struct Deque[ElementType: Movable](
             new_capacity <<= 1
 
         var new_data = alloc(
-            Layout[Self.ElementType](count=new_capacity)
+            Layout[Self.ElementType](length=new_capacity)
         ).unsafe_leak()
 
         for i in range(n_retain):
@@ -1141,7 +1140,7 @@ struct Deque[ElementType: Movable](
         if self._capacity > 0:
             dealloc(
                 ThinAllocation(unsafe_owned_ptr=self._data).unsafe_with_layout(
-                    {count = self._capacity}
+                    {length = self._capacity}
                 )
             )
 
@@ -1169,7 +1168,7 @@ struct Deque[ElementType: Movable](
             tail_len = 0
 
         var new_data = alloc(
-            Layout[Self.ElementType](count=new_capacity)
+            Layout[Self.ElementType](length=new_capacity)
         ).unsafe_leak()
 
         var src = self._data.unsafe_offset(self._head)
@@ -1188,7 +1187,7 @@ struct Deque[ElementType: Movable](
         if self._capacity > 0:
             dealloc(
                 ThinAllocation(unsafe_owned_ptr=self._data).unsafe_with_layout(
-                    {count = self._capacity}
+                    {length = self._capacity}
                 )
             )
         self._data = new_data

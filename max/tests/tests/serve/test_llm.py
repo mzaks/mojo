@@ -23,14 +23,18 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import numpy as np
 import pytest
 import pytest_asyncio
 from async_asgi_testclient import TestClient
 from fastapi import FastAPI
 from max.pipelines.context import (
     GenerationStatus,
+    LogProbabilities,
+    SamplingParams,
     TextContext,
     TextGenerationOutput,
+    TokenBuffer,
 )
 from max.pipelines.lib import (
     PIPELINE_REGISTRY,
@@ -54,6 +58,7 @@ from max.serve.pipelines.llm import (
     TokenGeneratorPipeline,
     _merge_outputs,
 )
+from max.serve.router.openai_routes import _process_chat_log_probabilities
 from max.serve.telemetry.stopwatch import StopWatch
 
 logger = logging.getLogger(__name__)
@@ -297,6 +302,9 @@ async def test_ttft_recorded_once_per_chunk() -> None:
 
     # Verify TTFT called exactly once, ITL called for remaining 2 chunks
     assert mock_metrics.ttft.call_count == 1
+    mock_metrics.ttft_by_prompt_length.assert_called_once_with(
+        mock_metrics.ttft.call_args.args[0], 10
+    )
     assert mock_metrics.itl.call_count == 2
     assert len(chunks) == 3
 
@@ -433,6 +441,7 @@ async def _recorded_preprocess_cache_media(
     order = Mock()
     order.attach_mock(pipeline.tokenizer.new_context, "new_context")
     order.attach_mock(pipeline._preprocess_cache_stats.record, "record")
+    order.attach_mock(pipeline._chat_encoder_outcomes.record, "outcomes")
 
     with patch("max.serve.pipelines.llm.METRICS", MagicMock()):
         bound = TokenGeneratorPipeline.next_token_chunk.__get__(
@@ -440,7 +449,11 @@ async def _recorded_preprocess_cache_media(
         )
         [chunk async for chunk in await bound(mock_request)]
 
-    assert [call[0] for call in order.mock_calls] == ["new_context", "record"]
+    assert [call[0] for call in order.mock_calls] == [
+        "new_context",
+        "record",
+        "outcomes",
+    ]
     pipeline._preprocess_cache_stats.record.assert_called_once()
     return pipeline._preprocess_cache_stats.record.call_args.kwargs[
         "carried_media"
@@ -553,6 +566,7 @@ async def _run_reasoning_pipeline(
     decode: Any = None,
     stop: list[str] | None = None,
     top_log_probs: AsyncMock | None = None,
+    parse_reasoning: bool = True,
 ) -> list[TokenGeneratorOutput]:
     """Build a mock TokenGeneratorPipeline with reasoning and collect all chunks."""
     from max.pipelines.architectures.kimik2_5.reasoning import (
@@ -606,7 +620,20 @@ async def _run_reasoning_pipeline(
         bound = TokenGeneratorPipeline.next_token_chunk.__get__(
             pipeline, type(pipeline)
         )
-        return [chunk async for chunk in await bound(mock_request)]
+        chunks = [
+            chunk
+            async for chunk in await bound(
+                mock_request, parse_reasoning=parse_reasoning
+            )
+        ]
+
+    # Every generated token is billed exactly once, stripped delimiters
+    # included.
+    assert sum(
+        chunk.token_count + (chunk.reasoning_token_count or 0)
+        for chunk in chunks
+    ) == sum(len(response.tokens) for response in scheduler_responses)
+    return chunks
 
 
 def _make_responses(
@@ -647,7 +674,7 @@ async def _input_sensitive_decode(token_array: Any, **kwargs: Any) -> str:
             [[THINK_START_TOKEN_ID, 10, 20, THINK_END_TOKEN_ID], [30]],
             None,
             _input_sensitive_decode,
-            [(2, 0, "reasoning_text", None), (0, 1, None, "content_text")],
+            [(4, 0, "reasoning_text", None), (0, 1, None, "content_text")],
             id="reasoning_then_content",
         ),
         pytest.param(
@@ -666,8 +693,8 @@ async def _input_sensitive_decode(token_array: Any, **kwargs: Any) -> str:
             None,
             None,
             [
-                (1, 0, "decoded_text", None),
-                (1, 0, "decoded_text", None),
+                (2, 0, "decoded_text", None),
+                (2, 0, "decoded_text", None),
                 (0, 1, None, "decoded_text"),
             ],
             id="multi_chunk_reasoning",
@@ -676,7 +703,7 @@ async def _input_sensitive_decode(token_array: Any, **kwargs: Any) -> str:
             [[THINK_START_TOKEN_ID, 10, 20], [30]],
             None,
             None,
-            [(2, 0, "decoded_text", None), (1, 0, "decoded_text", None)],
+            [(3, 0, "decoded_text", None), (1, 0, "decoded_text", None)],
             id="all_reasoning_no_content",
         ),
     ],
@@ -738,6 +765,7 @@ async def test_next_token_chunk_reasoning_partitions_logprobs() -> None:
     """Test that logprobs are correctly partitioned between reasoning and content."""
     logprob_content = Mock()
     logprob_content.token_log_probabilities = [-0.4]
+    logprob_content.sampled_token_ids = [30]
 
     responses = [
         TextGenerationOutput(
@@ -751,14 +779,118 @@ async def test_next_token_chunk_reasoning_partitions_logprobs() -> None:
     chunks = await _run_reasoning_pipeline(
         responses,
         decode=AsyncMock(return_value="text"),
-        top_log_probs=AsyncMock(return_value=[{"tok": -0.5}]),
+        top_log_probs=AsyncMock(return_value=[{7: ("tok", -0.5)}]),
     )
 
     assert len(chunks) == 1
     assert chunks[0].token_count == 1
-    assert chunks[0].reasoning_token_count == 1
+    assert chunks[0].reasoning_token_count == 3
     assert chunks[0].token_log_probabilities == [-0.4]
-    assert chunks[0].top_log_probabilities == [{"tok": -0.5}]
+    assert chunks[0].top_log_probabilities == [{7: ("tok", -0.5)}]
+    assert chunks[0].sampled_tokens == ["text"]
+
+
+@pytest.mark.asyncio
+async def test_next_token_chunk_without_reasoning_parser_keeps_all_tokens() -> (
+    None
+):
+    """``/v1/completions`` has no reasoning field, so it opts out of the
+    parser: every generated token, delimiters and reasoning span included,
+    must come back as content with its logprob."""
+    tokens = [THINK_START_TOKEN_ID, 10, THINK_END_TOKEN_ID, 30]
+    values = [-0.1, -0.2, -0.3, -0.4]
+    log_probs = [
+        LogProbabilities(
+            token_log_probabilities=[value],
+            top_log_probabilities=[],
+            sampled_token_ids=[token],
+        )
+        for value, token in zip(values, tokens, strict=True)
+    ]
+    responses = [
+        TextGenerationOutput(
+            request_id=RequestID(value="test-request"),
+            tokens=tokens,
+            log_probabilities=log_probs,
+            final_status=GenerationStatus.END_OF_SEQUENCE,
+        ),
+    ]
+
+    chunks = await _run_reasoning_pipeline(
+        responses,
+        decode=AsyncMock(return_value="text"),
+        top_log_probs=AsyncMock(return_value=[{7: ("tok", -0.5)}]),
+        parse_reasoning=False,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].token_count == 4
+    assert chunks[0].reasoning_token_count == 0
+    assert chunks[0].decoded_reasoning_tokens is None
+    assert chunks[0].decoded_tokens == "text"
+    assert chunks[0].token_log_probabilities == values
+    assert chunks[0].top_log_probabilities == [{7: ("tok", -0.5)}] * 4
+    assert chunks[0].token_ids == tokens
+
+
+@pytest.mark.asyncio
+async def test_chat_top_logprobs_keep_ids_that_decode_alike() -> None:
+    """Llama 3.1's ``<|eot_id|>`` (128009) and ``<|eom_id|>`` (128008) both
+    decode to ``""`` with special tokens skipped; chat must list both."""
+    decoded = {128009: "", 128008: "", 0: "!"}
+
+    async def decode(token_id: int, skip_special_tokens: bool) -> str:
+        assert skip_special_tokens
+        return decoded[token_id]
+
+    log_prob = LogProbabilities(
+        token_log_probabilities=[-0.1],
+        top_log_probabilities=[{128009: -0.1, 128008: -2.5, 0: -3.0}],
+        sampled_token_ids=[128009],
+    )
+    pipeline = Mock(tokenizer=Mock(decode=decode))
+    top = await TokenGeneratorPipeline._top_log_probs(pipeline, log_prob, True)
+    output = TokenGeneratorOutput(
+        status=GenerationStatus.END_OF_SEQUENCE,
+        token_log_probabilities=[-0.1],
+        top_log_probabilities=top,
+        sampled_tokens=[""],
+    )
+
+    content = _process_chat_log_probabilities([output]).content
+    assert content is not None
+    assert [(t.token, t.logprob) for t in content[0].top_logprobs] == [
+        ("", -0.1),
+        ("", -2.5),
+        ("!", -3.0),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "expected"), [({}, True), ({"parse_reasoning": False}, False)]
+)
+async def test_all_tokens_forwards_parse_reasoning(
+    kwargs: dict[str, bool], expected: bool
+) -> None:
+    """Non-streaming ``/v1/completions`` reaches the parser switch only
+    through ``all_tokens``."""
+    chunk = TokenGeneratorOutput(
+        status=GenerationStatus.END_OF_SEQUENCE, token_count=1
+    )
+
+    async def _gen() -> AsyncGenerator[TokenGeneratorOutput, None]:
+        yield chunk
+
+    pipeline = Mock()
+    pipeline.next_token_chunk = AsyncMock(return_value=_gen())
+    request = Mock()
+    bound = TokenGeneratorPipeline.all_tokens.__get__(pipeline, type(pipeline))
+
+    assert await bound(request, **kwargs) == [chunk]
+    pipeline.next_token_chunk.assert_awaited_once_with(
+        request, parse_reasoning=expected
+    )
 
 
 @pytest.mark.asyncio
@@ -984,6 +1116,43 @@ async def test_token_ids_on_a_terminal_stripped_chunk() -> None:
     assert chunks[0].token_ids == [THINK_START_TOKEN_ID]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token_lists",
+    [
+        pytest.param(
+            [[THINK_START_TOKEN_ID], [10], [THINK_END_TOKEN_ID], [30]],
+            id="stripped_then_text",
+        ),
+        pytest.param(
+            [[THINK_START_TOKEN_ID], [10], [THINK_END_TOKEN_ID]],
+            id="stripped_terminal_after_stripped",
+        ),
+    ],
+)
+async def test_fully_stripped_chunks_are_billed_once(
+    token_lists: list[list[int]],
+) -> None:
+    """Tokens of a chunk stripped to nothing still count toward usage.
+
+    Like a terminal chunk stripped to nothing, a non-terminal chunk the parser
+    reduces to nothing was genuinely generated, so the next emitted chunk
+    bills it as reasoning -- otherwise a parser that drops a long header
+    reports a completion_tokens far below what was generated.
+    """
+    chunks = await _run_reasoning_pipeline(_make_responses(token_lists))
+
+    generated = [t for tokens in token_lists for t in tokens]
+    assert [t for chunk in chunks for t in chunk.token_ids or []] == generated
+    assert sum(
+        chunk.token_count + (chunk.reasoning_token_count or 0)
+        for chunk in chunks
+    ) == len(generated)
+    assert sum(chunk.token_count for chunk in chunks) == sum(
+        1 for t in generated if t == 30
+    )
+
+
 def test_merge_outputs_concatenates_token_ids() -> None:
     """``all_tokens`` folds chunks into one output; ids must concatenate.
 
@@ -1038,3 +1207,62 @@ def test_merge_outputs_leaves_token_ids_unset_when_absent() -> None:
 
     assert merged.token_ids is None
     assert merged.prompt_token_ids is None
+
+
+@pytest.mark.asyncio
+async def test_score_caps_generation_at_one_token() -> None:
+    """``score`` owns the one-token cap, whatever the caller's request says."""
+    request_id = RequestID(value="score-request")
+    context = TextContext(
+        request_id=request_id,
+        max_length=16,
+        tokens=TokenBuffer(np.ones(4, dtype=np.int64)),
+    )
+    scored_requests: list[TextGenerationRequest] = []
+
+    async def new_context(request: TextGenerationRequest) -> TextContext:
+        scored_requests.append(request)
+        return context
+
+    async def stream(
+        request_id: RequestID, context: Any
+    ) -> AsyncGenerator[tuple[list[TextGenerationOutput], int | None], None]:
+        async def _gen() -> AsyncGenerator[
+            tuple[list[TextGenerationOutput], int | None], None
+        ]:
+            yield (
+                [
+                    TextGenerationOutput(
+                        request_id=request_id,
+                        tokens=[],
+                        final_status=GenerationStatus.ACTIVE,
+                        label_log_probabilities=[-0.5, -1.5],
+                        num_cached_tokens=2,
+                    )
+                ],
+                None,
+            )
+
+        return _gen()
+
+    pipeline = Mock()
+    pipeline.debug_logging = False
+    pipeline.tokenizer.new_context = new_context
+    pipeline.model_worker.stream = stream
+
+    request = TextGenerationRequest(
+        request_id=request_id,
+        model_name="m",
+        prompt=[1, 2, 3, 4],
+        sampling_params=SamplingParams(max_new_tokens=256),
+    )
+    output = await TokenGeneratorPipeline.score.__get__(pipeline)(
+        request, [7, 8]
+    )
+
+    assert scored_requests[0].sampling_params.max_new_tokens == 1
+    assert request.sampling_params.max_new_tokens == 256
+    assert context.label_token_ids == [7, 8]
+    assert output.label_log_probabilities == [-0.5, -1.5]
+    assert output.prompt_token_count == 4
+    assert output.cached_token_count == 2

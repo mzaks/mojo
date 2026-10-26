@@ -107,9 +107,9 @@ def _is_row_major_contiguous[
     var expected = 1
 
     comptime for i in reversed(range(LayoutType.rank)):
-        if Int(tensor.layout.stride[i]().value()) != expected:
+        if Int(tensor.layout.stride[i]()) != expected:
             return False
-        expected *= Int(tensor.layout.shape[i]().value())
+        expected *= Int(tensor.dim[i]())
 
     return True
 
@@ -136,7 +136,7 @@ def to_numpy[
     from layout.coord import Coord, Idx
 
     var storage = Array[Float32, 6](uninitialized=True)
-    var tensor = TileTensor(Span(storage), row_major(Coord(Idx[2], Idx[3])))
+    var tensor = TileTensor(Span(storage), row_major(Idx[2], Idx[3]))
     var array = to_numpy(tensor)  # a 2x3 NumPy float32 array
     ```
 
@@ -167,11 +167,9 @@ def to_numpy[
     var shape = DynamicCoord[.int, LayoutType.rank]()
 
     comptime for i in range(LayoutType.rank):
-        shape[i] = rebind[type_of(shape[i])](
-            Int(Int(tensor.layout.shape[i]().value()))
-        )
+        shape[i] = rebind[type_of(shape[i])](Int(tensor.dim[i]()))
 
-    var n = tensor.layout.size()
+    var n = tensor.num_elements()
 
     if _is_row_major_contiguous(tensor):
         return copy_to_numpy_tensor(
@@ -190,7 +188,7 @@ def to_numpy[
         comptime for i in reversed(range(LayoutType.rank)):
             if carry:
                 var next = read_coord[i].value() + 1
-                if Int(next) == Int(tensor.layout.shape[i]().value()):
+                if Int(next) == Int(tensor.dim[i]()):
                     next = 0
                 else:
                     carry = False

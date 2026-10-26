@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 from abc import ABC, abstractmethod
@@ -108,8 +109,14 @@ class Runtime(AsyncExitStack, ABC):
         with their worker classes (or :py:class:`typing.Protocol` interfaces)
         and get end-to-end type checking; the runtime cast is safe because
         :py:class:`Proxy` exposes a structurally compatible interface.
+
+        Raises:
+            asyncio.TimeoutError: If the worker is not deployed within its
+                ``deploy_timeout`` seconds.
         """
-        worker_id = await self.deploy_worker(worker)
+        worker_id = await asyncio.wait_for(
+            self.deploy_worker(worker), timeout=worker.deploy_timeout
+        )
         return cast(WorkerType, Proxy(self, worker_id, worker))
 
     @abstractmethod
@@ -146,7 +153,7 @@ class Runtime(AsyncExitStack, ABC):
 
         Single-consumer: the first call (across :py:meth:`stream_result` and
         :py:meth:`stream_next`) binds the stream; subsequent attempts on the
-        same ``resid`` raise. Used for lightweight inline streams (e.g. token
+        same ``resid`` raise. Used for lightweight inline streams (such as token
         streams) where backpressure rides on the underlying transport.
         """
         ...

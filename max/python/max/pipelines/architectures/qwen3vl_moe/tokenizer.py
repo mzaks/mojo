@@ -46,6 +46,7 @@ from max.pipelines.architectures.qwen3vl_moe.nn.video_processing import (
     preprocess_clip,
 )
 from max.pipelines.context import (
+    GrammarEnforcementState,
     ImageMetadata,
     TokenBuffer,
 )
@@ -54,9 +55,14 @@ from max.pipelines.lib import (
     TextAndVisionTokenizer,
     VisionPreprocessCache,
     max_tokens_to_generate,
+    resolve_eos_token_ids,
 )
 from max.pipelines.lib.config import PipelineConfig
-from max.pipelines.lib.tokenizer import encode_dkv_cache_hint
+from max.pipelines.lib.tokenizer import (
+    checked_token_ids,
+    encode_dkv_cache_hint,
+    resolve_token_id_bound,
+)
 from max.pipelines.modeling.types import (
     ImageContentPart,
     MessageContent,
@@ -394,6 +400,10 @@ class Qwen3VLTokenizer(TextAndVisionTokenizer):
       consecutive frames.
     """
 
+    _requires_vision_config = True
+    """Whether the checkpoint must carry a vision tower. Text-only subclasses
+    clear it."""
+
     def __init__(
         self,
         model_path: str,
@@ -422,7 +432,11 @@ class Qwen3VLTokenizer(TextAndVisionTokenizer):
         assert config is not None
 
         # Extract vision config parameters
-        vision_config = config.vision_config
+        vision_config = (
+            config.vision_config
+            if self._requires_vision_config
+            else getattr(config, "vision_config", None)
+        )
 
         self.spatial_merge_size = getattr(
             vision_config, "spatial_merge_size", 2
@@ -459,18 +473,14 @@ class Qwen3VLTokenizer(TextAndVisionTokenizer):
             QWEN3VL_VIDEO_MAX_PIXELS << 16
         ) | QWEN3VL_VIDEO_MAX_FRAMES
 
-        # Initialize EOS token IDs
-        eos_token_id = self.delegate.eos_token_id
-        self._eos_token_ids = (
-            {eos_token_id} if eos_token_id is not None else set()
+        self._eos_token_ids = resolve_eos_token_ids(
+            self.delegate.eos_token_id, pipeline_config
+        )
+        self._token_id_bound = resolve_token_id_bound(
+            self.delegate, pipeline_config
         )
 
         huggingface_config = pipeline_config.model.huggingface_config
-        if eos_token_id := getattr(huggingface_config, "eos_token_id", None):
-            if isinstance(eos_token_id, int):
-                self._eos_token_ids.add(eos_token_id)
-            elif isinstance(eos_token_id, list):
-                self._eos_token_ids.update(eos_token_id)
 
         self.enable_prefix_caching = (
             pipeline_config.model.kv_cache.enable_prefix_caching
@@ -479,42 +489,23 @@ class Qwen3VLTokenizer(TextAndVisionTokenizer):
             pipeline_config.runtime.vision_cache_utilization != 0
         )
 
-        if image_token_id := getattr(
-            huggingface_config, "image_token_id", None
-        ):
-            self.image_token_id = image_token_id
-        else:
-            raise ValueError("image_token_id not found in model_config config")
-
+        self.image_token_id = self._resolve_media_token_id(
+            huggingface_config, "image_token_id", "<|image_pad|>"
+        )
         # Required, not optional: `get_rope_index` and
         # `Qwen3VLTextAndVisionContext.video_token_id` both consume this
         # unconditionally, so leaving the attribute unset would fail every
         # request -- image or not -- rather than only the video ones.
-        if video_token_id := getattr(
-            huggingface_config, "video_token_id", None
-        ):
-            self.video_token_id = video_token_id
-        else:
-            raise ValueError("video_token_id not found in model_config config")
-
+        self.video_token_id = self._resolve_media_token_id(
+            huggingface_config, "video_token_id", "<|video_pad|>"
+        )
         # Qwen3VL specific: vision_start_token and vision_end_token
-        if vision_start_token_id := getattr(
-            huggingface_config, "vision_start_token_id", None
-        ):
-            self.vision_start_token_id = vision_start_token_id
-        else:
-            raise ValueError(
-                "vision_start_token_id not found in model_config config"
-            )
-
-        if vision_end_token_id := getattr(
-            huggingface_config, "vision_end_token_id", None
-        ):
-            self.vision_end_token_id = vision_end_token_id
-        else:
-            raise ValueError(
-                "vision_end_token_id not found in model_config config"
-            )
+        self.vision_start_token_id = self._resolve_media_token_id(
+            huggingface_config, "vision_start_token_id", "<|vision_start|>"
+        )
+        self.vision_end_token_id = self._resolve_media_token_id(
+            huggingface_config, "vision_end_token_id", "<|vision_end|>"
+        )
 
         vision_cfg = getattr(huggingface_config, "vision_config", None)
         if vision_cfg is not None:
@@ -523,16 +514,39 @@ class Qwen3VLTokenizer(TextAndVisionTokenizer):
                 self.num_position_embeddings = getattr(
                     vision_cfg, "num_position_embeddings", None
                 )
-        else:
+        elif self._requires_vision_config:
             raise ValueError(
                 "vision_config must be provided in HuggingFace Config"
             )
 
-        if self.num_position_embeddings is None:
+        if (
+            self._requires_vision_config
+            and self.num_position_embeddings is None
+        ):
             raise ValueError(
                 "num_position_embeddings not found in vision_config. "
                 "This is required for bilinear interpolation position embeddings."
             )
+
+    def _resolve_media_token_id(
+        self, config: Any, attribute: str, token: str
+    ) -> int:
+        """A multimodal special token id from the config.
+
+        Text-only subclasses (which do not require a vision config) fall back
+        to the token's id in the tokenizer vocabulary, since a checkpoint
+        saved from the language model alone omits these config fields.
+        """
+        value = getattr(config, attribute, None)
+        if value:
+            return int(value)
+        if not self._requires_vision_config:
+            token_id = self.delegate.convert_tokens_to_ids(token)
+            if isinstance(token_id, int) and token_id != (
+                self.delegate.unk_token_id
+            ):
+                return token_id
+        raise ValueError(f"{attribute} not found in model_config config")
 
     def apply_chat_template(
         self,
@@ -907,8 +921,8 @@ class Qwen3VLTokenizer(TextAndVisionTokenizer):
 
             text = text_list
         else:
-            assert isinstance(prompt, str)
-            text = [prompt]
+            # A pre-tokenized prompt (token ids) skips the tokenizer in step 4.
+            text = [prompt] if isinstance(prompt, str) else []
 
         # Step 3b: Preprocess clips and expand their <|video_pad|> placeholders
         clips: list[_PreprocessedClip] = []
@@ -942,7 +956,14 @@ class Qwen3VLTokenizer(TextAndVisionTokenizer):
             "add_special_tokens": add_special_tokens,
         }
 
-        tokenizer_outputs = self.delegate(text, **tokenizer_kwargs)
+        if isinstance(prompt, str):
+            tokenizer_outputs = self.delegate(text, **tokenizer_kwargs)
+        else:
+            token_ids = checked_token_ids(prompt, self._token_id_bound).tolist()
+            tokenizer_outputs = {
+                "input_ids": [token_ids],
+                "attention_mask": [[1] * len(token_ids)],
+            }
 
         # Extract input_ids from tokenizer outputs
         if isinstance(tokenizer_outputs["input_ids"][0], int):
@@ -982,6 +1003,14 @@ class Qwen3VLTokenizer(TextAndVisionTokenizer):
             if request.response_format
             and request.response_format.json_schema is not None
             else None
+        )
+
+        grammar = (
+            request.response_format.grammar if request.response_format else None
+        )
+
+        grammar_state = GrammarEnforcementState.from_response_format(
+            request.response_format
         )
 
         if self.max_length and encoded_prompt.shape[0] > self.max_length:
@@ -1148,6 +1177,8 @@ class Qwen3VLTokenizer(TextAndVisionTokenizer):
             if max_gen_tokens is not None
             else self.max_length,
             json_schema=json_schema,
+            grammar=grammar,
+            grammar_state=grammar_state,
             log_probabilities=request.logprobs,
             log_probabilities_echo=request.echo,
             sampling_params=request.sampling_params,

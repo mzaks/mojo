@@ -13,28 +13,25 @@
 """Layers specific to the DeepSeek-V4-Flash architecture."""
 
 from .attention import DeepseekV4Attention
-from .cache import CacheLeaf, DeepseekV4Cache
+from .cache import CacheLeaf, DeepseekV4Cache, LayerIndex
 from .compressor import DeepseekV4Compressor
 from .csa import CompressedStream, compressed_stream
 from .dspark import (
     DSparkAttention,
-    DSparkConfidenceHead,
     DSparkMarkovHead,
 )
 from .hadamard import hadamard_rotate
 from .hyper_connection import (
     expand_copies,
     hc_head,
-    hc_mix_width,
     hc_post,
-    hc_pre,
-    hc_split_sinkhorn,
 )
 from .indexer import DeepseekV4Indexer
 from .moe import (
     DeepseekV4Expert,
     DeepseekV4Gate,
     DeepseekV4MoE,
+    DeepseekV4SharedExpert,
     sqrt_softplus,
 )
 from .quantization import fp4_qat_quantize, fp8_qat_quantize
@@ -46,7 +43,6 @@ __all__ = [
     "CacheLeaf",
     "CompressedStream",
     "DSparkAttention",
-    "DSparkConfidenceHead",
     "DSparkMarkovHead",
     "DeepseekV4Attention",
     "DeepseekV4Cache",
@@ -56,6 +52,8 @@ __all__ = [
     "DeepseekV4Indexer",
     "DeepseekV4MoE",
     "DeepseekV4RotaryEmbedding",
+    "DeepseekV4SharedExpert",
+    "LayerIndex",
     "RaggedRows",
     "WindowRows",
     "apply_rope_tail",
@@ -65,10 +63,7 @@ __all__ = [
     "fp8_qat_quantize",
     "hadamard_rotate",
     "hc_head",
-    "hc_mix_width",
     "hc_post",
-    "hc_pre",
-    "hc_split_sinkhorn",
     "rope_for_layer",
     "sparse_attention",
     "sqrt_softplus",

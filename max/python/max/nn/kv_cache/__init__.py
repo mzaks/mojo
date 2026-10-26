@@ -11,11 +11,18 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+"""Key-value cache types for MAX layers.
+
+Defines cache parameters, host-side buffers, and the input values that
+attention layers consume, for paged and recurrent caches alike.
+"""
+
 from .cache_params import (
     PACKED_PAGE_STRIDE,
     BatchCharacteristics,
     CacheLeafKind,
     CacheLeafParamInterface,
+    HostStagingAlloc,
     KVCacheAssignments,
     KVCacheBuffer,
     KVCacheBufferInterface,
@@ -39,10 +46,11 @@ from .cache_params import (
     RecurrentStateBuffer,
     RecurrentStateParams,
     RecurrentStateRegion,
-    ScratchKVLeafRegion,
+    ScratchRecurrentKVLeafRegion,
     compute_max_seq_len_fitting_in_cache,
     compute_num_device_blocks,
     estimated_memory_size,
+    max_pages_per_request,
     packed_page_stride,
     recurrent_leaf,
     recurrent_leaves,
@@ -73,6 +81,7 @@ __all__ = [
     "BatchCharacteristics",
     "CacheLeafKind",
     "CacheLeafParamInterface",
+    "HostStagingAlloc",
     "KVCacheAssignments",
     "KVCacheBuffer",
     "KVCacheBufferInterface",
@@ -105,11 +114,12 @@ __all__ = [
     "RecurrentStateInputsPerDevice",
     "RecurrentStateParams",
     "RecurrentStateRegion",
-    "ScratchKVLeafRegion",
+    "ScratchRecurrentKVLeafRegion",
     "build_max_lengths_tensors",
     "compute_max_seq_len_fitting_in_cache",
     "compute_num_device_blocks",
     "estimated_memory_size",
+    "max_pages_per_request",
     "packed_page_stride",
     "padded_lut_cols",
     "recurrent_leaf",

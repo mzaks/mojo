@@ -11,6 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from std.memory.alloc import unsafe_alloc
 from max.gpu.host import DeviceContext
 from max.gpu import block_idx, thread_idx
 from layout import *
@@ -26,14 +27,14 @@ def gpu_kernel(
         + lhs[block_idx.x * 4 + thread_idx.x]
     )
 
-    _ = LayoutTensor[.float32, Layout(IntTuple(16, 1), IntTuple(1, 1))](dst)
+    _ = TileTensor(dst, row_major[16, 1]())
 
 
 def main() raises:
     with DeviceContext() as ctx:
-        var vec_a_ptr = alloc[Float32](16)
-        var vec_b_ptr = alloc[Float32](16)
-        var vec_c_ptr = alloc[Float32](16)
+        var vec_a_ptr = unsafe_alloc[Float32](16)
+        var vec_b_ptr = unsafe_alloc[Float32](16)
+        var vec_c_ptr = unsafe_alloc[Float32](16)
 
         var vec_a_dev = ctx.enqueue_create_buffer[.float32](16)
         var vec_b_dev = ctx.enqueue_create_buffer[.float32](16)

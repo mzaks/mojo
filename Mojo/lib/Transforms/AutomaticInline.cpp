@@ -61,6 +61,23 @@ static bool inContract(Operation *call) {
   return false;
 }
 
+/// Function attributes to compare when deciding whether to inline. The kernel
+/// id names an offload entry point which is added by the offload lowering,
+// not a property of the user code and should not impact inline decision.
+static constexpr llvm::StringLiteral kKernelIdAttr = "kgen.offload.kernelid";
+static DictionaryAttr fnAttrsForInlining(FuncOp func) {
+  DictionaryAttr attrs = func.getFnAttrs();
+  if (!attrs)
+    return DictionaryAttr::get(func.getContext());
+  if (!attrs.contains(kKernelIdAttr))
+    return attrs;
+  SmallVector<NamedAttribute> kept;
+  for (NamedAttribute attr : attrs)
+    if (attr.getName() != kKernelIdAttr)
+      kept.push_back(attr);
+  return DictionaryAttr::get(attrs.getContext(), kept);
+}
+
 namespace {
 //===----------------------------------------------------------------------===//
 // AlwaysInlineGraphNode
@@ -81,7 +98,8 @@ struct AlwaysInlineGraph
 
   static bool shouldAddToGraph(KGENCallOpInterface call,
                                AlwaysInlineGraphNode *node) {
-    return isAlwaysInlineFunction(node->func) && !inContract(call);
+    return !isa<CreateFuncPtrOp>(call) && isAlwaysInlineFunction(node->func) &&
+           !inContract(call);
   }
 
   LogicalResult diagnoseCycle(ModuleOp module, const SymbolTable &symtab);
@@ -236,7 +254,7 @@ struct CallGraph : CallGraphBase<CallGraph, CallGraphNode> {
   CallGraphNode externalNode;
 
   /// Function symbols referenced by non-call users (e.g. function-pointer
-  /// values taken via `kgen.param.constant` or `kgen.create_closure`).
+  /// values taken via `kgen.param.constant` or `kgen.create_func_ptr`).
   /// Populated by `collectNonCallReferencedSymbols`.
   llvm::DenseSet<mlir::StringAttr> nonCallReferencedSyms;
 
@@ -342,6 +360,11 @@ bool CallGraphNode::canInlineCallee(CallGraphNode *callee) {
   if (isAlwaysInlineFunction(callee->func))
     return true;
 
+  // Don't inline callee if it carries different non-empty function attributes.
+  DictionaryAttr calleeAttrs = fnAttrsForInlining(callee->func);
+  if (!calleeAttrs.empty() && calleeAttrs != fnAttrsForInlining(func))
+    return false;
+
   // Try to inline callee if it is not in the same SCC as the current node
   // (which is the caller).
   return !sccNodes.contains(callee) && (callee != this) && callee->reachable;
@@ -442,7 +465,7 @@ void CallGraph::inlineNode(CallGraphNode *caller, uint64_t threshold) {
   for (auto [call, callee] : caller->callsites) {
     // Don't attempt to inline functions in the SCCs of their callers or those
     // in unreachable SCCs.
-    if (!caller->canInlineCallee(callee) ||
+    if (isa<CreateFuncPtrOp>(call) || !caller->canInlineCallee(callee) ||
         caller->recursesThroughContract(call, callee))
       continue;
     if (seenNodes.insert(callee).second)
@@ -462,7 +485,7 @@ void CallGraph::inlineNode(CallGraphNode *caller, uint64_t threshold) {
     for (auto [call, callee] : caller->callsites) {
       // Make sure we don't call shouldInlineCallee on a callee that we are not
       // waiting on.
-      if (!caller->canInlineCallee(callee) ||
+      if (isa<CreateFuncPtrOp>(call) || !caller->canInlineCallee(callee) ||
           caller->recursesThroughContract(call, callee))
         continue;
 

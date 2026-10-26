@@ -445,8 +445,7 @@ OpFoldResult FMAOp::fold(FoldAdaptor adaptor) {
 
 /// We can fold loads of `pop.global_constant` ops.
 OpFoldResult LoadOp::fold(FoldAdaptor adaptor) {
-  if (adaptor.getOrdering() != AtomicOrdering::NOT_ATOMIC ||
-      mightBeVolatile()) {
+  if (isAtomicOrMightBeVolatile()) {
     // Don't fold volatile or atomic loads.
     return {};
   }
@@ -504,15 +503,14 @@ OpFoldResult LoadOp::fold(FoldAdaptor adaptor) {
 }
 
 LogicalResult LoadOp::canonicalize(LoadOp op, PatternRewriter &b) {
-  if (op.getOrdering() != AtomicOrdering::NOT_ATOMIC || op.mightBeVolatile()) {
+  if (op.isAtomicOrMightBeVolatile()) {
     // Don't canonicalize atomic or volatile loads.
     return failure();
   }
 
   // Canonicalize "store x -> ptr; tmp = load ptr" into "store; tmp = x".
   if (auto store = dyn_cast_if_present<StoreOp>(op->getPrevNode())) {
-    if ((store.getPtr() == op.getPtr()) &&
-        (store.getOrdering() == AtomicOrdering::NOT_ATOMIC)) {
+    if (store.getPtr() == op.getPtr() && !store.isAtomic()) {
       b.replaceOp(op, store.getArg());
       return success();
     }
@@ -1484,7 +1482,7 @@ SIMDSplatOp::parametric_interpret(ArrayRef<Attribute> operands,
 //===----------------------------------------------------------------------===//
 
 LogicalResult StoreOp::canonicalize(StoreOp op, PatternRewriter &b) {
-  if (op.getOrdering() != AtomicOrdering::NOT_ATOMIC || op.mightBeVolatile()) {
+  if (op.isAtomicOrMightBeVolatile()) {
     // Don't canonicalize atomic or volatile stores.
     return failure();
   }
@@ -2309,65 +2307,6 @@ PointerToIndexOp::parametric_interpret(ArrayRef<Attribute> operands,
 }
 
 //===----------------------------------------------------------------------===//
-// CompilerGlobalLoadOp
-//===----------------------------------------------------------------------===//
-
-ErrorTreeOrSuccess CompilerGlobalLoadOp::interpret(ArrayRef<Attribute> operands,
-                                                   InterpreterState &state) {
-  Attribute value = state.getNamedGlobal(getNameAttr());
-  if (!value)
-    return ErrorTree(
-        getLoc(),
-        "cannot evaluate standalone capturing closure at compile time");
-  // The global map is keyed by name, and one parametric generator's
-  // instantiations share a name while their capture types can differ.
-  if (!isAttributeTypeCompatible(value, getResult().getType())) {
-    return ErrorTree(getLoc(),
-                     "internal error: compiler global '" + getName().str() +
-                         "' holds a value whose type does not match the type "
-                         "it is loaded as");
-  }
-  return state.mapResults(value);
-}
-
-ErrorTreeOrSuccess
-CompilerGlobalLoadOp::parametric_interpret(ArrayRef<Attribute> operands,
-                                           ParametricInterpreterState &state) {
-  Attribute value = state.getNamedGlobal(getNameAttr());
-  if (!value)
-    return ErrorTree(
-        getLoc(),
-        "cannot evaluate standalone capturing closure at compile time");
-  // The global map is keyed by name, and one parametric generator's
-  // instantiations share a name while their capture types can differ.
-  if (!isAttributeTypeCompatible(value, getResult().getType())) {
-    return ErrorTree(getLoc(),
-                     "internal error: compiler global '" + getName().str() +
-                         "' holds a value whose type does not match the type "
-                         "it is loaded as");
-  }
-  return state.mapResults(value);
-}
-
-//===----------------------------------------------------------------------===//
-// CompilerGlobalStoreOp
-//===----------------------------------------------------------------------===//
-
-ErrorTreeOrSuccess
-CompilerGlobalStoreOp::interpret(ArrayRef<Attribute> operands,
-                                 InterpreterState &state) {
-  state.setNamedGlobal(getNameAttr(), operands.front());
-  return success();
-}
-
-ErrorTreeOrSuccess
-CompilerGlobalStoreOp::parametric_interpret(ArrayRef<Attribute> operands,
-                                            ParametricInterpreterState &state) {
-  state.setNamedGlobal(getNameAttr(), operands.front());
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
 // CastToBuiltinOp
 //===----------------------------------------------------------------------===//
 
@@ -2813,7 +2752,7 @@ static ErrorTreeOrSuccess interpreterWrite(ExternalCallOp op,
     return ErrorTree(op.getLoc(), "unable to interpret call to 'write', "
                                   "expected integer result type");
   ErrorOr<int64_t> fdOr =
-      getScalarIndexValue(dyn_cast_or_null<TypedAttr>(operands[0]));
+      getScalarIntegerValue(dyn_cast_or_null<TypedAttr>(operands[0]));
   if (fdOr.isError())
     return ErrorTree(op.getLoc(), "unable to interpret call to 'write', "
                                   "expected integer typed first operand");
@@ -2824,16 +2763,14 @@ static ErrorTreeOrSuccess interpreterWrite(ExternalCallOp op,
                                   "expected pointer typed second operand");
 
   ErrorOr<int64_t> nbytesOr =
-      getScalarIndexValue(dyn_cast_or_null<TypedAttr>(operands[2]));
+      getScalarIntegerValue(dyn_cast_or_null<TypedAttr>(operands[2]));
   if (nbytesOr.isError())
     return ErrorTree(op.getLoc(), "unable to interpret call to 'write', "
                                   "expected integer typed third operand");
-  unsigned ptrSize = state.getTarget().getDataLayout().getPointerSize();
-  ErrorOr<const void *> mem =
-      state.getReadableMemory(buffer.getAddr(), ptrSize);
+  int size = static_cast<int>(nbytesOr.get());
+  ErrorOr<const void *> mem = state.getReadableMemory(buffer.getAddr(), size);
   if (mem)
     return ErrorTree(op.getLoc(), mem.takeError());
-  int size = static_cast<int>(nbytesOr.get());
   int numWritten = write(fdOr.get(), (const void *)*mem, size);
   if (auto simdType = dyn_cast<SIMDType>(resultType)) {
     auto simdAttr = SIMDAttr::get(numWritten, simdType);

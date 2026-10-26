@@ -29,14 +29,12 @@ def random_uniform[
     target: StaticString,
     OutputFn: ImplicitlyCopyable
     & RegisterPassable
-    & def[width: SIMDLength, _rank: Int](
-        idx: IndexList[_rank], val: SIMD[dtype, width]
-    ),
+    & def[width: SIMDLength](idx: Coord, val: SIMD[dtype, width]),
 ](
     shape: IndexList[rank],
     lower_bound: Scalar[dtype],
     upper_bound: Scalar[dtype],
-    seed_ptr: UnsafePointer[UInt64, ImmutAnyOrigin],
+    seed_ptr: ImmPointer[UInt64, ImmutAnyOrigin],
     ctx: DeviceContext,
     output_fn: OutputFn,
 ) raises:
@@ -81,9 +79,7 @@ def random_uniform[
         var values: SIMD[.float32, 4] = generator.step_uniform()
         values = values * delta + Float32(lower_bound)
 
-        output_fn[width=width](
-            coord_to_index_list(idx), values.cast[dtype]().slice[width]()
-        )
+        output_fn[width=width](idx, values.cast[dtype]().slice[width]())
 
     elementwise[simd_width=4, target=target](generate, Coord(shape), ctx)
 
@@ -123,17 +119,12 @@ def keyed_uniform[
     if Int(seed.dim(0)) != rows:
         raise Error("keyed_uniform needs exactly one seed per output row")
 
-    var out_ptr = output.ptr
-    var seed_ptr = seed.ptr
-
     @inline(.always)
     def draw[width: Int, alignment: Int = 1](idx: Coord) {var}:
         comptime assert width == 1, "each row keys its own Philox stream"
 
-        var row = coord_to_index_list(idx)[0]
-        var generator = Random(seed=seed_ptr[row])
-        out_ptr[row] = generator.step_uniform()[0]
+        var row = Int(idx[0])
+        var generator = Random(seed=rebind[UInt64](seed.load((row,))))
+        output.store((row,), generator.step_uniform()[0])
 
-    elementwise[simd_width=1, target=target](
-        draw, Coord(IndexList[1](rows)), ctx
-    )
+    elementwise[simd_width=1, target=target](draw, (rows,), ctx)

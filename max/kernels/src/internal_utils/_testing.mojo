@@ -151,8 +151,8 @@ def assert_almost_equal[
     dtype: DType,
     //,
 ](
-    x: UnsafePointer[Scalar[dtype], _],
-    y: UnsafePointer[Scalar[dtype], _],
+    x: Pointer[Scalar[dtype], _],
+    y: Pointer[Scalar[dtype], _],
     num_elements: Int,
     msg: String = "",
     *,
@@ -217,8 +217,8 @@ def assert_equal[
     dtype: DType,
     //,
 ](
-    x: UnsafePointer[Scalar[dtype], _],
-    y: UnsafePointer[Scalar[dtype], _],
+    x: Pointer[Scalar[dtype], _],
+    y: Pointer[Scalar[dtype], _],
     num_elements: Int,
     msg: String = "",
     *,
@@ -305,13 +305,13 @@ def assert_with_measure[
     dtype: DType,
     //,
     measure: def[dtype: DType](
-        UnsafePointer[mut=False, Scalar[dtype], _],
-        UnsafePointer[mut=False, Scalar[dtype], _],
+        ImmPointer[Scalar[dtype], _],
+        ImmPointer[Scalar[dtype], _],
         Int,
     ) thin -> Float64,
 ](
-    x: UnsafePointer[Scalar[dtype], _],
-    y: UnsafePointer[Scalar[dtype], _],
+    x: Pointer[Scalar[dtype], _],
+    y: Pointer[Scalar[dtype], _],
     num_elements: Int,
     msg: String = "",
     *,
@@ -354,8 +354,8 @@ def assert_with_measure[
         -0.5 * Float64(FPUtils[dtype].mantissa_width())
     ).cast[.float64]()
     var m = measure(
-        x.address_space_cast[.GENERIC](),
-        y.address_space_cast[.GENERIC](),
+        x,
+        y,
         num_elements,
     )
     var t = threshold.or_else(sqrt_eps)
@@ -393,16 +393,17 @@ def pytorch_like_tolerances_for[dtype: DType]() -> Tuple[Float64, Float64]:
         ```
     """
 
-    comptime if dtype == .float16:
-        return (1e-3, 1e-5)
-    elif dtype == .bfloat16:
-        return (1.6e-2, 1e-5)
-    elif dtype == .float32:
-        return (1.3e-6, 1e-5)
-    elif dtype == .float64:
-        return (1e-7, 1e-7)
-    else:
-        return (0.0, 0.0)
+    comptime match dtype:
+        case .float16:
+            return (1e-3, 1e-5)
+        case .bfloat16:
+            return (1.6e-2, 1e-5)
+        case .float32:
+            return (1.3e-6, 1e-5)
+        case .float64:
+            return (1e-7, 1e-7)
+        case _:
+            return (0.0, 0.0)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -411,7 +412,6 @@ def pytorch_like_tolerances_for[dtype: DType]() -> Tuple[Float64, Float64]:
 
 
 @inline(.always)
-@__parameter
 def test_value_for_gpu_element[
     dtype: DType,
     modulo: Int = 251 if dtype == .float32 else 13,

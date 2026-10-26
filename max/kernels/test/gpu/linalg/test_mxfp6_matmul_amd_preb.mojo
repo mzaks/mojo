@@ -42,7 +42,6 @@ from std.testing import assert_true
 from std.utils import StaticTuple
 
 from layout import (
-    Coord,
     Idx,
     TensorLayout,
     TensorEngine,
@@ -128,10 +127,10 @@ def _mxfp6_matmul_ref[
         var fb = SIMD[.uint8, 32](0)
         comptime for chunk in range(3):
             fa = fa.insert[offset=chunk * 8](
-                a_ptr.load[width=8](a_base + chunk * 8)
+                a_ptr.unsafe_load[width=8](a_base + chunk * 8)
             )
             fb = fb.insert[offset=chunk * 8](
-                b_ptr.load[width=8](b_base + chunk * 8)
+                b_ptr.unsafe_load[width=8](b_base + chunk * 8)
             )
 
         var av = decode_fp6_to_f32[fmt](unpack_fp6_x32(fa)) * a_scale
@@ -225,7 +224,7 @@ def _preb_grid_kernel[
         N,
         K_BYTES,
     ](
-        c, a, b_pre, sfa, sfb, Int(block_idx.x), Int(block_idx.y)
+        c, a, b_pre, sfa, sfb, block_idx.x, block_idx.y
     )
 
 
@@ -312,10 +311,10 @@ def _test_case[
     # The scale path is format-independent: one E8M0 byte per 32 elements per
     # lane, identical for every f8f6f4 format.
     var sfa_h_tt = TileTensor(
-        sfa_h, row_major(Coord(Idx[1], Idx[M_static], Idx[scale_K]))
+        sfa_h, row_major(Idx[1], Idx[M_static], Idx[scale_K])
     )
     var sfb_h_tt = TileTensor(
-        sfb_h, row_major(Coord(Idx[1], Idx[N_static], Idx[scale_K]))
+        sfb_h, row_major(Idx[1], Idx[N_static], Idx[scale_K])
     )
     _ = Shuffler[1].preshuffle_scale_4d[MN=M_static, K_SCALES=scale_K](
         sfa_h_tt, sfa_pre_h
@@ -357,8 +356,8 @@ def _test_case[
     ctx.enqueue_function[_mxfp6_matmul_ref[fmt]](
         a_d.unsafe_ptr(),
         b_d.unsafe_ptr(),
-        sfa_d.unsafe_ptr().bitcast[Float8_e8m0fnu](),
-        sfb_d.unsafe_ptr().bitcast[Float8_e8m0fnu](),
+        sfa_d.unsafe_ptr().unsafe_bitcast[Float8_e8m0fnu](),
+        sfb_d.unsafe_ptr().unsafe_bitcast[Float8_e8m0fnu](),
         c_ref_d.unsafe_ptr(),
         mag_d.unsafe_ptr(),
         Int32(M_static),
@@ -368,9 +367,7 @@ def _test_case[
         block_dim=(BLOCK_DIM, BLOCK_DIM),
     )
 
-    var a_tt = TileTensor(
-        a_d, row_major(Coord(M_static, Idx[K_BYTES]))
-    ).as_imm()
+    var a_tt = TileTensor(a_d, row_major(M_static, Idx[K_BYTES])).as_imm()
     var b_pre_tt = TileTensor(
         b_pre_d, row_major[1, N_static * K_BYTES]()
     ).as_imm()
@@ -378,11 +375,11 @@ def _test_case[
     # kernel reads the underlying bytes through `PreshuffledScaleLoader`, so
     # the TileTensor layout is unused.
     var sfa_tt = TileTensor(
-        sfa_pre_d.unsafe_ptr().bitcast[Float8_e8m0fnu](),
+        sfa_pre_d.unsafe_ptr().unsafe_bitcast[Float8_e8m0fnu](),
         row_major[padded_M, scale_K](),
     ).as_imm()
     var sfb_tt = TileTensor(
-        sfb_pre_d.unsafe_ptr().bitcast[Float8_e8m0fnu](),
+        sfb_pre_d.unsafe_ptr().unsafe_bitcast[Float8_e8m0fnu](),
         row_major[N_static, scale_K](),
     ).as_imm()
     var c_tt = TileTensor(c_d, row_major[M_static, N_static]())

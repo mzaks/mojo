@@ -40,8 +40,8 @@ of two flips the ceiling and changes the scale by a factor of two.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING, NoReturn
 
 from max.dtype import DType
 from max.graph import DeviceRef, Dim, TensorValue, ops
@@ -51,12 +51,7 @@ from max.nn.kernels import (
 )
 from max.nn.linear import Linear
 from max.nn.quant_config import (
-    InputScaleSpec,
     QuantConfig,
-    QuantFormat,
-    ScaleGranularity,
-    ScaleOrigin,
-    WeightScaleSpec,
 )
 
 if TYPE_CHECKING:
@@ -81,7 +76,7 @@ _LN2 = math.log(2.0)
 
 def _pow2(k: TensorValue) -> TensorValue:
     """``2 ** k`` for a tensor holding integer-valued floats."""
-    return ops.pow(ops.constant(2.0, DType.float32, k.device), k)
+    return ops.pow(2.0, k)
 
 
 def _ceil_log2(x: TensorValue) -> TensorValue:
@@ -114,7 +109,7 @@ def block_scale(
     """
     grouped = _group(x, block_size)
     amax = ops.max(ops.abs(grouped), axis=-1)
-    amax = ops.max(amax, ops.constant(amax_floor, DType.float32, amax.device))
+    amax = ops.max(amax, amax_floor)
     return _pow2(_ceil_log2(amax * (1.0 / value_max)))
 
 
@@ -168,9 +163,7 @@ def fp4_qat_quantize(
     scale = block_scale(
         x, block_size, value_max=FP4_MAX, amax_floor=FP4_AMAX_FLOOR
     )
-    lo = ops.constant(-FP4_MAX, DType.float32, grouped.device)
-    hi = ops.constant(FP4_MAX, DType.float32, grouped.device)
-    clamped = ops.min(ops.max(grouped / scale, lo), hi)
+    clamped = ops.min(ops.max(grouped / scale, -FP4_MAX), FP4_MAX)
     roundtripped = _round_e2m1(clamped) * scale
     return ops.cast(ops.reshape(roundtripped, x.shape), x.dtype)
 
@@ -202,11 +195,10 @@ def _round_e2m1(x: TensorValue) -> TensorValue:
     a = ops.abs(x)
     acc = ops.constant(0.0, DType.float32, x.device)
     for threshold, step, tie_up in _E2M1_STEPS:
-        t = ops.constant(threshold, DType.float32, x.device)
-        crossed = a >= t if tie_up else a > t
+        crossed = a >= threshold if tie_up else a > threshold
         acc = acc + ops.cast(crossed, DType.float32) * step
     sign = ops.where(
-        x < ops.constant(0.0, DType.float32, x.device),
+        x < 0.0,
         ops.constant(-1.0, DType.float32, x.device),
         ops.constant(1.0, DType.float32, x.device),
     )
@@ -225,9 +217,7 @@ def _roundtrip(
         x, block_size, value_max=value_max, amax_floor=amax_floor
     )
 
-    lo = ops.constant(-value_max, DType.float32, grouped.device)
-    hi = ops.constant(value_max, DType.float32, grouped.device)
-    clamped = ops.min(ops.max(grouped / scale, lo), hi)
+    clamped = ops.min(ops.max(grouped / scale, -value_max), value_max)
 
     roundtripped = ops.cast(ops.cast(clamped, dtype), DType.float32) * scale
     return ops.cast(ops.reshape(roundtripped, x.shape), x.dtype)
@@ -284,22 +274,11 @@ def fp8_block_quant_config(
             f"DeepSeek-V4 expects weight_block_size {_WEIGHT_BLOCK_SIZE}, got "
             f"{block_size!r}"
         )
-    layers = set(range(num_layers))
-    return QuantConfig(
-        input_scale=InputScaleSpec(
-            granularity=ScaleGranularity.BLOCK,
-            origin=ScaleOrigin.DYNAMIC,
-            dtype=DType.float32,
-            block_size=(1, LINEAR_QUANT_BLOCK),
-        ),
-        weight_scale=WeightScaleSpec(
-            granularity=ScaleGranularity.BLOCK,
-            dtype=DType.float32,
-            block_size=(LINEAR_QUANT_BLOCK, LINEAR_QUANT_BLOCK),
-        ),
+    layers = range(num_layers)
+    return QuantConfig.blockscaled_fp8(
         mlp_quantized_layers=layers,
         attn_quantized_layers=layers,
-        format=QuantFormat.BLOCKSCALED_FP8,
+        block_size=LINEAR_QUANT_BLOCK,
     )
 
 
@@ -351,6 +330,22 @@ class DeepseekV4Fp8Linear(Linear):
             name=name,
         )
 
+    def shard(self, devices: Iterable[DeviceRef]) -> NoReturn:
+        """Refuses: :meth:`Linear.shard` would return plain ``Linear`` shards.
+
+        Their ``__call__`` is the stock ``amax / 448`` activation scale, so
+        the fp8 numerics would change without any error. A class-preserving
+        override cannot be typed against ``Linear.shard``'s ``list[Linear]``;
+        the multi-device model builds its replicas as this class instead
+        (``DeepseekV4.tensor_parallel_replicas``) and gives them only the
+        weight shards.
+        """
+        del devices
+        raise TypeError(
+            "DeepseekV4Fp8Linear cannot be sharded with Linear.shard, which "
+            "drops its e8m0 activation scales; shard its weights instead"
+        )
+
     def __call__(self, x: TensorValue) -> TensorValue:
         assert self.quant_config is not None
         assert self.weight_scale is not None
@@ -378,6 +373,26 @@ class DeepseekV4Fp8Linear(Linear):
         )
         out = ops.cast(out, x.dtype)
         return ops.reshape(out, leading + [out.shape[-1]])
+
+
+def dequantize_fp8_blocks(
+    weight: TensorValue, scale: TensorValue, dtype: DType
+) -> TensorValue:
+    """An fp8 weight times its ``[N / 128, K / 128]`` block scale, in ``dtype``.
+
+    Exact in bfloat16 for this checkpoint's power-of-two scales: an e4m3
+    value (3 mantissa bits) times a power of two fits bf16's 7 mantissa bits.
+    """
+    rows, cols = (int(d) for d in weight.shape)
+    block = LINEAR_QUANT_BLOCK
+    values = ops.reshape(
+        ops.cast(weight, DType.float32),
+        [rows // block, block, cols // block, block],
+    )
+    scales = ops.reshape(
+        scale.to(weight.device), [rows // block, 1, cols // block, 1]
+    )
+    return ops.cast(ops.reshape(values * scales, [rows, cols]), dtype)
 
 
 def linear_for(

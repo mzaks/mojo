@@ -13,7 +13,7 @@
 
 """Provides static configuration and heuristic config builders for SM90 (Hopper) GPU warp-specialized matmul kernels."""
 
-from std.hashlib.hasher import Hasher
+from std.hash.hasher import Hasher
 
 from std.collections.set import Set
 from std.math.uutils import ualign_down, ualign_up, ufloordiv, uceildiv
@@ -134,8 +134,8 @@ struct MatmulConfig[
         # Heuristic: Use 1 consumer group for small M, 2 otherwise
 
         var num_consumer_groups: Int
-        if consumer_groups:
-            num_consumer_groups = consumer_groups.value()
+        if case .Some(consumer_groups) = consumer_groups:
+            num_consumer_groups = consumer_groups
         else:
             num_consumer_groups = 1 if M <= 64 else 2
 
@@ -186,8 +186,8 @@ struct MatmulConfig[
         self.num_pipeline_stages = 4  # Default for compilation
         self.k_group_size = 1
 
-        if k_groups:
-            self.k_group_size = k_groups.value()
+        if case .Some(k_groups) = k_groups:
+            self.k_group_size = k_groups
         else:
             var output_block_size = mma_mn[0] * mma_mn[1]
 
@@ -262,7 +262,11 @@ struct MatmulConfig[
             Self.a_type, Self.b_type, Self.c_type, Self.transpose_b
         ](
             block_tile_shape=self.block_tile_shape,
-            mma_shape=self.mma_shape,
+            mma_shape=(
+                self.mma_shape[0],
+                self.mma_shape[1],
+                self.mma_shape[2],
+            ),
             cluster_shape=self.cluster_shape,
             num_pipeline_stages=self.num_pipeline_stages,
             num_k_partitions=self.num_k_partitions,
@@ -724,12 +728,7 @@ def build_configs_generic[
     var set = Set[MatmulConfig[a_type, b_type, c_type, transpose_b]]()
 
     for m in range(M_start, M_end):
-        var config = config_fn.__call__[
-            _a_type=a_type,
-            _b_type=b_type,
-            _c_type=c_type,
-            _transpose_b=transpose_b,
-        ](m)
+        var config = config_fn(m)
         if config not in set:
             set.add(config)
 
