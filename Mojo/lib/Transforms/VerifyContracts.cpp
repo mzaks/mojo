@@ -278,6 +278,59 @@ LIT::StructDeclOp closureStructOf(LIT::FnOp fn) {
   return parent;
 }
 
+/// The storage struct type of a local closure, for a value of it or a
+/// reference to one; null for any other type.
+LIT::StructType closureTypeOf(Type type) {
+  if (auto ref = dyn_cast<LIT::RefType>(type))
+    type = ref.getElementType();
+  auto st = dyn_cast<LIT::StructType>(type);
+  if (!st)
+    return {};
+  StringRef leaf = st.getSymbol().getLeafReference().getValue();
+  if (!leaf.starts_with("closure$") || !leaf.ends_with("::__storage"))
+    return {};
+  return st;
+}
+
+/// A capture of a local closure the closure writes: the parameter of its
+/// storage struct (printed) is a mutable origin.
+bool mutableCapture(StringRef param) {
+  return param.contains("!lit.origin<true>");
+}
+
+/// Whether `callee` takes its argument `index` as a function to call (a
+/// parameter of the closure trait, `func: Some[def(Int)]` or `F:
+/// def(var T)`): a local closure passed there is handed to be called, not
+/// stored as a value (`Tuple(f)`, `Optional(f)`).
+bool closureParam(LIT::FnOp callee, unsigned index) {
+  if (!callee || callee.getFunctionBody().empty())
+    return false;
+  Block &entry = callee.getFunctionBody().front();
+  if (index >= entry.getNumArguments())
+    return false;
+  Type type = entry.getArgument(index).getType();
+  if (auto ref = dyn_cast<LIT::RefType>(type))
+    type = ref.getElementType();
+  return StringRef(printed(type)).contains("##__mojo_closure__##");
+}
+
+/// The source file of a location, when it has one.
+std::optional<StringRef> fileOf(Location loc) {
+  if (auto file = dyn_cast<FileLineColLoc>(loc))
+    return file.getFilename().getValue();
+  if (auto fused = dyn_cast<FusedLoc>(loc)) {
+    for (Location inner : fused.getLocations())
+      if (std::optional<StringRef> file = fileOf(inner))
+        return file;
+    return std::nullopt;
+  }
+  if (auto name = dyn_cast<mlir::NameLoc>(loc))
+    return fileOf(name.getChildLoc());
+  if (auto site = dyn_cast<mlir::CallSiteLoc>(loc))
+    return fileOf(site.getCallee());
+  return std::nullopt;
+}
+
 /// `callee`'s symbol as `a::b::c`, and its parameter values as text.
 struct CalleeName {
   std::string path;
@@ -1570,38 +1623,7 @@ public:
       } else
         values[arg] = declare(sortOf(arg.getType()), "a");
     }
-    fn.walk([&](LIT::VarDeclOp decl) {
-      Value root = decl->getResult(0);
-      roots.push_back(root);
-      // Only ever loaded from, stored to and borrowed immutably (and its
-      // lifetime marked), or passed to a range's own methods, which keep no
-      // reference: nothing else writes it. That an immutable borrow is not
-      // turned into a pointer that is written through is assumed.
-      // A `kgen.rebind` of the reference is the same reference under
-      // another type: its uses count too.
-      std::function<bool(Value)> plain = [&](Value ref) {
-        return llvm::all_of(ref.getUses(), [&](OpOperand &use) {
-          Operation *user = use.getOwner();
-          StringRef op = user->getName().getStringRef();
-          if (auto call = dyn_cast<LIT::CallOp>(user)) {
-            std::optional<CalleeName> name = calleeName(call.getCallee());
-            return name &&
-                   StringRef(name->path).starts_with("std::builtin::range::");
-          }
-          if (isa<RebindOp>(user))
-            return plain(user->getResult(0));
-          return isa<LIT::RefLoadOp>(user) || op == "lit.load.consume" ||
-                 op == "lit.ref.immut" || op.starts_with("lit.var.lifetime.") ||
-                 op.starts_with("lit.ownership.") ||
-                 // A package's functions carry debug info, which names
-                 // the variable and does nothing with it.
-                 op.starts_with("debuginfo.") ||
-                 (isa<LIT::RefStoreOp>(user) && use.getOperandNumber() == 1);
-        });
-      };
-      if (plain(root))
-        unborrowed.insert(root);
-    });
+    registerLocals(fn);
     // The function's own constraints on its parameters (`where N <= 8`): the
     // compiler rejects any instantiation that breaks them, so they hold in
     // the body. One the parameter model cannot read is an unknown.
@@ -1636,7 +1658,7 @@ public:
             ob.cond = *cond;
           else
             ob.analyzed = false;
-          obligations.push_back(ob);
+          addObligation(ob);
         }
     }
     // The function's own preconditions hold at its entry (when refining,
@@ -1973,6 +1995,18 @@ private:
   /// While a closure's body is walked at a call: where its returns and
   /// raises leave it.
   SmallVector<SmallVector<State> *> closureExits;
+  /// A reference argument of a body walked inline, for the origins the
+  /// body's calls name (`self` of `Optional.deinit_with`, walked at its
+  /// call): the root of the caller's place bound to it; or, with none, an
+  /// owned argument (`var key`, memory of its own that nothing else
+  /// reaches), or else the origin of the caller's operand.
+  struct InlinedArg {
+    std::string name;
+    Value root;
+    bool owned = false;
+    std::string origin;
+  };
+  SmallVector<InlinedArg> inlinedArgs;
   /// The collection an iterator (by its place's root) iterates.
   DenseMap<Value, Loc> iterSources;
   /// The types of places named by a value of another type (an element an
@@ -1985,6 +2019,16 @@ private:
   bool lenDeclared = false;
   /// Inside a contract region: calls there are evaluated, not checked.
   unsigned inContract = 0;
+  /// While a library body is walked inline (a function handed a local
+  /// closure): its obligations are the library's, and are not recorded.
+  unsigned trusted = 0;
+
+  /// Records an obligation of this function: not one met while a library
+  /// body is walked inline.
+  void addObligation(Obligation ob) {
+    if (!trusted)
+      obligations.push_back(std::move(ob));
+  }
   SmallVector<LoopFrame *> loops;
   SmallVector<TryFrame *> tries;
 
@@ -2922,7 +2966,8 @@ private:
 
   /// The roots a mutable origin (printed) may reach; nullopt if it names none
   /// of the function's roots, so it may reach any of them.
-  std::optional<SmallVector<Value>> rootsNamedBy(StringRef origin) {
+  std::optional<SmallVector<Value>> rootsNamedBy(StringRef origin,
+                                                 unsigned depth = 0) {
     SmallVector<Value> named;
     // The empty union (`#lit<origin.union >`, no origin at all) reaches no
     // root; `MutAnyOrigin` is `#lit.any.origin`, which this does not match.
@@ -2933,7 +2978,29 @@ private:
       if (!name.empty() && origin.contains(name))
         named.push_back(root);
     }
-    if (named.empty())
+    // The arguments of the bodies walked inline, innermost first.
+    bool matched = false;
+    llvm::StringSet<> seen;
+    for (const InlinedArg &arg : llvm::reverse(inlinedArgs)) {
+      if (!seen.insert(arg.name).second || !origin.contains(arg.name))
+        continue;
+      matched = true;
+      if (arg.root) {
+        if (!llvm::is_contained(named, arg.root))
+          named.push_back(arg.root);
+      } else if (!arg.owned) {
+        if (depth >= 4)
+          return std::nullopt;
+        std::optional<SmallVector<Value>> through =
+            rootsNamedBy(arg.origin, depth + 1);
+        if (!through)
+          return std::nullopt;
+        for (Value root : *through)
+          if (!llvm::is_contained(named, root))
+            named.push_back(root);
+      }
+    }
+    if (named.empty() && !matched)
       return std::nullopt;
     return named;
   }
@@ -3924,6 +3991,12 @@ private:
                 continue;
             addOrigin(origin);
           }
+          // The captures a local closure handed to the callee writes.
+          for (Value operand : call.getOperands())
+            if (LIT::StructType closure = closureTypeOfValue(operand))
+              for (TypedAttr param : closure.getParamValues())
+                if (std::string origin = printed(param); mutableCapture(origin))
+                  addOrigin(origin);
           confined = false;
         } else if (op->getNumRegions() && !seen.count(op) &&
                    !isa<HLCF::IfOp, HLCF::LoopOp, LIT::TryOp, RequiresOp,
@@ -5042,7 +5115,7 @@ private:
       ob.cond = *cond;
     else
       ob.analyzed = false;
-    obligations.push_back(ob);
+    addObligation(ob);
   }
 
   /// Where the implementation returns, the trait method's postcondition, on
@@ -5062,7 +5135,7 @@ private:
         ob.cond = *cond;
       else
         ob.analyzed = false;
-      obligations.push_back(ob);
+      addObligation(ob);
     }
     callResult = {};
   }
@@ -5078,9 +5151,9 @@ private:
           for (Operation &calleeOp : callee.getFunctionBody().front())
             if (auto req = dyn_cast<RequiresOp>(&calleeOp);
                 req && !req.getInvariant())
-              obligations.push_back({state.pc, "true", call.getLoc(),
-                                     req.getLoc(), displayName(callee),
-                                     /*analyzed=*/false});
+              addObligation({state.pc, "true", call.getLoc(), req.getLoc(),
+                             displayName(callee),
+                             /*analyzed=*/false});
     });
     havocAll(state);
     setResultsUnknown(op);
@@ -5451,7 +5524,7 @@ private:
                                            bvConst(0, sortOfTerm(divisor).width) +
                                            "))");
     noteCondition(ob.cond);
-    obligations.push_back(ob);
+    addObligation(ob);
   }
 
   /// A partial tile (or a view of one) passed to a function other than the
@@ -5492,7 +5565,7 @@ private:
       ob.claim = "that the tile passed is not partial (every element backed)";
       ob.cond = define({true, 1, false}, all);
       noteCondition(ob.cond);
-      obligations.push_back(ob);
+      addObligation(ob);
     }
   }
 
@@ -6320,6 +6393,162 @@ private:
     return fn;
   }
 
+  /// Whether `op` is in the file of the function being verified: the
+  /// local closures handed to library functions there are its code, whose
+  /// obligations are reported; the library's are not.
+  bool userCode(Operation *op) {
+    if (!op)
+      return false;
+    std::optional<StringRef> file = fileOf(op->getLoc());
+    return file && file == fileOf(fn->getLoc());
+  }
+
+  /// Whether a closure's storage struct is this file's (the struct, or a
+  /// member of it, is located here).
+  bool userClosure(LIT::StructDeclOp decl) {
+    if (!decl)
+      return false;
+    if (userCode(decl))
+      return true;
+    for (auto member : decl.getBody()->getOps<LIT::FnOp>())
+      if (userCode(member))
+        return true;
+    return false;
+  }
+
+  /// The local variables declared in `scope` (the function, or a body
+  /// walked inline at a call of it) are roots; those only ever read, stored
+  /// and borrowed immutably are `unborrowed`.
+  DenseSet<Operation *> localsRegistered;
+  void registerLocals(Operation *scope) {
+    if (!localsRegistered.insert(scope).second)
+      return;
+    scope->walk([&](LIT::VarDeclOp decl) {
+      Value root = decl->getResult(0);
+      roots.push_back(root);
+      // Only ever loaded from, stored to and borrowed immutably (and its
+      // lifetime marked), or passed to a range's own methods, which keep no
+      // reference: nothing else writes it. That an immutable borrow is not
+      // turned into a pointer that is written through is assumed.
+      // A `kgen.rebind` of the reference is the same reference under
+      // another type: its uses count too.
+      std::function<bool(Value)> plain = [&](Value ref) {
+        return llvm::all_of(ref.getUses(), [&](OpOperand &use) {
+          Operation *user = use.getOwner();
+          StringRef op = user->getName().getStringRef();
+          if (auto call = dyn_cast<LIT::CallOp>(user)) {
+            std::optional<CalleeName> name = calleeName(call.getCallee());
+            return name &&
+                   StringRef(name->path).starts_with("std::builtin::range::");
+          }
+          if (isa<RebindOp>(user))
+            return plain(user->getResult(0));
+          return isa<LIT::RefLoadOp>(user) || op == "lit.load.consume" ||
+                 op == "lit.ref.immut" || op.starts_with("lit.var.lifetime.") ||
+                 op.starts_with("lit.ownership.") ||
+                 // A package's functions carry debug info, which names
+                 // the variable and does nothing with it.
+                 op.starts_with("debuginfo.") ||
+                 (isa<LIT::RefStoreOp>(user) && use.getOperandNumber() == 1);
+        });
+      };
+      if (plain(root))
+        unborrowed.insert(root);
+    });
+  }
+
+  /// The storage struct type of the local closure `value` is or refers to,
+  /// its type resolved in the current frame (`func: F` in a library body,
+  /// `F` bound to the closure's type by the call being walked); null for
+  /// any other value.
+  LIT::StructType closureTypeOfValue(Value value) {
+    Type type = value.getType();
+    if (auto ref = dyn_cast<LIT::RefType>(type))
+      type = ref.getElementType();
+    if (LIT::StructType closure = closureTypeOf(type))
+      return closure;
+    auto param = dyn_cast<KGEN::ParamType>(type);
+    if (!param)
+      return {};
+    auto typed = dyn_cast_or_null<TypeParamAttr>(
+        unwrapValue(resolveParam(param.getParam())));
+    return typed ? closureTypeOf(typed.getTypeValue()) : LIT::StructType();
+  }
+
+  /// How many bodies are walked inline at once, at most: a chain of
+  /// library calls handing a closure down (`Dict.deinit_with` reaches the
+  /// closure through five), or closures calling closures.
+  static constexpr size_t maxInlineDepth = 10;
+
+  /// `callee`'s body, walked at `call` with the caller's state: its
+  /// arguments the call's operands, its parameters `frame`. What its
+  /// returns and raises leave is merged; its results are unknown. False
+  /// when the arguments do not line up.
+  bool inlineBody(LIT::CallOp call, LIT::FnOp callee, ParamFrame &frame,
+                  State &state) {
+    Block &entry = callee.getFunctionBody().front();
+    if (entry.getNumArguments() != call.getNumOperands())
+      return false;
+    registerLocals(callee);
+    size_t boundArgs = inlinedArgs.size();
+    ArrayRef<ArgConvention> conventions =
+        callee.getFuncTypeGenerator().getArgConventions();
+    for (auto [index, arg, operand] :
+         llvm::enumerate(entry.getArguments(), call.getOperands())) {
+      auto ref = dyn_cast<LIT::RefType>(arg.getType());
+      if (!ref) {
+        values[arg] = term(operand, state);
+        continue;
+      }
+      refArgs.erase(arg);
+      std::optional<Loc> loc = placeOf(operand);
+      if (loc)
+        refArgs[arg] = *loc;
+      if (std::string name = quotedOriginName(arg); !name.empty()) {
+        InlinedArg bound{name, loc ? loc->root : Value()};
+        bound.owned = index < conventions.size() &&
+                      (conventions[index] == ArgConvention::OwnedMem ||
+                       conventions[index] == ArgConvention::DeinitMem);
+        if (auto from = dyn_cast<LIT::RefType>(operand.getType()))
+          bound.origin = printed(from.getOrigin());
+        inlinedArgs.push_back(std::move(bound));
+      }
+    }
+    ParamFrame *saved = params;
+    params = &frame;
+    // Its parameter expressions are this call's: not what an earlier call
+    // of it left.
+    callee->walk([&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
+    SmallVector<State> exits;
+    closureExits.push_back(&exits);
+    State body = state;
+    body.yields.clear();
+    walkBlock(entry, body);
+    closureExits.pop_back();
+    inlinedArgs.truncate(boundArgs);
+    params = saved;
+    if (body.alive)
+      exits.push_back(std::move(body));
+    State joined = merge(exits);
+    joined.yields = state.yields;
+    state = std::move(joined);
+    setResultsUnknown(call);
+    return true;
+  }
+
+  /// A closure member's body, walked at its call. A closure of this file
+  /// is this function's code, so its obligations are reported even inside
+  /// a library body walked inline (`trusted`).
+  bool inlineMember(LIT::CallOp call, LIT::FnOp member, ParamFrame &frame,
+                    State &state) {
+    unsigned savedTrusted = trusted;
+    if (userCode(member))
+      trusted = 0;
+    bool done = inlineBody(call, member, frame, state);
+    trusted = savedTrusted;
+    return done;
+  }
+
   /// A call of a local closure's member: its body, walked here with the
   /// caller's state. The constructor stores the captures into the closure's
   /// variable (a `mut` capture as a reference to the caller's variable, so
@@ -6329,42 +6558,117 @@ private:
   /// values. What its returns and raises leave is merged; its results are
   /// unknown.
   bool inlineClosure(LIT::CallOp call, State &state) {
-    LIT::FnOp fn = closureMember(call);
-    if (!fn || closureExits.size() >= 4)
+    LIT::FnOp member = closureMember(call);
+    if (!member || closureExits.size() >= maxInlineDepth)
       return false;
-    Block &entry = fn.getFunctionBody().front();
-    if (entry.getNumArguments() != call.getNumOperands())
+    ParamFrame frame = paramFrame(call, member);
+    return inlineMember(call, member, frame, state);
+  }
+
+  /// A call of a local closure through its trait (`func(i)` in `map`'s
+  /// body, `func` a parameter of the closure's type, bound by the call of
+  /// `map` being walked): the closure's `__call__` wrapper, walked as a
+  /// direct call of it. Its parameters are its storage struct's (the
+  /// captures' origins, from the type) and the wrapper's own
+  /// (`closure[simd_width](i)`), from the call.
+  bool inlineClosureWitness(LIT::CallOp call, State &state) {
+    if (inContract || closureExits.size() >= maxInlineDepth)
       return false;
-    for (auto [arg, operand] :
-         llvm::zip(entry.getArguments(), call.getOperands())) {
-      if (isa<LIT::RefType>(arg.getType())) {
-        refArgs.erase(arg);
-        if (std::optional<Loc> loc = placeOf(operand))
-          refArgs[arg] = *loc;
-      } else {
-        values[arg] = term(operand, state);
-      }
+    Attribute callee = call.getCallee();
+    ArrayRef<TypedAttr> own;
+    if (auto bind = dyn_cast<BindParamsAttr>(callee)) {
+      own = bind.getParamValues();
+      callee = bind.getGenerator();
     }
-    ParamFrame frame = paramFrame(call, fn);
-    ParamFrame *saved = params;
-    params = &frame;
-    // Its parameter expressions are this call's: not what an earlier call
-    // of it left.
-    fn->walk([&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
-    SmallVector<State> exits;
-    closureExits.push_back(&exits);
-    State body = state;
-    body.yields.clear();
-    walkBlock(entry, body);
-    closureExits.pop_back();
-    params = saved;
-    if (body.alive)
-      exits.push_back(std::move(body));
-    State joined = merge(exits);
-    joined.yields = state.yields;
-    state = std::move(joined);
-    setResultsUnknown(call);
-    return true;
+    auto witness = dyn_cast<GetWitnessAttr>(callee);
+    if (!witness || witness.getWitnessName() != "__call__")
+      return false;
+    auto typed = dyn_cast_or_null<TypeParamAttr>(
+        unwrapValue(resolveParam(witness.getTypeValue())));
+    LIT::StructType closure =
+        typed ? closureTypeOf(typed.getTypeValue()) : LIT::StructType();
+    auto decl = closure
+                    ? dyn_cast_or_null<LIT::StructDeclOp>(
+                          symbols.lookupSymbolIn(module, closure.getSymbol()))
+                    : LIT::StructDeclOp();
+    if (!decl)
+      return false;
+    LIT::FnOp impl;
+    for (auto conformance : decl.getBody()->getOps<ConformanceOp>()) {
+      if (conformance.getTraitSymbol()
+              .getSymbol()
+              .getLeafReference()
+              .getValue() != "##__mojo_closure__##")
+        continue;
+      for (auto member : conformance.getBody().getOps<WitnessOp>())
+        if (member.getSymName() == "__call__")
+          if (auto value = dyn_cast<SymbolConstantAttr>(member.getValue()))
+            impl = dyn_cast_or_null<LIT::FnOp>(
+                symbols.lookupSymbolIn(module, value.getSymbol()));
+    }
+    if (!impl || impl.getFunctionBody().empty())
+      return false;
+    ParamFrame frame;
+    frame.parent = params;
+    frame.fn = impl;
+    frame.scope = printed(closure) + "|" + (params ? params->scope : "");
+    SmallVector<ParamDeclAttr> decls(decl.getParams());
+    ArrayRef<ParamDeclAttr> implParams = impl.getParams();
+    size_t implicit = call.getImplicitOrigins().size();
+    if (implicit > implParams.size())
+      return false;
+    llvm::append_range(decls, implParams.drop_back(implicit));
+    SmallVector<TypedAttr> bound(closure.getParamValues());
+    llvm::append_range(bound, own);
+    if (decls.size() != bound.size())
+      return false;
+    for (auto [param, value] : llvm::zip(decls, bound))
+      frame.values[param.getName()] = value;
+    return inlineMember(call, impl, frame, state);
+  }
+
+  /// A call that hands a local closure of this file to a function with a
+  /// body (`map(n, f)`, `vectorize[4](n, g)`, `xs^.deinit_with(f)`): the
+  /// body is walked here, so that the closure's is walked where the body
+  /// calls it, with what the body knows there (`i < n`) and this caller's
+  /// captures. The body's own obligations are the library's, not this
+  /// function's: they are not reported. Beyond `maxInlineDepth` bodies the
+  /// closure is not walked at all, which is reported.
+  bool inlineHigherOrder(LIT::CallOp call, LIT::FnOp callee, ParamFrame &frame,
+                         State &state) {
+    if (inContract || !callee || callee.getFunctionBody().empty() ||
+        !isa<SymbolConstantAttr>(call.getCallee()) || closureStructOf(callee))
+      return false;
+    bool handed = false;
+    for (auto [index, operand] : llvm::enumerate(call.getOperands()))
+      if (LIT::StructType closure = closureTypeOfValue(operand))
+        if (closureParam(callee, index) &&
+            userClosure(dyn_cast_or_null<LIT::StructDeclOp>(
+                symbols.lookupSymbolIn(module, closure.getSymbol()))))
+          handed = true;
+    if (!handed)
+      return false;
+    if (closureExits.size() >= maxInlineDepth) {
+      Obligation ob{state.pc, "false", call.getLoc(), call.getLoc(),
+                    displayName(callee)};
+      ob.analyzed = false;
+      ob.claim = "that the closure handed to '" + displayName(callee) +
+                 "' meets its obligations (the call is nested too deeply "
+                 "to walk its body)";
+      obligations.push_back(ob);
+      return false;
+    }
+    State before = state;
+    ++trusted;
+    bool done = inlineBody(call, callee, frame, state);
+    --trusted;
+    // A body the walk cannot follow to a return (a `while case` loop,
+    // `hlcf.match`, leaves no exit): its effects are any call's.
+    if (done && before.alive && !state.alive) {
+      state = std::move(before);
+      return false;
+    }
+    return done;
   }
 
   /// Whether `fn` is a helper that only computes a value: no clauses, no
@@ -6470,7 +6774,7 @@ private:
   }
 
   void evalCall(LIT::CallOp call, State &state) {
-    if (inlineClosure(call, state))
+    if (inlineClosure(call, state) || inlineClosureWitness(call, state))
       return;
     std::optional<CalleeName> name = calleeName(call.getCallee());
     LIT::FnOp callee = lookup(call);
@@ -6509,14 +6813,16 @@ private:
         } else {
           ob.analyzed = false;
         }
-        obligations.push_back(ob);
+        addObligation(ob);
       }
     }
-    if (name && !inContract) {
+    if (name && !inContract && !trusted) {
       checkLaunch(call, *name, state);
       checkDereference(call, *name, callee, state);
       checkPartialTiles(call, *name, state);
     }
+    if (inlineHigherOrder(call, callee, frame, state))
+      return;
     if (name && evalReversedRange(call, *name, state))
       return;
     if (name && evalDim(call, *name, state))
@@ -6594,6 +6900,14 @@ private:
       if (mutableOrigin(origin) &&
           !covered.count(origin.str()))
         havocOrigin(origin, state, confined);
+    // A local closure handed to the callee (`map(n, f)`, not walked here):
+    // the callee may call it, which writes what it captures mutably (the
+    // origins in its type).
+    for (Value operand : call.getOperands())
+      if (LIT::StructType closure = closureTypeOfValue(operand))
+        for (TypedAttr param : closure.getParamValues())
+          if (std::string origin = printed(param); mutableCapture(origin))
+            havocOrigin(origin, state, confined);
     for (auto [index, operand] : llvm::enumerate(call.getOperands())) {
       auto ref = dyn_cast<LIT::RefType>(operand.getType());
       if (!ref || ref.isMutableKnown(false))
@@ -9044,7 +9358,7 @@ private:
     else
       ob.analyzed = false;
     noteCondition(ob.cond);
-    obligations.push_back(ob);
+    addObligation(ob);
   }
 
   /// The extent of the pointer value `p`, `Pointer._extent()`: how many
@@ -9205,7 +9519,7 @@ private:
     } else {
       ob.analyzed = false;
     }
-    obligations.push_back(ob);
+    addObligation(ob);
   }
 
   /// `Pointer._extent()`, and `p._offset_in_bounds[width](offset)`, the
@@ -9761,7 +10075,7 @@ private:
       } else {
         ob.analyzed = false;
       }
-      obligations.push_back(ob);
+      addObligation(ob);
     }
     // The kernel's hardware contract, its top-level `comptime assert`s that
     // name the target (a GPU predicate, `WARP_SIZE`), for the target it is
@@ -9789,7 +10103,7 @@ private:
                      "(and " + state.pc + " (not " + host + "))", "r");
       ob.cond = cond;
       noteCondition(ob.cond);
-      obligations.push_back(ob);
+      addObligation(ob);
     }
   }
 
@@ -11456,9 +11770,17 @@ struct VerifyContractsPass
           if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee()))
             if (auto callee = dyn_cast_or_null<LIT::FnOp>(
                     symbols.lookupSymbolIn(module, symbol.getSymbol()))) {
+              // A closure's own member, or a function with a body the
+              // closure is handed to as a function to call (`map(n, f)`,
+              // `xs^.deinit_with(f)`): the body is walked where it is
+              // called, and the closure's where the body calls it.
               if (closureStructOf(callee))
                 return;
-              owner = callee->getParentOfType<LIT::StructDeclOp>();
+              for (auto [index, operand] : llvm::enumerate(call.getOperands()))
+                if (Operation *closure = closureOf(operand.getType());
+                    closure && !closureParam(callee, index))
+                  escaping.insert(closure);
+              return;
             }
         for (Value operand : op->getOperands())
           if (Operation *closure = closureOf(operand.getType());

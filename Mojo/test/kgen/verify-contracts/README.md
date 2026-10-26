@@ -562,8 +562,19 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   assert t.flat_rank == 2` reaches a clause on `t.LayoutType.flat_rank`.
 - `x if comptime (c) else y` is the value of the taken arm.
 - A local closure (`@__parameter def` in a function) that is only ever
-  called is verified where it is called, with its caller's state; one
-  passed on (`vectorize[f]`, a launch, an epilogue parameter) on its own.
+  called is verified where it is called, with its caller's state. One
+  handed to a function with a body (`map(len(xs), f)`, `vectorize[4](n,
+  g)`, `xs^.deinit_with(d)`, also through a capture of another closure)
+  is verified where that body calls it: the body is walked at the call
+  (through up to 10 nested bodies: `Dict.deinit_with` reaches its closure
+  through five), so the closure sees what the body knows there (`i <
+  size`, with `size` the caller's `len(xs)`) and its captures as the
+  caller left them, and what it writes to them is what the call writes.
+  The library body's own obligations are not this function's, and are
+  not reported; the closure's are, and a closure that cannot be walked
+  (nested too deeply) is reported as not proven. One passed to a function
+  without a body (a launch, an epilogue parameter) is verified on its
+  own (`higher_order.mojo`).
   A closure with parameters of its own (`f[4]()`) is walked with that
   call's values; a kernel it launches is verified for them (`launch[4]()`
   launching `kernel[rows]` gives the instantiation `kernel[4]`).
@@ -712,6 +723,7 @@ machine that sleeps stops the solver too.
 | `kernels.mojo`       | all `bad_*`        | all `ok_*`       |
 | `pointers.mojo`      | all `bad_*`        | all `ok_*`       |
 | `structs.mojo`       | all `bad_*`        | all `ok_*`       |
+| `higher_order.mojo`  | all `bad_*`        | all `ok_*`       |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |
 | `gemm_mma_cpasync.mojo` | (none)          | all `ok_*`       |
 | `matmul_dispatch.mojo` | (none)           | (a corpus driver, nothing expected) |
