@@ -725,7 +725,15 @@ struct Array[T: AnyType, length: Int](
     @inline(.always)
     def __getitem__(
         ref self, slc: ContiguousSlice, /
-    ) -> Span[Self.T, origin_of(self)]:
+    ) -> Span[Self.T, origin_of(self)]
+        requires (
+            0 <= slc.start.or_else(0)
+            and slc.start.or_else(0) <= slc.end.or_else(len(self))
+            and slc.end.or_else(len(self)) <= len(self)
+        )
+        ensures len(result) == slc.end.or_else(len(self)) - slc.start.or_else(
+            0
+        ):
         """Gets a span over the elements at the specified slice positions.
 
         Aborts if `slc`'s start or end index is out of bounds (valid range is

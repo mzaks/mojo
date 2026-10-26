@@ -1929,6 +1929,8 @@ private:
     ParamFrame *parent = nullptr;
     std::string scope;
     bool transparent = false;
+    /// The function whose parameters these are, when it is known.
+    LIT::FnOp fn;
   };
   ParamFrame *params = nullptr;
   /// While the function's own constraints are read: its parameters, which
@@ -6965,8 +6967,31 @@ private:
     auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
     if (!callee || !symbol)
       return frame;
+    frame.fn = callee;
     return paramFrame(symbol, callee, call.getImplicitOrigins().size(),
                       std::move(frame));
+  }
+
+  /// The frame the parameters in the type of a place are read in: the
+  /// function's own for a place of the function (a callee's contract binds
+  /// its arguments to the caller's places, and is read in the callee's
+  /// frame), the member's for a variable of an inlined closure member.
+  ParamFrame *frameOfPlace(const Loc &loc) {
+    Operation *owner =
+        isa<BlockArgument>(loc.root)
+            ? cast<BlockArgument>(loc.root).getOwner()->getParentOp()
+            : loc.root.getDefiningOp();
+    LIT::FnOp in = owner ? dyn_cast<LIT::FnOp>(owner) : LIT::FnOp();
+    if (!in && owner)
+      in = owner->getParentOfType<LIT::FnOp>();
+    if (!in)
+      return params;
+    if (in == fn)
+      return rootParams;
+    for (ParamFrame *frame = params; frame; frame = frame->parent)
+      if (frame->fn == in)
+        return frame;
+    return params;
   }
 
   /// The parameters `symbol` binds of `callee`, whose last `implicit`
@@ -7015,14 +7040,17 @@ private:
                       "r");
   }
 
-  /// `_same_elements(a._data, b._data, n)` for lists `a` and `b`: their first
-  /// `n` elements are equal, for every element sort read so far. Anything
-  /// else is unknown (nothing when assumed, false to prove).
+  /// `_same_elements(a._storage.unsafe_ptr(), b._storage.unsafe_ptr(), n)`
+  /// for lists `a` and `b` (`a._data` where a collection still has that
+  /// field): their first `n` elements are equal, for every element sort
+  /// read so far. Anything else is unknown (nothing when assumed, false to
+  /// prove).
   std::string sameElements(const std::string &dst, const std::string &src,
                            const std::string &count) {
     auto dstField = fieldOwners.find(dst), srcField = fieldOwners.find(src);
     if (dstField == fieldOwners.end() || srcField == fieldOwners.end() ||
-        !StringRef(dstField->second.second).contains("_data") ||
+        !(StringRef(dstField->second.second).contains("_data") ||
+          StringRef(dstField->second.second).contains("/_storage")) ||
         dstField->second.second != srcField->second.second)
       return assuming ? "true" : "false";
     return sameElementsOf(dstField->second.first, srcField->second.first,
@@ -9209,6 +9237,18 @@ private:
       values[result] = pointer;
       return true;
     }
+    // `Allocation.unsafe_ptr()` (a list's `self._storage.unsafe_ptr()`, in
+    // its clauses): the allocation's pointer, a field of it, read without
+    // writing the allocation (it is `ref self`, which a call could write).
+    if (path.starts_with("std::memory::alloc::Allocation::unsafe_ptr[") &&
+        call.getNumOperands() == 1) {
+      std::optional<Loc> loc = placeOf(call.getOperands()[0]);
+      if (!loc)
+        return false;
+      values[result] = load(Loc{loc->root, loc->path + "/_alloc/_ptr"}, state,
+                            Sort{false, 64, false});
+      return true;
+    }
     if (path.starts_with("std::collections::array::Array::unsafe_ptr[") &&
         call.getNumOperands() == 1) {
       std::optional<Loc> loc = placeOf(call.getOperands()[0]);
@@ -10201,7 +10241,13 @@ private:
         }
       }
     }
-    if (path.starts_with("std::builtin::len::len[") &&
+    // `len(xs)`, or a collection's `__len__` called directly (a list
+    // pattern, `var [a, *rest] = xs`, reads `xs.__len__()`).
+    if ((path.starts_with("std::builtin::len::len[") ||
+         path.starts_with("std::collections::list::List::__len__(") ||
+         path.starts_with("std::collections::span::Span::__len__(") ||
+         path.starts_with("std::collections::array::Array::__len__(") ||
+         path.starts_with("std::collections::deque::Deque::__len__(")) &&
         call.getNumOperands() == 1) {
       // An `Array`'s length is its size parameter, in its type (an
       // expression in the parameters of the function the place is in).
@@ -10349,6 +10395,24 @@ private:
       values[result] =
           elementIs(call.getOperands()[0], state,
                     term(call.getOperands()[1], state), call.getOperands()[2]);
+      return true;
+    }
+    // `check_list_length(xs, n, exact)` (a list pattern, `var [a, *rest] =
+    // xs`): raises unless `xs` has `n` elements, at least `n` when not
+    // `exact`. Its result is the raised flag.
+    if (path.starts_with("std::builtin::_stubs::check_list_length[") &&
+        call.getNumOperands() == 5 && sortOf(result.getType()).isBool &&
+        isa<LIT::RefType>(call.getOperands()[0].getType())) {
+      std::string list = valueThrough(call.getOperands()[0], state);
+      std::string n = operand(1), exact = operand(2);
+      if (sortOfTerm(list).isBool || sortOfTerm(list).width != 64 ||
+          sortOfTerm(n).isBool || sortOfTerm(n).width != 64 ||
+          !sortOfTerm(exact).isBool)
+        return false;
+      std::string len = lenOf(list);
+      values[result] =
+          define({true, 1, false}, "(not (ite " + exact + " (= " + len + " " +
+                                       n + ") (bvsge " + len + " " + n + ")))");
       return true;
     }
     // An integer conversion (`Int(u8)`, `UInt8(i)`): extended by the
@@ -10587,16 +10651,8 @@ private:
     Sort sort = sortOf(size.getType());
     if (sort.isBool || sort.width != 64)
       return std::nullopt;
-    // The type is the caller's when the place is (a callee's contract binds
-    // its arguments to the caller's places).
     ParamFrame *saved = params;
-    Operation *owner =
-        isa<BlockArgument>(loc.root)
-            ? cast<BlockArgument>(loc.root).getOwner()->getParentOp()
-            : loc.root.getDefiningOp();
-    if (owner && (owner == fn.getOperation() ||
-                  owner->getParentOfType<LIT::FnOp>() == fn))
-      params = rootParams;
+    params = frameOfPlace(loc);
     std::string n = paramTerm(size, sort);
     params = saved;
     return n;
@@ -11368,9 +11424,12 @@ struct VerifyContractsPass
     // A local closure only ever called directly is verified where it is
     // called, with its caller's state (`inlineClosure`); one that escapes
     // (a value of it given to another function: `vectorize[f]`, a launch's
-    // argument) on its own too, with nothing known of its captures. It
-    // escapes where anything but a call of its own members, or the
-    // bookkeeping of its variable, has a value of its type.
+    // argument) on its own too, with nothing known of its captures: its
+    // body, which the `__call__` wrapper and the constructors have no
+    // obligations beyond. It escapes where anything but a call of a
+    // closure's members (its own, or another closure's that captures it
+    // and is walked the same way), or the bookkeeping of its variable, has
+    // a value of its type.
     DenseSet<Operation *> escaping;
     {
       SymbolTableCollection symbols;
@@ -11395,9 +11454,12 @@ struct VerifyContractsPass
         Operation *owner = op->getParentOfType<LIT::StructDeclOp>();
         if (auto call = dyn_cast<LIT::CallOp>(op))
           if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee()))
-            if (Operation *callee =
-                    symbols.lookupSymbolIn(module, symbol.getSymbol()))
+            if (auto callee = dyn_cast_or_null<LIT::FnOp>(
+                    symbols.lookupSymbolIn(module, symbol.getSymbol()))) {
+              if (closureStructOf(callee))
+                return;
               owner = callee->getParentOfType<LIT::StructDeclOp>();
+            }
         for (Value operand : op->getOperands())
           if (Operation *closure = closureOf(operand.getType());
               closure && closure != owner)
@@ -11406,7 +11468,14 @@ struct VerifyContractsPass
     }
     auto calledOnly = [&](LIT::FnOp fn) {
       LIT::StructDeclOp closure = closureStructOf(fn);
-      return closure && !escaping.count(closure);
+      if (!closure)
+        return false;
+      if (!escaping.count(closure))
+        return true;
+      std::optional<StringRef> name = fn.getSymName();
+      return name && (name->starts_with("__call__$trait") ||
+                      name->starts_with("__init__(") ||
+                      name->starts_with("__deinit__("));
     };
     getOperation().walk([&](LIT::FnOp fn) {
       if (selected(fn) && !isRequiredTraitMethod(fn) && !isDefaultWrapper(fn) &&
