@@ -1861,8 +1861,11 @@ public:
         value = sugar.getCanonical();
       bool opaque = false;
       value.walk([&](SymbolConstantAttr symbol) {
-        if (opaque ||
-            StringRef(printed(symbol.getSymbol())).starts_with("@std::"))
+        // The stdlib's functions, and the ones naming the build's
+        // accelerator (`get_gpu_target()`), are what `paramTerm` models.
+        std::string path = printed(symbol.getSymbol());
+        if (opaque || StringRef(path).starts_with("@std::") ||
+            StringRef(path).starts_with("@max::@gpu::@host::@info::"))
           return;
         opaque = isa_and_nonnull<LIT::FnOp>(
             symbols.lookupSymbolIn(module, symbol.getSymbol()));
@@ -1973,6 +1976,9 @@ private:
   uint64_t unrolledBodies = 1;
   /// The references a variadic pack holds, by the pack's term.
   std::map<std::string, SmallVector<Value>> packRefs;
+  /// The references a tuple literal was built from, by the variable it
+  /// was built into (a launch's `host_args=(...)`).
+  DenseMap<Value, SmallVector<Value>> tupleRefs;
   /// Element references `__getitem__` returned: the list's place and the
   /// index.
   DenseMap<Value, std::pair<Loc, std::string>> elements;
@@ -5651,6 +5657,17 @@ private:
                                 flag("accelerator_apple") + ")");
       if (path == "has_accelerator()")
         return define(sort, "(or " + gpu + " " + flag("accelerator") + ")");
+      // The build's accelerator (`default_accelerator()`), by vendor.
+      if (path == "default_accelerator().is_nvidia_gpu()")
+        return declared("accelerator_nvidia");
+      if (path == "default_accelerator().is_amd_gpu()")
+        return declared("accelerator_amd");
+      if (path == "default_accelerator().is_apple_gpu()")
+        return declared("accelerator_apple");
+      if (path == "default_accelerator().is_gpu()")
+        return define(sort, "(or " + declared("accelerator_nvidia") + " " +
+                                declared("accelerator_amd") + " " +
+                                declared("accelerator_apple") + ")");
       return std::nullopt;
     }
     if (path == "std::_gpu::globals::_resolve_warp_size()" && !sort.isBool &&
@@ -5689,6 +5706,58 @@ private:
   /// `SIMD` (`apply` of `__ge__`, ...) over them. Anything else (a parameter,
   /// a value computed at comptime) is one unknown per expression, so the same
   /// expression in two places has the same value.
+  /// `name`'s path without its parameter list where its sub-architecture
+  /// parameter is the default (`is_nvidia_gpu[subarch = _ANY]()`; the
+  /// other parameters, a method's target, name no string): the predicate
+  /// of the vendor alone, as `targetPredicate` names it.
+  static std::string anySubarch(const CalleeName &name) {
+    StringRef path = name.path;
+    size_t open = path.find('['), close = StringRef::npos;
+    for (size_t i = open, depth = 0; i < path.size(); ++i) {
+      if (path[i] == '[')
+        ++depth;
+      else if (path[i] == ']' && --depth == 0) {
+        close = i;
+        break;
+      }
+    }
+    bool any = false;
+    for (const std::string &param : name.params) {
+      if (StringRef(param).contains("\"<any>\""))
+        any = true;
+      else if (StringRef(param).contains(":string \""))
+        return name.path;
+    }
+    if (open == StringRef::npos || close == StringRef::npos || close < open ||
+        !any)
+      return name.path;
+    return (path.take_front(open) + path.drop_front(close + 1)).str();
+  }
+
+  /// `target.is_nvidia_gpu()`, `is_amd_gpu()`, `is_apple_gpu()` and
+  /// `is_gpu()` of a `CompilationTarget` value (`self`), for any
+  /// sub-architecture: of the current target, `std.sys.info`'s predicate;
+  /// of the build's accelerator (`default_accelerator()`), its vendor.
+  MaybeTerm targetMethod(const CalleeName &name, TypedAttr self, Sort sort) {
+    std::string stripped = anySubarch(name);
+    StringRef path = stripped;
+    if (!path.consume_front("std::sys::info::CompilationTarget::"))
+      return std::nullopt;
+    StringRef method = path.take_until([](char c) { return c == '('; });
+    if (method != "is_nvidia_gpu" && method != "is_amd_gpu" &&
+        method != "is_apple_gpu" && method != "is_gpu")
+      return std::nullopt;
+    std::string target = printed(resolveParam(self));
+    if (StringRef(target).contains("\"_current_target()\""))
+      return targetPredicate(("std::sys::info::" + method + "()").str(), sort);
+    if (StringRef(target).contains("\"_accelerator_arch()\"") &&
+        StringRef(target).contains("_gpu_mlir_target["))
+      return targetPredicate(
+          ("std::sys::info::default_accelerator()." + method + "()").str(),
+          sort);
+    return std::nullopt;
+  }
+
   std::string paramTerm(TypedAttr attr, Sort sort, unsigned depth = 0) {
     if (depth > 32)
       return parameterValue(printed(attr), sort);
@@ -5861,6 +5930,16 @@ private:
               paramTerm(op, operand, depth + 1) + "))";
       return define({true, 1, false}, all);
     }
+    // `WARP_SIZE`: the `warp_size` of the target's MAX plugin
+    // (`CurrentMaxPlugin`, a `MaxPluginHooks` witness), what the targets'
+    // plugins and the host's accelerator make of it.
+    if (auto witness = dyn_cast<GetWitnessAttr>(attr);
+        witness && !sort.isBool && sort.width == 64 &&
+        witness.getWitnessName() == "warp_size" &&
+        StringRef(printed(witness.getTraitSymbol())).contains("MaxPluginHooks"))
+      if (MaybeTerm w =
+              targetPredicate("std::_gpu::globals::_resolve_warp_size()", sort))
+        return *w;
     if (auto expr = dyn_cast<ParamOperatorAttr>(attr)) {
       ArrayRef<TypedAttr> ops = expr.getOperands();
       auto sub = [&](size_t i, Sort s) {
@@ -5925,7 +6004,11 @@ private:
       case POC::Apply:
         if (ops.size() == 1)
           if (std::optional<CalleeName> name = calleeName(ops[0]))
-            if (MaybeTerm t = targetPredicate(name->path, sort))
+            if (MaybeTerm t = targetPredicate(anySubarch(*name), sort))
+              return *t;
+        if (ops.size() == 2 && sort.isBool)
+          if (std::optional<CalleeName> name = calleeName(ops[0]))
+            if (MaybeTerm t = targetMethod(*name, ops[1], sort))
               return *t;
         if (ops.size() == 3 && sort.isBool)
           if (MaybeTerm t = dtypeMembership(ops))
@@ -6594,6 +6677,7 @@ private:
       checkReshape(call, *name, before);
     }
     recordLayoutExtent(call, before);
+    recordLayoutCall(call, before, state);
     assumeListLiteral(call, name, before, state);
     if (callee)
       assumeCopy(call, callee, before, state);
@@ -7534,6 +7618,8 @@ private:
                         load(*place, state, placeType(*place))});
     }
     storeFields(*out, state, fields);
+    if (out->path.empty())
+      tupleRefs[out->root] = it->second;
     setResultsUnknown(call);
     return true;
   }
@@ -7546,7 +7632,7 @@ private:
     if (params.size() < 4 || k < 0)
       return std::nullopt;
     // The shape is the first list of the layout type's parameters.
-    std::string layout = printed(resolveParam(params[3]));
+    std::string layout = layoutText(resolveParam(params[3]));
     SmallVector<StringRef> shape = layoutList(layout, 0);
     if ((size_t)k < shape.size())
       if (std::optional<int64_t> n = comptimeIntValue(shape[k]))
@@ -7624,6 +7710,30 @@ private:
   /// Extent `k` of a `TileTensor` layout type parameter whose shape says
   /// `ComptimeInt[v]` for a parameter expression `v` (`BM` in a function
   /// generic over it), as a term in the scope the layout came from.
+  /// The printed layout type, for `layoutList`. A tile's layout
+  /// (`Parent._NestedTileLayout[shape]`, the type `tile[...]` returns) is
+  /// spelled as a `Layout` with the tile's shape and no stride list: its
+  /// strides are the parent's, mode for mode where the parent is flat,
+  /// which the parent's `static_stride` answers (`_access_in_bounds`).
+  std::string layoutText(TypedAttr layoutAttr) {
+    std::string text = printed(layoutAttr);
+    auto bind = dyn_cast<BindParamsAttr>(layoutAttr);
+    auto witness =
+        bind ? dyn_cast<GetWitnessAttr>(bind.getGenerator()) : GetWitnessAttr();
+    if (!witness || witness.getWitnessName() != "_NestedTileLayout" ||
+        bind.getParamValues().empty())
+      return text;
+    std::string list = printed(resolveParam(bind.getParamValues()[0]));
+    StringRef rest = list;
+    if (!rest.consume_front("#kgen.param_list<"))
+      return text;
+    std::string elements;
+    for (StringRef element : listElements(rest))
+      elements += (elements.empty() ? "" : ", ") + element.str();
+    return "@layout::@tile_layout::@Layout<:param_list<> [" + elements +
+           "], :param_list<> []> " + text;
+  }
+
   MaybeTerm comptimeShape(TypedAttr layoutParam, int64_t k) {
     ParamFrame *scope = nullptr;
     auto layout = dyn_cast<TypeParamAttr>(resolveParam(layoutParam, &scope));
@@ -7917,92 +8027,8 @@ private:
       if (!st || st.getParamValues().size() < 4 ||
           elements == indexLists.end() || elements->second.empty())
         return true;
-      ArrayRef<TypedAttr> params = st.getParamValues();
-      size_t rank = elements->second.size();
-      std::string within = "true";
-      std::string rest;
-      for (size_t k = 0; k < rank; ++k) {
-        MaybeTerm d = tensorDim(params, tensor, k, state);
-        const std::string &i = elements->second[k];
-        if (!d || sortOfTerm(i).isBool || sortOfTerm(i).width != 64)
-          return true;
-        bool last = k + 1 == rank;
-        within = "(and " + within + " (bvsle " + bvConst(0, 64) + " " + i +
-                 ") (" + (last ? "bvsle " : "bvslt ") + i + " " + *d + "))";
-        if (last)
-          rest = "(bvsub " + *d + " " + i + ")";
-      }
-      // The last stride: the layout's own list, or a generic layout's
-      // `static_stride` (flat, of this rank).
-      ParamFrame *layoutScope = nullptr;
-      TypedAttr layoutAttr = resolveParam(params[3], &layoutScope);
-      std::string layout = printed(layoutAttr);
-      SmallVector<StringRef> strides = layoutList(layout, 1);
-      std::string unit;
-      if (strides.size() == rank) {
-        std::optional<int64_t> stride = comptimeIntValue(strides[rank - 1]);
-        if (!stride || *stride != 1)
-          return true;
-        unit = "true";
-      } else {
-        ParamFrame *saved = this->params;
-        this->params = layoutScope;
-        std::string key = layoutKey(layoutAttr);
-        this->params = saved;
-        auto [it, inserted] =
-            staticStrideTerms.try_emplace({key, (int64_t)rank - 1}, "");
-        if (inserted) {
-          it->second = declare(Sort{false, 64, true}, "p");
-          prelude += "; " + it->second + ": static_stride[" +
-                     std::to_string(rank - 1) + "] of " +
-                     StringRef(key).take_front(300).str() + "\n";
-        }
-        unit = "(and (= " + layoutWitness("flat_rank", key) + " " +
-               bvConst(rank, 64) + ") (= " + layoutWitness("rank", key) + " " +
-               bvConst(rank, 64) + ") (= " + it->second + " " +
-               bvConst(1, 64) + "))";
-      }
-      // The offset as an `Int`: what `Int(offset)` gives.
-      std::string offset = values[result];
-      Sort got = sortOfTerm(offset);
-      if (got.isBool)
-        return true;
-      std::string asInt = offset;
-      std::optional<Sort> dtype = dtypeSort(printed(result.getType()));
-      if (!dtype) {
-        auto [it, inserted] = intConversions.try_emplace(offset, "");
-        if (inserted)
-          it->second = declare(Sort{false, 64, true});
-        asInt = it->second;
-      } else if (dtype->width != 64) {
-        if (got.width != dtype->width)
-          return true;
-        asInt = define(Sort{false, 64, true},
-                       "((_ " +
-                           std::string(dtype->isSigned ? "sign_extend "
-                                                       : "zero_extend ") +
-                           std::to_string(64 - dtype->width) + ") " + offset +
-                           ")");
-      }
-      std::string tensorValue = tensorTerm(tensor, state);
-      std::string pointer;
-      if (auto built = tensorPointers.find(tensorValue);
-          built != tensorPointers.end()) {
-        pointer = built->second;
-      } else {
-        auto [it, inserted] =
-            tensorFields.try_emplace({tensorValue, "ptr"}, "");
-        if (inserted)
-          it->second = declare(Sort{false, 64, false});
-        pointer = it->second;
-      }
-      state.pc = define(
-          {true, 1, false},
-          "(and " + state.pc + " (=> (and " + within + " " + unit +
-              ") (and (bvsle " + bvConst(0, 64) + " " + asInt +
-              ") (bvsge (bvsub " + extentOf(pointer) + " " + asInt + ") " +
-              rest + "))))",
-          "r");
+      linearOffsetFacts(tensor, st.getParamValues(), elements->second, result,
+                        state);
       return true;
     }
     // `TileTensor(storage, layout)`: over a pointer (the default engine's
@@ -8079,7 +8105,7 @@ private:
         }
         return p;
       };
-      std::string layout = printed(resolveParam(params[3]));
+      std::string layout = layoutText(resolveParam(params[3]));
       size_t rank = layoutList(layout, 0).size();
       if (rank != 0) {
         MaybeTerm p = product(rank);
@@ -8246,7 +8272,7 @@ private:
       std::optional<SmallVector<StringRef>> elementTypes =
           coordTypes(lists.back());
       SmallVector<StringRef> shape =
-          layoutList(printed(resolveParam(params[3])), 0);
+          layoutList(layoutText(resolveParam(params[3])), 0);
       if (!elementTypes || shape.empty())
         return false;
       size_t rank = shape.size();
@@ -8315,7 +8341,7 @@ private:
       SmallVector<StringRef> elementTypes = listElements(types);
       ParamFrame *layoutScope = nullptr;
       TypedAttr layoutAttr = resolveParam(params[3], &layoutScope);
-      std::string layout = printed(layoutAttr);
+      std::string layout = layoutText(layoutAttr);
       SmallVector<StringRef> shape = layoutList(layout, 0);
       SmallVector<StringRef> strides = layoutList(layout, 1);
       // A tile of a generic layout: its strides are not a list but the
@@ -8323,11 +8349,14 @@ private:
       // parent's `__stride_types`), mode for mode where the parent is
       // flat. Whether the last is 1 is then the parent's `static_stride`.
       std::string parentUnit;
-      if (!shape.empty() && StringRef(layout).contains("\"__stride_types\"")) {
+      if (!shape.empty() &&
+          (StringRef(layout).contains("\"__stride_types\"") ||
+           StringRef(layout).contains("\"_NestedTileLayout\""))) {
         TypedAttr parent;
         bool one = true;
         layoutAttr.walk([&](GetWitnessAttr witness) {
-          if (witness.getWitnessName() != "__stride_types")
+          if (witness.getWitnessName() != "__stride_types" &&
+              witness.getWitnessName() != "_NestedTileLayout")
             return;
           if (!parent)
             parent = witness.getTypeValue();
@@ -8517,7 +8546,7 @@ private:
       ParamFrame *scope = nullptr;
       auto threads = dyn_cast<ParamListAttr>(resolveParam(params[8], &scope));
       SmallVector<StringRef> shape =
-          layoutList(printed(resolveParam(params[3])), 0);
+          layoutList(layoutText(resolveParam(params[3])), 0);
       if (!threads || shape.empty() ||
           threads.getValues().size() != shape.size() ||
           llvm::any_of(shape, [](StringRef mode) {
@@ -8721,6 +8750,157 @@ private:
   }
   std::map<std::string, SmallVector<std::string>> indexLists;
 
+  /// The facts of the offset `result` of element `elements` (one index per
+  /// dimension) of the tensor `tensor`, whose type parameters are `params`:
+  /// as for `t[i0, ..., in]` and `load[width]`, a tensor's elements are
+  /// taken to be backed (assumption: its dimensions and strides describe
+  /// memory its pointer has, and its offsets fit its index type), so for
+  /// an index within the dimensions the offset is not negative, and where
+  /// the last stride is 1 the rest of that row follows it.
+  void linearOffsetFacts(Value tensor, ArrayRef<TypedAttr> params,
+                         ArrayRef<std::string> elements, Value result,
+                         State &state) {
+    size_t rank = elements.size();
+    std::string within = "true";
+    std::string rest;
+    for (size_t k = 0; k < rank; ++k) {
+      MaybeTerm d = tensorDim(params, tensor, k, state);
+      const std::string &i = elements[k];
+      if (!d || sortOfTerm(i).isBool || sortOfTerm(i).width != 64)
+        return;
+      bool last = k + 1 == rank;
+      within = "(and " + within + " (bvsle " + bvConst(0, 64) + " " + i +
+               ") (" + (last ? "bvsle " : "bvslt ") + i + " " + *d + "))";
+      if (last)
+        rest = "(bvsub " + *d + " " + i + ")";
+    }
+    // The last stride: the layout's own list, or a generic layout's
+    // `static_stride` (flat, of this rank).
+    ParamFrame *layoutScope = nullptr;
+    TypedAttr layoutAttr = resolveParam(params[3], &layoutScope);
+    std::string layout = layoutText(layoutAttr);
+    SmallVector<StringRef> strides = layoutList(layout, 1);
+    std::string unit;
+    if (strides.size() == rank) {
+      std::optional<int64_t> stride = comptimeIntValue(strides[rank - 1]);
+      if (!stride || *stride != 1)
+        return;
+      unit = "true";
+    } else {
+      ParamFrame *saved = this->params;
+      this->params = layoutScope;
+      std::string key = layoutKey(layoutAttr);
+      this->params = saved;
+      auto [it, inserted] =
+          staticStrideTerms.try_emplace({key, (int64_t)rank - 1}, "");
+      if (inserted) {
+        it->second = declare(Sort{false, 64, true}, "p");
+        prelude += "; " + it->second + ": static_stride[" +
+                   std::to_string(rank - 1) + "] of " +
+                   StringRef(key).take_front(300).str() + "\n";
+      }
+      unit = "(and (= " + layoutWitness("flat_rank", key) + " " +
+             bvConst(rank, 64) + ") (= " + layoutWitness("rank", key) + " " +
+             bvConst(rank, 64) + ") (= " + it->second + " " + bvConst(1, 64) +
+             "))";
+    }
+    // The offset as an `Int`: what `Int(offset)` gives.
+    std::string offset = term(result, state);
+    Sort got = sortOfTerm(offset);
+    if (got.isBool)
+      return;
+    std::string asInt = offset;
+    std::optional<Sort> dtype = dtypeSort(printed(result.getType()));
+    if (!dtype) {
+      auto [it, inserted] = intConversions.try_emplace(offset, "");
+      if (inserted)
+        it->second = declare(Sort{false, 64, true});
+      asInt = it->second;
+    } else if (dtype->width != 64) {
+      if (got.width != dtype->width)
+        return;
+      asInt = define(
+          Sort{false, 64, true},
+          "((_ " +
+              std::string(dtype->isSigned ? "sign_extend " : "zero_extend ") +
+              std::to_string(64 - dtype->width) + ") " + offset + ")");
+    }
+    std::string tensorValue = tensorTerm(tensor, state);
+    std::string pointer;
+    if (auto built = tensorPointers.find(tensorValue);
+        built != tensorPointers.end()) {
+      pointer = built->second;
+    } else {
+      auto [it, inserted] = tensorFields.try_emplace({tensorValue, "ptr"}, "");
+      if (inserted)
+        it->second = declare(Sort{false, 64, false});
+      pointer = it->second;
+    }
+    state.pc = define({true, 1, false},
+                      "(and " + state.pc + " (=> (and " + within + " " + unit +
+                          ") (and (bvsle " + bvConst(0, 64) + " " + asInt +
+                          ") (bvsge (bvsub " + extentOf(pointer) + " " + asInt +
+                          ") " + rest + "))))",
+                      "r");
+  }
+
+  /// After `t.layout[linear_idx_type=...](Coord(i0, ..., in))` (the
+  /// layout's `__call__`, a witness call on the `layout` field of `t`):
+  /// the result is the offset of that element from `t.ptr`, with the facts
+  /// `_linear_offset` had.
+  void recordLayoutCall(LIT::CallOp call, State &before, State &state) {
+    auto bind = dyn_cast<BindParamsAttr>(call.getCallee());
+    auto witness =
+        bind ? dyn_cast<GetWitnessAttr>(bind.getGenerator()) : GetWitnessAttr();
+    if (!witness ||
+        !witness.getWitnessName().getValue().starts_with("__call__[") ||
+        call.getNumOperands() != 2 || call->getNumResults() != 1 ||
+        !StringRef(printed(witness.getTraitSymbol())).contains("TensorLayout"))
+      return;
+    auto extract = call.getOperands()[0].getDefiningOp<LIT::StructExtractOp>();
+    auto field =
+        extract ? extract->getAttrOfType<StringAttr>("field") : StringAttr();
+    if (!field || field.getValue() != "layout")
+      return;
+    Value tensor = extract.getContainer();
+    Type tensorType = tensor.getType();
+    if (auto ref = dyn_cast<LIT::RefType>(tensorType))
+      tensorType = ref.getElementType();
+    auto st = dyn_cast<LIT::StructType>(tensorType);
+    if (!st || st.getParamValues().size() < 4)
+      return;
+    // The coordinate's elements, by the element types of its `Coord`.
+    Value coord = call.getOperands()[1];
+    Type coordType = coord.getType();
+    if (auto ref = dyn_cast<LIT::RefType>(coordType))
+      coordType = ref.getElementType();
+    std::string typeText = printed(coordType);
+    size_t at = typeText.find("@std::@utils::@coord::@Coord<");
+    size_t open = at == std::string::npos ? at : typeText.find('[', at);
+    if (open == std::string::npos)
+      return;
+    StringRef rest = StringRef(typeText).drop_front(open + 1);
+    SmallVector<StringRef> types = listElements(rest);
+    std::string coordValue = isa<LIT::RefType>(coord.getType())
+                                 ? valueThrough(coord, before)
+                                 : term(coord, before);
+    SmallVector<std::string> elements;
+    for (auto [k, type] : llvm::enumerate(types)) {
+      // A type in a type list is spelled as a type; the element types of a
+      // parameter list, which `coordElement` reads, as attributes.
+      if (type.consume_front("!lit.struct<"))
+        type = type.drop_back(1);
+      MaybeTerm element = coordElement(type, coordValue, k);
+      if (!element)
+        return;
+      elements.push_back(*element);
+    }
+    if (elements.empty())
+      return;
+    linearOffsetFacts(tensor, st.getParamValues(), elements, call->getResult(0),
+                      state);
+  }
+
   /// After `t.layout.shape[k]()` (a generic layout's extent, of its own
   /// coordinate type): the value stands for `t`'s `k`th dimension.
   void recordLayoutExtent(LIT::CallOp call, State &state) {
@@ -8795,7 +8975,7 @@ private:
       }
       return p;
     };
-    size_t rank = layoutList(printed(resolveParam(params[3])), 0).size();
+    size_t rank = layoutList(layoutText(resolveParam(params[3])), 0).size();
     if (rank)
       return product(rank);
     auto it = layoutWitnesses.find({"rank", layoutKey(params[3])});
@@ -9378,8 +9558,9 @@ private:
   bool evalDim(LIT::CallOp call, const CalleeName &name, State &state) {
     StringRef path = name.path;
     auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
-    if (!path.starts_with("max::gpu::host::dim::Dim::__init__[") || !symbol ||
-        call->getNumResults() != 1)
+    if (!(path.starts_with("max::gpu::host::dim::Dim::__init__[") ||
+          path.starts_with("max::gpu::host::_legacy::dim::Dim::__init__[")) ||
+        !symbol || call->getNumResults() != 1)
       return false;
     ArrayRef<TypedAttr> types = symbol.getParamValues();
     bool fromTuple = path.contains("](::Tuple[");
@@ -9424,14 +9605,17 @@ private:
   }
 
   /// A kernel launch, `ctx.enqueue_function[kernel](*args, grid_dim=g,
-  /// block_dim=b)`: the kernel's preconditions are obligations here, with
-  /// its arguments the launch's and its `grid_dim` and `block_dim` the
-  /// launch's dimensions. They are not analyzed where the arguments or
-  /// dimensions are not known.
+  /// block_dim=b)` (of `DeviceContext`, or of the `DeviceContextBase`
+  /// extension every context shares): the kernel's preconditions are
+  /// obligations here, with its arguments the launch's and its `grid_dim`
+  /// and `block_dim` the launch's dimensions. They are not analyzed where
+  /// the arguments or dimensions are not known.
   void checkLaunch(LIT::CallOp call, const CalleeName &name, State &state) {
     auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    StringRef path = name.path;
     if (!symbol ||
-        !StringRef(name.path).contains("DeviceContext::enqueue_function[") ||
+        !(path.contains("DeviceContext::enqueue_function[") ||
+          path.contains("DeviceContextBase::enqueue_function[")) ||
         call.getNumOperands() < 4)
       return;
     auto [kernel, kernelSymbol] =
@@ -9458,18 +9642,35 @@ private:
         break;
       }
     // The dimensions: the first two `Dim`s after it, as `Dim` built them.
-    // Operands between the pack and them are host arguments
-    // (`host_arg=`), the kernel's last arguments.
+    // Operands between the pack and them are host arguments, the kernel's
+    // last arguments: each `host_arg=` one, or the elements of the
+    // `host_args=(...)` tuple (none for the default `()`).
     SmallVector<Value, 2> dimOperands;
     for (size_t i = next; i < call.getNumOperands() && dimOperands.size() < 2;
          ++i) {
-      Type type = call.getOperands()[i].getType();
+      Value operand = call.getOperands()[i];
+      Type type = operand.getType();
       if (auto ref = dyn_cast<LIT::RefType>(type))
         type = ref.getElementType();
-      if (StringRef(printed(type)).contains("@max::@gpu::@host::@dim::@Dim"))
-        dimOperands.push_back(call.getOperands()[i]);
-      else if (dimOperands.empty() && known)
-        refs.push_back(call.getOperands()[i]);
+      std::string text = printed(type);
+      if (StringRef(text).contains("::@dim::@Dim")) {
+        dimOperands.push_back(operand);
+      } else if (!dimOperands.empty() || !known) {
+        continue;
+      } else if (StringRef(text).starts_with("!lit.struct<#Tuple <")) {
+        if (StringRef(text).contains("<:param_list<!AnyType> [], "))
+          continue;
+        std::optional<Loc> place = placeOf(operand);
+        auto elements = place && place->path.empty()
+                            ? tupleRefs.find(place->root)
+                            : tupleRefs.end();
+        if (elements == tupleRefs.end())
+          known = false;
+        else
+          refs.append(elements->second.begin(), elements->second.end());
+      } else {
+        refs.push_back(operand);
+      }
     }
     if (dimOperands.size() != 2)
       known = false;
@@ -9481,7 +9682,7 @@ private:
       if (auto r = dyn_cast<LIT::RefType>(type))
         type = r.getElementType();
       if (!StringRef(printed(type))
-               .contains("@max::@gpu::@host::@device_context::@DeviceBuffer<"))
+               .contains("::@device_context::@DeviceBuffer<"))
         continue;
       std::string value = valueOf(ref);
       if (!sortOfTerm(value).isBool && sortOfTerm(value).width == 64)
@@ -9588,8 +9789,9 @@ private:
   bool evalWarpShuffle(LIT::CallOp call, const CalleeName &name,
                        State &state) {
     StringRef path = name.path;
-    const char *prefix = "std::_gpu::primitives::warp::";
-    if (!path.consume_front(prefix) || call->getNumResults() != 1)
+    if (!(path.consume_front("std::_gpu::primitives::warp::") ||
+          path.consume_front("max::gpu::primitives::warp::")) ||
+        call->getNumResults() != 1)
       return false;
     unsigned operands = path.starts_with("broadcast[") ? 1 : 2;
     if (!(path.starts_with("broadcast[") || path.starts_with("shuffle_idx[") ||
@@ -9820,10 +10022,11 @@ private:
   /// stdlib defines it.
   bool evalGpuId(LIT::CallOp call, const CalleeName &name) {
     StringRef path = name.path;
-    const char *prefix = "std::_gpu::primitives::id::";
-    if (!path.starts_with(prefix) || call->getNumResults() != 1)
+    StringRef rest = path;
+    if (!(rest.consume_front("std::_gpu::primitives::id::") ||
+          rest.consume_front("max::gpu::primitives::id::")) ||
+        call->getNumResults() != 1)
       return false;
-    StringRef rest = path.drop_front(strlen(prefix));
     // `lane_id()`: below the warp size (`WARP_SIZE`), 32 or 64 on
     // supported GPUs.
     if (rest.starts_with("lane_id(") && call.getNumOperands() == 0 &&
@@ -11302,7 +11505,9 @@ struct VerifyContractsPass
                    : ArrayRef<FlatSymbolRefAttr>();
         if (nested.size() < 2 ||
             !nested.back().getValue().starts_with("enqueue_function[") ||
-            !nested[nested.size() - 2].getValue().ends_with("DeviceContext"))
+            !(nested[nested.size() - 2].getValue().ends_with("DeviceContext") ||
+              nested[nested.size() - 2].getValue().ends_with(
+                  "DeviceContextBase")))
           return;
         auto [kernel, instance] = launchedKernel(
             symbol, module, symbols, [](TypedAttr param) { return param; });
