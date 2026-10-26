@@ -260,18 +260,22 @@ std::string bvConst(int64_t value, unsigned width) {
          std::to_string(width) + ")";
 }
 
-/// The local closure a call's callee names: the reference itself (`f()`),
-/// or the one all of whose parameters the callee binds (`f[4]()`, to
-/// `bound`). Null for any other callee.
-Attribute closureCallee(Attribute callee, ArrayRef<TypedAttr> &bound) {
-  if (auto bind = dyn_cast<BindParamsAttr>(callee)) {
-    for (TypedAttr value : bind.getParamValues())
-      if (isa<UnboundAttr>(value))
-        return {};
-    bound = bind.getParamValues();
-    callee = bind.getGenerator();
-  }
-  return isa<ParamDeclRefAttr>(callee) ? callee : Attribute();
+/// The struct a local closure (`def g(): ...` in `f`) is lowered to
+/// (`closure$f(...)::g::__storage`): its captures are the fields (by
+/// reference for `mut` and borrowed ones, else by value), its parameters
+/// the captures' origins and the parameters of `f` the body reads, and its
+/// members the capture constructor, the body (`g()`), and the `__call__`
+/// wrapper that calls it. The struct `fn` is a member of, when it is such
+/// a closure; null otherwise.
+LIT::StructDeclOp closureStructOf(LIT::FnOp fn) {
+  auto parent =
+      fn ? fn->getParentOfType<LIT::StructDeclOp>() : LIT::StructDeclOp();
+  if (!parent)
+    return {};
+  StringRef name = parent.getSymName();
+  if (!name.starts_with("closure$") || !name.ends_with("::__storage"))
+    return {};
+  return parent;
 }
 
 /// `callee`'s symbol as `a::b::c`, and its parameter values as text.
@@ -1417,14 +1421,8 @@ struct InstanceLink {
   SymbolConstantAttr symbol;
   LIT::FnOp fn;
   size_t implicit = 0;
-  BindParamsAttr closure = {};
 
-  ArrayRef<TypedAttr> values() const {
-    return closure ? closure.getParamValues() : symbol.getParamValues();
-  }
-  Attribute callee() const {
-    return closure ? Attribute(closure) : Attribute(symbol);
-  }
+  ArrayRef<TypedAttr> values() const { return symbol.getParamValues(); }
 };
 
 struct Obligation {
@@ -1559,15 +1557,6 @@ public:
     });
     valueOrder = &order;
     llvm::scope_exit reset([] { valueOrder = nullptr; });
-    // Local closures were nested functions declaring a parameter until the
-    // legacy capture ABI went (2026-10-21): a closure is now a struct whose
-    // `__call__` holds the body, so none is found here. Kept for the
-    // struct-closure rework.
-    fn.walk([&](LIT::FnOp nested) {
-      if (nested != fn)
-        if (auto decl = nested->getAttrOfType<ParamDeclAttr>("paramDecl"))
-          closures[ParamDeclRefAttr::get(decl)] = nested;
-    });
     Block &entry = body.front();
     // Arguments: integers and Booleans are unknowns of their sort; references
     // are places, whose values at entry are unknowns.
@@ -1790,24 +1779,9 @@ public:
                                         Sort{true, 1, false}))
       facts.push_back(*gpu);
     instanceFrames.clear();
-    for (const InstanceLink &link : chain) {
-      if (!link.closure) {
-        instanceFrames.push_back(
-            paramFrame(link.symbol, link.fn, link.implicit, ParamFrame{}));
-        continue;
-      }
-      ParamFrame frame;
-      frame.transparent = true;
-      frame.scope = printed(link.closure);
-      LIT::FnOp closure = link.fn;
-      ArrayRef<ParamDeclAttr> decls = closure.getParams();
-      decls = decls.drop_back(std::min(decls.size(), link.implicit));
-      ArrayRef<TypedAttr> bound = link.closure.getParamValues();
-      if (decls.size() == bound.size())
-        for (auto [decl, value] : llvm::zip(decls, bound))
-          frame.values[decl.getName()] = value;
-      instanceFrames.push_back(std::move(frame));
-    }
+    for (const InstanceLink &link : chain)
+      instanceFrames.push_back(
+          paramFrame(link.symbol, link.fn, link.implicit, ParamFrame{}));
     for (size_t k = 0; k + 1 < instanceFrames.size(); ++k)
       instanceFrames[k].parent = &instanceFrames[k + 1];
     // Whether the frames from `frame` on give `name` a value: a closure's
@@ -1994,9 +1968,6 @@ private:
   std::map<std::string, SmallVector<std::string>> partialValid;
   /// The shapes of layout values `row_major(Coord(...))` built, by term.
   std::map<std::string, SmallVector<std::string>> layoutShapes;
-  /// Local closures (`@parameter def` in the function), by the reference a
-  /// call names them with: walked inline at their calls.
-  DenseMap<Attribute, LIT::FnOp> closures;
   /// While a closure's body is walked at a call: where its returns and
   /// raises leave it.
   SmallVector<SmallVector<State> *> closureExits;
@@ -3910,12 +3881,9 @@ private:
           addRef(store->getOperand(1));
           confined = false;
         } else if (auto call = dyn_cast<LIT::CallOp>(op)) {
-          ArrayRef<TypedAttr> bound;
-          if (auto closure =
-                  closures.find(closureCallee(call.getCallee(), bound));
-              closure != closures.end() &&
-              seen.insert(closure->second.getOperation()).second)
-            work.push_back(closure->second.getOperation());
+          if (LIT::FnOp member = closureMember(call);
+              member && seen.insert(member.getOperation()).second)
+            work.push_back(member.getOperation());
           // An array element that is only read (`self.offsets[v]` through
           // `mut self`: the reference is mutable, its uses are not): the
           // array is not written, and keeps its value around the loop.
@@ -4470,12 +4438,9 @@ private:
         if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
           only = !names(store->getOperand(1));
         } else if (auto call = dyn_cast<LIT::CallOp>(op)) {
-          ArrayRef<TypedAttr> bound;
-          if (auto closure =
-                  closures.find(closureCallee(call.getCallee(), bound));
-              closure != closures.end() &&
-              seen.insert(closure->second.getOperation()).second)
-            work.push_back(closure->second.getOperation());
+          if (LIT::FnOp member = closureMember(call);
+              member && seen.insert(member.getOperation()).second)
+            work.push_back(member.getOperation());
           bool takes = false;
           for (Value operand : call.getOperands())
             if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
@@ -6335,47 +6300,55 @@ private:
     return term;
   }
 
-  /// A call of a local closure: its body, walked here with the caller's
-  /// state (it reads and writes the caller's variables it captures, by
-  /// reference), its arguments the call's operands, its own parameters
-  /// (`f[4]()`) the call's values. What its returns and raises leave is
-  /// merged; its results are unknown.
+  /// The member of a local closure's struct (`closureStructOf`) a call
+  /// runs, when it has a body: the capture constructor, the `__call__`
+  /// wrapper, or the body itself. Null for any other callee.
+  LIT::FnOp closureMember(LIT::CallOp call) {
+    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (!symbol)
+      return {};
+    ArrayRef<FlatSymbolRefAttr> nested =
+        symbol.getSymbol().getNestedReferences();
+    if (nested.size() < 2 ||
+        !nested[nested.size() - 2].getValue().starts_with("closure$"))
+      return {};
+    LIT::FnOp fn = lookup(call);
+    if (!fn || fn.getFunctionBody().empty() || !closureStructOf(fn))
+      return {};
+    return fn;
+  }
+
+  /// A call of a local closure's member: its body, walked here with the
+  /// caller's state. The constructor stores the captures into the closure's
+  /// variable (a `mut` capture as a reference to the caller's variable, so
+  /// the body's writes through it are writes of that variable); the wrapper
+  /// calls the body, which is walked the same way, its arguments the call's
+  /// operands, its parameters (the struct's, and `f[4]()`'s own) the call's
+  /// values. What its returns and raises leave is merged; its results are
+  /// unknown.
   bool inlineClosure(LIT::CallOp call, State &state) {
-    ArrayRef<TypedAttr> bound;
-    Attribute ref = closureCallee(call.getCallee(), bound);
-    auto it = closures.find(ref);
-    if (it == closures.end() || closureExits.size() >= 4)
+    LIT::FnOp fn = closureMember(call);
+    if (!fn || closureExits.size() >= 4)
       return false;
-    // Its implicit origin parameters come last; the call binds them apart.
-    ArrayRef<ParamDeclAttr> decls = it->second.getParams();
-    decls = decls.drop_back(
-        std::min(decls.size(), call.getImplicitOrigins().size()));
-    Block &entry = it->second.getFunctionBody().front();
-    if (entry.getNumArguments() != call.getNumOperands() ||
-        (!bound.empty() && bound.size() != decls.size()))
+    Block &entry = fn.getFunctionBody().front();
+    if (entry.getNumArguments() != call.getNumOperands())
       return false;
-    for (auto [arg, operand] : llvm::zip(entry.getArguments(), call.getOperands())) {
+    for (auto [arg, operand] :
+         llvm::zip(entry.getArguments(), call.getOperands())) {
       if (isa<LIT::RefType>(arg.getType())) {
+        refArgs.erase(arg);
         if (std::optional<Loc> loc = placeOf(operand))
           refArgs[arg] = *loc;
       } else {
         values[arg] = term(operand, state);
       }
     }
-    ParamFrame frame;
-    frame.parent = params;
-    frame.transparent = true;
-    frame.scope = printed(call.getCallee());
-    for (auto [decl, value] : llvm::zip(decls, bound))
-      frame.values[decl.getName()] = value;
+    ParamFrame frame = paramFrame(call, fn);
     ParamFrame *saved = params;
-    if (!bound.empty()) {
-      params = &frame;
-      // Its parameter expressions are this call's: not what an earlier call
-      // of it left.
-      it->second->walk(
-          [&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
-    }
+    params = &frame;
+    // Its parameter expressions are this call's: not what an earlier call
+    // of it left.
+    fn->walk([&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
     SmallVector<State> exits;
     closureExits.push_back(&exits);
     State body = state;
@@ -11394,45 +11367,46 @@ struct VerifyContractsPass
     };
     // A local closure only ever called directly is verified where it is
     // called, with its caller's state (`inlineClosure`); one that escapes
-    // (a parameter of another call: `vectorize[f]`, a launch) on its own.
-    auto calledOnly = [](LIT::FnOp fn) {
-      LIT::FnOp outer = fn->getParentOfType<LIT::FnOp>();
-      auto decl = fn->getAttrOfType<ParamDeclAttr>("paramDecl");
-      if (!outer || !decl)
-        return false;
-      Attribute ref = ParamDeclRefAttr::get(decl);
-      bool escapes = false;
-      outer->walk([&](Operation *op) {
-        if (escapes || op == fn.getOperation())
+    // (a value of it given to another function: `vectorize[f]`, a launch's
+    // argument) on its own too, with nothing known of its captures. It
+    // escapes where anything but a call of its own members, or the
+    // bookkeeping of its variable, has a value of its type.
+    DenseSet<Operation *> escaping;
+    {
+      SymbolTableCollection symbols;
+      ModuleOp module = getOperation();
+      auto closureOf = [&](Type type) -> Operation * {
+        if (auto ref = dyn_cast<LIT::RefType>(type))
+          type = ref.getElementType();
+        auto st = dyn_cast<LIT::StructType>(type);
+        if (!st)
+          return nullptr;
+        StringRef leaf = st.getSymbol().getLeafReference().getValue();
+        if (!leaf.starts_with("closure$") || !leaf.ends_with("::__storage"))
+          return nullptr;
+        return symbols.lookupSymbolIn(module, st.getSymbol());
+      };
+      module.walk([&](Operation *op) {
+        if (isa<LIT::VarDeclOp, LIT::VarLifetimeStartOp, LIT::VarLifetimeEndOp,
+                LIT::RefImmutOp, LIT::RefUpcastOp, RebindOp,
+                LIT::OwnershipMarkInitializedOp, LIT::OwnershipMarkConsumedOp,
+                LIT::OwnershipMarkDestroyedOp>(op))
           return;
-        // A direct call names the closure as its callee; any other
-        // mention (a callee's parameter, `f[elementwise_lambda_fn=g]`) passes
-        // it on.
-        auto call = dyn_cast<LIT::CallOp>(op);
-        for (NamedAttribute attr : op->getAttrs()) {
-          if (call && attr.getValue() == call.getCalleeAttr()) {
-            // `f()`, or `f[4]()` with all of its parameters, none of which
-            // mentions it.
-            ArrayRef<TypedAttr> bound;
-            size_t own = fn.getParams().size();
-            own -= std::min(own, call.getImplicitOrigins().size());
-            if (closureCallee(call.getCallee(), bound) == ref &&
-                (bound.empty() || bound.size() == own)) {
-              for (TypedAttr value : bound)
-                value.walk([&](Attribute a) {
-                  if (a == ref)
-                    escapes = true;
-                });
-              continue;
-            }
-          }
-          attr.getValue().walk([&](Attribute a) {
-            if (a == ref)
-              escapes = true;
-          });
-        }
+        Operation *owner = op->getParentOfType<LIT::StructDeclOp>();
+        if (auto call = dyn_cast<LIT::CallOp>(op))
+          if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee()))
+            if (Operation *callee =
+                    symbols.lookupSymbolIn(module, symbol.getSymbol()))
+              owner = callee->getParentOfType<LIT::StructDeclOp>();
+        for (Value operand : op->getOperands())
+          if (Operation *closure = closureOf(operand.getType());
+              closure && closure != owner)
+            escaping.insert(closure);
       });
-      return !escapes;
+    }
+    auto calledOnly = [&](LIT::FnOp fn) {
+      LIT::StructDeclOp closure = closureStructOf(fn);
+      return closure && !escaping.count(closure);
     };
     getOperation().walk([&](LIT::FnOp fn) {
       if (selected(fn) && !isRequiredTraitMethod(fn) && !isDefaultWrapper(fn) &&
@@ -11527,16 +11501,9 @@ struct VerifyContractsPass
       auto open = [&](SymbolConstantAttr symbol) {
         return openValues(symbol.getParamValues());
       };
-      // The same of a chain's last step; through a closure's call, which
-      // gives only the closure's own parameters, of the step before it too.
+      // The same of a chain's last step.
       auto openChain = [&](ArrayRef<InstanceLink> chain) {
-        for (const InstanceLink &link : llvm::reverse(chain)) {
-          if (openValues(link.values()))
-            return true;
-          if (!link.closure)
-            break;
-        }
-        return false;
+        return openValues(chain.back().values());
       };
       // The calls of the functions whose parameters a launch (or a call
       // on the way to it) passes on, up to three levels out.
@@ -11550,29 +11517,40 @@ struct VerifyContractsPass
       for (Launch &launch : launches)
         if (launch.launcher && open(launch.kernel.symbol))
           wanted.insert(launch.launcher);
-      // A launch in a local closure with parameters of its own
-      // (`_rows_per_warp[rows]`): the closure's calls give them, the
-      // function they are in the rest.
+      // A launch in a local closure's body (`launch[rows]()` in a function
+      // that calls it): the calls of the closure's `__call__` wrapper give
+      // the body's parameters, the closure struct's (the captures' origins,
+      // and the function's parameters the body reads) and its own, which
+      // the wrapper passes on as they are.
       for (Operation *op :
            SmallVector<Operation *>(wanted.begin(), wanted.end())) {
-        auto closure = cast<LIT::FnOp>(op);
-        auto decl = closure->getAttrOfType<ParamDeclAttr>("paramDecl");
-        auto outer = closure->getParentOfType<LIT::FnOp>();
-        if (!decl || !outer || !calledOnly(closure))
+        auto body = cast<LIT::FnOp>(op);
+        LIT::StructDeclOp closure = closureStructOf(body);
+        if (!closure)
           continue;
-        Attribute ref = ParamDeclRefAttr::get(decl);
-        outer->walk([&](LIT::CallOp call) {
-          ArrayRef<TypedAttr> bound;
-          auto bind = dyn_cast<BindParamsAttr>(call.getCallee());
-          if (!bind || closureCallee(bind, bound) != ref)
+        LIT::FnOp wrapper;
+        for (auto member : closure.getBody()->getOps<LIT::FnOp>())
+          if (member.getSymName() &&
+              member.getSymName()->starts_with("__call__$trait"))
+            wrapper = member;
+        if (!wrapper)
+          continue;
+        StringRef wrapperName = *wrapper.getSymName();
+        module.walk([&](LIT::CallOp call) {
+          auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+          if (!symbol ||
+              symbol.getSymbol().getLeafReference().getValue() != wrapperName ||
+              symbols.lookupSymbolIn(module, symbol.getSymbol()) != wrapper)
             return;
           auto from = call->getParentOfType<LIT::FnOp>();
-          InstanceLink link{
-              {}, closure, call.getImplicitOrigins().size(), bind};
-          callers[closure].push_back({link, from, call.getLoc()});
+          callers[body].push_back(
+              {{symbol, body, call.getImplicitOrigins().size()},
+               from,
+               call.getLoc()});
           if (from)
             wanted.insert(from);
         });
+        wanted.erase(op);
       }
       for (int level = 0; level < 3 && !wanted.empty(); ++level) {
         llvm::StringSet<> names;
@@ -11619,7 +11597,7 @@ struct VerifyContractsPass
             }
             std::string key;
             for (const InstanceLink &link : chain)
-              key += printed(link.callee()) + "|";
+              key += printed(link.symbol) + "|";
             SmallVector<Instance> &list = instances[chain.front().fn];
             if (list.size() < 32 && seen.insert(key).second)
               list.push_back({std::move(chain), launch, via});
