@@ -540,14 +540,21 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   whose extent nothing states is reported. Extents are about bounds only;
   whether the memory is still allocated and written is the next point.
 - Allocations of the function itself (`allocations.mojo`): memory from
-  `unsafe_alloc` must still be allocated at every access (`p[]`,
-  `p[unsafe_offset=i]`, `load`, `store`, `unsafe_write`, `take_pointee`,
-  ...) and at `free`, which retires it; and an element must have been
-  written (`p[i] = v`, `unsafe_write`, `store`) before it is read
-  (`p[i]`, `load`, `take_pointee`, or `len(p[])` handed to a function),
-  and not moved out since. The pass keeps, per allocation, whether it is
-  allocated, the prefix of elements written in order (which the invariant
-  search follows through a loop that fills the memory: `ok_filled_in_loop`)
+  `unsafe_alloc`, `alloc[T](n)` or `alloc(layout)` must still be allocated
+  at every access (`p[]`, `p[unsafe_offset=i]`, `load`, `store`,
+  `unsafe_write`, `take_pointee`, ...) and at `free` or `dealloc`, which
+  retire it; and an element must have been written (`p[i] = v`,
+  `unsafe_write`, `store`) before it is read (`p[i]`, `load`,
+  `take_pointee`, or `len(p[])` handed to a function), and not moved out
+  since. An `Allocation` from `alloc(layout)` is followed through
+  `unsafe_ptr()`, `into_managed()` and `into_thin()` (and their
+  `unsafe_ptr()`), `unsafe_leak()` and `dealloc(a^)`; `Layout(length=n)`
+  states its extent. Memory from `stack_allocation` is never freed:
+  reading it before writing it is reported (`bad_stack_uninit`), and so
+  is freeing it (`bad_stack_freed`). The pass keeps, per allocation,
+  whether it is allocated, the prefix of elements written in order (which
+  the invariant search follows through a loop that fills the memory:
+  `ok_filled_in_loop`)
   and the elements written on their own (`ok_any_order`). A pointer moved
   by `p + k` or `p.unsafe_offset(k)`, or cast, points into the same
   allocation. A pointer from `xs.unsafe_ptr()` is retired by a call that
@@ -562,8 +569,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   initialized, and a function handed a local pointer by value is taken to
   initialize all of it (`ok_filled_by_callee`, `memcpy`); a function that
   frees through a pointer it is handed is not seen. A pointer chosen by a
-  condition (`p if c else q`) is not followed. Memory from `alloc` (an
-  `Allocation`) and `stack_allocation` is not checked for either.
+  condition (`p if c else q`) is not followed. A span over an allocation
+  (`a.unsafe_span()`, `a.storage()`) counts as initializing all of it,
+  and a write through it leaves the handle's pointer and layout known
+  (`ok_span_filled`). The compiler itself rejects reading an
+  `Allocation` after `dealloc(a^)` and keeps a `ManagedAllocation` alive
+  while its pointers are used, so those are not the pass's to report.
 - A struct with a single integer field and no parameters (an enum-like
   wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
   field is the value, `Wrapper(n)` (a constructor that only stores its

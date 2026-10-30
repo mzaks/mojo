@@ -60,6 +60,7 @@ def ok_store(p: Pointer[Float32, MutAnyOrigin], n: Int, i: Int)
 def ok_stack(i: Int) -> Float32:
     var p = stack_allocation[16, DType.float32]()
     if 0 <= i and i < 4:
+        p.unsafe_store[width=4](i * 4, 1)
         return p.unsafe_load[width=4](i * 4).reduce_add()
     return 0
 

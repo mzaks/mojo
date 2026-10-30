@@ -1918,6 +1918,8 @@ private:
     std::string storage;
     /// The pointer to the start of the memory (whose extent is its size).
     std::string base;
+    /// Stack memory (`stack_allocation`), which is not freed.
+    bool stack = false;
   };
   /// By the pointer's term.
   std::map<std::string, Allocation> pointerBases;
@@ -3048,6 +3050,11 @@ private:
         // `placeOf` tracks as the field).
         std::string name = quotedOriginName(root);
         size_t at = origin.find(name);
+        // A write to the memory an allocation handle owns (through a span
+        // of it) changes nothing of the handle: its pointer and layout.
+        if (pointee && pointee != placeType(loc) &&
+            isAllocationHandle(placeType(loc)))
+          continue;
         if ((at != StringRef::npos &&
              origin.take_front(at).ends_with(
                  "#lit.interior.origin<#kgen.param.decl.ref<")) ||
@@ -3272,6 +3279,15 @@ private:
     return literal(v.getType());
   }
 
+  /// An `Allocation`, `ManagedAllocation` or `ThinAllocation`.
+  static bool isAllocationHandle(Type type) {
+    std::string t = printed(type);
+    return t.starts_with("!lit.struct<@std::@memory::@alloc::@Allocation<") ||
+           t.starts_with(
+               "!lit.struct<@std::@memory::@alloc::@ManagedAllocation<") ||
+           t.starts_with("!lit.struct<@std::@memory::@alloc::@ThinAllocation<");
+  }
+
   static bool isPointerType(Type type) {
     return StringRef(printed(type))
         .starts_with("!lit.struct<@std::@memory::@pointer::@Pointer<");
@@ -3369,6 +3385,43 @@ private:
                              pointee->offset, 1, state);
     if (path.starts_with("std::builtin::"))
       return;
+    // The `Allocation` family: the pointer is a field of the handle.
+    auto handlePointer = [&](const char *field) -> std::optional<Allocation> {
+      if (ops.empty())
+        return std::nullopt;
+      std::optional<Loc> self = placeOf(ops[0]);
+      if (!self)
+        return std::nullopt;
+      auto it = pointerBases.find(load(Loc{self->root, self->path + field},
+                                       state, Sort{false, 64, false}));
+      if (it == pointerBases.end())
+        return std::nullopt;
+      return it->second;
+    };
+    if (path.starts_with("std::memory::alloc::dealloc[") ||
+        path.starts_with(
+            "std::memory::alloc::ManagedAllocation::__deinit__(")) {
+      if (std::optional<Allocation> a =
+              handlePointer(path.starts_with("std::memory::alloc::dealloc[")
+                                ? "/_alloc/_ptr"
+                                : "/_alloc/_alloc/_ptr")) {
+        checkAlive(at, "dealloc", *a, state);
+        store(Loc{a->place.root, "/alive"}, state, "false");
+      }
+      return;
+    }
+    if (path.starts_with("std::memory::alloc::Allocation::unsafe_span[") ||
+        path.starts_with("std::memory::alloc::Allocation::storage[") ||
+        path.starts_with(
+            "std::memory::alloc::ManagedAllocation::unsafe_span[")) {
+      // A span over the memory may initialize all of it.
+      if (std::optional<Allocation> a =
+              handlePointer(path.contains("Managed") ? "/_alloc/_alloc/_ptr"
+                                                     : "/_alloc/_ptr"))
+        store(Loc{a->place.root, "/upto"}, state,
+              define(i64, extentOf(a->base)));
+      return;
+    }
     if (!path.consume_front("std::memory::pointer::Pointer::")) {
       for (Value operand : ops) {
         if (isa<LIT::RefType>(operand.getType()) ||
@@ -3424,6 +3477,13 @@ private:
     } else if (path.starts_with("free(") || path.starts_with("free[") ||
                path.starts_with("unsafe_free(") ||
                path.starts_with("unsafe_free[")) {
+      if (a->stack) {
+        checkClaim(at, "Pointer.free",
+                   "that the memory the pointer points into was allocated "
+                   "on the heap",
+                   "false", state);
+        return;
+      }
       checkAlive(at, "Pointer.free", *a, state);
       if (a->storage.empty())
         store(Loc{a->place.root, "/alive"}, state, "false");
@@ -3451,22 +3511,89 @@ private:
   /// pointer moved by `p + k` or `p.unsafe_offset(k)`) and the pointee a
   /// reference it returns refers to (`p[]`, `p[unsafe_offset=i]`).
   void followPointerResults(LIT::CallOp call, const CalleeName &name,
-                            State &state) {
+                            State &before, State &state) {
     StringRef path = name.path;
     ValueRange ops = call.getOperands();
     if (call->getNumResults() != 1)
       return;
     Value result = call->getResult(0);
-    Sort i64{false, 64, true};
-    if (path.starts_with("std::memory::alloc::unsafe_alloc[")) {
-      std::string t = term(result, state);
+    Sort i64{false, 64, true}, handle{false, 64, false};
+    // New memory: `unsafe_alloc`, `alloc` (a pointer, or an `Allocation`
+    // whose pointer is a field, as long as its layout) and
+    // `stack_allocation`.
+    auto allocated = [&](const std::string &pointer, bool stack) {
       Loc place{result, ""};
       storeFields(place, state,
                   {{"/alive", "true"},
                    {"/upto", bvConst(0, 64)},
-                   {"/initv", declare({false, 64, false}, "iv")}});
-      pointerBases[t] = {place, bvConst(0, 64), "", t};
+                   {"/initv", declare(handle, "iv")}});
+      pointerBases[pointer] = {place, bvConst(0, 64), "", pointer, stack};
       allocationRoots.push_back(result);
+    };
+    if (path.starts_with("std::memory::alloc::unsafe_alloc[") ||
+        (path.starts_with("std::memory::alloc::alloc[") &&
+         isPointerType(result.getType()))) {
+      allocated(term(result, state), false);
+      return;
+    }
+    if (path.starts_with("std::memory::stack_allocation::stack_allocation[")) {
+      allocated(term(result, state), true);
+      return;
+    }
+    if (path.starts_with("std::memory::alloc::alloc[") && ops.size() == 1) {
+      std::string r = term(result, state);
+      std::string pointer = fieldOf(r, "/_alloc/_ptr", handle);
+      std::string n = fieldOf(term(ops[0], state), "/_length", i64);
+      facts.push_back("(= " + extentOf(pointer) + " " + n + ")");
+      fieldValues[{r, "/_layout/_length"}] = n;
+      allocated(pointer, false);
+      return;
+    }
+    // `Layout(length=n)`: its length; a copy or move keeps it.
+    if (path.starts_with("std::memory::alloc::Layout::__init__(") &&
+        ops.size() == 1) {
+      std::string n = isa<LIT::RefType>(ops[0].getType())
+                          ? valueThrough(ops[0], state)
+                          : term(ops[0], state);
+      if (path.contains("(copy:") || path.contains("(move:"))
+        n = fieldOf(n, "/_length", i64);
+      if (!sortOfTerm(n).isBool && sortOfTerm(n).width == 64)
+        fieldValues[{term(result, state), "/_length"}] = n;
+      return;
+    }
+    if (path.starts_with("std::memory::alloc::Layout::single(")) {
+      fieldValues[{term(result, state), "/_length"}] = bvConst(1, 64);
+      return;
+    }
+    // The handle's pointer, through the handles made from it.
+    auto fieldBefore = [&](const char *field) -> MaybeTerm {
+      if (ops.empty())
+        return std::nullopt;
+      std::optional<Loc> self = placeOf(ops[0]);
+      if (!self)
+        return std::nullopt;
+      return load(Loc{self->root, self->path + field}, before, handle);
+    };
+    if (path.starts_with("std::memory::alloc::Allocation::into_managed(")) {
+      if (MaybeTerm pointer = fieldBefore("/_alloc/_ptr"))
+        fieldValues[{term(result, state), "/_alloc/_alloc/_ptr"}] = *pointer;
+      return;
+    }
+    if (path.starts_with("std::memory::alloc::Allocation::into_thin(")) {
+      if (MaybeTerm pointer = fieldBefore("/_alloc/_ptr"))
+        fieldValues[{term(result, state), "/_ptr"}] = *pointer;
+      return;
+    }
+    if (path.starts_with("std::memory::alloc::Allocation::unsafe_leak(") ||
+        path.starts_with("std::memory::alloc::ThinAllocation::unsafe_leak(") ||
+        path.starts_with("std::memory::alloc::ThinAllocation::unsafe_ptr[") ||
+        path.starts_with(
+            "std::memory::alloc::ManagedAllocation::unsafe_ptr[")) {
+      const char *field = path.contains("Managed") ? "/_alloc/_alloc/_ptr"
+                          : path.contains("Thin")  ? "/_ptr"
+                                                   : "/_alloc/_ptr";
+      if (MaybeTerm pointer = fieldBefore(field))
+        values[result] = *pointer;
       return;
     }
     if (!path.consume_front("std::memory::pointer::Pointer::") || ops.empty())
@@ -3515,7 +3642,8 @@ private:
         return;
       std::optional<CalleeName> n = calleeName(call.getCallee());
       StringRef path = n ? StringRef(n->path) : StringRef();
-      if (path.starts_with("std::memory::alloc::unsafe_alloc[")) {
+      if (path.starts_with("std::memory::alloc::") ||
+          path.starts_with("std::memory::stack_allocation::")) {
         touches = true;
         return;
       }
@@ -3543,8 +3671,11 @@ private:
       if (!n)
         return;
       StringRef path(n->path);
-      if (path.consume_front("std::memory::pointer::Pointer::") &&
-          path.contains("free"))
+      if ((path.consume_front("std::memory::pointer::Pointer::") &&
+           path.contains("free")) ||
+          path.starts_with("std::memory::alloc::dealloc[") ||
+          path.starts_with(
+              "std::memory::alloc::ManagedAllocation::__deinit__("))
         frees = true;
     });
     return frees;
@@ -7516,7 +7647,7 @@ private:
                             "r");
         }
     if (name)
-      followPointerResults(call, *name, state);
+      followPointerResults(call, *name, before, state);
   }
 
   /// A call of a trait method that only reads its arguments and returns an
@@ -10111,6 +10242,24 @@ private:
         return false;
       values[result] = load(Loc{loc->root, loc->path + "/_alloc/_ptr"}, state,
                             Sort{false, 64, false});
+      return true;
+    }
+    // `Allocation.unsafe_span()`: a span as long as the layout, over the
+    // allocation's pointer; the allocation is not written either.
+    if ((path.starts_with("std::memory::alloc::Allocation::unsafe_span[") ||
+         path.starts_with("std::memory::alloc::Allocation::storage[")) &&
+        call.getNumOperands() == 1) {
+      std::optional<Loc> loc = placeOf(call.getOperands()[0]);
+      if (!loc)
+        return false;
+      std::string n = load(Loc{loc->root, loc->path + "/_layout/_length"},
+                           state, Sort{false, 64, true});
+      std::string pointer = load(Loc{loc->root, loc->path + "/_alloc/_ptr"},
+                                 state, Sort{false, 64, false});
+      std::string span = declare({false, 64, false}, "g");
+      facts.push_back("(= " + lenOf(span) + " " + n + ")");
+      facts.push_back("(bvsge " + extentOf(pointer) + " " + n + ")");
+      values[result] = span;
       return true;
     }
     if (path.starts_with("std::collections::array::Array::unsafe_ptr[") &&

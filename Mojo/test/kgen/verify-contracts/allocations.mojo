@@ -10,13 +10,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# Allocations for `verify-contracts`: memory this function allocates must
-# still be allocated when it is read, written or freed, and an element
-# must be written before it is read; a pointer taken from a list must not
-# outlive a reallocation of the list. See README.md.
+# Allocations for `verify-contracts`: memory this function allocates
+# (`unsafe_alloc`, `alloc`, `stack_allocation`) must still be allocated when
+# it is read, written or freed, and an element must be written before it is
+# read; a pointer taken from a list must not outlive a reallocation of the
+# list. See README.md.
 
 
-from std.memory.alloc import unsafe_alloc
+from std.memory import stack_allocation
+from std.memory.alloc import Layout, alloc, dealloc, unsafe_alloc
 
 
 def fill(p: Pointer[Int, MutUntrackedOrigin], n: Int)
@@ -119,6 +121,56 @@ def ok_freed_in_branch(c: Bool) -> Int:
     return t
 
 
+def ok_allocation() -> Int:
+    var a = alloc(Layout[Int](length=4))
+    var p = a.unsafe_ptr()
+    p[] = 1
+    var t = p[]
+    dealloc(a^)
+    return t
+
+
+def ok_allocation_loop() -> Int:
+    var a = alloc(Layout[Int](length=4))
+    var p = a.unsafe_ptr()
+    for i in range(4):
+        p[unsafe_offset=i] = i
+    var t = p[unsafe_offset=3]
+    dealloc(a^)
+    return t
+
+
+def ok_managed() -> Int:
+    var m = alloc(Layout[Int](length=4)).into_managed()
+    var p = m.unsafe_ptr()
+    p[unsafe_offset=1] = 1
+    return p[unsafe_offset=1]
+
+
+def ok_leaked() -> Int:
+    var a = alloc(Layout[Int](length=2))
+    var p = a^.unsafe_leak()
+    p[] = 1
+    var t = p[]
+    p.unsafe_free()
+    return t
+
+
+def ok_span_filled() -> Int:
+    var a = alloc(Layout[Int](length=2))
+    var s = a.unsafe_span()
+    s[0] = 1
+    var t = a.unsafe_ptr()[]  # the span may have written it
+    dealloc(a^)
+    return t
+
+
+def ok_stack() -> Int:
+    var p = stack_allocation[4, Int]()
+    p[] = 3
+    return p[]
+
+
 # --- must stay UNPROVEN ---
 def bad_read_before_write() -> Int:
     var p = unsafe_alloc[Int](1)
@@ -201,3 +253,37 @@ def bad_load_uninit() -> Float32:
     var v = p.unsafe_load[width=4](0)  # elements 2 and 3
     p.unsafe_free()
     return v[0]
+
+
+def bad_allocation_uninit() -> Int:
+    var a = alloc(Layout[Int](length=4))
+    var p = a.unsafe_ptr()
+    var t = p[]
+    dealloc(a^)
+    return t
+
+
+def bad_allocation_past_end() -> Int:
+    var a = alloc(Layout[Int](length=4))
+    var p = a.unsafe_ptr()
+    p[unsafe_offset=4] = 1
+    dealloc(a^)
+    return 0
+
+
+def bad_leaked_after_free() -> Int:
+    var a = alloc(Layout[Int](length=2))
+    var p = a^.unsafe_leak()
+    p[] = 1
+    p.unsafe_free()
+    return p[]
+
+
+def bad_stack_uninit() -> Int:
+    var p = stack_allocation[4, Int]()
+    return p[]
+
+
+def bad_stack_freed():
+    var p = stack_allocation[4, Int]()
+    p.unsafe_free()
