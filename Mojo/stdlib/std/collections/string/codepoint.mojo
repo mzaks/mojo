@@ -197,7 +197,11 @@ struct Codepoint(Comparable, ImplicitlyCopyable, Intable, Movable, Writable):
     # ===-------------------------------------------------------------------===#
 
     @staticmethod
-    def from_u32(codepoint: UInt32) -> Optional[Self]:
+    def from_u32(codepoint: UInt32) -> Optional[Self]
+        ensures result.__bool__() == (
+            codepoint <= 0xD7FF
+            or (codepoint >= 0xE000 and codepoint <= 0x10FFFF)
+        ):
         """Construct a `Codepoint` from a code point value. Returns None if the
         provided `codepoint` is not in the valid range.
 

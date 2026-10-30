@@ -523,7 +523,9 @@ struct LinkedList[ElementType: Movable](
     def maybe_pop(mut self) -> Optional[Self.ElementType]
         ensures len(self) == (
             old(len(self)) - 1 if old(len(self)) > 0 else 0
-        ) and _elements_kept(self, len(self)):
+        ) and _elements_kept(self, len(self)) and result.__bool__() == (
+            old(len(self)) > 0
+        ):
         """Removes the tail of the list and returns it, if it exists.
 
         Returns:
@@ -550,7 +552,9 @@ struct LinkedList[ElementType: Movable](
     @inline(.always)
     def maybe_pop[
         I: Indexer & Deinitable, //
-    ](mut self, var i: I) -> Optional[Self.ElementType]:
+    ](mut self, var i: I) -> Optional[Self.ElementType]
+        requires _index_in_bounds(index(i), len(self))
+        ensures len(self) == old(len(self)) - 1 and result.__bool__():
         """Remove the ith element of the list, counting from the tail if
         given a negative index.
 

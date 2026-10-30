@@ -298,9 +298,22 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `extendleft`, `clear`, `reverse` and `rotate` state lengths. A bounded
   deque (`maxlen=`) evicts when full, so these clauses go through its
   `_maxlen`, which constructors state and mutators keep.
-- `LinkedList`: `get_nth(i)`, `pop(i)` and `insert(i, ...)` require their
-  index in range; constructors, `append`, `prepend`, `pop`, `insert`,
-  `extend`, `clear` and `reverse` state lengths. Indices are generic
+- `Optional`: `value()` and `take()` require a value to be held
+  (`optionals.mojo`). The pass follows whether one is: constructors
+  (`Optional(x)`, `Optional[T]()`, `None`, `init_with=`), `copy()`,
+  `copied()`, `take()` (empty afterwards), `o^.map(f)` (held exactly when
+  `o` was), and the checks `if o`, `not o`, `o is None`, `o is not None`,
+  `o == None`, `assert_true(o)` and `assert_false(o)`. A function returning
+  an `Optional` states when it holds a value in an `ensures` on `result`
+  (`LinkedList.maybe_pop()`: when the list was not empty;
+  `Codepoint.from_u32(c)`: when `c` is a scalar value). A closure handed to
+  `init_with=` or `map` is not walked there (it is verified on its own);
+  what it captures mutably is unknown after the call. Not followed:
+  `and_then(f)` (its result is `f`'s) and the `Optional` in
+  `Iterator.bounds()[1]`.
+- `LinkedList`: `get_nth(i)`, `pop(i)`, `maybe_pop(i)` and `insert(i, ...)`
+  require their index in range; constructors, `append`, `prepend`, `pop`,
+  `insert`, `extend`, `clear` and `reverse` state lengths. Indices are generic
   (`I: Indexer`): `index(i)` is `i` for an `Int` and the literal's value
   for an `IntLiteral`.
 - `Dict` states its lengths and which keys it holds (`_has_key(d, k)`,
@@ -724,6 +737,7 @@ machine that sleeps stops the solver too.
 | `pointers.mojo`      | all `bad_*`        | all `ok_*`       |
 | `structs.mojo`       | all `bad_*`        | all `ok_*`       |
 | `higher_order.mojo`  | all `bad_*`        | all `ok_*`       |
+| `optionals.mojo`     | all `bad_*`        | all `ok_*`       |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |
 | `gemm_mma_cpasync.mojo` | (none)          | all `ok_*`       |
 | `matmul_dispatch.mojo` | (none)           | (a corpus driver, nothing expected) |

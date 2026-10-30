@@ -577,7 +577,7 @@ struct Optional[T: AnyType](
     # ===-------------------------------------------------------------------===#
 
     @inline(.always)
-    def value(ref self) -> ref[self._value] Self.T:
+    def value(ref self) -> ref[self._value] Self.T requires self.__bool__():
         """Retrieve a reference to the value of the `Optional`.
 
         Returns:
@@ -677,7 +677,9 @@ struct Optional[T: AnyType](
         assert self.__bool__(), "`.value()` on empty `Optional`"
         return self._unsafe_unchecked_value()
 
-    def take(mut self) -> Self.T where conforms_to(Self.T, Movable):
+    def take(mut self) -> Self.T
+        where conforms_to(Self.T, Movable)
+        requires self.__bool__():
         """Move the value out of the `Optional`.
 
         Returns:

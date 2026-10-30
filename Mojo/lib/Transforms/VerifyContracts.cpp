@@ -6627,6 +6627,30 @@ private:
     return inlineMember(call, impl, frame, state);
   }
 
+  /// A local closure handed to the callee (`map(n, f)`, not walked here):
+  /// the callee may call it, which writes what it captures mutably (the
+  /// origins in its type).
+  void havocCaptures(LIT::CallOp call, State &state, bool confined) {
+    for (Value operand : call.getOperands())
+      if (LIT::StructType closure = closureTypeOfValue(operand))
+        for (TypedAttr param : closure.getParamValues())
+          if (std::string origin = printed(param); mutableCapture(origin))
+            havocOrigin(origin, state, confined);
+  }
+
+  /// An `Optional` method that takes a closure and is modelled by the pass
+  /// (`Optional(init_with=f)`, `o^.map(f)`): what it returns is known
+  /// without walking its body, which is `Variant`'s.
+  static bool modelledHigherOrder(const CalleeName &name) {
+    StringRef path = name.path;
+    const char *optional = "std::collections::optional::Optional::";
+    if (!path.starts_with(optional))
+      return false;
+    StringRef method = path.drop_front(strlen(optional));
+    return method.starts_with("map[") ||
+           (method.starts_with("__init__[") && method.contains("](init_with:"));
+  }
+
   /// A call that hands a local closure of this file to a function with a
   /// body (`map(n, f)`, `vectorize[4](n, g)`, `xs^.deinit_with(f)`): the
   /// body is walked here, so that the closure's is walked where the body
@@ -6638,6 +6662,9 @@ private:
                          State &state) {
     if (inContract || !callee || callee.getFunctionBody().empty() ||
         !isa<SymbolConstantAttr>(call.getCallee()) || closureStructOf(callee))
+      return false;
+    if (std::optional<CalleeName> name = calleeName(call.getCallee());
+        name && modelledHigherOrder(*name))
       return false;
     bool handed = false;
     for (auto [index, operand] : llvm::enumerate(call.getOperands()))
@@ -6900,14 +6927,7 @@ private:
       if (mutableOrigin(origin) &&
           !covered.count(origin.str()))
         havocOrigin(origin, state, confined);
-    // A local closure handed to the callee (`map(n, f)`, not walked here):
-    // the callee may call it, which writes what it captures mutably (the
-    // origins in its type).
-    for (Value operand : call.getOperands())
-      if (LIT::StructType closure = closureTypeOfValue(operand))
-        for (TypedAttr param : closure.getParamValues())
-          if (std::string origin = printed(param); mutableCapture(origin))
-            havocOrigin(origin, state, confined);
+    havocCaptures(call, state, confined);
     for (auto [index, operand] : llvm::enumerate(call.getOperands())) {
       auto ref = dyn_cast<LIT::RefType>(operand.getType());
       if (!ref || ref.isMutableKnown(false))
@@ -7080,6 +7100,15 @@ private:
       if (!sortOfTerm(v).isBool)
         return;
       fact = kind == "true" ? v : "(not " + v + ")";
+    } else if ((kind == "true" || kind == "false") && isOptionalType(type) &&
+               ops.size() >= 1) {
+      // `assert_true(o)` of an `Optional`: it holds a value.
+      std::optional<Loc> opt = placeOf(ops[0]);
+      if (!opt)
+        return;
+      std::string has =
+          load(Loc{opt->root, opt->path + "/has"}, state, {true, 1, false});
+      fact = kind == "true" ? has : "(not " + has + ")";
     } else if ((kind == "equal" || kind == "not_equal") &&
                (isIntType(type) || isBoolType(type) || isIntegerScalar(type)) &&
                ops.size() >= 2) {
@@ -7245,6 +7274,16 @@ private:
     auto type = dyn_cast<TypeParamAttr>(attr);
     return type && printed(type.getTypeValue()) ==
                        "!lit.struct<@std::@builtin::@bool::@Bool>";
+  }
+
+  /// Whether a type parameter's value is an `Optional`.
+  static bool isOptionalType(TypedAttr attr) {
+    if (auto sugar = dyn_cast<SugarAttr>(attr))
+      attr = sugar.getCanonical();
+    auto type = dyn_cast<TypeParamAttr>(attr);
+    return type && StringRef(printed(type.getTypeValue()))
+                       .starts_with("!lit.struct<@std::@collections::"
+                                    "@optional::@Optional<");
   }
 
   /// Whether a type parameter's value is a width-1 integer `SIMD`
@@ -11070,6 +11109,22 @@ private:
       values[call->getResult(0)] = has(*self);
       return true;
     }
+    // `not o`, `o is None`, `o is not None`, `o == None`, `o != None`.
+    if (call->getNumResults() == 1 &&
+        ((method.starts_with("__invert__(") && ops.size() == 1) ||
+         ((method.starts_with("__is__(") || method.starts_with("__isnot__(") ||
+           method.starts_with("__eq__(") || method.starts_with("__ne__(")) &&
+          ops.size() == 2 &&
+          StringRef(printed(ops[1].getType())).contains("NoneType")))) {
+      std::optional<Loc> self = place(ops[0]);
+      if (!self)
+        return false;
+      bool present =
+          method.starts_with("__isnot__(") || method.starts_with("__ne__(");
+      values[call->getResult(0)] =
+          present ? has(*self) : define(flag, "(not " + has(*self) + ")");
+      return true;
+    }
     if ((method.starts_with("value[") || method.starts_with("value(")) &&
         ops.size() == 1 && call->getNumResults() == 1 &&
         isa<LIT::RefType>(call->getResult(0).getType())) {
@@ -11088,11 +11143,33 @@ private:
       return false;
     if (method.starts_with("__init__(None)")) {
       storeFields(*out, state, {{"/has", "false"}});
-    } else if (method.starts_with("__init__(copy:")) {
+    } else if (method.starts_with("__init__[") &&
+               method.contains("](init_with:")) {
+      // Built in place by a closure: a value is held, whatever it is. The
+      // closure (not walked) writes what it captures mutably.
+      havocCaptures(call, state, confinedWrites(call));
+      storeFields(*out, state, {{"/has", "true"}});
+    } else if (method.starts_with("copied[") || method.starts_with("map[")) {
+      // A copy of the pointee, or the mapper's result: held exactly when
+      // `self` holds a value.
+      std::optional<Loc> src = place(ops[0]);
+      if (!src)
+        return false;
+      havocCaptures(call, state, confinedWrites(call));
+      storeFields(*out, state, {{"/has", has(*src)}});
+    } else if (method.starts_with("__init__(copy:") ||
+               method.starts_with("copy(")) {
       std::optional<Loc> src = place(ops[0]);
       if (!src)
         return false;
       storeFields(*out, state, {{"/has", has(*src)}, {"/val", val(*src)}});
+    } else if (method.starts_with("take(") && ops.size() == 2) {
+      // The value moves out: the `Optional` is empty afterwards.
+      std::optional<Loc> self = place(ops[0]);
+      if (!self)
+        return false;
+      store(*out, state, val(*self));
+      storeFields(*self, state, {{"/has", "false"}});
     } else if (method.starts_with("__init__($0$)")) {
       std::optional<Loc> value = place(ops[0]);
       if (!value)
