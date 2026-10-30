@@ -29,13 +29,15 @@ def ok_stated(p: Pointer[Int, MutAnyOrigin], n: Int, i: Int) -> Int
 def ok_alloc(n: Int, i: Int) -> Int:
     var p = unsafe_alloc[Int](n)
     if 0 <= i and i < n:
-        return p[unsafe_offset=i]  # `unsafe_alloc` states it
+        p[unsafe_offset=i] = i  # `unsafe_alloc` states the extent
+        return p[unsafe_offset=i]  # and the element was written
     return 0
 
 
 def ok_offset(n: Int, i: Int) -> Int:
     var p = unsafe_alloc[Int](n)
     if n >= 2 and 0 <= i and i < n - 2:
+        p[unsafe_offset=i + 2] = i
         return p.unsafe_offset(2)[unsafe_offset=i]  # two fewer from there
     return 0
 
@@ -65,6 +67,7 @@ def ok_stack(i: Int) -> Float32:
 def ok_deref(n: Int) -> Int:
     var p = unsafe_alloc[Int](n)
     if n >= 1:
+        p[] = 1
         return p[]  # no offset: one element
     return 0
 

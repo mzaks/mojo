@@ -1460,6 +1460,9 @@ struct State {
   unsigned epoch = 0;
   /// False once the path has left (returned, broken out, continued, raised).
   bool alive = true;
+  /// The version of each list's storage (by the list's place) that a
+  /// call which may reallocate it has changed; others are as on entry.
+  std::map<Loc, std::string> storage;
   /// The values of the region's terminator, when it yields.
   SmallVector<std::string> yields;
 };
@@ -1903,6 +1906,28 @@ private:
   DenseMap<Value, std::map<std::string, std::string>> records;
   /// Places that reference values loaded from `ref` locals refer to.
   DenseMap<Value, Loc> derivedPlaces;
+  /// A pointer into memory this function allocated (`unsafe_alloc`) or
+  /// took from a list (`xs.unsafe_ptr()`): the allocation's place (for heap
+  /// memory the allocating call's result, whose fields `/alive`, `/upto`
+  /// and `/initv` hold its state; for a list, the list) and the pointer's
+  /// offset from its start.
+  struct Allocation {
+    Loc place;
+    std::string offset;
+    /// For a list's storage: its version when the pointer was taken.
+    std::string storage;
+    /// The pointer to the start of the memory (whose extent is its size).
+    std::string base;
+  };
+  /// By the pointer's term.
+  std::map<std::string, Allocation> pointerBases;
+  /// References to a pointee (`p[]`, `p[unsafe_offset=i]`) of such a pointer.
+  DenseMap<Value, Allocation> pointeeRefs;
+  /// The heap allocations of the function being verified, in order.
+  SmallVector<Value> allocationRoots;
+  /// Each list's storage version on entry, once a pointer is taken from it.
+  std::map<Loc, std::string> entryStorage;
+  bool initvDeclared = false;
   std::map<Loc, std::string> entryValues;
   std::map<std::pair<Loc, unsigned>, std::string> epochValues;
   std::map<std::pair<std::string, std::string>, std::string> fieldValues;
@@ -3113,6 +3138,457 @@ private:
   }
 
   //===--------------------------------------------------------------------===//
+  // Allocations: memory still allocated, elements initialized
+  //===--------------------------------------------------------------------===//
+
+  /// `(initv v o)`: whether element `o` of an allocation is initialized in
+  /// version `v` of its initialization state; each write makes a new
+  /// version, equal to the old one at every other element.
+  std::string initvOf(const std::string &version, const std::string &offset) {
+    if (!initvDeclared) {
+      prelude += "(declare-fun initv ((_ BitVec 64) (_ BitVec 64)) Bool)\n";
+      initvDeclared = true;
+    }
+    return "(initv " + version + " " + offset + ")";
+  }
+
+  /// The version of a list's storage: a new one at each call that may
+  /// reallocate it (`append`, `reserve`, ...).
+  std::string storageOf(const Loc &list, State &state) {
+    if (auto it = state.storage.find(list); it != state.storage.end())
+      return it->second;
+    auto [it, inserted] = entryStorage.try_emplace(list, "");
+    if (inserted)
+      it->second = declare({false, 64, false}, "sv");
+    return it->second;
+  }
+
+  /// Whether the memory a pointer points into is still allocated: heap
+  /// memory not freed; a list's storage not reallocated since the pointer
+  /// was taken.
+  std::string aliveOf(const Allocation &a, State &state) {
+    if (!a.storage.empty())
+      return define({true, 1, false},
+                    "(= " + storageOf(a.place, state) + " " + a.storage + ")");
+    return load(Loc{a.place.root, "/alive"}, state, Sort{true, 1, false});
+  }
+
+  /// Whether element `offset` of heap memory is initialized: below the
+  /// initialized prefix (`/upto`, which writes in order extend, and which
+  /// the invariant search follows through a loop), or written on its own.
+  std::string initializedAt(const Allocation &a, const std::string &offset,
+                            State &state) {
+    Sort i64{false, 64, true};
+    std::string upto = load(Loc{a.place.root, "/upto"}, state, i64);
+    std::string version =
+        load(Loc{a.place.root, "/initv"}, state, Sort{false, 64, false});
+    return define({true, 1, false}, "(or (and (bvsle " + bvConst(0, 64) + " " +
+                                        offset + ") (bvslt " + offset + " " +
+                                        upto + ")) " +
+                                        initvOf(version, offset) + ")");
+  }
+
+  /// Whether `width` elements from `offset` are initialized.
+  std::string initializedRange(const Allocation &a, const std::string &offset,
+                               int64_t width, State &state) {
+    Sort i64{false, 64, true};
+    if (width > 16) {
+      std::string upto = load(Loc{a.place.root, "/upto"}, state, i64);
+      return define({true, 1, false}, "(and (bvsle " + bvConst(0, 64) + " " +
+                                          offset + ") (bvsle (bvadd " + offset +
+                                          " " + bvConst(width, 64) + ") " +
+                                          upto + "))");
+    }
+    std::string all = "true";
+    for (int64_t k = 0; k < width; ++k)
+      all = "(and " + all + " " +
+            initializedAt(
+                a, define(i64, "(bvadd " + offset + " " + bvConst(k, 64) + ")"),
+                state) +
+            ")";
+    return define({true, 1, false}, all);
+  }
+
+  /// After a write to (`init`) or a move out of element `offset` of heap
+  /// memory.
+  void markInitialized(const Allocation &a, const std::string &offset,
+                       bool init, State &state) {
+    if (!a.storage.empty() || inContract)
+      return;
+    Sort i64{false, 64, true};
+    Loc uptoLoc{a.place.root, "/upto"}, versionLoc{a.place.root, "/initv"};
+    std::string upto = load(uptoLoc, state, i64);
+    std::string version = load(versionLoc, state, Sort{false, 64, false});
+    std::string next = declare({false, 64, false}, "iv");
+    std::string at = initvOf(next, offset);
+    facts.push_back(init ? at : "(not " + at + ")");
+    facts.push_back("(forall ((x (_ BitVec 64))) (! (=> (not (= x " + offset +
+                    ")) (= " + initvOf(next, "x") + " " +
+                    initvOf(version, "x") + ")) :pattern ((initv " + next +
+                    " x))))");
+    // In order, a write extends the prefix; a move out cuts it.
+    std::string nextUpto = init ? "(ite (= " + offset + " " + upto +
+                                      ") (bvadd " + upto + " " +
+                                      bvConst(1, 64) + ") " + upto + ")"
+                                : "(ite (bvslt " + offset + " " + upto + ") " +
+                                      offset + " " + upto + ")";
+    noteCondition(define({true, 1, false}, "(= " + offset + " " + upto + ")"));
+    store(uptoLoc, state, define(i64, nextUpto));
+    store(versionLoc, state, next);
+  }
+
+  /// The allocation a pointer value (or the pointer a reference holds)
+  /// points into, if this function allocated it or took it from a list.
+  std::optional<Allocation> allocationOf(Value pointer, State &state) {
+    std::string t = isa<LIT::RefType>(pointer.getType())
+                        ? valueThrough(pointer, state)
+                        : term(pointer, state);
+    auto it = pointerBases.find(t);
+    if (it == pointerBases.end())
+      return std::nullopt;
+    return it->second;
+  }
+
+  /// An `Indexer` operand (`p[unsafe_offset=i]`, `p + 2`): an `Int`, by
+  /// value or by reference, or a literal, whose value is in its type.
+  MaybeTerm indexOperand(Value v, State &state) {
+    static llvm::Regex literalRe("int_literal (-?[0-9]+)|"
+                                 "#pop<int_literal (-?[0-9]+)>");
+    auto literal = [&](Type type) -> MaybeTerm {
+      SmallVector<StringRef> m;
+      int64_t n;
+      if (literalRe.match(printed(type), &m) &&
+          !(m[1].empty() ? m[2] : m[1]).getAsInteger(10, n))
+        return bvConst(n, 64);
+      return std::nullopt;
+    };
+    if (auto ref = dyn_cast<LIT::RefType>(v.getType()))
+      return isInt(ref.getElementType()) ? MaybeTerm(valueThrough(v, state))
+                                         : literal(ref.getElementType());
+    Sort sort = sortOf(v.getType());
+    if (!sort.isBool && sort.width == 64 &&
+        !StringRef(printed(v.getType())).contains("IntLiteral"))
+      return term(v, state);
+    return literal(v.getType());
+  }
+
+  static bool isPointerType(Type type) {
+    return StringRef(printed(type))
+        .starts_with("!lit.struct<@std::@memory::@pointer::@Pointer<");
+  }
+
+  /// The pointee `ref` refers to, through rebinding, immutable views and
+  /// upcasts of it.
+  std::optional<Allocation> pointeeOf(Value ref) {
+    while (true) {
+      if (auto it = pointeeRefs.find(ref); it != pointeeRefs.end())
+        return it->second;
+      Operation *def = ref.getDefiningOp();
+      if (!def || !isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp>(def))
+        return std::nullopt;
+      ref = def->getOperand(0);
+    }
+  }
+
+  /// The number of elements of a `SIMD` type (1 for anything else).
+  static int64_t simdWidth(Type type) {
+    std::string text = printed(type);
+    StringRef t(text);
+    if (!t.starts_with("!lit.struct<@std::@simd::@SIMD<"))
+      return 1;
+    t = t.drop_until([](char c) { return c == 'L'; }); // `SIMDLength`
+    static llvm::Regex widthRe("\\{([0-9]+)\\}|_mlir_value = ([0-9]+)\\}");
+    SmallVector<StringRef> m;
+    int64_t n;
+    if (widthRe.match(t, &m) &&
+        !(m[1].empty() ? m[2] : m[1]).getAsInteger(10, n))
+      return n;
+    return 1;
+  }
+
+  void checkClaim(Location at, StringRef callee, StringRef claim,
+                  const std::string &cond, State &state) {
+    if (inContract)
+      return;
+    Obligation ob{state.pc, cond, at, at, callee.str()};
+    ob.claim = claim.str();
+    noteCondition(cond);
+    addObligation(ob);
+  }
+
+  void checkAlive(Location at, StringRef callee, const Allocation &a,
+                  State &state) {
+    checkClaim(at, callee,
+               a.storage.empty()
+                   ? "that the memory the pointer points into has not been "
+                     "freed"
+                   : "that the list the pointer points into has not been "
+                     "reallocated since 'unsafe_ptr()'",
+               aliveOf(a, state), state);
+  }
+
+  void checkInitialized(Location at, StringRef callee, const Allocation &a,
+                        const std::string &offset, int64_t width,
+                        State &state) {
+    if (!a.storage.empty())
+      return;
+    checkClaim(at, callee, "that the element read is initialized",
+               initializedRange(a, offset, width, state), state);
+  }
+
+  /// A call about an allocation of this function: `p[]`,
+  /// `p[unsafe_offset=i]`, `load`, `store`, `unsafe_write`, `take_pointee`,
+  /// `free`, ... check that the memory is allocated (and what they read
+  /// initialized) and record what they write or free. Any other function
+  /// handed such a pointer may initialize all of it (which is then as much
+  /// as is known). A list method that may reallocate retires the pointers
+  /// taken from the list.
+  void checkPointerCall(LIT::CallOp call, const CalleeName &name,
+                        State &state) {
+    StringRef path = name.path;
+    ValueRange ops = call.getOperands();
+    Location at = call.getLoc();
+    Sort i64{false, 64, true};
+    if (path.consume_front("std::collections::list::List::")) {
+      for (const char *method :
+           {"append(", "insert(", "extend(", "extend[", "reserve(", "resize(",
+            "resize[", "__iadd__(", "shrink(", "_realloc(", "steal_data(",
+            "__deinit__("})
+        if (path.starts_with(method) && !ops.empty())
+          if (std::optional<Loc> self = placeOf(ops[0]);
+              self && (state.storage.count(*self) || entryStorage.count(*self)))
+            state.storage[*self] = declare({false, 64, false}, "sv");
+      return;
+    }
+    if (!path.starts_with("std::memory::pointer::Pointer::"))
+      for (Value operand : ops)
+        if (isa<LIT::RefType>(operand.getType()))
+          // A pointee reference read by the callee (`len(p[])`).
+          if (std::optional<Allocation> pointee = pointeeOf(operand))
+            checkInitialized(at, "Pointer.__getitem__", *pointee,
+                             pointee->offset, 1, state);
+    if (path.starts_with("std::builtin::"))
+      return;
+    if (!path.consume_front("std::memory::pointer::Pointer::")) {
+      for (Value operand : ops) {
+        if (isa<LIT::RefType>(operand.getType()) ||
+            !isPointerType(operand.getType()))
+          continue;
+        if (std::optional<Allocation> a = allocationOf(operand, state);
+            a && a->storage.empty())
+          store(Loc{a->place.root, "/upto"}, state,
+                define(i64, extentOf(a->base)));
+      }
+      return;
+    }
+    if (ops.empty())
+      return;
+    std::optional<Allocation> a = allocationOf(ops[0], state);
+    if (!a)
+      return;
+    // The offset of the element operand `index` names, from the start of
+    // the memory; the pointer's own if there is none.
+    auto offsetAt = [&](unsigned index) -> MaybeTerm {
+      if (ops.size() <= index)
+        return a->offset;
+      MaybeTerm k = indexOperand(ops[index], state);
+      if (!k)
+        return std::nullopt;
+      return define(i64, "(bvadd " + a->offset + " " + *k + ")");
+    };
+    auto mark = [&](const std::string &offset, int64_t width, bool init) {
+      if (width > 16)
+        return;
+      for (int64_t k = 0; k < width; ++k)
+        markInitialized(
+            *a, define(i64, "(bvadd " + offset + " " + bvConst(k, 64) + ")"),
+            init, state);
+    };
+    if (path.starts_with("__getitem__(") || path.starts_with("__getitem__[")) {
+      checkAlive(at, "Pointer.__getitem__", *a, state);
+    } else if (path.starts_with("unsafe_write(") ||
+               path.starts_with("unsafe_write[") ||
+               path.starts_with("unsafe_write_move_from(")) {
+      checkAlive(at, "Pointer.unsafe_write", *a, state);
+      mark(a->offset, 1, true);
+    } else if (path.starts_with("take_pointee(") ||
+               path.starts_with("unsafe_take_pointee(") ||
+               path.starts_with("unsafe_deinit_pointee(") ||
+               path.starts_with("unsafe_deinit_pointee_with(")) {
+      std::string callee = path.contains("deinit")
+                               ? "Pointer.unsafe_deinit_pointee"
+                               : "Pointer.take_pointee";
+      checkAlive(at, callee, *a, state);
+      checkInitialized(at, callee, *a, a->offset, 1, state);
+      mark(a->offset, 1, false);
+    } else if (path.starts_with("free(") || path.starts_with("free[") ||
+               path.starts_with("unsafe_free(") ||
+               path.starts_with("unsafe_free[")) {
+      checkAlive(at, "Pointer.free", *a, state);
+      if (a->storage.empty())
+        store(Loc{a->place.root, "/alive"}, state, "false");
+    } else if (path.starts_with("load[") || path.starts_with("unsafe_load[")) {
+      std::string callee =
+          path.starts_with("load[") ? "Pointer.load" : "Pointer.unsafe_load";
+      checkAlive(at, callee, *a, state);
+      if (MaybeTerm offset = offsetAt(1); offset && call->getNumResults() == 1)
+        checkInitialized(at, callee, *a, *offset,
+                         simdWidth(call->getResult(0).getType()), state);
+    } else if (path.starts_with("store[") ||
+               path.starts_with("unsafe_store[")) {
+      checkAlive(at,
+                 path.starts_with("store[") ? "Pointer.store"
+                                            : "Pointer.unsafe_store",
+                 *a, state);
+      if (MaybeTerm offset = offsetAt(ops.size() == 3 ? 1 : 99))
+        mark(*offset, simdWidth(ops.back().getType()), true);
+    } else if (path.starts_with("swap_pointees[")) {
+      checkAlive(at, "Pointer.swap_pointees", *a, state);
+    }
+  }
+
+  /// After a call: the allocation a result points into (`unsafe_alloc`, a
+  /// pointer moved by `p + k` or `p.unsafe_offset(k)`) and the pointee a
+  /// reference it returns refers to (`p[]`, `p[unsafe_offset=i]`).
+  void followPointerResults(LIT::CallOp call, const CalleeName &name,
+                            State &state) {
+    StringRef path = name.path;
+    ValueRange ops = call.getOperands();
+    if (call->getNumResults() != 1)
+      return;
+    Value result = call->getResult(0);
+    Sort i64{false, 64, true};
+    if (path.starts_with("std::memory::alloc::unsafe_alloc[")) {
+      std::string t = term(result, state);
+      Loc place{result, ""};
+      storeFields(place, state,
+                  {{"/alive", "true"},
+                   {"/upto", bvConst(0, 64)},
+                   {"/initv", declare({false, 64, false}, "iv")}});
+      pointerBases[t] = {place, bvConst(0, 64), "", t};
+      allocationRoots.push_back(result);
+      return;
+    }
+    if (!path.consume_front("std::memory::pointer::Pointer::") || ops.empty())
+      return;
+    std::optional<Allocation> a = allocationOf(ops[0], state);
+    if (!a)
+      return;
+    auto moved = [&](Value index) -> std::optional<Allocation> {
+      MaybeTerm k = indexOperand(index, state);
+      if (!k)
+        return std::nullopt;
+      Allocation at = *a;
+      at.offset = define(i64, "(bvadd " + a->offset + " " + *k + ")");
+      return at;
+    };
+    if ((path.starts_with("__add__[") || path.starts_with("unsafe_offset[")) &&
+        ops.size() == 2) {
+      if (std::optional<Allocation> at = moved(ops[1]))
+        pointerBases[term(result, state)] = *at;
+    } else if (path.starts_with("__getitem__(") && ops.size() == 1) {
+      pointeeRefs[result] = *a;
+    } else if (path.starts_with("__getitem__[") && ops.size() == 2) {
+      if (std::optional<Allocation> at = moved(ops[1]))
+        pointeeRefs[result] = *at;
+    }
+  }
+
+  /// Whether code may change the state of this function's allocations: a
+  /// write through a pointee reference, a pointer method that writes, frees
+  /// or moves out, an allocation, or another function handed a pointer.
+  bool mayTouchAllocations(Operation *root) {
+    bool touches = false;
+    root->walk([&](Operation *op) {
+      if (touches)
+        return;
+      if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
+        if (auto call = store->getOperand(1).getDefiningOp<LIT::CallOp>())
+          if (std::optional<CalleeName> n = calleeName(call.getCallee());
+              n && StringRef(n->path).starts_with(
+                       "std::memory::pointer::Pointer::__getitem__"))
+            touches = true;
+        return;
+      }
+      auto call = dyn_cast<LIT::CallOp>(op);
+      if (!call)
+        return;
+      std::optional<CalleeName> n = calleeName(call.getCallee());
+      StringRef path = n ? StringRef(n->path) : StringRef();
+      if (path.starts_with("std::memory::alloc::unsafe_alloc[")) {
+        touches = true;
+        return;
+      }
+      if (path.starts_with("std::builtin::"))
+        return;
+      if (path.consume_front("std::memory::pointer::Pointer::")) {
+        for (const char *writer : {"unsafe_write", "store", "take_pointee",
+                                   "deinit_pointee", "free", "swap_pointees"})
+          if (path.contains(writer))
+            touches = true;
+        return;
+      }
+      for (Value operand : call.getOperands())
+        if (!isa<LIT::RefType>(operand.getType()) &&
+            isPointerType(operand.getType()))
+          touches = true;
+    });
+    return touches;
+  }
+
+  bool freesIn(Operation *root) {
+    bool frees = false;
+    root->walk([&](LIT::CallOp call) {
+      std::optional<CalleeName> n = calleeName(call.getCallee());
+      if (!n)
+        return;
+      StringRef path(n->path);
+      if (path.consume_front("std::memory::pointer::Pointer::") &&
+          path.contains("free"))
+        frees = true;
+    });
+    return frees;
+  }
+
+  bool reallocatesIn(Operation *root, const Loc &list) {
+    bool reallocates = false;
+    root->walk([&](LIT::CallOp call) {
+      std::optional<CalleeName> n = calleeName(call.getCallee());
+      if (!n || call.getNumOperands() == 0)
+        return;
+      StringRef path(n->path);
+      if (!path.consume_front("std::collections::list::List::"))
+        return;
+      for (const char *method :
+           {"append(", "insert(", "extend(", "extend[", "reserve(", "resize(",
+            "resize[", "__iadd__(", "shrink(", "_realloc(", "steal_data(",
+            "__deinit__("})
+        if (path.starts_with(method))
+          if (std::optional<Loc> self = placeOf(call.getOperands()[0]);
+              self && *self == list)
+            reallocates = true;
+    });
+    return reallocates;
+  }
+
+  /// At a loop head: an allocation stays allocated unless the loop frees
+  /// (the invariant search is about integers, which a flag is not); a
+  /// list's storage keeps its version unless the loop may reallocate it.
+  void keepAllocationState(Operation *loop, State &before, State &head) {
+    bool frees = freesIn(loop);
+    for (Value root : allocationRoots) {
+      Loc alive{root, "/alive"};
+      if (auto it = before.env.find(alive);
+          it != before.env.end() && !frees && !head.env.count(alive))
+        head.env[alive] = it->second;
+    }
+    for (auto &[list, version] : before.storage)
+      head.storage[list] = reallocatesIn(loop, list)
+                               ? declare({false, 64, false}, "sv")
+                               : version;
+  }
+
+  //===--------------------------------------------------------------------===//
   // Merging paths
   //===--------------------------------------------------------------------===//
 
@@ -3161,6 +3637,16 @@ private:
             return it != s->refs.end() && it->second == target;
           }))
         out.refs[loc] = target;
+    std::set<Loc> lists;
+    for (const State *s : live)
+      for (auto &[list, _] : s->storage)
+        lists.insert(list);
+    for (const Loc &list : lists) {
+      SmallVector<std::string> vals;
+      for (const State *s : live)
+        vals.push_back(storageOf(list, const_cast<State &>(*s)));
+      out.storage[list] = ite(live, vals, Sort{false, 64, false});
+    }
     std::string pc = "(or";
     for (const State *s : live)
       pc += " " + s->pc;
@@ -4552,6 +5038,13 @@ private:
     // by the invariants found below.
     std::optional<llvm::DenseSet<Value>> written = writtenRoots(loop);
     DenseMap<Value, std::set<std::string>> fields = storedPaths;
+    // The allocations the loop may write, free or move out of hold unknown
+    // states at the head (`keepAllocationState` keeps what it cannot
+    // change).
+    if (written && mayTouchAllocations(loop))
+      for (Value root : allocationRoots)
+        if (state.env.count(Loc{root, "/alive"}))
+          written->insert(root);
     // Locals declared in the loop are written whole.
     loop->walk([&](LIT::VarDeclOp decl) { fields.erase(decl->getResult(0)); });
     State before = state;
@@ -4592,6 +5085,7 @@ private:
               it != before.env.end() && onlyAdvanced(loop, root))
             head.env[Loc{root, field}] = it->second;
       }
+      keepAllocationState(loop, before, head);
     } else {
       // Anything a reference leads to: not a variable that is never
       // borrowed and that the loop does not write, nor the end and step of
@@ -4615,6 +5109,7 @@ private:
       havocAll(head);
       head.env = std::move(kept);
       head.refs = std::move(keptRefs);
+      keepAllocationState(loop, before, head);
     }
     State headAtEntry = head;
     LoopFrame frame{labelOf(loop), comptime, {}, {}, {}, {}, {}};
@@ -5273,6 +5768,9 @@ private:
     }
     if (auto storeOp = dyn_cast<LIT::RefStoreOp>(op)) {
       Value value = storeOp->getOperand(0), dest = storeOp->getOperand(1);
+      // `p[] = v`, `p[unsafe_offset=i] = v`: the element is initialized.
+      if (std::optional<Allocation> pointee = pointeeOf(dest))
+        markInitialized(*pointee, pointee->offset, true, state);
       if (auto it = elements.find(dest); it != elements.end()) {
         auto [list, index] = it->second;
         storeElement(list, index, term(value, state), state);
@@ -5330,6 +5828,10 @@ private:
         op->getName().getStringRef() == "lit.load.consume") {
       Operation *loadOp = op;
       Value ref = loadOp->getOperand(0), result = loadOp->getResult(0);
+      // A read of `p[]`, `p[unsafe_offset=i]`: of an initialized element.
+      if (std::optional<Allocation> pointee = pointeeOf(ref))
+        checkInitialized(op->getLoc(), "Pointer.__getitem__", *pointee,
+                         pointee->offset, 1, state);
       if (auto it = elements.find(ref); it != elements.end()) {
         auto [list, index] = it->second;
         values[result] = elem(load(list, state, placeType(list)), index,
@@ -6848,6 +7350,8 @@ private:
       checkDereference(call, *name, callee, state);
       checkPartialTiles(call, *name, state);
     }
+    if (name && !inContract)
+      checkPointerCall(call, *name, state);
     if (inlineHigherOrder(call, callee, frame, state))
       return;
     if (name && evalReversedRange(call, *name, state))
@@ -7011,6 +7515,8 @@ private:
                                 bvConst(*n, 64) + "))",
                             "r");
         }
+    if (name)
+      followPointerResults(call, *name, state);
   }
 
   /// A call of a trait method that only reads its arguments and returns an
@@ -9587,6 +10093,11 @@ private:
         return false;
       std::string pointer = declare({false, 64, false}, "ptr");
       facts.push_back("(bvsge " + extentOf(pointer) + " " + lenOf(value) + ")");
+      // A pointer into the list's storage, which a reallocation retires.
+      if (path.starts_with("std::collections::list::List::unsafe_ptr["))
+        if (std::optional<Loc> list = placeOf(self))
+          pointerBases[pointer] = {*list, bvConst(0, 64),
+                                   storageOf(*list, state), pointer};
       values[result] = pointer;
       return true;
     }

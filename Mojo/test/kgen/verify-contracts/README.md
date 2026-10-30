@@ -537,9 +537,33 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   conversion, `as_imm()`, `unsafe_origin_cast`, ...) keep its extent;
   `unsafe_bitcast` does not. A `DeviceBuffer` passed for a kernel's
   pointer argument has its length as that pointer's extent. A pointer
-  whose extent nothing states is reported. Extents are about bounds only:
-  a pointer used after its memory is freed or reallocated (a list
-  appended to after `unsafe_ptr()`) keeps the extent it had.
+  whose extent nothing states is reported. Extents are about bounds only;
+  whether the memory is still allocated and written is the next point.
+- Allocations of the function itself (`allocations.mojo`): memory from
+  `unsafe_alloc` must still be allocated at every access (`p[]`,
+  `p[unsafe_offset=i]`, `load`, `store`, `unsafe_write`, `take_pointee`,
+  ...) and at `free`, which retires it; and an element must have been
+  written (`p[i] = v`, `unsafe_write`, `store`) before it is read
+  (`p[i]`, `load`, `take_pointee`, or `len(p[])` handed to a function),
+  and not moved out since. The pass keeps, per allocation, whether it is
+  allocated, the prefix of elements written in order (which the invariant
+  search follows through a loop that fills the memory: `ok_filled_in_loop`)
+  and the elements written on their own (`ok_any_order`). A pointer moved
+  by `p + k` or `p.unsafe_offset(k)`, or cast, points into the same
+  allocation. A pointer from `xs.unsafe_ptr()` is retired by a call that
+  may reallocate the list (`append`, `insert`, `extend`, `reserve`,
+  `resize`, `shrink`, or its destruction; `bad_list_appended`), not by a
+  write to an element (`ok_list_pointer`). These are the pass's own
+  obligations ("that the element read is initialized", "that the memory
+  the pointer points into has not been freed"), not clauses: `p[]` cannot
+  carry one (see above), and `__getitem__` serves writes too.
+  Only what this function can see: a pointer it did not allocate or take
+  from a list (an argument, a field) is taken to be allocated and
+  initialized, and a function handed a local pointer by value is taken to
+  initialize all of it (`ok_filled_by_callee`, `memcpy`); a function that
+  frees through a pointer it is handed is not seen. A pointer chosen by a
+  condition (`p if c else q`) is not followed. Memory from `alloc` (an
+  `Allocation`) and `stack_allocation` is not checked for either.
 - A struct with a single integer field and no parameters (an enum-like
   wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
   field is the value, `Wrapper(n)` (a constructor that only stores its
@@ -738,6 +762,7 @@ machine that sleeps stops the solver too.
 | `structs.mojo`       | all `bad_*`        | all `ok_*`       |
 | `higher_order.mojo`  | all `bad_*`        | all `ok_*`       |
 | `optionals.mojo`     | all `bad_*`        | all `ok_*`       |
+| `allocations.mojo`   | all `bad_*`        | all `ok_*`       |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |
 | `gemm_mma_cpasync.mojo` | (none)          | all `ok_*`       |
 | `matmul_dispatch.mojo` | (none)           | (a corpus driver, nothing expected) |
