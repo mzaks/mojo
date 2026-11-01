@@ -1626,6 +1626,19 @@ public:
       } else
         values[arg] = declare(sortOf(arg.getType()), "a");
     }
+    // A span given by value: its `_len` is its length, at most the extent
+    // of its memory (`Span`'s invariant, which its constructors prove; the
+    // one from a pointer and a length is builtin and trusted).
+    for (BlockArgument arg : entry.getArguments())
+      if (!isa<LIT::RefType>(arg.getType()) && isSpanType(arg.getType())) {
+        Sort i64{false, 64, true};
+        std::string span = values[arg];
+        std::string n = define(i64, lenOf(span));
+        fieldValues[{span, "/_len"}] = n;
+        facts.push_back("(bvsle " + n + " " +
+                        extentOf(fieldOf(span, "/_data", {false, 64, false})) +
+                        ")");
+      }
     registerLocals(fn);
     // The function's own constraints on its parameters (`where N <= 8`): the
     // compiler rejects any instantiation that breaks them, so they hold in
@@ -2831,6 +2844,8 @@ private:
       if (it == state.env.end())
         continue;
       std::string rest = StringRef(loc.path).drop_front(path.size()).str();
+      if (MaybeTerm n = spanLength(loc, it->second, rest, sort))
+        return *n;
       return fieldOf(it->second, rest, sort);
     }
     // A field of a root whose value is unknown: a function of that value
@@ -2839,6 +2854,8 @@ private:
       ++storing;
       std::string root = load(Loc{loc.root, ""}, state, Sort{false, 64, false});
       --storing;
+      if (MaybeTerm n = spanLength(loc, root, loc.path, sort))
+        return *n;
       return fieldOf(root, loc.path, sort);
     }
     if (state.epoch) {
@@ -2853,11 +2870,59 @@ private:
     return it->second;
   }
 
-  /// The value of field path `rest` of the struct value `value`.
-  std::string fieldOf(const std::string &value, const std::string &rest,
-                      Sort sort) {
-    if (auto it = fieldValues.find({value, rest}); it != fieldValues.end())
+  /// The `_len` of a span, read at `loc` as field `rest` of `value` (the
+  /// value of a place above it): the field when something determines it,
+  /// else the span's `len` (what `Span.__len__` returns), kept as the
+  /// field. None when `loc` is not a span's `_len`.
+  MaybeTerm spanLength(const Loc &loc, const std::string &value, StringRef rest,
+                       Sort sort) {
+    if (!rest.ends_with("/_len") || sort.isBool || sort.width != 64)
+      return std::nullopt;
+    if (!isSpanType(
+            placeType(Loc{loc.root, loc.path.substr(0, loc.path.size() - 5)})))
+      return std::nullopt;
+    Sort handle{false, 64, false};
+    std::string span = rest == "/_len"
+                           ? value
+                           : fieldOf(value, rest.drop_back(5).str(), handle);
+    std::string n = fieldOf(span, "/_len", sort, /*declare=*/false);
+    if (n.empty()) {
+      n = define(sort, lenOf(span));
+      fieldValues[{span, "/_len"}] = n;
+    }
+    return n;
+  }
+
+  /// What `load` returns when a value written at `loc` or at a place above
+  /// it determines it; none when it would be an unknown.
+  MaybeTerm loadKnown(const Loc &loc, State &state, Sort sort) {
+    if (auto it = state.env.find(loc); it != state.env.end())
       return it->second;
+    StringRef path(loc.path);
+    while (!path.empty()) {
+      path = path.take_front(path.rfind('/'));
+      auto it = state.env.find(Loc{loc.root, path.str()});
+      if (it == state.env.end())
+        continue;
+      std::string rest = StringRef(loc.path).drop_front(path.size()).str();
+      std::string field = fieldOf(it->second, rest, sort, /*declare=*/false);
+      if (field.empty())
+        return std::nullopt;
+      return field;
+    }
+    return std::nullopt;
+  }
+
+  /// Field `rest` of the struct value `value`; with `declare` false, empty
+  /// when nothing determines it (instead of an unknown).
+  std::string fieldOf(const std::string &value, const std::string &rest,
+                      Sort sort, bool declare = true) {
+    if (auto it = fieldValues.find({value, rest}); it != fieldValues.end()) {
+      // An unknown declared for the field determines nothing.
+      if (!declare && fieldOwners.count(it->second))
+        return "";
+      return it->second;
+    }
     // A field of a field: the field at the joined path, so that `x.a`
     // loaded whole and then read at `.b` is `x.a.b`.
     if (auto it = fieldOwners.find(value); it != fieldOwners.end()) {
@@ -2906,9 +2971,11 @@ private:
       if (auto it = builtFields.find({value, rest.substr(0, cut)});
           it != builtFields.end())
         return fieldOf(it->second, rest.substr(cut), sort);
+    if (!declare)
+      return "";
     auto [field, inserted] = fieldValues.try_emplace({value, rest}, "");
     if (inserted) {
-      field->second = declare(sort, "f");
+      field->second = this->declare(sort, "f");
       fieldOwners[field->second] = {value, rest};
     }
     return field->second;
@@ -7040,6 +7107,15 @@ private:
               inner[name.substr(path.size())] = term;
           }
         std::string container_ = term(container, state);
+        // A span's `_len`, when nothing determines it, is its `len`.
+        if (known.empty() && path == "/_len" && !sort.isBool &&
+            sort.width == 64 && isSpanType(container.getType()) &&
+            !sortOfTerm(container_).isBool &&
+            sortOfTerm(container_).width == 64) {
+          known = fieldOf(container_, path, sort, /*declare=*/false);
+          if (known.empty())
+            known = define(sort, lenOf(container_));
+        }
         if (known.empty() && !sortOfTerm(container_).isBool &&
             sortOfTerm(container_).width == 64)
           known = fieldOf(container_, path, sort);
@@ -11344,8 +11420,17 @@ private:
     addObligation(ob);
   }
 
+  /// Whether `type` is `Span`, or a reference to one.
+  bool isSpanType(Type type) {
+    if (auto ref = dyn_cast<LIT::RefType>(type))
+      type = ref.getElementType();
+    return StringRef(printed(type))
+        .starts_with("!lit.struct<@std::@collections::@span::@Span<");
+  }
+
   /// The length a field of `xs` holds: an allocation handle's layout
-  /// length, a tracked list's `_len`.
+  /// length, a tracked list's `_len`, a span's `_len` where the span is in
+  /// memory (`out self` of its constructors; a span by value is its `len`).
   MaybeTerm fieldLength(Value xs, State &state) {
     Sort i64{false, 64, true};
     Type type = xs.getType();
@@ -11363,6 +11448,18 @@ private:
                  "!lit.struct<@std::@collections::@list::@List<") &&
              trackedPointerOf(xs, state))
       field = "/_len";
+    else if (isSpanType(type) && isa<LIT::RefType>(xs.getType())) {
+      // A span in memory: its `_len` where something determines it (the
+      // `out self` a constructor fills, a span stored whole); else `len`
+      // of its value, which `Span.__len__` returns, with `Sized`'s bound.
+      std::optional<Loc> loc = placeOf(xs);
+      if (!loc)
+        return std::nullopt;
+      Loc len{loc->root, loc->path + "/_len"};
+      if (!loadKnown(len, state, i64))
+        return std::nullopt;
+      return load(len, state, i64);
+    }
     if (!field)
       return std::nullopt;
     if (isa<LIT::RefType>(xs.getType())) {
@@ -11468,6 +11565,7 @@ private:
       facts.push_back("(= " + lenOf(span) + " " + n + ")");
       facts.push_back("(bvsge " + extentOf(pointer) + " " + n + ")");
       fieldValues[{span, "/_data"}] = pointer;
+      fieldValues[{span, "/_len"}] = n;
       values[result] = span;
       return true;
     }
@@ -12499,6 +12597,20 @@ private:
       return true;
     if (evalOptional(call, name, state))
       return true;
+    // `ImmSpan(span)`, the implicit cast of a span to one over an immutable
+    // origin (`__init__[...](::Span[...])`, with the origin's parameters):
+    // the same span.
+    if (path.starts_with("std::collections::span::Span::__init__") &&
+        path.contains("](::Span[") && call.getNumOperands() == 1 &&
+        call->getNumResults() == 1 &&
+        !isa<LIT::RefType>(call.getOperands()[0].getType()) &&
+        sortOf(result.getType()).width == 64) {
+      std::string value = term(call.getOperands()[0], state);
+      if (!sortOfTerm(value).isBool && sortOfTerm(value).width == 64) {
+        values[result] = value;
+        return true;
+      }
+    }
     // `Span(list)`: a span of the list's length over its storage (which
     // the constructor reads, and does not write).
     if (path.starts_with("std::collections::span::Span::__init__(::List[") &&
@@ -12511,6 +12623,7 @@ private:
                                              lenOf(valueThrough(list, state))));
         std::string span = declare({false, 64, false}, "g");
         facts.push_back("(= " + lenOf(span) + " " + n + ")");
+        fieldValues[{span, "/_len"}] = n;
         if (MaybeTerm data = trackedPointerOf(list, state))
           fieldValues[{span, "/_data"}] = *data;
         values[result] = span;
@@ -12527,6 +12640,7 @@ private:
       if (!sortOfTerm(n).isBool && sortOfTerm(n).width == 64) {
         std::string span = declare({false, 64, false}, "g");
         facts.push_back("(= " + lenOf(span) + " " + n + ")");
+        fieldValues[{span, "/_len"}] = n;
         if (!isa<LIT::RefType>(call.getOperands()[0].getType()))
           fieldValues[{span, "/_data"}] = term(call.getOperands()[0], state);
         values[result] = span;
@@ -12552,8 +12666,9 @@ private:
       std::string last =
           define(i64, "(ite " + has + " " + val + " " + lenOf(self) + ")");
       std::string span = declare({false, 64, false}, "g");
-      facts.push_back("(= " + lenOf(span) + " (bvsub " + last + " " + start +
-                      "))");
+      std::string n = define(i64, "(bvsub " + last + " " + start + ")");
+      facts.push_back("(= " + lenOf(span) + " " + n + ")");
+      fieldValues[{span, "/_len"}] = n;
       if (MaybeTerm data = trackedPointerOf(call.getOperands()[0], state)) {
         Allocation at = pointerBases[*data];
         at.offset = define(i64, "(bvadd " + at.offset + " " + start + ")");
@@ -12972,6 +13087,8 @@ private:
     params = frameOfPlace(loc);
     std::string n = paramTerm(size, sort);
     params = saved;
+    // A count: an array of a negative length cannot be made.
+    facts.push_back("(bvsge " + n + " " + bvConst(0, 64) + ")");
     return n;
   }
 

@@ -100,6 +100,22 @@ def ok_span_from_pointer(p: Pointer[Int, MutUntrackedOrigin]) -> Int:
     return s[1]
 
 
+def ok_total_length(a: Span[Int, _], b: Span[Int, _]) -> Int
+    ensures result == len(a) + len(b) and result >= 0:
+    # A span is at most as long as the memory it views (`Span`'s
+    # invariant), so two lengths add without wrapping.
+    return len(a) + len(b)
+
+
+def _imm_length(s: ImmSpan[Int, _]) -> Int ensures result == len(s):
+    return len(s)
+
+
+def ok_length_through_imm(s: Span[Int, MutUntrackedOrigin]) -> Int
+    ensures result == len(s):
+    return _imm_length(s)  # the implicit cast to an immutable span keeps it
+
+
 # --- must stay UNPROVEN ---
 def bad_slice_tail_past(vs: List[Int]) -> Int:
     if len(vs) > 0:
@@ -143,3 +159,8 @@ def bad_zero_step() -> Int:
 def bad_span_from_pointer_past(p: Pointer[Int, MutUntrackedOrigin]) -> Int:
     var s = Span(unsafe_ptr=p, length=2)
     return s[2]
+
+
+def bad_length_plus_unbounded(a: Span[Int, _], n: Int) -> Int
+    ensures result >= 0:
+    return len(a) + n  # `n` is not bounded: the sum may wrap

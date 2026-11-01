@@ -270,7 +270,18 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   constructors, `or_else`, `__bool__`) to read the bounds, and `value()`
   as a reference to the value it holds (`ok_optional_list`). `List(span)`
   copies a span and is as long as it. `Span(unsafe_ptr=p, length=n)` has
-  `n` elements (a builtin constructor, modelled by the pass). A write
+  `n` elements (a builtin constructor, modelled by the pass), and the
+  implicit cast of a span to one over an immutable origin is the same
+  span (`ok_length_through_imm`). `Span` states its invariant: its
+  `_len` is not negative and at most the extent of its `_data`. It is
+  proven where the constructors from a list, an array, nothing and
+  another span return, and assumed of every span a function is given by
+  value, so that two spans' lengths add without wrapping
+  (`ok_total_length`; `bad_length_plus_unbounded` adds an unbounded
+  integer). The builtin constructor from a pointer and a length is
+  trusted, and a span a call returns is not assumed to satisfy it (the
+  callee's postcondition says what it does). A span's `_len` field and
+  its `len` are the same value. A write
   through a span of a list (`s[0] = 9`) writes an element of the list,
   whose length is kept (`ok_write_through_span`): a store through a
   reference the pass does not track, whose origin names a variable of
@@ -288,7 +299,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   a nonzero literal is an obligation ("that the divisor is not 0").
 
 - `Array`: `len(a)` is the size parameter in `a`'s type (a number, or a
-  parameter such as `n` in generic code), `a[i]` requires `i` in range, and
+  parameter such as `n` in generic code), not negative (the struct
+  asserts it), `a[i]` requires `i` in range, and
   `Span(array=)` is as long as the array. A callee's contract that names its
   parameters (`array.length`, `Self.size`) sees the values the call binds.
 
@@ -656,9 +668,9 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   and bitcast pointers), and `List.shrink` and `List._unchecked_grow`
   gained the preconditions the invariant needs (`new_length >= 0`).
   `List.insert` and `List.pop(i)` are proven through their overlapping
-  moves; `extend(Span)` (a span's length is not bounded, so the new
-  length may wrap) and `append` (`_element_is` is only stated) are
-  not.
+  moves, and `extend(Span)` through `Span`'s invariant (the span's
+  length is bounded by its memory, so the new length does not wrap);
+  `append` (`_element_is` is only stated) is not.
 - A struct with a single integer field and no parameters (an enum-like
   wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
   field is the value, `Wrapper(n)` (a constructor that only stores its
