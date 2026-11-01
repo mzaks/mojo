@@ -29,6 +29,7 @@ from std.builtin._verification import (
     _assume,
     _index_in_bounds,
     _initialized,
+    _same_elements,
     _uninitialized,
 )
 from std.sys.info import simd_width_of
@@ -1388,7 +1389,10 @@ struct Span[
         requires len(self) == len(copy_from)
         requires _uninitialized(self._data, 0, len(self))
         requires _initialized(copy_from._data, 0, len(copy_from))
-        ensures _initialized(self._data, 0, len(self)):
+        ensures _initialized(self._data, 0, len(self))
+        ensures _same_elements(
+            self._data.unsafe_bitcast[U](), old(copy_from._data), len(self)
+        ):
         """Initializes every element with a copy of the matching `copy_from`
         element.
 
@@ -1455,7 +1459,10 @@ struct Span[
         requires _uninitialized(self._data, 0, len(self))
         requires _initialized(move_from._data, 0, len(move_from))
         ensures _initialized(self._data, 0, len(self))
-        ensures _uninitialized(move_from._data, 0, len(move_from)):
+        ensures _uninitialized(move_from._data, 0, len(move_from))
+        ensures _same_elements(
+            self._data.unsafe_bitcast[U](), old(move_from._data), len(self)
+        ):
         """Initializes every element by moving out of the matching `move_from`
         element.
 

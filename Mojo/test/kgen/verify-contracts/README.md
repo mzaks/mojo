@@ -630,7 +630,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   of a range, those of the source; `_same_elements(dst, src, n)` of
   pointers into memory the function tracks, in a postcondition, says
   the `n` elements at `dst` as it returns are those that were at `src`
-  on entry (`ok_shift_down`, `bad_shift_claims_kept`; `List.pop(i)`). A
+  on entry (`ok_shift_down`, `bad_shift_claims_kept`; `List.pop(i)`,
+  `_grow_amortized` and `_realloc`, through the Span contracts). A
   pointer's `_extent()` is taken to be below a quarter of the address
   space, so a length below it plus a few does not wrap.
   What a call changes is bounded by the hull of the ranges its
@@ -656,8 +657,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   gained the preconditions the invariant needs (`new_length >= 0`).
   `List.insert` and `List.pop(i)` are proven through their overlapping
   moves; `extend(Span)` (a span's length is not bounded, so the new
-  length may wrap), `_realloc` and `append` (`_element_is` is only
-  stated) are not.
+  length may wrap) and `append` (`_element_is` is only stated) are
+  not.
 - A struct with a single integer field and no parameters (an enum-like
   wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
   field is the value, `Wrapper(n)` (a constructor that only stores its

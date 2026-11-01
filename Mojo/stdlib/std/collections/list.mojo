@@ -921,7 +921,10 @@ struct List[T: AnyType, /](
     def _grow_amortized(
         mut self, min_capacity: Int
     ) where conforms_to(Self.T, Movable)
-        ensures len(self) == old(len(self)) and self.capacity() >= min_capacity:
+        ensures len(self) == old(len(self)) and self.capacity() >= min_capacity
+        ensures _same_elements(
+            self._storage.unsafe_ptr(), old(self._storage.unsafe_ptr()), len(self)
+        ):
         """Grows the storage to hold at least `min_capacity` elements, at least
         doubling the capacity.
 
