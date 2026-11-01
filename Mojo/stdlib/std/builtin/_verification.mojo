@@ -172,6 +172,89 @@ def _same_elements[
 
 
 @inline(.nodebug)
+def _allocated[T: AnyType](p: Pointer[mut=False, T, _]) -> Bool:
+    """States whether the memory `p` points into is allocated, for the
+    verifier.
+
+    Use it in the clauses of a function that takes a pointer: `requires
+    _allocated(p)` for one that reads or frees through it, `ensures not
+    _allocated(p)` for one that frees it. The verifier then tracks the
+    memory behind that argument (allocated, and which elements are
+    initialized) inside the function, proves the `ensures` at its returns,
+    and at calls proves the `requires` of memory the caller allocated and
+    assumes the `ensures` of it. A pointer no clause names is taken to be
+    allocated. It has no runtime effect (it returns `True`).
+
+    Parameters:
+        T: The element type.
+
+    Args:
+        p: The pointer.
+
+    Returns:
+        The statement, for the verifier.
+    """
+    return True
+
+
+@inline(.nodebug)
+def _initialized[
+    T: AnyType
+](p: Pointer[mut=False, T, _], start: Int, end: Int) -> Bool:
+    """States whether the elements of `p` from `start` up to `end` are
+    initialized, for the verifier.
+
+    Use it in the clauses of a function that takes a pointer: `requires
+    _initialized(p, 0, n)` for one that reads `n` elements, `ensures
+    _initialized(p, 0, n)` for one that writes them. The verifier follows
+    the elements written in order (and not destroyed since) through the
+    function; `_uninitialized` is its counterpart. An empty range states
+    nothing. It has no runtime effect (it returns `True`).
+
+    Parameters:
+        T: The element type.
+
+    Args:
+        p: The pointer.
+        start: The first element.
+        end: One past the last element.
+
+    Returns:
+        The statement, for the verifier.
+    """
+    return True
+
+
+@inline(.nodebug)
+def _uninitialized[
+    T: AnyType
+](p: Pointer[mut=False, T, _], start: Int, end: Int) -> Bool:
+    """States whether the elements of `p` from `start` up to `end` are
+    not initialized (never written, or destroyed or moved out since), and
+    no element was written out of order, for the verifier.
+
+    Use it as `requires _uninitialized(p, 0, n)` in a function that fills
+    fresh memory, or `ensures _uninitialized(p, 0, n)` in one that
+    destroys its elements before the memory is freed. The verifier follows
+    the elements written in order: with `_initialized(p, 0, n)`, saying
+    `_uninitialized(p, n, p._extent())` states that those `n` are all the
+    elements there are. It has no runtime effect (it returns `True`).
+
+    Parameters:
+        T: The element type.
+
+    Args:
+        p: The pointer.
+        start: The first element.
+        end: One past the last element.
+
+    Returns:
+        The statement, for the verifier.
+    """
+    return True
+
+
+@inline(.nodebug)
 def _element_is[
     C: AnyType, T: AnyType
 ](collection: C, index: Int, value: T) -> Bool:

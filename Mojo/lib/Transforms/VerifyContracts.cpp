@@ -1664,6 +1664,9 @@ public:
           addObligation(ob);
         }
     }
+    // The memory behind a pointer argument the clauses name is tracked.
+    for (Value arg : memoryClauses(fn).pointers)
+      trackArgument(arg, state);
     // The function's own preconditions hold at its entry (when refining,
     // after they are proven there: on the path, not as global facts).
     for (Operation &op : entry)
@@ -3245,18 +3248,26 @@ private:
     if (init) {
       // In order, a write extends the window `[from, upto)`; one outside
       // it is a stray element, which only `initv` knows about.
+      // An empty window (nothing written, or all destroyed) starts again
+      // at the element written.
       std::string inWindow = "(and (bvsle " + from + " " + offset +
                              ") (bvsle " + offset + " " + upto + "))";
+      std::string empty = "(= " + from + " " + upto + ")";
       noteCondition(define({true, 1, false}, atUpto));
       noteCondition(define({true, 1, false}, inWindow));
+      noteCondition(define({true, 1, false}, empty));
+      store(fromLoc, state,
+            define(i64, "(ite " + empty + " " + offset + " " + from + ")"));
       store(uptoLoc, state,
-            define(i64, "(ite " + atUpto + " (bvadd " + upto + " " + one +
-                            ") " + upto + ")"));
+            define(i64, "(ite " + empty + " (bvadd " + offset + " " + one +
+                            ") (ite " + atUpto + " (bvadd " + upto + " " + one +
+                            ") " + upto + "))"));
       std::string stray = load(strayLoc, state, i64);
       noteCondition(
           define({true, 1, false}, "(= " + stray + " " + bvConst(0, 64) + ")"));
       store(strayLoc, state,
-            define(i64, "(ite " + inWindow + " " + stray + " " + one + ")"));
+            define(i64, "(ite (or " + empty + " " + inWindow + ") " + stray +
+                            " " + one + ")"));
     } else {
       // A move out or destruction at the front advances the window; one
       // inside cuts it there (the elements above are still in `initv`).
@@ -3289,9 +3300,11 @@ private:
     std::string zero = bvConst(0, 64);
     // Nothing was initialized at allocation: the frame axioms of the
     // writes and destructions since build on this.
-    std::string base = "(forall ((x (_ BitVec 64))) (! (not " +
-                       initvOf(a.initv0, "x") + ") :pattern ((initv " +
-                       a.initv0 + " x))))";
+    std::string base = a.initv0.empty()
+                           ? "true"
+                           : "(forall ((x (_ BitVec 64))) (! (not " +
+                                 initvOf(a.initv0, "x") +
+                                 ") :pattern ((initv " + a.initv0 + " x))))";
     return define({true, 1, false},
                   "(=> " + base + " (or (not (= " + handed + " " + zero +
                       ")) (and (bvsle " + upto + " " + from +
@@ -3299,6 +3312,143 @@ private:
                       ") (forall ((x (_ BitVec 64))) (! (not " +
                       initvOf(version, "x") + ") :pattern ((initv " + version +
                       " x))))))))");
+  }
+
+  /// `_initialized(p, lo, hi)` (or, `uninit`, `_uninitialized`): the
+  /// elements from `lo` to `hi` of the pointer are in the window of
+  /// elements written in order (or no stray element was written, and the
+  /// window lies below `lo` or is empty). An empty range is initialized.
+  std::string initializedWindow(const Allocation &a, const std::string &lo,
+                                const std::string &hi, bool uninit,
+                                State &state) {
+    Sort i64{false, 64, true};
+    std::string from = load(Loc{a.place.root, "/from"}, state, i64);
+    std::string upto = load(Loc{a.place.root, "/upto"}, state, i64);
+    std::string first = define(i64, "(bvadd " + a.offset + " " + lo + ")");
+    std::string last = define(i64, "(bvadd " + a.offset + " " + hi + ")");
+    std::string empty = "(bvsle " + hi + " " + lo + ")";
+    if (!uninit)
+      return define({true, 1, false}, "(or " + empty + " (and (bvsle " + from +
+                                          " " + first + ") (bvsle " + last +
+                                          " " + upto + ")))");
+    // No stray element, even for an empty range: `_uninitialized(p, n,
+    // p._extent())` of memory that is full says the `n` are all there is.
+    std::string stray = load(Loc{a.place.root, "/stray"}, state, i64);
+    return define({true, 1, false}, "(and (= " + stray + " " + bvConst(0, 64) +
+                                        ") (or " + empty + " (= " + from + " " +
+                                        upto + ") (bvsle " + upto + " " +
+                                        first + ")))");
+  }
+
+  /// The memory behind `a` holds an unknown state: at entry for a declared
+  /// argument, after a call to a function whose clauses declare what it
+  /// does to it (which are then assumed of this state). With `alive`,
+  /// whether it is allocated is unknown too.
+  void unknownMemoryState(const Allocation &a, bool alive, State &state) {
+    Sort i64{false, 64, true};
+    std::string from = declare(i64, "m"), upto = declare(i64, "m"),
+                stray = declare(i64, "m");
+    facts.push_back("(bvsle " + bvConst(0, 64) + " " + from + ")");
+    facts.push_back("(bvsle " + from + " " + upto + ")");
+    facts.push_back("(bvsle " + upto + " " + extentOf(a.base) + ")");
+    facts.push_back("(or (= " + stray + " " + bvConst(0, 64) + ") (= " + stray +
+                    " " + bvConst(1, 64) + "))");
+    // An empty window is at 0 (where it is makes no difference to what is
+    // stated; at 0, a loop that then fills the memory finds its invariant).
+    facts.push_back("(=> (= " + from + " " + upto + ") (= " + from + " " +
+                    bvConst(0, 64) + "))");
+    store(Loc{a.place.root, "/from"}, state, from);
+    store(Loc{a.place.root, "/upto"}, state, upto);
+    store(Loc{a.place.root, "/stray"}, state, stray);
+    store(Loc{a.place.root, "/initv"}, state,
+          declare({false, 64, false}, "iv"));
+    if (alive)
+      store(Loc{a.place.root, "/alive"}, state,
+            declare({true, 1, false}, "al"));
+  }
+
+  /// What the clauses of `fn` state about memory: the pointer arguments
+  /// they name in `_allocated`, `_initialized` or `_uninitialized`, and
+  /// whether a postcondition says whether the memory is still allocated
+  /// (otherwise the function does not free it).
+  struct MemoryClauses {
+    SmallVector<Value> pointers;
+    bool allocated = false;
+  };
+  DenseMap<Operation *, MemoryClauses> memoryClausesOf;
+  const MemoryClauses &memoryClauses(LIT::FnOp fn) {
+    auto [it, inserted] = memoryClausesOf.try_emplace(fn.getOperation());
+    if (!inserted)
+      return it->second;
+    MemoryClauses &found = it->second;
+    auto clause = [&](Region &body, OperandRange args, bool ensures) {
+      body.walk([&](LIT::CallOp call) {
+        std::optional<CalleeName> n = calleeName(call.getCallee());
+        if (!n || call.getNumOperands() == 0)
+          return;
+        StringRef path(n->path);
+        if (!path.consume_front("std::builtin::_verification::"))
+          return;
+        if (path.starts_with("_allocated["))
+          found.allocated |= ensures;
+        else if (!path.starts_with("_initialized[") &&
+                 !path.starts_with("_uninitialized["))
+          return;
+        // Through the casts that keep the pointer (the implicit
+        // conversion to the immutable pointer the predicates take).
+        Value pointer = call.getOperands()[0];
+        while (Operation *def = pointer.getDefiningOp()) {
+          if (auto cast = dyn_cast<LIT::CallOp>(def)) {
+            std::optional<CalleeName> c = calleeName(cast.getCallee());
+            StringRef castPath = c ? StringRef(c->path) : StringRef();
+            if (cast.getNumOperands() != 1 ||
+                !castPath.consume_front("std::memory::pointer::Pointer::") ||
+                !isSamePointerCast(castPath))
+              return;
+          } else if (!isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp>(def))
+            return;
+          pointer = def->getOperand(0);
+        }
+        auto arg = dyn_cast<BlockArgument>(pointer);
+        if (!arg || arg.getParentRegion() != &body ||
+            arg.getArgNumber() >= args.size())
+          return;
+        Value actual = args[arg.getArgNumber()];
+        if (!llvm::is_contained(found.pointers, actual))
+          found.pointers.push_back(actual);
+      });
+    };
+    if (!fn.getFunctionBody().empty()) {
+      for (Operation &op : fn.getFunctionBody().front())
+        if (auto req = dyn_cast<RequiresOp>(&op))
+          clause(req.getBody(), req.getArgs(), false);
+      fn.getFunctionBody().walk(
+          [&](EnsuresOp ens) { clause(ens.getBody(), ens.getArgs(), true); });
+    }
+    return found;
+  }
+
+  /// A pointer argument the function's own clauses name: the memory
+  /// behind it is tracked from entry, in an unknown state the
+  /// preconditions then constrain, so that the postconditions about it
+  /// can be proven.
+  void trackArgument(Value arg, State &state) {
+    if (isa<LIT::RefType>(arg.getType()) || !isPointerType(arg.getType()))
+      return;
+    std::string pointer = term(arg, state);
+    if (pointerBases.count(pointer))
+      return;
+    Loc place{arg, ""};
+    storeFields(place, state,
+                {{"/alive", "true"},
+                 {"/from", bvConst(0, 64)},
+                 {"/upto", bvConst(0, 64)},
+                 {"/stray", bvConst(0, 64)},
+                 {"/handed", bvConst(0, 64)},
+                 {"/initv", declare({false, 64, false}, "iv")}});
+    pointerBases[pointer] = {place, bvConst(0, 64), "", pointer, false, ""};
+    allocationRoots.push_back(arg);
+    unknownMemoryState(pointerBases[pointer], /*alive=*/true, state);
   }
 
   /// At `free` or `dealloc` of memory whose elements have a destructor to
@@ -3475,7 +3625,7 @@ private:
   /// as is known). A list method that may reallocate retires the pointers
   /// taken from the list.
   void checkPointerCall(LIT::CallOp call, const CalleeName &name,
-                        State &state) {
+                        LIT::FnOp contract, State &state) {
     StringRef path = name.path;
     ValueRange ops = call.getOperands();
     Location at = call.getLoc();
@@ -3541,10 +3691,22 @@ private:
       return;
     }
     if (!path.consume_front("std::memory::pointer::Pointer::")) {
+      // A callee whose clauses declare what it does to the memory: it
+      // leaves it in a state they describe (assumed after the call).
+      const MemoryClauses *declared =
+          contract && !contract.getFunctionBody().empty()
+              ? &memoryClauses(contract)
+              : nullptr;
       for (Value operand : ops) {
         if (isa<LIT::RefType>(operand.getType()) ||
             !isPointerType(operand.getType()))
           continue;
+        if (std::optional<Allocation> a = allocationOf(operand, state);
+            a && a->storage.empty() && declared &&
+            !declared->pointers.empty()) {
+          unknownMemoryState(*a, declared->allocated, state);
+          continue;
+        }
         if (std::optional<Allocation> a = allocationOf(operand, state);
             a && a->storage.empty()) {
           Loc handed{a->place.root, "/handed"};
@@ -3923,7 +4085,7 @@ private:
       // The window's start moves at a destruction (and a function handed
       // the pointer resets it); a stray element comes from a write; a
       // pointer is handed out by a call.
-      keep("/from", destroys || hands, i64);
+      keep("/from", destroys || hands || writes, i64);
       keep("/stray", writes, i64);
       keep("/handed", hands, i64);
     }
@@ -7696,7 +7858,7 @@ private:
       checkPartialTiles(call, *name, state);
     }
     if (name && !inContract)
-      checkPointerCall(call, *name, state);
+      checkPointerCall(call, *name, contract, state);
     if (inlineHigherOrder(call, callee, frame, state))
       return;
     if (name && evalReversedRange(call, *name, state))
@@ -10251,6 +10413,20 @@ private:
     addObligation(ob);
   }
 
+  /// A `Pointer` method (`path` after `Pointer::`) that keeps the element
+  /// type and the address: the same pointer. (`unsafe_bitcast` changes the
+  /// element type, so its extent stays unknown.)
+  static bool isSamePointerCast(StringRef path) {
+    return (path.starts_with("__init__[") && path.contains("](::Pointer[")) ||
+           path.starts_with("as_imm(") ||
+           path.starts_with("as_unsafe_any_origin(") ||
+           path.starts_with("unsafe_as_noalias(") ||
+           path.starts_with("unsafe_mut_cast[") ||
+           path.starts_with("unsafe_origin_cast[") ||
+           path.starts_with("address_space_cast[") ||
+           path.starts_with("unsafe_address_space_cast[");
+  }
+
   /// The extent of the pointer value `p`, `Pointer._extent()`: how many
   /// elements are valid from it, an unknown per pointer, not negative.
   MaybeTerm pointerExtent(Value p, State &state) {
@@ -10503,18 +10679,7 @@ private:
     }
     if (!path.consume_front("std::memory::pointer::Pointer::"))
       return false;
-    // Casts that keep the element type and the address. (`unsafe_bitcast`
-    // changes the element type, so its extent stays unknown.)
-    bool samePointer =
-        (path.starts_with("__init__[") && path.contains("](::Pointer[")) ||
-        path.starts_with("as_imm(") ||
-        path.starts_with("as_unsafe_any_origin(") ||
-        path.starts_with("unsafe_as_noalias(") ||
-        path.starts_with("unsafe_mut_cast[") ||
-        path.starts_with("unsafe_origin_cast[") ||
-        path.starts_with("address_space_cast[") ||
-        path.starts_with("unsafe_address_space_cast[");
-    if (samePointer && call.getNumOperands() == 1 &&
+    if (isSamePointerCast(path) && call.getNumOperands() == 1 &&
         !isa<LIT::RefType>(call.getOperands()[0].getType())) {
       values[result] = term(call.getOperands()[0], state);
       return true;
@@ -11591,6 +11756,31 @@ private:
                 packRefs[pack] = SmallVector<Value>(create->getOperands());
         return true;
       }
+    }
+    // `_allocated(p)`, `_initialized(p, lo, hi)`, `_uninitialized(p, lo,
+    // hi)`: the state of memory this function allocated or tracks as a
+    // declared argument; of any other pointer nothing is known, which is
+    // stated as holding (as the other defaults take it).
+    if (path.starts_with("std::builtin::_verification::_allocated[") &&
+        call.getNumOperands() == 1) {
+      std::optional<Allocation> a = allocationOf(call.getOperands()[0], state);
+      values[result] = a ? aliveOf(*a, state) : "true";
+      return true;
+    }
+    if ((path.starts_with("std::builtin::_verification::_initialized[") ||
+         path.starts_with("std::builtin::_verification::_uninitialized[")) &&
+        call.getNumOperands() == 3) {
+      std::optional<Allocation> a = allocationOf(call.getOperands()[0], state);
+      std::string lo = operand(1), hi = operand(2);
+      if (!a || !a->storage.empty() || sortOfTerm(lo).isBool ||
+          sortOfTerm(lo).width != 64 || sortOfTerm(hi).isBool ||
+          sortOfTerm(hi).width != 64) {
+        values[result] = "true";
+        return true;
+      }
+      values[result] = initializedWindow(
+          *a, lo, hi, path.contains("::_uninitialized["), state);
+      return true;
     }
     if (path.starts_with("std::builtin::_verification::_same_elements[") &&
         call.getNumOperands() == 3) {

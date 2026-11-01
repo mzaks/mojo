@@ -583,6 +583,30 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   pointer and layout known (`ok_span_filled`). The compiler itself rejects
   reading an `Allocation` after `dealloc(a^)` and keeps a `ManagedAllocation`
   alive while its pointers are used, so those are not the pass's to report.
+- Memory clauses (`memory_clauses.mojo`): `_allocated(p)`,
+  `_initialized(p, lo, hi)` and `_uninitialized(p, lo, hi)` (in
+  `std.builtin._verification`) state the allocation state above in the
+  `requires` and `ensures` of a function that takes a pointer. Inside
+  such a function the memory behind the argument is tracked from an
+  unknown state (allocated or not, the window of elements written in
+  order, whether any was written out of order) that the preconditions
+  constrain, and the postconditions are proven at its returns (`fill`,
+  `release`, `destroy_lists`; `bad_fill_short`). At a call, the
+  preconditions are proven of memory the caller allocated
+  (`bad_read_by_contract`, `bad_fill_on_initialized`) and, after the
+  call, the memory holds an unknown state the postconditions describe
+  (`ok_filled_by_contract`; `bad_use_after_release`, whose callee
+  `ensures not _allocated(p)`): the defaults for a pointer handed to a
+  function (initialized, leak check off) do not apply to such a callee,
+  so `bad_lists_leaked_by_contract` is reported. `_initialized` is about
+  the window of elements written in order (an element written out of
+  order does not satisfy it); `_uninitialized` says the window lies
+  below `lo` or is empty, and that no element was written out of order,
+  even for an empty range, so `_uninitialized(p, n, p._extent())` with
+  `_initialized(p, 0, n)` pins the state exactly. A callee leaves the
+  allocation itself as it was unless an `ensures` names `_allocated`. Of
+  a pointer no clause names, and of a list's storage, the predicates
+  hold. Only pointer arguments passed by value are tracked.
 - A struct with a single integer field and no parameters (an enum-like
   wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
   field is the value, `Wrapper(n)` (a constructor that only stores its
@@ -782,6 +806,7 @@ machine that sleeps stops the solver too.
 | `higher_order.mojo`  | all `bad_*`        | all `ok_*`       |
 | `optionals.mojo`     | all `bad_*`        | all `ok_*`       |
 | `allocations.mojo`   | all `bad_*`        | all `ok_*`       |
+| `memory_clauses.mojo` | all `bad_*`       | all `ok_*`       |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |
 | `gemm_mma_cpasync.mojo` | (none)          | all `ok_*`       |
 | `matmul_dispatch.mojo` | (none)           | (a corpus driver, nothing expected) |
