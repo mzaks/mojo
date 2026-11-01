@@ -614,7 +614,9 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   initialized and the rest of the storage is not, so its `__deinit__`
   is proven to destroy the elements and to free the storage only when
   it was allocated), which every method then proves where it returns
-  (`bad_pop_copy`: a copy of the element leaves it initialized).
+  (`bad_pop_copy`: a copy of the element leaves it initialized). A
+  pointer's `_extent()` is taken to be below a quarter of the address
+  space, so a length below it plus a few does not wrap.
   What a call changes is bounded by the hull of the ranges its
   preconditions name of each pointer (the invariant's included): the
   callee proves where it returns that it wrote or destroyed no element

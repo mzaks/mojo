@@ -10953,6 +10953,10 @@ private:
     }
     std::string e = "(pext " + value + ")";
     facts.push_back("(bvsge " + e + " " + bvConst(0, 64) + ")");
+    // At most a quarter of the address space: a length below it plus a
+    // few does not wrap.
+    facts.push_back("(bvsle " + e + " " +
+                    bvConst((int64_t(1) << 62) - 1, 64) + ")");
     return e;
   }
 
