@@ -42,11 +42,14 @@ from std.memory import (
 from std.utils._nicheable import _FieldNicheable
 from std.builtin.builtin_slice import ContiguousSlice, StridedSlice
 from std.builtin._verification import (
+    _allocated,
     _element_is,
     _ensures,
     _index_in_bounds,
+    _initialized,
     _position_in_bounds,
     _same_elements,
+    _uninitialized,
 )
 from .optional import Optional
 
@@ -175,7 +178,16 @@ struct List[T: AnyType, /](
     Writable where conforms_to(T, Writable),
     _FieldNicheable,
 )
-    invariant self._len >= 0:
+    invariant self._len >= 0
+    invariant self._len <= len(self._storage)
+    invariant self._storage.unsafe_ptr()._extent() >= len(self._storage)
+    invariant len(self._storage) == 0 or _allocated(self._storage.unsafe_ptr())
+    invariant _initialized(self._storage.unsafe_ptr(), 0, self._len)
+    invariant _uninitialized(
+        self._storage.unsafe_ptr(),
+        self._len,
+        self._storage.unsafe_ptr()._extent(),
+    ):
     """A dynamically-allocated and resizable list.
 
     This is Mojo's primary dynamic array implementation, meaning the list can
@@ -562,14 +574,21 @@ struct List[T: AnyType, /](
 
     @staticmethod
     @inline(.always)
-    def _dangling_storage() -> Allocation[Self.T]:
+    def _dangling_storage() -> Allocation[Self.T]
+        ensures len(result) == 0
+        ensures result.unsafe_ptr()._extent() == 0
+        ensures not _allocated(result.unsafe_ptr()):
         return ThinAllocation(
             unsafe_owned_ptr=Self._PointerType.unsafe_dangling()
         ).unsafe_with_layout(Layout[Self.T](length=0))
 
     @staticmethod
     @inline(.always)
-    def _dealloc_storage(var storage: Allocation[Self.T]):
+    def _dealloc_storage(var storage: Allocation[Self.T])
+        requires len(storage) == 0 or _allocated(storage.unsafe_ptr())
+        requires _uninitialized(
+            storage.unsafe_ptr(), 0, storage.unsafe_ptr()._extent()
+        ):
         # Zero-capacity storage is the placeholder from `_dangling_storage`,
         # which never came from the allocator, so it must not reach `dealloc`.
         if len(storage) > 0:
@@ -577,8 +596,12 @@ struct List[T: AnyType, /](
         else:
             _ = storage^.unsafe_leak()
 
-    def _unsafe_assume_destroyed_and_deallocate(deinit self):
+    def _unsafe_assume_destroyed_and_deallocate(deinit self)
+        requires len(self) == 0:
         """Assumes self's values are already destroyed and deallocate the backing storage.
+
+        The list must say so: with no elements, its invariant states that
+        the storage holds none.
         """
         if self.capacity() > 0:
             self._annotate_delete()
@@ -588,6 +611,7 @@ struct List[T: AnyType, /](
     def __deinit__(deinit self) where conforms_to(Self.T, Deinitable):
         """Destroy all elements in the list and free its memory."""
         Span(self).unsafe_deinit_elements()
+        self._len = 0
         self^._unsafe_assume_destroyed_and_deallocate()
 
     def deinit_with(deinit self, deinit_func: Some[def(var Self.T)], /):
@@ -599,6 +623,7 @@ struct List[T: AnyType, /](
             deinit_func: The deinitializing closure called on each `List` element.
         """
         Span(self).unsafe_deinit_elements_with(deinit_func)
+        self._len = 0
         self^._unsafe_assume_destroyed_and_deallocate()
 
     # ===-------------------------------------------------------------------===#
@@ -895,7 +920,8 @@ struct List[T: AnyType, /](
     @inline(.always)
     def _grow_amortized(
         mut self, min_capacity: Int
-    ) where conforms_to(Self.T, Movable):
+    ) where conforms_to(Self.T, Movable)
+        ensures len(self) == old(len(self)) and self.capacity() >= min_capacity:
         """Grows the storage to hold at least `min_capacity` elements, at least
         doubling the capacity.
 
@@ -1022,6 +1048,7 @@ struct List[T: AnyType, /](
         self._len = final_size
         # `other` only needs to deallocate its underlying buffer and not destroy
         # its elements as they were moved into `self`.
+        other._len = 0
         other^._unsafe_assume_destroyed_and_deallocate()
 
     def extend(mut self, elements: Span[Self.T, _])
@@ -1241,7 +1268,8 @@ struct List[T: AnyType, /](
 
     def _unchecked_grow(
         mut self, new_length: Int, fill: Self.T
-    ) where conforms_to(Self.T, Copyable):
+    ) where conforms_to(Self.T, Copyable)
+        requires new_length >= len(self):
         assert new_length >= self._len
 
         self._grow_amortized(new_length)
@@ -1284,7 +1312,9 @@ struct List[T: AnyType, /](
             self._annotate_increase(unsafe_uninit_length - self._len)
             self._len = unsafe_uninit_length
 
-    def shrink(mut self, new_length: Int) where conforms_to(Self.T, Deinitable):
+    def shrink(mut self, new_length: Int)
+        where conforms_to(Self.T, Deinitable)
+        requires new_length >= 0:
         """Resizes to the given new length which must be <= the current size.
 
         Args:

@@ -609,11 +609,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   allocation itself as it was unless an `ensures` names `_allocated`. Of
   a pointer no clause names the predicates hold. A clause may name a
   pointer held in a field of an argument (`self._data` of a span,
-  `self._storage.unsafe_ptr()` of `Strs`), and a struct's invariant may
-  state its memory (`Strs`: the elements below `_len` are initialized
-  and the rest of the storage is not), which every method then proves
-  where it returns (`bad_pop_copy`: a copy of the element leaves it
-  initialized).
+  `self._storage.unsafe_ptr()` of a list), and a struct's invariant may
+  state its memory (`Strs`; `List` does: the elements below `_len` are
+  initialized and the rest of the storage is not, so its `__deinit__`
+  is proven to destroy the elements and to free the storage only when
+  it was allocated), which every method then proves where it returns
+  (`bad_pop_copy`: a copy of the element leaves it initialized).
   What a call changes is bounded by the hull of the ranges its
   preconditions name of each pointer (the invariant's included): the
   callee proves where it returns that it wrote or destroyed no element
@@ -632,7 +633,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   it, which is not a state of the model). `Span.unsafe_deinit_elements`,
   `unsafe_init_move_from`, `unsafe_init_copy_from` and `unsafe_init_with`
   carry such clauses (their bodies are not proven: loops over closures
-  and bitcast pointers).
+  and bitcast pointers), and `List.shrink` and `List._unchecked_grow`
+  gained the preconditions the invariant needs (`new_length >= 0`).
 - A struct with a single integer field and no parameters (an enum-like
   wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
   field is the value, `Wrapper(n)` (a constructor that only stores its
