@@ -191,7 +191,9 @@ struct Span[
     TrivialRegisterPassable,
     UnsafeNicheable,
     Writable where conforms_to(T, Writable) and address_space == .GENERIC,
-):
+)
+    invariant self._len >= 0
+    invariant self._data._extent() >= self._len:
     """A non-owning view of contiguous data.
 
     Parameters:
