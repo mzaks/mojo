@@ -3341,19 +3341,51 @@ private:
     return load(slot(a, "/alive"), state, Sort{true, 1, false});
   }
 
-  /// Whether element `offset` of heap memory is initialized: below the
-  /// initialized prefix (`/upto`, which writes in order extend, and which
-  /// the invariant search follows through a loop), or written on its own.
+  /// The windows of initialized elements of heap memory: `[from, upto)`,
+  /// which writes in order extend and which the invariant search follows
+  /// through a loop, and above it `[from2, upto2)` (empty where `from2 ==
+  /// upto2`), which a move out of an element inside the first leaves,
+  /// and a move of the elements above the gap back down joins again.
+  struct Windows {
+    std::string from, upto, from2, upto2;
+  };
+  Windows windowsOf(const Allocation &a, State &state) {
+    Sort i64{false, 64, true};
+    return {load(slot(a, "/from"), state, i64),
+            load(slot(a, "/upto"), state, i64),
+            load(slot(a, "/from2"), state, i64),
+            load(slot(a, "/upto2"), state, i64)};
+  }
+
+  /// Stores the windows. An empty first window stays where it is (where
+  /// a loop's counter left it) even with a second above it: the
+  /// elements are contiguous then too (`contiguousOf`).
+  void storeWindows(const Allocation &a, const Windows &w, State &state) {
+    store(slot(a, "/from"), state, w.from);
+    store(slot(a, "/upto"), state, w.upto);
+    store(slot(a, "/from2"), state, w.from2);
+    store(slot(a, "/upto2"), state, w.upto2);
+  }
+
+  /// Whether `[lo, hi)` lies in `[from, upto)`.
+  static std::string within(const std::string &lo, const std::string &hi,
+                            const std::string &from, const std::string &upto) {
+    return "(and (bvsle " + from + " " + lo + ") (bvsle " + hi + " " + upto +
+           "))";
+  }
+
+  /// Whether element `offset` of heap memory is initialized: in a window,
+  /// or written on its own.
   std::string initializedAt(const Allocation &a, const std::string &offset,
                             State &state) {
-    Sort i64{false, 64, true};
-    std::string from = load(slot(a, "/from"), state, i64);
-    std::string upto = load(slot(a, "/upto"), state, i64);
+    Windows w = windowsOf(a, state);
     std::string version =
         load(slot(a, "/initv"), state, Sort{false, 64, false});
-    return define({true, 1, false}, "(or (and (bvsle " + from + " " + offset +
-                                        ") (bvslt " + offset + " " + upto +
-                                        ")) " + initvOf(version, offset) + ")");
+    return define({true, 1, false},
+                  "(or (and (bvsle " + w.from + " " + offset + ") (bvslt " +
+                      offset + " " + w.upto + ")) (and (bvsle " + w.from2 +
+                      " " + offset + ") (bvslt " + offset + " " + w.upto2 +
+                      ")) " + initvOf(version, offset) + ")");
   }
 
   /// Whether `width` elements from `offset` are initialized.
@@ -3361,11 +3393,11 @@ private:
                                int64_t width, State &state) {
     Sort i64{false, 64, true};
     if (width > 16) {
-      std::string from = load(slot(a, "/from"), state, i64);
-      std::string upto = load(slot(a, "/upto"), state, i64);
+      Windows w = windowsOf(a, state);
+      std::string end = "(bvadd " + offset + " " + bvConst(width, 64) + ")";
       return define({true, 1, false},
-                    "(and (bvsle " + from + " " + offset + ") (bvsle (bvadd " +
-                        offset + " " + bvConst(width, 64) + ") " + upto + "))");
+                    "(or " + within(offset, end, w.from, w.upto) + " " +
+                        within(offset, end, w.from2, w.upto2) + ")");
     }
     std::string all = "true";
     for (int64_t k = 0; k < width; ++k)
@@ -3377,88 +3409,153 @@ private:
     return define({true, 1, false}, all);
   }
 
-  /// After a write to (`init`) or a move out of element `offset` of heap
-  /// memory.
-  void markInitialized(const Allocation &a, const std::string &offset,
-                       bool init, State &state) {
+  /// After `n` elements from `d` of heap memory are written: the first
+  /// window grows at either end (and joins the second where they meet),
+  /// the second at either end, a range above the first where there is no
+  /// second yet becomes the second, one inside a window is already there,
+  /// and any other is astray (known to `initv` alone).
+  void writeRange(const Allocation &a, const std::string &d,
+                  const std::string &n, State &state) {
+    Sort i64{false, 64, true}, b{true, 1, false};
+    Windows w = windowsOf(a, state);
+    std::string zero = bvConst(0, 64), one = bvConst(1, 64);
+    std::string end = define(i64, "(bvadd " + d + " " + n + ")");
+    std::string some = "(bvsgt " + n + " " + zero + ")";
+    std::string empty1 = "(= " + w.from + " " + w.upto + ")";
+    std::string empty2 = "(= " + w.from2 + " " + w.upto2 + ")";
+    std::string atUpto = "(= " + d + " " + w.upto + ")";
+    std::string atFrom =
+        "(and (not " + empty1 + ") (= " + end + " " + w.from + "))";
+    std::string joins =
+        "(and (not " + empty2 + ") (= " + end + " " + w.from2 + "))";
+    std::string atUpto2 =
+        "(and (not " + empty2 + ") (= " + d + " " + w.upto2 + "))";
+    std::string above = "(and " + empty2 + " (bvsgt " + d + " " + w.upto + "))";
+    std::string in1 = within(d, end, w.from, w.upto);
+    std::string in2 = within(d, end, w.from2, w.upto2);
+    for (const std::string &c :
+         {empty1, empty2, atUpto, atFrom, joins, atUpto2, above, in1})
+      noteCondition(define(b, c));
+    std::string stray = load(slot(a, "/stray"), state, i64);
+    noteCondition(define(b, "(= " + stray + " " + zero + ")"));
+    // In order of precedence.
+    std::string c1 = "(and " + some + " " + empty1 + " " + empty2 + ")";
+    std::string c2 = "(and " + some + " (not " + c1 + ") " + atUpto + ")";
+    std::string rest = "(and " + some + " (not " + c1 + ") (not " + c2 + ") ";
+    std::string c3 = rest + joins + ")";
+    std::string c4 = rest + atUpto2 + ")";
+    std::string c5 = rest + above + ")";
+    std::string c6 = rest + atFrom + ")";
+    std::string known = "(or (not " + some + ") " + c1 + " " + c2 + " " + c3 +
+                        " " + c4 + " " + c5 + " " + c6 + " " + in1 + " " + in2 +
+                        ")";
+    Windows after;
+    after.from = define(i64, "(ite (or " + c1 + " " + c6 + ") " + d + " " +
+                                 w.from + ")");
+    after.upto = define(i64, "(ite " + c1 + " " + end + " (ite " + c2 +
+                                 " (ite " + joins + " " + w.upto2 + " " + end +
+                                 ") " + w.upto + "))");
+    after.from2 = define(i64, "(ite (and " + c2 + " " + joins + ") " + w.upto2 +
+                                  " (ite (or " + c3 + " " + c5 + ") " + d +
+                                  " " + w.from2 + "))");
+    after.upto2 = define(i64, "(ite (or " + c4 + " " + c5 + ") " + end + " " +
+                                  w.upto2 + ")");
+    storeWindows(a, after, state);
+    store(slot(a, "/stray"), state,
+          define(i64, "(ite " + known + " " + stray + " " + one + ")"));
+  }
+
+  /// After `n` elements from `s` of heap memory are moved out or
+  /// destroyed: a window loses them at its start or its end; the first
+  /// window cut inside leaves the elements above the cut as the second
+  /// (where there is none yet, else they are astray); the second cut
+  /// inside leaves them astray. Elements in no window are `initv`'s.
+  void removeRange(const Allocation &a, const std::string &s,
+                   const std::string &n, State &state) {
+    Sort i64{false, 64, true}, b{true, 1, false};
+    Windows w = windowsOf(a, state);
+    std::string zero = bvConst(0, 64), one = bvConst(1, 64);
+    std::string end = define(i64, "(bvadd " + s + " " + n + ")");
+    std::string some = "(bvsgt " + n + " " + zero + ")";
+    std::string empty2 = "(= " + w.from2 + " " + w.upto2 + ")";
+    std::string in1 =
+        "(and " + some + " " + within(s, end, w.from, w.upto) + ")";
+    std::string in2 = "(and " + some + " (not " + in1 + ") " +
+                      within(s, end, w.from2, w.upto2) + ")";
+    std::string atFrom = "(= " + s + " " + w.from + ")";
+    std::string atUpto = "(= " + end + " " + w.upto + ")";
+    std::string atFrom2 = "(= " + s + " " + w.from2 + ")";
+    std::string atUpto2 = "(= " + end + " " + w.upto2 + ")";
+    std::string stray = load(slot(a, "/stray"), state, i64);
+    for (const std::string &c : {empty2, atFrom, atUpto, atFrom2, atUpto2, in1,
+                                 "(= " + stray + " " + zero + ")"})
+      noteCondition(define(b, c));
+    std::string p1 = "(and " + in1 + " " + atFrom + ")";
+    std::string q1 = "(and " + in1 + " (not " + atFrom + ") " + atUpto + ")";
+    std::string i1 =
+        "(and " + in1 + " (not " + atFrom + ") (not " + atUpto + "))";
+    std::string cut = "(and " + i1 + " " + empty2 + ")";
+    std::string p2 = "(and " + in2 + " " + atFrom2 + ")";
+    std::string q2 = "(and " + in2 + " (not " + atFrom2 + ") " + atUpto2 + ")";
+    std::string i2 =
+        "(and " + in2 + " (not " + atFrom2 + ") (not " + atUpto2 + "))";
+    Windows after;
+    after.from = define(i64, "(ite " + p1 + " " + end + " " + w.from + ")");
+    after.upto = define(i64, "(ite (or " + q1 + " " + cut + ") " + s + " " +
+                                 w.upto + ")");
+    after.from2 = define(i64, "(ite " + cut + " " + end + " (ite " + p2 + " " +
+                                  end + " " + w.from2 + "))");
+    after.upto2 = define(i64, "(ite " + cut + " " + w.upto + " (ite " + q2 +
+                                  " " + s + " " + w.upto2 + "))");
+    storeWindows(a, after, state);
+    store(slot(a, "/stray"), state,
+          define(i64, "(ite (or (and " + i1 + " (not " + empty2 + ")) " + i2 +
+                          ") " + one + " " + stray + ")"));
+  }
+
+  /// After a write to (`init`) or a move out of `n` elements from
+  /// `offset` of heap memory.
+  void markRange(const Allocation &a, const std::string &offset,
+                 const std::string &n, bool init, State &state) {
     if (!a.storage.empty() || inContract)
       return;
     Sort i64{false, 64, true};
-    Loc fromLoc = slot(a, "/from"), uptoLoc = slot(a, "/upto"),
-        strayLoc = slot(a, "/stray"), versionLoc = slot(a, "/initv");
-    std::string from = load(fromLoc, state, i64);
-    std::string upto = load(uptoLoc, state, i64);
-    std::string version = load(versionLoc, state, Sort{false, 64, false});
+    std::string version =
+        load(slot(a, "/initv"), state, Sort{false, 64, false});
     std::string next = declare({false, 64, false}, "iv");
-    std::string at = initvOf(next, offset);
-    facts.push_back(init ? at : "(not " + at + ")");
-    facts.push_back("(forall ((x (_ BitVec 64))) (! (=> (not (= x " + offset +
-                    ")) (= " + initvOf(next, "x") + " " +
+    std::string end = define(i64, "(bvadd " + offset + " " + n + ")");
+    facts.push_back("(forall ((x (_ BitVec 64))) (! (= " + initvOf(next, "x") +
+                    " (ite (and (bvsle " + offset + " x) (bvslt x " + end +
+                    ")) " + (init ? "true" : "false") + " " +
                     initvOf(version, "x") + ")) :pattern ((initv " + next +
                     " x))))");
-    std::string one = bvConst(1, 64);
-    std::string atUpto = "(= " + offset + " " + upto + ")";
-    std::string atFrom = "(= " + offset + " " + from + ")";
+    store(slot(a, "/initv"), state, next);
     // Memory tracked from entry: an element outside the hull of what the
     // preconditions name is one the function promised not to touch.
     if (auto hull = hulls.find(a.base); hull != hulls.end()) {
       Loc outsideLoc = slot(a, "/outside");
-      std::string inHull = "(and (bvsle " + hull->second.first + " " + offset +
-                           ") (bvslt " + offset + " " + hull->second.second +
-                           "))";
+      std::string inHull =
+          "(or (bvsle " + n + " " + bvConst(0, 64) + ") " +
+          within(offset, end, hull->second.first, hull->second.second) + ")";
       std::string outside = load(outsideLoc, state, i64);
       noteCondition(define({true, 1, false}, inHull));
       noteCondition(define({true, 1, false},
                            "(= " + outside + " " + bvConst(0, 64) + ")"));
       store(outsideLoc, state,
-            define(i64, "(ite " + inHull + " " + outside + " " + one + ")"));
+            define(i64, "(ite " + inHull + " " + outside + " " +
+                            bvConst(1, 64) + ")"));
     }
-    if (init) {
-      // In order, a write extends the window `[from, upto)`; one outside
-      // it is a stray element, which only `initv` knows about.
-      // An empty window (nothing written, or all destroyed) starts again
-      // at the element written.
-      std::string inWindow = "(and (bvsle " + from + " " + offset +
-                             ") (bvsle " + offset + " " + upto + "))";
-      std::string empty = "(= " + from + " " + upto + ")";
-      noteCondition(define({true, 1, false}, atUpto));
-      noteCondition(define({true, 1, false}, inWindow));
-      noteCondition(define({true, 1, false}, empty));
-      store(fromLoc, state,
-            define(i64, "(ite " + empty + " " + offset + " " + from + ")"));
-      store(uptoLoc, state,
-            define(i64, "(ite " + empty + " (bvadd " + offset + " " + one +
-                            ") (ite " + atUpto + " (bvadd " + upto + " " + one +
-                            ") " + upto + "))"));
-      std::string stray = load(strayLoc, state, i64);
-      noteCondition(
-          define({true, 1, false}, "(= " + stray + " " + bvConst(0, 64) + ")"));
-      store(strayLoc, state,
-            define(i64, "(ite (or " + empty + " " + inWindow + ") " + stray +
-                            " " + one + ")"));
-    } else {
-      // A move out or destruction at the front advances the window; one
-      // inside cuts it there: the elements above the cut (if any: at the
-      // back, there are none) are astray, known to `initv` alone.
-      noteCondition(define({true, 1, false}, atFrom));
-      noteCondition(define({true, 1, false}, atUpto));
-      std::string inside = "(and (bvslt " + from + " " + offset + ") (bvslt " +
-                           offset + " " + upto + "))";
-      std::string above =
-          "(bvslt (bvadd " + offset + " " + one + ") " + upto + ")";
-      noteCondition(define({true, 1, false}, above));
-      store(fromLoc, state,
-            define(i64, "(ite (and " + atFrom + " (bvslt " + from + " " + upto +
-                            ")) (bvadd " + from + " " + one + ") " + from +
-                            ")"));
-      store(uptoLoc, state,
-            define(i64, "(ite " + inside + " " + offset + " " + upto + ")"));
-      std::string stray = load(strayLoc, state, i64);
-      store(strayLoc, state,
-            define(i64, "(ite (and " + inside + " " + above + ") " + one + " " +
-                            stray + ")"));
-    }
-    store(versionLoc, state, next);
+    if (init)
+      writeRange(a, offset, n, state);
+    else
+      removeRange(a, offset, n, state);
+  }
+
+  /// After a write to (`init`) or a move out of element `offset` of heap
+  /// memory.
+  void markInitialized(const Allocation &a, const std::string &offset,
+                       bool init, State &state) {
+    markRange(a, offset, bvConst(1, 64), init, state);
   }
 
   /// Whether no element of heap memory is left initialized: the window
@@ -3467,8 +3564,8 @@ private:
   /// have destroyed them (nothing is known then).
   std::string destroyedOf(const Allocation &a, State &state) {
     Sort i64{false, 64, true};
-    std::string from = load(slot(a, "/from"), state, i64);
-    std::string upto = load(slot(a, "/upto"), state, i64);
+    Windows w = windowsOf(a, state);
+    const std::string &from = w.from, &upto = w.upto;
     std::string stray = load(slot(a, "/stray"), state, i64);
     std::string handed = load(slot(a, "/handed"), state, i64);
     std::string version =
@@ -3483,9 +3580,9 @@ private:
                                  ") :pattern ((initv " + a.initv0 + " x))))";
     return define({true, 1, false},
                   "(=> " + base + " (or (not (= " + handed + " " + zero +
-                      ")) (and (bvsle " + upto + " " + from +
-                      ") (or (= " + stray + " " + zero +
-                      ") (forall ((x (_ BitVec 64))) (! (not " +
+                      ")) (and (bvsle " + upto + " " + from + ") (bvsle " +
+                      w.upto2 + " " + w.from2 + ") (or (= " + stray + " " +
+                      zero + ") (forall ((x (_ BitVec 64))) (! (not " +
                       initvOf(version, "x") + ") :pattern ((initv " + version +
                       " x))))))))");
   }
@@ -3498,24 +3595,24 @@ private:
                                 const std::string &hi, bool uninit,
                                 State &state) {
     Sort i64{false, 64, true};
-    std::string from = load(slot(a, "/from"), state, i64);
-    std::string upto = load(slot(a, "/upto"), state, i64);
+    Windows w = windowsOf(a, state);
     std::string first = define(i64, "(bvadd " + a.offset + " " + lo + ")");
     std::string last = define(i64, "(bvadd " + a.offset + " " + hi + ")");
     std::string empty = "(bvsle " + hi + " " + lo + ")";
     if (!uninit)
-      return define({true, 1, false}, "(or " + empty + " (and (bvsle " + from +
-                                          " " + first + ") (bvsle " + last +
-                                          " " + upto + ")))");
+      return define({true, 1, false},
+                    "(or " + empty + " " + within(first, last, w.from, w.upto) +
+                        " " + within(first, last, w.from2, w.upto2) + ")");
     // No stray element, even for an empty range: `_uninitialized(p, n,
     // p._extent())` of memory that is full says the `n` are all there is.
-    // The window lies below the range (not above it: a write below a
+    // The windows lie below the range (not above it: a write below a
     // window is a stray element, since the window grows in order).
     std::string stray = load(slot(a, "/stray"), state, i64);
-    return define({true, 1, false}, "(and (= " + stray + " " + bvConst(0, 64) +
-                                        ") (or " + empty + " (= " + from + " " +
-                                        upto + ") (bvsle " + upto + " " +
-                                        first + ")))");
+    return define({true, 1, false},
+                  "(and (= " + stray + " " + bvConst(0, 64) + ") (or " + empty +
+                      " (and (or (= " + w.from + " " + w.upto + ") (bvsle " +
+                      w.upto + " " + first + ")) (or (= " + w.from2 + " " +
+                      w.upto2 + ") (bvsle " + w.upto2 + " " + first + ")))))");
   }
 
   /// The memory behind `a` holds an unknown state: at entry for a declared
@@ -3534,6 +3631,8 @@ private:
                     bvConst(0, 64) + "))");
     store(slot(a, "/from"), state, from);
     store(slot(a, "/upto"), state, upto);
+    store(slot(a, "/from2"), state, upto);
+    store(slot(a, "/upto2"), state, upto);
     // The initialized elements are the window, with none astray: a caller
     // proves that of memory it hands to a function whose clauses name it,
     // and a function proves it of what it leaves (`proveMemoryFrame`).
@@ -3706,6 +3805,33 @@ private:
   /// memory tracked from entry, no element outside the hull of what the
   /// preconditions name was written or destroyed (a caller keeps what it
   /// knew of the others). Not of memory the function consumes.
+  /// Whether the initialized elements of heap memory are contiguous: one
+  /// window (the other empty), none astray.
+  std::string contiguousOf(const Allocation &a, State &state) {
+    Sort i64{false, 64, true};
+    std::string stray = load(slot(a, "/stray"), state, i64);
+    Windows w = windowsOf(a, state);
+    if (stray == bvConst(0, 64) && w.from2 == w.upto2)
+      return "true";
+    return define({true, 1, false}, "(and (= " + stray + " " + bvConst(0, 64) +
+                                        ") (or (= " + w.from2 + " " + w.upto2 +
+                                        ") (= " + w.from + " " + w.upto +
+                                        ")))");
+  }
+
+  /// The window of heap memory whose elements are contiguous: the first,
+  /// or the second where the first is empty.
+  std::pair<std::string, std::string> theWindow(const Allocation &a,
+                                                State &state) {
+    Sort i64{false, 64, true};
+    Windows w = windowsOf(a, state);
+    if (w.from2 == w.upto2)
+      return {w.from, w.upto};
+    std::string empty1 = "(= " + w.from + " " + w.upto + ")";
+    return {define(i64, "(ite " + empty1 + " " + w.from2 + " " + w.from + ")"),
+            define(i64, "(ite " + empty1 + " " + w.upto2 + " " + w.upto + ")")};
+  }
+
   void proveMemoryFrame(Operation *ret, State &state) {
     ArrayRef<ArgConvention> conventions =
         fn.getFuncTypeGenerator().getArgConventions();
@@ -3724,13 +3850,11 @@ private:
       if (it == pointerBases.end() || !it->second.storage.empty())
         continue;
       const Allocation &a = it->second;
-      std::string stray = load(slot(a, "/stray"), state, i64);
-      if (stray != zero)
+      if (std::string contiguous = contiguousOf(a, state); contiguous != "true")
         checkClaim(ret->getLoc(), displayName(fn),
                    "that the elements of " + placeName(place) +
                        " left initialized are contiguous",
-                   define({true, 1, false}, "(= " + stray + " " + zero + ")"),
-                   state);
+                   contiguous, state);
       if (!hulls.count(a.base))
         continue;
       std::string outside = load(slot(a, "/outside"), state, i64);
@@ -3817,15 +3941,12 @@ private:
                    State &state) {
     Sort i64{false, 64, true};
     std::string zero = bvConst(0, 64);
-    std::string stray = load(slot(a, "/stray"), before, i64);
-    if (stray != zero)
+    if (std::string contiguous = contiguousOf(a, before); contiguous != "true")
       checkClaim(call.getLoc(), displayName(callee),
                  "that the initialized elements of the memory handed over "
                  "are contiguous",
-                 define({true, 1, false}, "(= " + stray + " " + zero + ")"),
-                 state);
-    std::string from0 = load(slot(a, "/from"), before, i64);
-    std::string upto0 = load(slot(a, "/upto"), before, i64);
+                 contiguous, state);
+    auto [from0, upto0] = theWindow(a, before);
     unknownMemoryState(a, allocated, state);
     std::string from = load(slot(a, "/from"), state, i64);
     std::string upto = load(slot(a, "/upto"), state, i64);
@@ -4075,6 +4196,36 @@ private:
       }
       return;
     }
+    // `unsafe_uninit_move_n(dest, src, count)` and `unsafe_uninit_copy_n`
+    // of memory this function tracks: the `count` elements at `src` must
+    // be initialized; they are then at `dest`, and moved, no longer at
+    // `src` (of the same memory, the elements of `src` not under `dest`:
+    // a shift leaves a window at the other end).
+    if ((path.starts_with("std::memory::memory::unsafe_uninit_move_n[") ||
+         path.starts_with("std::memory::memory::unsafe_uninit_copy_n[")) &&
+        ops.size() == 3 && !inContract) {
+      std::optional<Allocation> dest = allocationOf(ops[0], state);
+      std::optional<Allocation> src = allocationOf(ops[1], state);
+      MaybeTerm count = indexOperand(ops[2], state);
+      if (dest && src && count && dest->storage.empty() &&
+          src->storage.empty()) {
+        bool move = path.contains("move_n");
+        StringRef callee =
+            move ? "unsafe_uninit_move_n" : "unsafe_uninit_copy_n";
+        checkAlive(at, callee, *src, state);
+        checkAlive(at, callee, *dest, state);
+        checkClaim(
+            at, callee,
+            move ? "that the elements moved are initialized"
+                 : "that the elements copied are initialized",
+            initializedWindow(*src, bvConst(0, 64), *count, false, state),
+            state);
+        if (move)
+          markRange(*src, src->offset, *count, false, state);
+        markRange(*dest, dest->offset, *count, true, state);
+        return;
+      }
+    }
     if (!path.starts_with("std::memory::pointer::Pointer::"))
       for (Value operand : ops)
         if (isa<LIT::RefType>(operand.getType()))
@@ -4161,8 +4312,11 @@ private:
           noteCondition(
               define({true, 1, false}, "(= " + load(handed, state, i64) + " " +
                                            bvConst(0, 64) + ")"));
+          std::string extent = define(i64, extentOf(a->base));
           store(slot(*a, "/from"), state, bvConst(0, 64));
-          store(slot(*a, "/upto"), state, define(i64, extentOf(a->base)));
+          store(slot(*a, "/upto"), state, extent);
+          store(slot(*a, "/from2"), state, extent);
+          store(slot(*a, "/upto2"), state, extent);
           store(handed, state, bvConst(1, 64));
         }
       }
@@ -4197,6 +4351,14 @@ private:
                path.starts_with("unsafe_write[") ||
                path.starts_with("unsafe_write_move_from(")) {
       checkAlive(at, "Pointer.unsafe_write", *a, state);
+      // The source of a move is left uninitialized.
+      if (path.starts_with("unsafe_write_move_from(") && ops.size() >= 2)
+        if (std::optional<Allocation> src = allocationOf(ops[1], state);
+            src && src->storage.empty()) {
+          checkInitialized(at, "Pointer.unsafe_write_move_from", *src,
+                           src->offset, 1, state);
+          markInitialized(*src, src->offset, false, state);
+        }
       mark(a->offset, 1, true);
     } else if (path.starts_with("take_pointee(") ||
                path.starts_with("unsafe_take_pointee(") ||
@@ -4264,6 +4426,8 @@ private:
                   {{"/alive", "true"},
                    {"/from", bvConst(0, 64)},
                    {"/upto", bvConst(0, 64)},
+                   {"/from2", bvConst(0, 64)},
+                   {"/upto2", bvConst(0, 64)},
                    {"/stray", bvConst(0, 64)},
                    {"/handed", bvConst(0, 64)},
                    {"/initv", version}});
@@ -4480,9 +4644,11 @@ private:
       if (!n)
         return;
       StringRef path(n->path);
-      if (path.consume_front("std::memory::pointer::Pointer::") &&
-          (path.contains("take_pointee") || path.contains("deinit_pointee") ||
-           path.contains("swap_pointees")))
+      if (path.starts_with("std::memory::memory::unsafe_uninit_move_n[") ||
+          (path.consume_front("std::memory::pointer::Pointer::") &&
+           (path.contains("take_pointee") || path.contains("deinit_pointee") ||
+            path.contains("swap_pointees") ||
+            path.starts_with("unsafe_write_move_from("))))
         destroys = true;
     });
     return destroys;
@@ -4498,10 +4664,12 @@ private:
         if (!n)
           return;
         StringRef path(n->path);
-        if (path.consume_front("std::memory::pointer::Pointer::") &&
-            (path.contains("unsafe_write") || path.starts_with("store") ||
-             path.starts_with("unsafe_store") ||
-             path.contains("swap_pointees")))
+        if (path.starts_with("std::memory::memory::unsafe_uninit_move_n[") ||
+            path.starts_with("std::memory::memory::unsafe_uninit_copy_n[") ||
+            (path.consume_front("std::memory::pointer::Pointer::") &&
+             (path.contains("unsafe_write") || path.starts_with("store") ||
+              path.starts_with("unsafe_store") ||
+              path.contains("swap_pointees"))))
           writes = true;
         return;
       }
@@ -4582,7 +4750,9 @@ private:
       // the pointer resets it); a stray element comes from a write; a
       // pointer is handed out by a call.
       keep("/from", destroys || hands || writes, i64);
-      keep("/stray", writes, i64);
+      keep("/from2", destroys || hands || writes, i64);
+      keep("/upto2", destroys || hands || writes, i64);
+      keep("/stray", destroys || hands || writes, i64);
       keep("/handed", hands, i64);
     }
     for (auto &[list, version] : before.storage)
@@ -10955,8 +11125,8 @@ private:
     facts.push_back("(bvsge " + e + " " + bvConst(0, 64) + ")");
     // At most a quarter of the address space: a length below it plus a
     // few does not wrap.
-    facts.push_back("(bvsle " + e + " " +
-                    bvConst((int64_t(1) << 62) - 1, 64) + ")");
+    facts.push_back("(bvsle " + e + " " + bvConst((int64_t(1) << 62) - 1, 64) +
+                    ")");
     return e;
   }
 

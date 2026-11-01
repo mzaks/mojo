@@ -20,7 +20,13 @@
 
 
 from std.builtin._verification import _allocated, _initialized, _uninitialized
-from std.memory import Allocation, Layout, alloc, dealloc
+from std.memory import (
+    Allocation,
+    Layout,
+    alloc,
+    dealloc,
+    unsafe_uninit_move_n,
+)
 from std.memory.alloc import unsafe_alloc
 
 
@@ -134,6 +140,17 @@ def destroy_tail(p: Pointer[List[Int], MutUntrackedOrigin])
     p.unsafe_offset(1).unsafe_deinit_pointee()
 
 
+def ok_shift_down(p: Pointer[List[Int], MutUntrackedOrigin])
+    requires _allocated(p) and _initialized(p, 0, 3)
+    requires _uninitialized(p, 3, p._extent())
+    ensures _initialized(p, 0, 2) and _uninitialized(p, 2, p._extent()):
+    p.unsafe_deinit_pointee()
+    # The two above the gap move down over it; the last is moved out.
+    unsafe_uninit_move_n[overlapping=True](
+        dest=p, src=p.unsafe_offset(1), count=2
+    )
+
+
 def ok_cut_last(p: Pointer[List[Int], MutUntrackedOrigin])
     requires _allocated(p) and p._extent() >= 3 and _uninitialized(p, 0, 3)
     ensures _uninitialized(p, 2, 3):
@@ -207,6 +224,39 @@ struct Strs
         ).unsafe_deinit_elements()
         self._len = 0
 
+    def ok_remove(mut self, i: Int) -> String
+        requires 0 <= i < self._len
+        ensures self._len == old(self._len) - 1:
+        # Untracked: `dest` and `src` alias.
+        var data = self._storage.unsafe_ptr().unsafe_origin_cast[
+            MutUntrackedOrigin
+        ]()
+        var s = data.unsafe_offset(i).unsafe_take_pointee()
+        # The elements above the gap move down over it.
+        unsafe_uninit_move_n[overlapping=True](
+            dest=data.unsafe_offset(i),
+            src=data.unsafe_offset(i + 1),
+            count=self._len - i - 1,
+        )
+        self._len -= 1
+        return s^
+
+    def ok_insert(mut self, i: Int, var s: String)
+        requires 0 <= i <= self._len and self._len < len(self._storage)
+        ensures self._len == old(self._len) + 1
+        ensures len(self._storage) == old(len(self._storage)):
+        var data = self._storage.unsafe_ptr().unsafe_origin_cast[
+            MutUntrackedOrigin
+        ]()
+        # The elements from `i` move up, leaving a gap at `i`.
+        unsafe_uninit_move_n[overlapping=True](
+            dest=data.unsafe_offset(i + 1),
+            src=data.unsafe_offset(i),
+            count=self._len - i,
+        )
+        data.unsafe_offset(i).unsafe_write(s^)
+        self._len += 1
+
     def __deinit__(deinit self):
         Span(
             unsafe_ptr=self._storage.unsafe_ptr(), length=self._len
@@ -223,9 +273,25 @@ struct Strs
         )
 
 
+    def bad_remove_leaves_gap(mut self, i: Int) -> String
+        requires 0 <= i < self._len:
+        var data = self._storage.unsafe_ptr()
+        var s = data.unsafe_offset(i).unsafe_take_pointee()
+        self._len -= 1  # the elements above `i` were not moved down
+        return s^
+
+    def bad_insert_no_gap(mut self, i: Int, var s: String)
+        requires 0 <= i < self._len and self._len < len(self._storage):
+        var data = self._storage.unsafe_ptr()
+        data.unsafe_offset(i).unsafe_write(s^)  # nothing moved up
+        self._len += 1  # the last element is not initialized
+
+
 def ok_strs() -> Int:
-    var v = Strs(capacity=2)
+    var v = Strs(capacity=3)
+    v.ok_insert(0, "b")
     v.ok_push("a")
+    var t = v.ok_remove(1)
     var s = v.ok_pop()
     v.ok_clear()
-    return s.byte_length()
+    return s.byte_length() + t.byte_length()

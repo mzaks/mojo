@@ -614,7 +614,17 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   initialized and the rest of the storage is not, so its `__deinit__`
   is proven to destroy the elements and to free the storage only when
   it was allocated), which every method then proves where it returns
-  (`bad_pop_copy`: a copy of the element leaves it initialized). A
+  (`bad_pop_copy`: a copy of the element leaves it initialized). The
+  initialized elements are a window written in order, a second window
+  above it where an element inside the first was moved out or destroyed
+  (`ok_cut_last`), and any others astray (`initv` alone knows them: a
+  write below the first window, a third piece). `unsafe_uninit_move_n`
+  and `unsafe_uninit_copy_n` of memory the pass tracks move or copy the
+  `count` elements as a range (they must be initialized): a shift down
+  over a gap joins the windows again, a shift up opens one, which the
+  write into it closes (`Strs.ok_remove`, `Strs.ok_insert`,
+  `ok_shift_down`; `bad_remove_leaves_gap`, `bad_insert_no_gap`), and
+  `unsafe_write_move_from` leaves its source uninitialized. A
   pointer's `_extent()` is taken to be below a quarter of the address
   space, so a length below it plus a few does not wrap.
   What a call changes is bounded by the hull of the ranges its
@@ -631,12 +641,17 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   nothing of the memory. A span's constructor and accessors
   (`_unchecked_get`, `__getitem__`, `unsafe_ptr`, `_unchecked_subspan`)
   hand the memory to no one. `_uninitialized` is provable only of a
-  range above the window (destroying a prefix leaves the window above
-  it, which is not a state of the model). `Span.unsafe_deinit_elements`,
+  range above the windows (destroying a prefix leaves a window above
+  it, which is not a state the predicate accepts).
+  `Span.unsafe_deinit_elements`,
   `unsafe_init_move_from`, `unsafe_init_copy_from` and `unsafe_init_with`
   carry such clauses (their bodies are not proven: loops over closures
   and bitcast pointers), and `List.shrink` and `List._unchecked_grow`
   gained the preconditions the invariant needs (`new_length >= 0`).
+  `List.insert` and `List.pop(i)` are proven through their overlapping
+  moves; `pop(i)`'s `_same_elements` postcondition and
+  `extend(Span)` (a span's length is not bounded, so the new length may
+  wrap) are not.
 - A struct with a single integer field and no parameters (an enum-like
   wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
   field is the value, `Wrapper(n)` (a constructor that only stores its
