@@ -501,9 +501,23 @@ void CallGraph::inlineNode(CallGraphNode *caller, uint64_t threshold) {
         DebugInfo::LineTableLocOp::create(builder, call->getLoc());
       }
       // Inline the callee.
+      bool contract = inContract(call);
       IRMapping map;
       auto [scope, singleExit] =
           inlineRegion(map, call, callee->func.getBodyRegion());
+      // A contract clause is never run: the debug variables of a body
+      // inlined into it serve nothing, and their types' debug info may not
+      // concretize (`Pointer._extent` on a pointer to `MaybeUninit` of a
+      // non-movable type, in `Span`'s invariant).
+      if (contract) {
+        SmallVector<Operation *> debugOps;
+        scope->walk([&](Operation *op) {
+          if (isa<DebugInfo::ValueOp, DebugInfo::KillOp>(op))
+            debugOps.push_back(op);
+        });
+        for (Operation *op : debugOps)
+          op->erase();
+      }
 
       maybeUpdateDebugInfo(scope, updateAttrName, singleExit);
       callee->numTimesInlined++;

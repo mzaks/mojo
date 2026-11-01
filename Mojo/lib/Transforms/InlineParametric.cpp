@@ -331,6 +331,23 @@ static void inlineGeneratorCall(GeneratorOp caller, CallOp call,
     cloned->erase();
     return WalkResult::advance();
   });
+  // A contract clause is never run: the debug variables of a body inlined
+  // into it serve nothing, and their types' debug info, which the mangling
+  // above does not reach, may not concretize (`Pointer._extent` on a
+  // pointer to `MaybeUninit` of a non-movable type, in `Span`'s invariant).
+  bool verificationOnly = false;
+  for (Operation *parent = call->getParentOp(); parent && !verificationOnly;
+       parent = parent->getParentOp())
+    verificationOnly = isVerificationOnly(parent);
+  if (verificationOnly) {
+    SmallVector<Operation *> debugOps;
+    scope->walk([&](Operation *op) {
+      if (isa<DebugInfo::ValueOp, DebugInfo::KillOp>(op))
+        debugOps.push_back(op);
+    });
+    for (Operation *op : debugOps)
+      op->erase();
+  }
   b.replaceOp(call, scope.getResults());
 
   // Always update the callsite locations. We need them to be intact for the
