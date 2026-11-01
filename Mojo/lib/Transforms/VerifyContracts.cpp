@@ -1664,11 +1664,15 @@ public:
           addObligation(ob);
         }
     }
-    // The memory behind a pointer argument the clauses name is tracked.
-    for (Value arg : memoryClauses(fn).pointers)
-      trackArgument(arg, state);
+    // The memory behind the places the clauses name is tracked.
+    SmallVector<std::string> entryBases;
+    for (const ClausePlace &place : memoryClauses(fn).places)
+      if (const Allocation *a = trackPlace(place, state))
+        entryBases.push_back(a->base);
     // The function's own preconditions hold at its entry (when refining,
     // after they are proven there: on the path, not as global facts).
+    SmallVector<ClauseRange> ranges;
+    rangeSink = &ranges;
     for (Operation &op : entry)
       if (auto req = dyn_cast<RequiresOp>(&op))
         if (MaybeTerm cond = instantiate(req.getBody(), req.getArgs(), state,
@@ -1679,6 +1683,14 @@ public:
           else
             facts.push_back(*cond);
         }
+    rangeSink = nullptr;
+    // The function touches only the elements its preconditions name of
+    // the memory tracked from entry (none, when they name no range).
+    for (const std::string &base : entryBases) {
+      hulls[base] = hullOf(base, ranges)
+                        .value_or(std::pair{bvConst(0, 64), bvConst(0, 64)});
+      store(slot(pointerBases[base], "/outside"), state, bvConst(0, 64));
+    }
     entryState = state;
     walkBlock(entry, state);
     // The body's own obligations are checked by the function's own run.
@@ -1928,12 +1940,55 @@ private:
     /// fact of the script it made the invariant search's queries unknown).
     std::string initv0;
   };
+  /// A range of elements a memory clause names, `_initialized(p, lo, hi)`:
+  /// from `first` to `last` of the memory behind `base`.
+  struct ClauseRange {
+    std::string base, first, last;
+  };
+  /// Where the ranges of the clauses being instantiated are collected: at
+  /// entry, those of the function's own preconditions (its hull); at a
+  /// call, those of the callee's (the frame of the call).
+  SmallVector<ClauseRange> *rangeSink = nullptr;
+  /// The hull of the elements the function's preconditions name of memory
+  /// tracked from entry (by `base`): the function touches no other.
+  std::map<std::string, std::pair<std::string, std::string>> hulls;
+
+  /// The hull of the ranges named of `base`: the least `first` and the
+  /// greatest `last`; none when no range names it.
+  std::optional<std::pair<std::string, std::string>>
+  hullOf(const std::string &base, ArrayRef<ClauseRange> ranges) {
+    std::optional<std::pair<std::string, std::string>> hull;
+    Sort i64{false, 64, true};
+    for (const ClauseRange &range : ranges) {
+      if (range.base != base)
+        continue;
+      if (!hull) {
+        hull = {range.first, range.last};
+        continue;
+      }
+      hull->first =
+          define(i64, "(ite (bvslt " + range.first + " " + hull->first + ") " +
+                          range.first + " " + hull->first + ")");
+      hull->second =
+          define(i64, "(ite (bvsgt " + range.last + " " + hull->second + ") " +
+                          range.last + " " + hull->second + ")");
+    }
+    return hull;
+  }
+
+  /// The field `field` of the allocation's state (`/alive`, `/from`,
+  /// ...): under its place, which is the pointer's value for memory this
+  /// function allocates, and a place of its own under the argument for
+  /// memory tracked from entry (`trackPlace`).
+  static Loc slot(const Allocation &a, const char *field) {
+    return Loc{a.place.root, a.place.path + field};
+  }
   /// By the pointer's term.
   std::map<std::string, Allocation> pointerBases;
   /// References to a pointee (`p[]`, `p[unsafe_offset=i]`) of such a pointer.
   DenseMap<Value, Allocation> pointeeRefs;
   /// The heap allocations of the function being verified, in order.
-  SmallVector<Value> allocationRoots;
+  SmallVector<Loc> allocationPlaces;
   /// Each list's storage version on entry, once a pointer is taken from it.
   std::map<Loc, std::string> entryStorage;
   bool initvDeclared = false;
@@ -3039,13 +3094,82 @@ private:
     return named;
   }
 
+  /// Whether the field path `rest` leads from a value of `type` into an
+  /// allocation handle: what is written through it is the memory the
+  /// handle owns. `rest` follows the root's name in a printed origin,
+  /// `#lit.origin.field<#lit.origin.field<ref<"self">, "_storage">,
+  /// "_alloc">`: the field names come in order, from the root.
+  bool reachesAllocationHandle(Type type, StringRef rest) {
+    while (true) {
+      size_t at = rest.find(", \"");
+      if (at == StringRef::npos)
+        return false;
+      rest = rest.drop_front(at + 3);
+      StringRef field = rest.take_until([](char c) { return c == '"'; });
+      rest = rest.drop_front(field.size());
+      if (!rest.starts_with("\">"))
+        return false;
+      auto st = dyn_cast<LIT::StructType>(type);
+      if (!st || field.empty())
+        return false;
+      auto decl = dyn_cast_or_null<LIT::StructDeclOp>(
+          symbols.lookupSymbolIn(module, st.getSymbol()));
+      if (!decl)
+        return false;
+      type = {};
+      for (Region &region : decl->getRegions())
+        for (Block &block : region)
+          for (auto f : block.getOps<LIT::StructFieldOp>())
+            if (f.getName() == field)
+              type = f.getType();
+      if (!type)
+        return false;
+      if (isAllocationHandle(type))
+        return true;
+    }
+    return false;
+  }
+
   /// Memory a mutable origin (printed) may reach becomes unknown. With
   /// `pointee`, the type the reference written through refers to: a part
   /// of a variable of another type (an element of a list, through a span
   /// of it: the reference `Span.__getitem__` returns has the list's
   /// origin), not the variable itself.
+  /// What a call's by-value operands (a span, a pointer) reach through
+  /// the origin named by a root (`Span(self)`, over a list's elements):
+  /// the root's name (quoted) and the operand's element type.
+  SmallVector<std::pair<std::string, Type>> pointeesVia(LIT::CallOp call) {
+    SmallVector<std::pair<std::string, Type>> via;
+    for (Value operand : call.getOperands()) {
+      Type type = operand.getType();
+      if (isa<LIT::RefType>(type))
+        continue;
+      bool span =
+          StringRef(printed(type))
+              .starts_with("!lit.struct<@std::@collections::@span::@Span<");
+      if (!span && !isPointerType(type))
+        continue;
+      Type element = typeParamOf(type, span ? 0 : 2);
+      if (!element)
+        continue;
+      // `*"self`2x"` then `>` or `,`: the whole root, not a field of it.
+      StringRef text(printed(type));
+      for (size_t at = text.find("*\""); at != StringRef::npos;
+           at = text.find("*\"", at + 1)) {
+        size_t end = text.find('"', at + 2);
+        if (end == StringRef::npos)
+          break;
+        if (end + 1 < text.size() &&
+            (text[end + 1] == '>' || text[end + 1] == ','))
+          via.push_back({text.slice(at + 1, end + 1).str(), element});
+      }
+    }
+    return via;
+  }
+
   void havocOrigin(StringRef origin, State &state, bool confined = false,
-                   Type pointee = {}) {
+                   Type pointee = {},
+                   ArrayRef<std::pair<std::string, Type>> via = {}) {
     if (std::optional<SmallVector<Value>> named = rootsNamedBy(origin)) {
       for (Value root : *named) {
         Loc loc{root, ""};
@@ -3062,6 +3186,36 @@ private:
         if (pointee && pointee != placeType(loc) &&
             isAllocationHandle(placeType(loc)))
           continue;
+        // Nor of a struct holding the handle in a field the origin names
+        // (`"self"->_storage->_alloc`, the origin of a span over a list's
+        // storage).
+        if (at != StringRef::npos &&
+            reachesAllocationHandle(placeType(loc),
+                                    origin.drop_front(at + name.size())))
+          continue;
+        // A write to the elements of a struct whose memory is tracked (a
+        // list, through a span of it): its fields and what is known of
+        // the memory's state are kept; the elements' values are not.
+        Type element = pointee;
+        if (!element)
+          for (const auto &[viaName, viaElement] : via)
+            if (viaName == name)
+              element = viaElement;
+        if (element && element != placeType(loc) &&
+            !isa<LIT::RefType>(placeType(loc)) &&
+            trackedPointerOf(root, state)) {
+          SmallVector<std::pair<Loc, std::string>> fields;
+          for (const auto &[field, value] : state.env)
+            if (field.root == root && !field.path.empty())
+              fields.push_back({field, value});
+          std::string old = load(loc, state, placeType(loc));
+          std::string fresh = declare({false, 64, false}, "h");
+          facts.push_back("(= " + lenOf(fresh) + " " + lenOf(old) + ")");
+          store(loc, state, fresh);
+          for (const auto &[field, value] : fields)
+            state.env[field] = value;
+          continue;
+        }
         if ((at != StringRef::npos &&
              origin.take_front(at).ends_with(
                  "#lit.interior.origin<#kgen.param.decl.ref<")) ||
@@ -3184,7 +3338,7 @@ private:
     if (!a.storage.empty())
       return define({true, 1, false},
                     "(= " + storageOf(a.place, state) + " " + a.storage + ")");
-    return load(Loc{a.place.root, "/alive"}, state, Sort{true, 1, false});
+    return load(slot(a, "/alive"), state, Sort{true, 1, false});
   }
 
   /// Whether element `offset` of heap memory is initialized: below the
@@ -3193,10 +3347,10 @@ private:
   std::string initializedAt(const Allocation &a, const std::string &offset,
                             State &state) {
     Sort i64{false, 64, true};
-    std::string from = load(Loc{a.place.root, "/from"}, state, i64);
-    std::string upto = load(Loc{a.place.root, "/upto"}, state, i64);
+    std::string from = load(slot(a, "/from"), state, i64);
+    std::string upto = load(slot(a, "/upto"), state, i64);
     std::string version =
-        load(Loc{a.place.root, "/initv"}, state, Sort{false, 64, false});
+        load(slot(a, "/initv"), state, Sort{false, 64, false});
     return define({true, 1, false}, "(or (and (bvsle " + from + " " + offset +
                                         ") (bvslt " + offset + " " + upto +
                                         ")) " + initvOf(version, offset) + ")");
@@ -3207,8 +3361,8 @@ private:
                                int64_t width, State &state) {
     Sort i64{false, 64, true};
     if (width > 16) {
-      std::string from = load(Loc{a.place.root, "/from"}, state, i64);
-      std::string upto = load(Loc{a.place.root, "/upto"}, state, i64);
+      std::string from = load(slot(a, "/from"), state, i64);
+      std::string upto = load(slot(a, "/upto"), state, i64);
       return define({true, 1, false},
                     "(and (bvsle " + from + " " + offset + ") (bvsle (bvadd " +
                         offset + " " + bvConst(width, 64) + ") " + upto + "))");
@@ -3230,8 +3384,8 @@ private:
     if (!a.storage.empty() || inContract)
       return;
     Sort i64{false, 64, true};
-    Loc fromLoc{a.place.root, "/from"}, uptoLoc{a.place.root, "/upto"},
-        strayLoc{a.place.root, "/stray"}, versionLoc{a.place.root, "/initv"};
+    Loc fromLoc = slot(a, "/from"), uptoLoc = slot(a, "/upto"),
+        strayLoc = slot(a, "/stray"), versionLoc = slot(a, "/initv");
     std::string from = load(fromLoc, state, i64);
     std::string upto = load(uptoLoc, state, i64);
     std::string version = load(versionLoc, state, Sort{false, 64, false});
@@ -3245,6 +3399,20 @@ private:
     std::string one = bvConst(1, 64);
     std::string atUpto = "(= " + offset + " " + upto + ")";
     std::string atFrom = "(= " + offset + " " + from + ")";
+    // Memory tracked from entry: an element outside the hull of what the
+    // preconditions name is one the function promised not to touch.
+    if (auto hull = hulls.find(a.base); hull != hulls.end()) {
+      Loc outsideLoc = slot(a, "/outside");
+      std::string inHull = "(and (bvsle " + hull->second.first + " " + offset +
+                           ") (bvslt " + offset + " " + hull->second.second +
+                           "))";
+      std::string outside = load(outsideLoc, state, i64);
+      noteCondition(define({true, 1, false}, inHull));
+      noteCondition(define({true, 1, false},
+                           "(= " + outside + " " + bvConst(0, 64) + ")"));
+      store(outsideLoc, state,
+            define(i64, "(ite " + inHull + " " + outside + " " + one + ")"));
+    }
     if (init) {
       // In order, a write extends the window `[from, upto)`; one outside
       // it is a stray element, which only `initv` knows about.
@@ -3270,17 +3438,25 @@ private:
                             " " + one + ")"));
     } else {
       // A move out or destruction at the front advances the window; one
-      // inside cuts it there (the elements above are still in `initv`).
+      // inside cuts it there: the elements above the cut (if any: at the
+      // back, there are none) are astray, known to `initv` alone.
       noteCondition(define({true, 1, false}, atFrom));
       noteCondition(define({true, 1, false}, atUpto));
       std::string inside = "(and (bvslt " + from + " " + offset + ") (bvslt " +
                            offset + " " + upto + "))";
+      std::string above =
+          "(bvslt (bvadd " + offset + " " + one + ") " + upto + ")";
+      noteCondition(define({true, 1, false}, above));
       store(fromLoc, state,
             define(i64, "(ite (and " + atFrom + " (bvslt " + from + " " + upto +
                             ")) (bvadd " + from + " " + one + ") " + from +
                             ")"));
       store(uptoLoc, state,
             define(i64, "(ite " + inside + " " + offset + " " + upto + ")"));
+      std::string stray = load(strayLoc, state, i64);
+      store(strayLoc, state,
+            define(i64, "(ite (and " + inside + " " + above + ") " + one + " " +
+                            stray + ")"));
     }
     store(versionLoc, state, next);
   }
@@ -3291,12 +3467,12 @@ private:
   /// have destroyed them (nothing is known then).
   std::string destroyedOf(const Allocation &a, State &state) {
     Sort i64{false, 64, true};
-    std::string from = load(Loc{a.place.root, "/from"}, state, i64);
-    std::string upto = load(Loc{a.place.root, "/upto"}, state, i64);
-    std::string stray = load(Loc{a.place.root, "/stray"}, state, i64);
-    std::string handed = load(Loc{a.place.root, "/handed"}, state, i64);
+    std::string from = load(slot(a, "/from"), state, i64);
+    std::string upto = load(slot(a, "/upto"), state, i64);
+    std::string stray = load(slot(a, "/stray"), state, i64);
+    std::string handed = load(slot(a, "/handed"), state, i64);
     std::string version =
-        load(Loc{a.place.root, "/initv"}, state, Sort{false, 64, false});
+        load(slot(a, "/initv"), state, Sort{false, 64, false});
     std::string zero = bvConst(0, 64);
     // Nothing was initialized at allocation: the frame axioms of the
     // writes and destructions since build on this.
@@ -3322,8 +3498,8 @@ private:
                                 const std::string &hi, bool uninit,
                                 State &state) {
     Sort i64{false, 64, true};
-    std::string from = load(Loc{a.place.root, "/from"}, state, i64);
-    std::string upto = load(Loc{a.place.root, "/upto"}, state, i64);
+    std::string from = load(slot(a, "/from"), state, i64);
+    std::string upto = load(slot(a, "/upto"), state, i64);
     std::string first = define(i64, "(bvadd " + a.offset + " " + lo + ")");
     std::string last = define(i64, "(bvadd " + a.offset + " " + hi + ")");
     std::string empty = "(bvsle " + hi + " " + lo + ")";
@@ -3333,7 +3509,9 @@ private:
                                           " " + upto + ")))");
     // No stray element, even for an empty range: `_uninitialized(p, n,
     // p._extent())` of memory that is full says the `n` are all there is.
-    std::string stray = load(Loc{a.place.root, "/stray"}, state, i64);
+    // The window lies below the range (not above it: a write below a
+    // window is a stray element, since the window grows in order).
+    std::string stray = load(slot(a, "/stray"), state, i64);
     return define({true, 1, false}, "(and (= " + stray + " " + bvConst(0, 64) +
                                         ") (or " + empty + " (= " + from + " " +
                                         upto + ") (bvsle " + upto + " " +
@@ -3346,33 +3524,40 @@ private:
   /// whether it is allocated is unknown too.
   void unknownMemoryState(const Allocation &a, bool alive, State &state) {
     Sort i64{false, 64, true};
-    std::string from = declare(i64, "m"), upto = declare(i64, "m"),
-                stray = declare(i64, "m");
+    std::string from = declare(i64, "m"), upto = declare(i64, "m");
     facts.push_back("(bvsle " + bvConst(0, 64) + " " + from + ")");
     facts.push_back("(bvsle " + from + " " + upto + ")");
     facts.push_back("(bvsle " + upto + " " + extentOf(a.base) + ")");
-    facts.push_back("(or (= " + stray + " " + bvConst(0, 64) + ") (= " + stray +
-                    " " + bvConst(1, 64) + "))");
     // An empty window is at 0 (where it is makes no difference to what is
     // stated; at 0, a loop that then fills the memory finds its invariant).
     facts.push_back("(=> (= " + from + " " + upto + ") (= " + from + " " +
                     bvConst(0, 64) + "))");
-    store(Loc{a.place.root, "/from"}, state, from);
-    store(Loc{a.place.root, "/upto"}, state, upto);
-    store(Loc{a.place.root, "/stray"}, state, stray);
-    store(Loc{a.place.root, "/initv"}, state,
-          declare({false, 64, false}, "iv"));
+    store(slot(a, "/from"), state, from);
+    store(slot(a, "/upto"), state, upto);
+    // The initialized elements are the window, with none astray: a caller
+    // proves that of memory it hands to a function whose clauses name it,
+    // and a function proves it of what it leaves (`proveMemoryFrame`).
+    store(slot(a, "/stray"), state, bvConst(0, 64));
+    store(slot(a, "/initv"), state, declare({false, 64, false}, "iv"));
     if (alive)
-      store(Loc{a.place.root, "/alive"}, state,
-            declare({true, 1, false}, "al"));
+      store(slot(a, "/alive"), state, declare({true, 1, false}, "al"));
   }
 
-  /// What the clauses of `fn` state about memory: the pointer arguments
-  /// they name in `_allocated`, `_initialized` or `_uninitialized`, and
-  /// whether a postcondition says whether the memory is still allocated
-  /// (otherwise the function does not free it).
+  /// What the clauses of `fn` state about memory: the pointers they name
+  /// in `_allocated`, `_initialized` or `_uninitialized` (an argument, or
+  /// a field of one: `self._storage.unsafe_ptr()` of a list, `self._data`
+  /// of a span), and whether a postcondition says whether the memory is
+  /// still allocated (otherwise the function does not free it).
+  struct ClausePlace {
+    /// The function's argument (or its named result).
+    Value formal;
+    /// The field path of the pointer in it (empty: the argument is it).
+    std::string path;
+    /// Named only by the struct's invariant.
+    bool invariantOnly = true;
+  };
   struct MemoryClauses {
-    SmallVector<Value> pointers;
+    SmallVector<ClausePlace> places;
     bool allocated = false;
   };
   DenseMap<Operation *, MemoryClauses> memoryClausesOf;
@@ -3381,7 +3566,8 @@ private:
     if (!inserted)
       return it->second;
     MemoryClauses &found = it->second;
-    auto clause = [&](Region &body, OperandRange args, bool ensures) {
+    auto clause = [&](Region &body, OperandRange args, bool ensures,
+                      bool invariant) {
       body.walk([&](LIT::CallOp call) {
         std::optional<CalleeName> n = calleeName(call.getCallee());
         if (!n || call.getNumOperands() == 0)
@@ -3395,17 +3581,35 @@ private:
                  !path.starts_with("_uninitialized["))
           return;
         // Through the casts that keep the pointer (the implicit
-        // conversion to the immutable pointer the predicates take).
+        // conversion to the immutable pointer the predicates take), and
+        // down the fields it is read from.
         Value pointer = call.getOperands()[0];
+        std::string field;
         while (Operation *def = pointer.getDefiningOp()) {
           if (auto cast = dyn_cast<LIT::CallOp>(def)) {
             std::optional<CalleeName> c = calleeName(cast.getCallee());
             StringRef castPath = c ? StringRef(c->path) : StringRef();
-            if (cast.getNumOperands() != 1 ||
-                !castPath.consume_front("std::memory::pointer::Pointer::") ||
-                !isSamePointerCast(castPath))
+            if (cast.getNumOperands() != 1)
               return;
-          } else if (!isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp>(def))
+            if (castPath.starts_with(
+                    "std::memory::alloc::Allocation::unsafe_ptr["))
+              field = "/_alloc/_ptr" + field;
+            else if (!castPath.consume_front(
+                         "std::memory::pointer::Pointer::") ||
+                     !isSamePointerCast(castPath))
+              return;
+          } else if (auto gep = dyn_cast<LIT::RefStructGEROp>(def)) {
+            auto name = gep->getAttrOfType<StringAttr>("field");
+            if (!name)
+              return;
+            field = "/" + name.getValue().str() + field;
+          } else if (auto extract = dyn_cast<LIT::StructExtractOp>(def)) {
+            auto name = def->getAttrOfType<StringAttr>("field");
+            if (!name)
+              return;
+            field = "/" + name.getValue().str() + field;
+          } else if (!isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp,
+                          LIT::RefLoadOp>(def))
             return;
           pointer = def->getOperand(0);
         }
@@ -3414,41 +3618,245 @@ private:
             arg.getArgNumber() >= args.size())
           return;
         Value actual = args[arg.getArgNumber()];
-        if (!llvm::is_contained(found.pointers, actual))
-          found.pointers.push_back(actual);
+        for (ClausePlace &place : found.places)
+          if (place.formal == actual && place.path == field) {
+            place.invariantOnly &= invariant;
+            return;
+          }
+        found.places.push_back({actual, field, invariant});
       });
     };
     if (!fn.getFunctionBody().empty()) {
       for (Operation &op : fn.getFunctionBody().front())
         if (auto req = dyn_cast<RequiresOp>(&op))
-          clause(req.getBody(), req.getArgs(), false);
-      fn.getFunctionBody().walk(
-          [&](EnsuresOp ens) { clause(ens.getBody(), ens.getArgs(), true); });
+          clause(req.getBody(), req.getArgs(), false,
+                 req.getInvariant().has_value());
+      fn.getFunctionBody().walk([&](EnsuresOp ens) {
+        clause(ens.getBody(), ens.getArgs(), true,
+               ens.getInvariant().has_value());
+      });
     }
     return found;
   }
 
-  /// A pointer argument the function's own clauses name: the memory
-  /// behind it is tracked from entry, in an unknown state the
-  /// preconditions then constrain, so that the postconditions about it
-  /// can be proven.
-  void trackArgument(Value arg, State &state) {
-    if (isa<LIT::RefType>(arg.getType()) || !isPointerType(arg.getType()))
-      return;
-    std::string pointer = term(arg, state);
-    if (pointerBases.count(pointer))
-      return;
-    Loc place{arg, ""};
-    storeFields(place, state,
-                {{"/alive", "true"},
-                 {"/from", bvConst(0, 64)},
-                 {"/upto", bvConst(0, 64)},
-                 {"/stray", bvConst(0, 64)},
-                 {"/handed", bvConst(0, 64)},
-                 {"/initv", declare({false, 64, false}, "iv")}});
+  /// The pointer a clause place names, for `actual` (an argument of this
+  /// function, or at a call its operand or result): the argument itself,
+  /// or the field of the place it refers to, or of its value.
+  MaybeTerm clausePointer(Value actual, StringRef path, State &state) {
+    Sort handle{false, 64, false};
+    if (isa<LIT::RefType>(actual.getType())) {
+      std::optional<Loc> loc = placeOf(actual);
+      if (!loc)
+        return std::nullopt;
+      return load(Loc{loc->root, loc->path + path.str()}, state, handle);
+    }
+    if (path.empty())
+      return isPointerType(actual.getType()) ? MaybeTerm(term(actual, state))
+                                             : std::nullopt;
+    return fieldOf(term(actual, state), path.str(), handle);
+  }
+
+  /// Tracks the memory behind `pointer` from here on, in an unknown state
+  /// (which clauses then constrain): at entry for a place the function's
+  /// own clauses name, after a call for one the callee's name. Its state
+  /// is kept at a place of its own under `root` (unknown again where
+  /// `root` is: a mutable `self` a call may write).
+  Allocation &trackPointer(const std::string &pointer, Value root, bool alive,
+                           State &state) {
+    Loc place{root, "/.m" + std::to_string(allocationPlaces.size())};
     pointerBases[pointer] = {place, bvConst(0, 64), "", pointer, false, ""};
-    allocationRoots.push_back(arg);
-    unknownMemoryState(pointerBases[pointer], /*alive=*/true, state);
+    Allocation &a = pointerBases[pointer];
+    allocationPlaces.push_back(place);
+    store(slot(a, "/handed"), state, bvConst(0, 64));
+    if (!alive)
+      store(slot(a, "/alive"), state, "true");
+    unknownMemoryState(a, alive, state);
+    return a;
+  }
+
+  /// A place the function's own clauses name: the memory behind it is
+  /// tracked from entry, in an unknown state the preconditions then
+  /// constrain, so that the postconditions about it can be proven.
+  const Allocation *trackPlace(const ClausePlace &place, State &state) {
+    MaybeTerm pointer = clausePointer(place.formal, place.path, state);
+    if (!pointer || pointerBases.count(*pointer))
+      return nullptr;
+    return &trackPointer(*pointer, place.formal, /*alive=*/true, state);
+  }
+
+  /// The place as the clauses write it: `self._storage.unsafe_ptr()`.
+  std::string placeName(const ClausePlace &place) {
+    std::string name = quotedOriginName(place.formal); // `"self`2x"`
+    name = name.size() > 2 ? name.substr(1, name.find('`', 1) - 1) : "";
+    if (name.empty())
+      name = isa<LIT::RefType>(place.formal.getType()) ? "self" : "the pointer";
+    std::string path = place.path;
+    size_t ptr = path.rfind("/_alloc/_ptr");
+    if (ptr != std::string::npos && ptr + 12 == path.size())
+      path = path.substr(0, ptr) + ".unsafe_ptr()";
+    for (char &c : path)
+      if (c == '/')
+        c = '.';
+    return "'" + name + path + "'";
+  }
+
+  /// Where the function returns: of the memory its clauses name, which a
+  /// caller follows after the call, the initialized elements are the
+  /// window (none astray: `_uninitialized` is said of the rest), and of
+  /// memory tracked from entry, no element outside the hull of what the
+  /// preconditions name was written or destroyed (a caller keeps what it
+  /// knew of the others). Not of memory the function consumes.
+  void proveMemoryFrame(Operation *ret, State &state) {
+    ArrayRef<ArgConvention> conventions =
+        fn.getFuncTypeGenerator().getArgConventions();
+    Sort i64{false, 64, true};
+    std::string zero = bvConst(0, 64);
+    for (const ClausePlace &place : memoryClauses(fn).places) {
+      if (auto formal = dyn_cast<BlockArgument>(place.formal))
+        if (formal.getArgNumber() < conventions.size() &&
+            (conventions[formal.getArgNumber()] == ArgConvention::OwnedMem ||
+             conventions[formal.getArgNumber()] == ArgConvention::DeinitMem))
+          continue;
+      MaybeTerm pointer = clausePointer(place.formal, place.path, state);
+      if (!pointer)
+        continue;
+      auto it = pointerBases.find(*pointer);
+      if (it == pointerBases.end() || !it->second.storage.empty())
+        continue;
+      const Allocation &a = it->second;
+      std::string stray = load(slot(a, "/stray"), state, i64);
+      if (stray != zero)
+        checkClaim(ret->getLoc(), displayName(fn),
+                   "that the elements of " + placeName(place) +
+                       " left initialized are contiguous",
+                   define({true, 1, false}, "(= " + stray + " " + zero + ")"),
+                   state);
+      if (!hulls.count(a.base))
+        continue;
+      std::string outside = load(slot(a, "/outside"), state, i64);
+      if (outside != zero)
+        checkClaim(ret->getLoc(), displayName(fn),
+                   "that only elements of " + placeName(place) +
+                       " its preconditions name are written or destroyed",
+                   define({true, 1, false}, "(= " + outside + " " + zero + ")"),
+                   state);
+    }
+  }
+
+  /// After a call to a function whose clauses name places of its
+  /// operands (or its result): the memory behind each is in a state its
+  /// postconditions describe (assumed after this), unknown otherwise. A
+  /// place named only by the callee's struct invariant is followed where
+  /// it was tracked before the call (in a method of the struct), not
+  /// where the caller never looked at the memory.
+  void retrackClausePlaces(LIT::CallOp call, LIT::FnOp callee, State &before,
+                           ArrayRef<ClauseRange> ranges, State &state) {
+    const MemoryClauses &declared = memoryClauses(callee);
+    if (declared.places.empty())
+      return;
+    Block &entry = callee.getFunctionBody().front();
+    for (const ClausePlace &place : declared.places) {
+      Value actual;
+      if (auto formal = dyn_cast<BlockArgument>(place.formal)) {
+        if (formal.getOwner() != &entry ||
+            formal.getArgNumber() >= call.getNumOperands())
+          continue;
+        // Through an immutable reference (`capacity(self)`) the callee
+        // changes nothing of the memory.
+        if (auto ref = dyn_cast<LIT::RefType>(formal.getType());
+            ref && ref.isMutableKnown(false))
+          continue;
+        actual = call.getOperands()[formal.getArgNumber()];
+      } else if (isNamedResult(callee, place.formal) &&
+                 call->getNumResults() == 1) {
+        actual = call->getResult(0);
+      } else {
+        continue;
+      }
+      MaybeTerm now = clausePointer(actual, place.path, state);
+      if (!now)
+        continue;
+      auto it = pointerBases.find(*now);
+      if (it != pointerBases.end()) {
+        if (it->second.storage.empty())
+          frameOfCall(call, callee, it->second, declared.allocated, before,
+                      ranges, state);
+        continue;
+      }
+      // The pointer the operand held before the call, where the call
+      // left it unknown (`self._storage` of a `mut self`).
+      MaybeTerm was = isa<LIT::RefType>(actual.getType())
+                          ? clausePointer(actual, place.path, before)
+                          : std::nullopt;
+      bool tracked =
+          was && pointerBases.count(*was) && pointerBases[*was].storage.empty();
+      if (place.invariantOnly && !tracked)
+        continue;
+      Value root = actual;
+      if (isa<LIT::RefType>(actual.getType()))
+        if (std::optional<Loc> loc = placeOf(actual))
+          root = loc->root;
+      trackPointer(*now, root, /*alive=*/!tracked || declared.allocated, state);
+      if (tracked && !declared.allocated)
+        store(slot(pointerBases[*now], "/alive"), state,
+              load(slot(pointerBases[*was], "/alive"), before,
+                   Sort{true, 1, false}));
+    }
+  }
+
+  /// After a call to a function whose clauses name the memory behind `a`
+  /// (and that leaves it where it was): the callee was handed it with no
+  /// element astray (its clauses are read so), and leaves it so. It
+  /// touched no element outside the hull of the ranges its preconditions
+  /// name (`proveMemoryFrame`), so what lay outside is as it was: the
+  /// window after, `[from', upto')`, keeps what was initialized outside
+  /// the hull and stays within what was initialized or named. With no
+  /// range named, nothing changes.
+  void frameOfCall(LIT::CallOp call, LIT::FnOp callee, const Allocation &a,
+                   bool allocated, State &before, ArrayRef<ClauseRange> ranges,
+                   State &state) {
+    Sort i64{false, 64, true};
+    std::string zero = bvConst(0, 64);
+    std::string stray = load(slot(a, "/stray"), before, i64);
+    if (stray != zero)
+      checkClaim(call.getLoc(), displayName(callee),
+                 "that the initialized elements of the memory handed over "
+                 "are contiguous",
+                 define({true, 1, false}, "(= " + stray + " " + zero + ")"),
+                 state);
+    std::string from0 = load(slot(a, "/from"), before, i64);
+    std::string upto0 = load(slot(a, "/upto"), before, i64);
+    unknownMemoryState(a, allocated, state);
+    std::string from = load(slot(a, "/from"), state, i64);
+    std::string upto = load(slot(a, "/upto"), state, i64);
+    std::optional<std::pair<std::string, std::string>> hull =
+        hullOf(a.base, ranges);
+    if (!hull) {
+      facts.push_back("(= " + from + " " + from0 + ")");
+      facts.push_back("(= " + upto + " " + upto0 + ")");
+      return;
+    }
+    const std::string &lo = hull->first, &hi = hull->second;
+    std::string empty = "(= " + from + " " + upto + ")";
+    std::string minFrom =
+        "(ite (bvslt " + from0 + " " + lo + ") " + from0 + " " + lo + ")";
+    std::string maxUpto =
+        "(ite (bvsgt " + upto0 + " " + hi + ") " + upto0 + " " + hi + ")";
+    std::string belowHull =
+        "(ite (bvslt " + upto0 + " " + lo + ") " + upto0 + " " + lo + ")";
+    std::string aboveHull =
+        "(ite (bvsgt " + from0 + " " + hi + ") " + from0 + " " + hi + ")";
+    // Nothing was initialized below the window and the hull, or at or
+    // above both: still nothing.
+    facts.push_back("(or " + empty + " (bvsle " + minFrom + " " + from + "))");
+    facts.push_back("(or " + empty + " (bvsle " + upto + " " + maxUpto + "))");
+    // What was initialized below the hull, or above it, still is.
+    facts.push_back("(=> (bvslt " + from0 + " " + belowHull + ") (and (bvsle " +
+                    from + " " + from0 + ") (bvsle " + belowHull + " " + upto +
+                    ")))");
+    facts.push_back("(=> (bvslt " + aboveHull + " " + upto0 + ") (and (bvsle " +
+                    from + " " + aboveHull + ") (bvsle " + upto0 + " " + upto +
+                    ")))");
   }
 
   /// At `free` or `dealloc` of memory whose elements have a destructor to
@@ -3468,6 +3876,8 @@ private:
   /// with a field of such a type. A type that cannot be looked at (a
   /// parameter) is taken to have one.
   bool needsDestroy(Type type, unsigned depth = 0) {
+    if (!type)
+      return true; // Not resolved: as unknown.
     auto st = dyn_cast<LIT::StructType>(type);
     if (!st)
       return false; // A builtin (`!pop.simd`, a raw pointer).
@@ -3641,6 +4051,30 @@ private:
             state.storage[*self] = declare({false, 64, false}, "sv");
       return;
     }
+    // `MaybeUninit` methods on an element: a write initializes it, a
+    // read or a move out needs it initialized (and a move out or a
+    // destruction leaves it uninitialized).
+    if (path.consume_front("std::memory::maybe_uninit::MaybeUninit::")) {
+      std::optional<Allocation> pointee =
+          ops.empty() ? std::nullopt : pointeeOf(ops[0]);
+      if (!pointee)
+        return;
+      if (path.starts_with("unsafe_write(")) {
+        checkAlive(at, "MaybeUninit.unsafe_write", *pointee, state);
+        markInitialized(*pointee, pointee->offset, true, state);
+      } else if (path.starts_with("unsafe_assume_init(") ||
+                 path.starts_with("unsafe_deinit(")) {
+        std::string callee = path.starts_with("unsafe_deinit(")
+                                 ? "MaybeUninit.unsafe_deinit"
+                                 : "MaybeUninit.unsafe_assume_init";
+        checkAlive(at, callee, *pointee, state);
+        checkInitialized(at, callee, *pointee, pointee->offset, 1, state);
+        // `deinit self` (`$)`) moves the value out; `ref self` reads it.
+        if (path.contains("$)"))
+          markInitialized(*pointee, pointee->offset, false, state);
+      }
+      return;
+    }
     if (!path.starts_with("std::memory::pointer::Pointer::"))
       for (Value operand : ops)
         if (isa<LIT::RefType>(operand.getType()))
@@ -3671,51 +4105,64 @@ private:
                                 ? "/_alloc/_ptr"
                                 : "/_alloc/_alloc/_ptr")) {
         checkAlive(at, "dealloc", *a, state);
-        if (std::optional<Loc> self = placeOf(ops[0]))
-          checkDestroyed(at, "dealloc", *a, typeParamOf(placeType(*self), 0),
-                         state);
-        store(Loc{a->place.root, "/alive"}, state, "false");
+        // The handle's type (a field's, `self._storage`, is not its
+        // place's root's).
+        Type handle = ops[0].getType();
+        if (auto ref = dyn_cast<LIT::RefType>(handle))
+          handle = ref.getElementType();
+        checkDestroyed(at, "dealloc", *a, typeParamOf(handle, 0), state);
+        store(slot(*a, "/alive"), state, "false");
       }
       return;
     }
-    if (path.starts_with("std::memory::alloc::Allocation::unsafe_span[") ||
-        path.starts_with("std::memory::alloc::Allocation::storage[") ||
-        path.starts_with(
-            "std::memory::alloc::ManagedAllocation::unsafe_span[")) {
-      // A span over the memory may initialize all of it.
-      if (std::optional<Allocation> a =
-              handlePointer(path.contains("Managed") ? "/_alloc/_alloc/_ptr"
-                                                     : "/_alloc/_ptr"))
-        store(Loc{a->place.root, "/upto"}, state,
-              define(i64, extentOf(a->base)));
-      return;
-    }
     if (!path.consume_front("std::memory::pointer::Pointer::")) {
-      // A callee whose clauses declare what it does to the memory: it
-      // leaves it in a state they describe (assumed after the call).
+      // The sanitizer's annotations read nothing and write nothing; a
+      // span's constructor keeps the pointer (`evalBuiltin`), and its
+      // accessors hand out references to the elements
+      // (`followPointerResults`), through which the elements are then
+      // written or read.
+      if (path.starts_with("std::collections::_asan_annotations::"))
+        return;
+      if (path.consume_front("std::collections::span::Span::") &&
+          (path.starts_with("__init__(unsafe_ptr:") ||
+           path.starts_with("_unchecked_get(") ||
+           path.starts_with("_unchecked_subspan(") ||
+           path.starts_with("__getitem__(") ||
+           path.starts_with("__getitem__[") || path.starts_with("unsafe_ptr(")))
+        return;
+      // A callee whose clauses declare what it does to the memory leaves
+      // it in a state they describe (`retrackClausePlaces`, after the
+      // call); one handed a pointer without them may do anything.
       const MemoryClauses *declared =
           contract && !contract.getFunctionBody().empty()
               ? &memoryClauses(contract)
               : nullptr;
-      for (Value operand : ops) {
-        if (isa<LIT::RefType>(operand.getType()) ||
-            !isPointerType(operand.getType()))
+      for (auto [index, operand] : llvm::enumerate(ops)) {
+        // A pointer, or a span over tracked memory, given by value.
+        if (isa<LIT::RefType>(operand.getType()))
           continue;
-        if (std::optional<Allocation> a = allocationOf(operand, state);
-            a && a->storage.empty() && declared &&
-            !declared->pointers.empty()) {
-          unknownMemoryState(*a, declared->allocated, state);
+        bool span = !isPointerType(operand.getType());
+        MaybeTerm pointer = span ? trackedPointerOf(operand, state)
+                                 : MaybeTerm(term(operand, state));
+        if (!pointer)
           continue;
-        }
-        if (std::optional<Allocation> a = allocationOf(operand, state);
-            a && a->storage.empty()) {
-          Loc handed{a->place.root, "/handed"};
+        if (declared && llvm::any_of(declared->places, [&](auto &place) {
+              auto formal = dyn_cast<BlockArgument>(place.formal);
+              return formal && formal.getArgNumber() == index &&
+                     place.path == (span ? "/_data" : "");
+            }))
+          continue;
+        auto found = pointerBases.find(*pointer);
+        std::optional<Allocation> a = found == pointerBases.end()
+                                          ? std::nullopt
+                                          : std::optional(found->second);
+        if (a && a->storage.empty()) {
+          Loc handed = slot(*a, "/handed");
           noteCondition(
               define({true, 1, false}, "(= " + load(handed, state, i64) + " " +
                                            bvConst(0, 64) + ")"));
-          store(Loc{a->place.root, "/from"}, state, bvConst(0, 64));
-          store(Loc{a->place.root, "/upto"}, state,
-                define(i64, extentOf(a->base)));
+          store(slot(*a, "/from"), state, bvConst(0, 64));
+          store(slot(*a, "/upto"), state, define(i64, extentOf(a->base)));
           store(handed, state, bvConst(1, 64));
         }
       }
@@ -3775,7 +4222,7 @@ private:
       checkDestroyed(at, "Pointer.free", *a, typeParamOf(ops[0].getType(), 2),
                      state);
       if (a->storage.empty())
-        store(Loc{a->place.root, "/alive"}, state, "false");
+        store(slot(*a, "/alive"), state, "false");
     } else if (path.starts_with("load[") || path.starts_with("unsafe_load[")) {
       std::string callee =
           path.starts_with("load[") ? "Pointer.load" : "Pointer.unsafe_load";
@@ -3822,7 +4269,7 @@ private:
                    {"/initv", version}});
       pointerBases[pointer] = {place,   bvConst(0, 64), "",
                                pointer, stack,          version};
-      allocationRoots.push_back(result);
+      allocationPlaces.push_back(place);
     };
     if (path.starts_with("std::memory::alloc::unsafe_alloc[") ||
         (path.starts_with("std::memory::alloc::alloc[") &&
@@ -3888,6 +4335,55 @@ private:
                                                    : "/_alloc/_ptr";
       if (MaybeTerm pointer = fieldBefore(field))
         values[result] = *pointer;
+      return;
+    }
+    // A dangling pointer: memory that is not allocated, of no extent.
+    if (path.starts_with("std::memory::pointer::Pointer::unsafe_dangling(")) {
+      std::string pointer = term(result, state);
+      allocated(pointer, false);
+      store(Loc{result, "/alive"}, state, "false");
+      facts.push_back("(= " + extentOf(pointer) + " " + bvConst(0, 64) + ")");
+      return;
+    }
+    // A thin handle built from a pointer, and the allocation it is given
+    // a layout with.
+    if (path.starts_with(
+            "std::memory::alloc::ThinAllocation::__init__(unsafe_owned_ptr:") &&
+        ops.size() == 1 && !isa<LIT::RefType>(ops[0].getType())) {
+      fieldValues[{term(result, state), "/_ptr"}] = term(ops[0], state);
+      return;
+    }
+    if (path.starts_with(
+            "std::memory::alloc::ThinAllocation::unsafe_with_layout[") &&
+        ops.size() == 2 && !isa<LIT::RefType>(ops[1].getType())) {
+      std::string r = term(result, state);
+      if (MaybeTerm pointer = fieldBefore("/_ptr"))
+        fieldValues[{r, "/_alloc/_ptr"}] = *pointer;
+      fieldValues[{r, "/_layout/_length"}] =
+          fieldOf(term(ops[1], state), "/_length", i64);
+      return;
+    }
+    // An element of a span over tracked memory (`s[i]`, a reference).
+    if ((path.starts_with("std::collections::span::Span::_unchecked_get(") ||
+         path.starts_with("std::collections::span::Span::__getitem__(") ||
+         path.starts_with("std::collections::span::Span::__getitem__[")) &&
+        ops.size() == 2 && isa<LIT::RefType>(result.getType())) {
+      if (MaybeTerm data = trackedPointerOf(ops[0], state)) {
+        const Allocation &span = pointerBases[*data];
+        if (MaybeTerm k = indexOperand(ops[1], state)) {
+          Allocation at = span;
+          at.offset = define(i64, "(bvadd " + span.offset + " " + *k + ")");
+          pointeeRefs[result] = at;
+        }
+      }
+      return;
+    }
+    // `MaybeUninit.unsafe_ptr()` of an element: a pointer to it.
+    if (path.starts_with(
+            "std::memory::maybe_uninit::MaybeUninit::unsafe_ptr[") &&
+        ops.size() == 1) {
+      if (std::optional<Allocation> pointee = pointeeOf(ops[0]))
+        pointerBases[term(result, state)] = *pointee;
       return;
     }
     if (!path.consume_front("std::memory::pointer::Pointer::") || ops.empty())
@@ -4072,12 +4568,12 @@ private:
   void keepAllocationState(Operation *loop, State &before, State &head) {
     bool frees = freesIn(loop), hands = handsPointersIn(loop),
          destroys = destroysIn(loop), writes = writesElementsIn(loop);
-    for (Value root : allocationRoots) {
+    for (const Loc &place : allocationPlaces) {
       // What the loop cannot change holds its value from before it (a
       // field of the allocation's value, where a loop before left it).
       auto keep = [&](const char *field, bool changed, Sort sort) {
-        Loc loc{root, field};
-        if (!changed && !head.env.count(loc) && before.env.count(Loc{root, ""}))
+        Loc loc{place.root, place.path + field};
+        if (!changed && !head.env.count(loc) && before.env.count(place))
           head.env[loc] = load(loc, before, sort);
       };
       Sort i64{false, 64, true};
@@ -4286,6 +4782,8 @@ private:
       }
       if (refines && !inContract)
         proveTraitEnsures(op, state);
+      if (!inContract)
+        proveMemoryFrame(op, state);
       state.alive = false;
       return;
     }
@@ -5549,9 +6047,9 @@ private:
     // states at the head (`keepAllocationState` keeps what it cannot
     // change).
     if (written && mayTouchAllocations(loop))
-      for (Value root : allocationRoots)
-        if (state.env.count(Loc{root, "/alive"}))
-          written->insert(root);
+      for (const Loc &place : allocationPlaces)
+        if (state.env.count(Loc{place.root, place.path + "/alive"}))
+          written->insert(place.root);
     // Locals declared in the loop are written whole.
     loop->walk([&](LIT::VarDeclOp decl) { fields.erase(decl->getResult(0)); });
     State before = state;
@@ -5944,12 +6442,12 @@ private:
           open[i] = open[i] && !refuted[i];
           undecided += open[i];
         }
-        // Without it: a round's few undecided candidates (at most 3) are
+        // Without it: a round's few undecided candidates (at most 8) are
         // asked once more with twice the limit. A query at the edge of the
         // limit otherwise flips with any change in the script (the number
         // of constants declared), taking proofs with it, and the cost is
         // bounded; a kernel's rounds, with many undecided, pay nothing.
-        if (undecided && (solver.invariantRetry || undecided <= 3)) {
+        if (undecided && (solver.invariantRetry || undecided <= 8)) {
           SmallVector<size_t> again;
           for (size_t i = 0; i < set.size(); ++i)
             if (kept[i] && open[i])
@@ -7831,18 +8329,24 @@ private:
     bool hasBody = contract && !contract.getFunctionBody().empty();
     // A call to a function with preconditions: they are obligations here,
     // except for a struct's invariant, which holds for every value of it.
+    // The ranges of memory they name (the invariant's too) bound what
+    // the call changes (`retrackClausePlaces`).
+    SmallVector<ClauseRange> callRanges;
     if (hasBody && !inContract) {
+      rangeSink = &callRanges;
       for (Operation &calleeOp : contract.getFunctionBody().front()) {
         auto req = dyn_cast<RequiresOp>(&calleeOp);
-        if (!req || req.getInvariant())
+        if (!req)
           continue;
-        Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
-                      displayName(contract)};
         params = contractFrame;
         MaybeTerm cond =
             instantiate(req.getBody(), req.getArgs(), state, call.getOperands(),
                         contract, nullptr, false);
         params = frame.parent;
+        if (req.getInvariant())
+          continue;
+        Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
+                      displayName(contract)};
         if (cond) {
           ob.cond = *cond;
           noteCondition(ob.cond);
@@ -7851,6 +8355,7 @@ private:
         }
         addObligation(ob);
       }
+      rangeSink = nullptr;
     }
     if (name && !inContract && !trusted) {
       checkLaunch(call, *name, state);
@@ -7934,10 +8439,11 @@ private:
           ref && !ref.isMutableKnown(false) && placeOf(operand))
         covered.insert(printed(ref.getOrigin()));
     bool confined = confinedWrites(call);
+    SmallVector<std::pair<std::string, Type>> via = pointeesVia(call);
     for (StringRef origin : topLevelElements(origins))
       if (mutableOrigin(origin) &&
           !covered.count(origin.str()))
-        havocOrigin(origin, state, confined);
+        havocOrigin(origin, state, confined, {}, via);
     havocCaptures(call, state, confined);
     for (auto [index, operand] : llvm::enumerate(call.getOperands())) {
       auto ref = dyn_cast<LIT::RefType>(operand.getType());
@@ -7984,6 +8490,8 @@ private:
     evalTraitQuery(call, callee, state);
     if (hasBody) {
       params = contractFrame;
+      if (!inContract)
+        retrackClausePlaces(call, contract, before, callRanges, state);
       assumeEnsures(call, contract, before, state);
       params = frame.parent;
     }
@@ -10588,6 +11096,62 @@ private:
     addObligation(ob);
   }
 
+  /// The length a field of `xs` holds: an allocation handle's layout
+  /// length, a tracked list's `_len`.
+  MaybeTerm fieldLength(Value xs, State &state) {
+    Sort i64{false, 64, true};
+    Type type = xs.getType();
+    if (auto ref = dyn_cast<LIT::RefType>(type))
+      type = ref.getElementType();
+    std::string t = printed(type);
+    const char *field = nullptr;
+    if (StringRef(t).starts_with(
+            "!lit.struct<@std::@memory::@alloc::@Allocation<"))
+      field = "/_layout/_length";
+    else if (StringRef(t).starts_with(
+                 "!lit.struct<@std::@memory::@alloc::@ManagedAllocation<"))
+      field = "/_alloc/_layout/_length";
+    else if (StringRef(t).starts_with(
+                 "!lit.struct<@std::@collections::@list::@List<") &&
+             trackedPointerOf(xs, state))
+      field = "/_len";
+    if (!field)
+      return std::nullopt;
+    if (isa<LIT::RefType>(xs.getType())) {
+      std::optional<Loc> loc = placeOf(xs);
+      if (!loc)
+        return std::nullopt;
+      return load(Loc{loc->root, loc->path + field}, state, i64);
+    }
+    return fieldOf(term(xs, state), field, i64);
+  }
+
+  /// The tracked pointer a list's storage or a span's `_data` holds
+  /// (`self` by reference or by value), if it is one.
+  MaybeTerm trackedPointerOf(Value self, State &state) {
+    Sort handle{false, 64, false};
+    Type type = self.getType();
+    if (auto ref = dyn_cast<LIT::RefType>(type))
+      type = ref.getElementType();
+    std::string t = printed(type);
+    const char *field = StringRef(t).starts_with(
+                            "!lit.struct<@std::@collections::@list::@List<")
+                            ? "/_storage/_alloc/_ptr"
+                        : StringRef(t).starts_with(
+                              "!lit.struct<@std::@collections::@span::@Span<")
+                            ? "/_data"
+                            : nullptr;
+    if (!field)
+      return std::nullopt;
+    MaybeTerm pointer = clausePointer(self, field, state);
+    if (!pointer)
+      return std::nullopt;
+    auto it = pointerBases.find(*pointer);
+    if (it == pointerBases.end() || !it->second.storage.empty())
+      return std::nullopt;
+    return pointer;
+  }
+
   /// `Pointer._extent()`, and `p._offset_in_bounds[width](offset)`, the
   /// clause of accessing `width` elements at `offset`:
   /// `0 <= offset <= extent - width` (the width is the last parameter).
@@ -10612,6 +11176,12 @@ private:
                               : term(self, state);
       if (sortOfTerm(value).isBool || sortOfTerm(value).width != 64)
         return false;
+      // Of a list whose storage is tracked (in its own methods, by its
+      // invariant), or a span of such memory: that pointer.
+      if (MaybeTerm tracked = trackedPointerOf(self, state)) {
+        values[result] = *tracked;
+        return true;
+      }
       std::string pointer = declare({false, 64, false}, "ptr");
       facts.push_back("(bvsge " + extentOf(pointer) + " " + lenOf(value) + ")");
       // A pointer into the list's storage, which a reallocation retires.
@@ -10649,6 +11219,7 @@ private:
       std::string span = declare({false, 64, false}, "g");
       facts.push_back("(= " + lenOf(span) + " " + n + ")");
       facts.push_back("(bvsge " + extentOf(pointer) + " " + n + ")");
+      fieldValues[{span, "/_data"}] = pointer;
       values[result] = span;
       return true;
     }
@@ -11649,14 +12220,55 @@ private:
           values[result] = *n;
           return true;
         }
-      values[result] = define(
-          {false, 64, true}, lenOf(valueThrough(call.getOperands()[0], state)));
+      Value xs = call.getOperands()[0];
+      // An allocation's length is its layout's; a list's whose storage
+      // is tracked (in its own methods) is its `_len` field, which its
+      // `__len__` returns.
+      if (MaybeTerm n = fieldLength(xs, state)) {
+        values[result] = *n;
+        return true;
+      }
+      // A register-passable collection (`len(self._layout)` in the
+      // stdlib) is passed by value.
+      values[result] =
+          define({false, 64, true},
+                 lenOf(isa<LIT::RefType>(xs.getType()) ? valueThrough(xs, state)
+                                                       : term(xs, state)));
       return true;
+    }
+    // `List.capacity()`: the length of its storage.
+    if (path.starts_with("std::collections::list::List::capacity(") &&
+        call.getNumOperands() == 1 &&
+        isa<LIT::RefType>(call.getOperands()[0].getType())) {
+      if (std::optional<Loc> loc = placeOf(call.getOperands()[0])) {
+        values[result] =
+            load(Loc{loc->root, loc->path + "/_storage/_layout/_length"}, state,
+                 Sort{false, 64, true});
+        return true;
+      }
     }
     if (evalRange(call, name, state))
       return true;
     if (evalOptional(call, name, state))
       return true;
+    // `Span(list)`: a span of the list's length over its storage (which
+    // the constructor reads, and does not write).
+    if (path.starts_with("std::collections::span::Span::__init__(::List[") &&
+        call.getNumOperands() == 1 && call->getNumResults() == 1 &&
+        isa<LIT::RefType>(call.getOperands()[0].getType())) {
+      Value list = call.getOperands()[0];
+      if (placeOf(list)) {
+        std::string n = fieldLength(list, state)
+                            .value_or(define({false, 64, true},
+                                             lenOf(valueThrough(list, state))));
+        std::string span = declare({false, 64, false}, "g");
+        facts.push_back("(= " + lenOf(span) + " " + n + ")");
+        if (MaybeTerm data = trackedPointerOf(list, state))
+          fieldValues[{span, "/_data"}] = *data;
+        values[result] = span;
+        return true;
+      }
+    }
     // `Span(unsafe_ptr=p, length=n)`: a span of `n` elements. The
     // constructor is `@always_inline("builtin")`, which admits no clause.
     if (path.starts_with(
@@ -11667,9 +12279,43 @@ private:
       if (!sortOfTerm(n).isBool && sortOfTerm(n).width == 64) {
         std::string span = declare({false, 64, false}, "g");
         facts.push_back("(= " + lenOf(span) + " " + n + ")");
+        if (!isa<LIT::RefType>(call.getOperands()[0].getType()))
+          fieldValues[{span, "/_data"}] = term(call.getOperands()[0], state);
         values[result] = span;
         return true;
       }
+    }
+    // `s._unchecked_subspan(start=a, end=b)`: the elements from `a` to
+    // `b` (to the end, when `end` is not given) of `s`, over the memory
+    // `s` is over when that is tracked.
+    if (path.starts_with("std::collections::span::Span::_unchecked_subspan(") &&
+        call.getNumOperands() == 3 && call->getNumResults() == 1 &&
+        !isa<LIT::RefType>(call.getOperands()[0].getType()) &&
+        !isa<LIT::RefType>(call.getOperands()[1].getType())) {
+      Sort i64{false, 64, true};
+      std::string self = term(call.getOperands()[0], state);
+      std::string start = term(call.getOperands()[1], state);
+      std::optional<Loc> end = placeOf(call.getOperands()[2]);
+      if (!end || sortOfTerm(start).isBool || sortOfTerm(start).width != 64)
+        return false;
+      std::string has =
+          load(Loc{end->root, end->path + "/has"}, state, Sort{true, 1, false});
+      std::string val = load(Loc{end->root, end->path + "/val"}, state, i64);
+      std::string last =
+          define(i64, "(ite " + has + " " + val + " " + lenOf(self) + ")");
+      std::string span = declare({false, 64, false}, "g");
+      facts.push_back("(= " + lenOf(span) + " (bvsub " + last + " " + start +
+                      "))");
+      if (MaybeTerm data = trackedPointerOf(call.getOperands()[0], state)) {
+        Allocation at = pointerBases[*data];
+        at.offset = define(i64, "(bvadd " + at.offset + " " + start + ")");
+        std::string moved =
+            define({false, 64, false}, "(bvadd " + *data + " " + start + ")");
+        pointerBases[moved] = at;
+        fieldValues[{span, "/_data"}] = moved;
+      }
+      values[result] = span;
+      return true;
     }
     // A string's length in bytes: `len` of its value (`String` has no
     // `__len__` of its own); a literal's, from its type.
@@ -11777,6 +12423,12 @@ private:
           sortOfTerm(hi).width != 64) {
         values[result] = "true";
         return true;
+      }
+      if (rangeSink) {
+        Sort i64{false, 64, true};
+        rangeSink->push_back(
+            {a->base, define(i64, "(bvadd " + a->offset + " " + lo + ")"),
+             define(i64, "(bvadd " + a->offset + " " + hi + ")")});
       }
       values[result] = initializedWindow(
           *a, lo, hi, path.contains("::_uninitialized["), state);

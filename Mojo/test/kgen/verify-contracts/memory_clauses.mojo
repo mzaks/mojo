@@ -20,6 +20,7 @@
 
 
 from std.builtin._verification import _allocated, _initialized, _uninitialized
+from std.memory import Allocation, Layout, alloc, dealloc
 from std.memory.alloc import unsafe_alloc
 
 
@@ -113,3 +114,118 @@ def bad_fill_on_initialized(n: Int) requires 1 <= n < 1000:
     p.unsafe_write(7)
     fill(p, n)  # element 0 is not uninitialized
     p.unsafe_free()
+
+
+# --- the frame of a call: what a callee's preconditions name is all it
+# touches; the rest is as the caller left it ---
+def fill3(p: Pointer[List[Int], MutUntrackedOrigin])
+    requires _allocated(p) and p._extent() >= 3 and _uninitialized(p, 0, 3)
+    ensures _initialized(p, 0, 3):
+    p.unsafe_offset(0).unsafe_write(List[Int]())
+    p.unsafe_offset(1).unsafe_write(List[Int]())
+    p.unsafe_offset(2).unsafe_write(List[Int]())
+
+
+def destroy_tail(p: Pointer[List[Int], MutUntrackedOrigin])
+    requires _allocated(p) and p._extent() >= 3
+    requires _initialized(p, 1, 3) and _uninitialized(p, 3, p._extent())
+    ensures _uninitialized(p, 1, p._extent()):
+    p.unsafe_offset(2).unsafe_deinit_pointee()  # the last each time
+    p.unsafe_offset(1).unsafe_deinit_pointee()
+
+
+def ok_cut_last(p: Pointer[List[Int], MutUntrackedOrigin])
+    requires _allocated(p) and p._extent() >= 3 and _uninitialized(p, 0, 3)
+    ensures _uninitialized(p, 2, 3):
+    fill3(p)
+    p.unsafe_offset(2).unsafe_deinit_pointee()
+
+
+def ok_head_kept_by_callee():
+    var p = unsafe_alloc[List[Int]](3)
+    fill3(p)
+    destroy_tail(p)  # names elements 1 to 3: element 0 is as it was
+    p.unsafe_deinit_pointee()
+    p.unsafe_free()
+
+
+def bad_cut_claims_tail(p: Pointer[List[Int], MutUntrackedOrigin])
+    requires _allocated(p) and p._extent() >= 3 and _uninitialized(p, 0, 3)
+    ensures _uninitialized(p, 1, 3):
+    fill3(p)
+    p.unsafe_offset(1).unsafe_deinit_pointee()  # element 2 stays initialized
+
+
+def bad_head_leaked_after_callee():
+    var p = unsafe_alloc[List[Int]](3)
+    fill3(p)
+    destroy_tail(p)
+    p.unsafe_free()  # element 0 is still initialized
+
+
+# --- a struct whose invariant states its memory: the elements below its
+# length are initialized, the rest of its storage is not ---
+struct Strs
+    invariant self._len >= 0
+    invariant self._len <= len(self._storage)
+    invariant self._storage.unsafe_ptr()._extent() >= len(self._storage)
+    invariant _allocated(self._storage.unsafe_ptr())
+    invariant _initialized(self._storage.unsafe_ptr(), 0, self._len)
+    invariant _uninitialized(
+        self._storage.unsafe_ptr(),
+        self._len,
+        self._storage.unsafe_ptr()._extent(),
+    ):
+    var _storage: Allocation[String]
+    var _len: Int
+
+    def __init__(out self, capacity: Int)
+        requires capacity > 0
+        ensures self._len == 0 and len(self._storage) == capacity:
+        self._storage = alloc(Layout[String](length=capacity))
+        self._len = 0
+
+    def ok_push(mut self, var s: String)
+        requires self._len < len(self._storage)
+        ensures self._len == old(self._len) + 1:
+        self._storage.storage()._unchecked_get(self._len).unsafe_write(s^)
+        self._len += 1
+
+    def ok_pop(mut self) -> String
+        requires self._len > 0
+        ensures self._len == old(self._len) - 1:
+        self._len -= 1
+        return (
+            self._storage.unsafe_ptr()
+            .unsafe_offset(self._len)
+            .unsafe_take_pointee()
+        )
+
+    def ok_clear(mut self):
+        Span(
+            unsafe_ptr=self._storage.unsafe_ptr(), length=self._len
+        ).unsafe_deinit_elements()
+        self._len = 0
+
+    def __deinit__(deinit self):
+        Span(
+            unsafe_ptr=self._storage.unsafe_ptr(), length=self._len
+        ).unsafe_deinit_elements()
+        dealloc(self._storage^)  # every element destroyed
+
+    def bad_pop_copy(mut self) -> String requires self._len > 0:
+        self._len -= 1
+        # A copy of the element: it stays initialized above `_len`.
+        return (
+            self._storage.storage()
+            ._unchecked_get(self._len)
+            .unsafe_assume_init()
+        )
+
+
+def ok_strs() -> Int:
+    var v = Strs(capacity=2)
+    v.ok_push("a")
+    var s = v.ok_pop()
+    v.ok_clear()
+    return s.byte_length()

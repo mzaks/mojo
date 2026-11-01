@@ -578,9 +578,11 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   for that memory); a function that frees through a pointer it is handed is
   not seen. A type the pass cannot look at (a parameter) is taken to have a
   destructor. A pointer chosen by a condition (`p if c else q`) is not
-  followed. A span over an allocation (`a.unsafe_span()`, `a.storage()`)
-  counts as initializing all of it, and a write through it leaves the handle's
-  pointer and layout known (`ok_span_filled`). The compiler itself rejects
+  followed. A span over an allocation (`a.unsafe_span()`, `a.storage()`,
+  `s._unchecked_subspan(start=a, end=b)`) is over its memory, and a write
+  through it (or through a span over a list's elements, `Span(xs)`) leaves
+  the handle's pointer and layout, and a list's fields, known
+  (`ok_span_filled`). The compiler itself rejects
   reading an `Allocation` after `dealloc(a^)` and keeps a `ManagedAllocation`
   alive while its pointers are used, so those are not the pass's to report.
 - Memory clauses (`memory_clauses.mojo`): `_allocated(p)`,
@@ -605,8 +607,32 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   even for an empty range, so `_uninitialized(p, n, p._extent())` with
   `_initialized(p, 0, n)` pins the state exactly. A callee leaves the
   allocation itself as it was unless an `ensures` names `_allocated`. Of
-  a pointer no clause names, and of a list's storage, the predicates
-  hold. Only pointer arguments passed by value are tracked.
+  a pointer no clause names the predicates hold. A clause may name a
+  pointer held in a field of an argument (`self._data` of a span,
+  `self._storage.unsafe_ptr()` of `Strs`), and a struct's invariant may
+  state its memory (`Strs`: the elements below `_len` are initialized
+  and the rest of the storage is not), which every method then proves
+  where it returns (`bad_pop_copy`: a copy of the element leaves it
+  initialized).
+  What a call changes is bounded by the hull of the ranges its
+  preconditions name of each pointer (the invariant's included): the
+  callee proves where it returns that it wrote or destroyed no element
+  outside that hull, and that the elements it leaves initialized are
+  contiguous (a destruction inside the window leaves the elements above
+  it astray; `bad_cut_claims_tail`, `ok_cut_last`); the caller proves
+  the memory it hands over has none astray, and keeps what it knew of
+  the elements outside the hull (`ok_head_kept_by_callee`,
+  `bad_head_leaked_after_callee`; `destroy_tail` names elements 1 to 3
+  only). A callee that names no range of a pointer changes none of its
+  elements; one given an immutable reference (`capacity(self)`) changes
+  nothing of the memory. A span's constructor and accessors
+  (`_unchecked_get`, `__getitem__`, `unsafe_ptr`, `_unchecked_subspan`)
+  hand the memory to no one. `_uninitialized` is provable only of a
+  range above the window (destroying a prefix leaves the window above
+  it, which is not a state of the model). `Span.unsafe_deinit_elements`,
+  `unsafe_init_move_from`, `unsafe_init_copy_from` and `unsafe_init_with`
+  carry such clauses (their bodies are not proven: loops over closures
+  and bitcast pointers).
 - A struct with a single integer field and no parameters (an enum-like
   wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
   field is the value, `Wrapper(n)` (a constructor that only stores its

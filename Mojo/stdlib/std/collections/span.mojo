@@ -25,7 +25,12 @@ from std.bit.mask import splat
 from std.memory import unsafe_uninit_copy_n, unsafe_memcpy, MaybeUninit
 from std.collections import check_bounds, check_slice_bounds
 from std.builtin.rebind import downcast
-from std.builtin._verification import _assume, _index_in_bounds
+from std.builtin._verification import (
+    _assume,
+    _index_in_bounds,
+    _initialized,
+    _uninitialized,
+)
 from std.sys.info import simd_width_of
 from std.traits import (
     IsTriviallyCopyable,
@@ -1212,7 +1217,9 @@ struct Span[
 
     @inline(.always)
     @__allow_legacy_custom_self_type
-    def unsafe_deinit_elements[U: Deinitable](self: MutSpan[U, _]):
+    def unsafe_deinit_elements[U: Deinitable](self: MutSpan[U, _])
+        requires _initialized(self._data, 0, len(self))
+        ensures _uninitialized(self._data, 0, len(self)):
         """Destroys every element, leaving the memory uninitialized.
 
         Each element's deinitializer runs in place, in index order, so the
@@ -1240,7 +1247,9 @@ struct Span[
     @__allow_legacy_custom_self_type
     def unsafe_deinit_elements_with[
         U: AnyType
-    ](self: MutSpan[U, _], f: Some[def(var U)], /):
+    ](self: MutSpan[U, _], f: Some[def(var U)], /)
+        requires _initialized(self._data, 0, len(self))
+        ensures _uninitialized(self._data, 0, len(self)):
         """Destroys every element by passing it to `f`, leaving the memory
         uninitialized.
 
@@ -1327,9 +1336,9 @@ struct Span[
         self: MutSpan[MaybeUninit[U], _],
         f: Some[def(Int) -> U],
         /,
-    ) -> MutSpan[
-        U, self.origin
-    ]:
+    ) -> MutSpan[U, self.origin]
+        requires _uninitialized(self._data, 0, len(self))
+        ensures _initialized(self._data, 0, len(self)):
         """Initializes every element with the result of `f(i)`.
 
         Parameters:
@@ -1375,7 +1384,11 @@ struct Span[
         self: MutSpan[MaybeUninit[U], _],
         copy_from: ImmSpan[U, _],
         /,
-    ) -> MutSpan[U, self.origin]:
+    ) -> MutSpan[U, self.origin]
+        requires len(self) == len(copy_from)
+        requires _uninitialized(self._data, 0, len(self))
+        requires _initialized(copy_from._data, 0, len(copy_from))
+        ensures _initialized(self._data, 0, len(self)):
         """Initializes every element with a copy of the matching `copy_from`
         element.
 
@@ -1437,7 +1450,12 @@ struct Span[
         self: MutSpan[MaybeUninit[U], _],
         move_from: MutSpan[U, _],
         /,
-    ) -> MutSpan[U, self.origin]:
+    ) -> MutSpan[U, self.origin]
+        requires len(self) == len(move_from)
+        requires _uninitialized(self._data, 0, len(self))
+        requires _initialized(move_from._data, 0, len(move_from))
+        ensures _initialized(self._data, 0, len(self))
+        ensures _uninitialized(move_from._data, 0, len(move_from)):
         """Initializes every element by moving out of the matching `move_from`
         element.
 
