@@ -540,41 +540,49 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   whose extent nothing states is reported. Extents are about bounds only;
   whether the memory is still allocated and written is the next point.
 - Allocations of the function itself (`allocations.mojo`): memory from
-  `unsafe_alloc`, `alloc[T](n)` or `alloc(layout)` must still be allocated
-  at every access (`p[]`, `p[unsafe_offset=i]`, `load`, `store`,
-  `unsafe_write`, `take_pointee`, ...) and at `free` or `dealloc`, which
-  retire it; and an element must have been written (`p[i] = v`,
-  `unsafe_write`, `store`) before it is read (`p[i]`, `load`,
-  `take_pointee`, or `len(p[])` handed to a function), and not moved out
-  since. An `Allocation` from `alloc(layout)` is followed through
-  `unsafe_ptr()`, `into_managed()` and `into_thin()` (and their
-  `unsafe_ptr()`), `unsafe_leak()` and `dealloc(a^)`; `Layout(length=n)`
-  states its extent. Memory from `stack_allocation` is never freed:
-  reading it before writing it is reported (`bad_stack_uninit`), and so
-  is freeing it (`bad_stack_freed`). The pass keeps, per allocation,
-  whether it is allocated, the prefix of elements written in order (which
-  the invariant search follows through a loop that fills the memory:
-  `ok_filled_in_loop`)
-  and the elements written on their own (`ok_any_order`). A pointer moved
-  by `p + k` or `p.unsafe_offset(k)`, or cast, points into the same
-  allocation. A pointer from `xs.unsafe_ptr()` is retired by a call that
-  may reallocate the list (`append`, `insert`, `extend`, `reserve`,
-  `resize`, `shrink`, or its destruction; `bad_list_appended`), not by a
-  write to an element (`ok_list_pointer`). These are the pass's own
-  obligations ("that the element read is initialized", "that the memory
-  the pointer points into has not been freed"), not clauses: `p[]` cannot
-  carry one (see above), and `__getitem__` serves writes too.
-  Only what this function can see: a pointer it did not allocate or take
-  from a list (an argument, a field) is taken to be allocated and
-  initialized, and a function handed a local pointer by value is taken to
-  initialize all of it (`ok_filled_by_callee`, `memcpy`); a function that
-  frees through a pointer it is handed is not seen. A pointer chosen by a
-  condition (`p if c else q`) is not followed. A span over an allocation
-  (`a.unsafe_span()`, `a.storage()`) counts as initializing all of it,
-  and a write through it leaves the handle's pointer and layout known
-  (`ok_span_filled`). The compiler itself rejects reading an
-  `Allocation` after `dealloc(a^)` and keeps a `ManagedAllocation` alive
-  while its pointers are used, so those are not the pass's to report.
+  `unsafe_alloc`, `alloc[T](n)` or `alloc(layout)` must still be allocated at
+  every access (`p[]`, `p[unsafe_offset=i]`, `load`, `store`, `unsafe_write`,
+  `take_pointee`, ...) and at `free` or `dealloc`, which retire it; an element
+  must have been written (`p[i] = v`, `unsafe_write`, `store`) before it is
+  read (`p[i]`, `load`, `take_pointee`, or `len(p[])` handed to a function),
+  and not moved out since; and where the elements have a destructor to run (a
+  struct whose `__deinit__` is written out, or with a field of such a type: a
+  `List`, not an `Int`), every element must have been destroyed
+  (`unsafe_deinit_pointee`) or moved out (`take_pointee`) before `free` or
+  `dealloc`, or the memory leaks them (`bad_list_leak_pointee`,
+  `bad_destroyed_all_but_last`). An `Allocation` from `alloc(layout)` is
+  followed through `unsafe_ptr()`, `into_managed()` and `into_thin()` (and
+  their `unsafe_ptr()`), `unsafe_leak()` and `dealloc(a^)`; `Layout(length=n)`
+  states its extent. Memory from `stack_allocation` is never freed: reading it
+  before writing it is reported (`bad_stack_uninit`), and so is freeing it
+  (`bad_stack_freed`). The pass keeps, per allocation, whether it is
+  allocated, the window of elements written in order and not yet destroyed
+  (which the invariant search follows through a loop that fills the memory,
+  `ok_filled_in_loop`, and one that destroys it front to back,
+  `ok_destroyed_in_loop`), whether an element was written outside that window,
+  and the elements written on their own (`ok_any_order`; "every element
+  destroyed" is then proven element by element, `ok_stray_destroyed`, which
+  does not reach through a loop). A pointer moved by `p + k` or
+  `p.unsafe_offset(k)`, or cast, points into the same allocation. A pointer
+  from `xs.unsafe_ptr()` is retired by a call that may reallocate the list
+  (`append`, `insert`, `extend`, `reserve`, `resize`, `shrink`, or its
+  destruction; `bad_list_appended`), not by a write to an element
+  (`ok_list_pointer`). These are the pass's own obligations ("that the element
+  read is initialized", "that the memory the pointer points into has not been
+  freed"), not clauses: `p[]` cannot carry one (see above), and `__getitem__`
+  serves writes too. Only what this function can see: a pointer it did not
+  allocate or take from a list (an argument, a field) is taken to be allocated
+  and initialized, and a function handed a local pointer by value is taken to
+  initialize all of it (`ok_filled_by_callee`, `memcpy`) and, after that, to
+  have destroyed what it wished (`ok_handed_then_freed`: the leak check is off
+  for that memory); a function that frees through a pointer it is handed is
+  not seen. A type the pass cannot look at (a parameter) is taken to have a
+  destructor. A pointer chosen by a condition (`p if c else q`) is not
+  followed. A span over an allocation (`a.unsafe_span()`, `a.storage()`)
+  counts as initializing all of it, and a write through it leaves the handle's
+  pointer and layout known (`ok_span_filled`). The compiler itself rejects
+  reading an `Allocation` after `dealloc(a^)` and keeps a `ManagedAllocation`
+  alive while its pointers are used, so those are not the pass's to report.
 - A struct with a single integer field and no parameters (an enum-like
   wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
   field is the value, `Wrapper(n)` (a constructor that only stores its

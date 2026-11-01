@@ -1920,6 +1920,10 @@ private:
     std::string base;
     /// Stack memory (`stack_allocation`), which is not freed.
     bool stack = false;
+    /// The version of `initv` at allocation, where nothing is initialized
+    /// (stated only where "every element destroyed" is to be proven: as a
+    /// fact of the script it made the invariant search's queries unknown).
+    std::string initv0;
   };
   /// By the pointer's term.
   std::map<std::string, Allocation> pointerBases;
@@ -3186,13 +3190,13 @@ private:
   std::string initializedAt(const Allocation &a, const std::string &offset,
                             State &state) {
     Sort i64{false, 64, true};
+    std::string from = load(Loc{a.place.root, "/from"}, state, i64);
     std::string upto = load(Loc{a.place.root, "/upto"}, state, i64);
     std::string version =
         load(Loc{a.place.root, "/initv"}, state, Sort{false, 64, false});
-    return define({true, 1, false}, "(or (and (bvsle " + bvConst(0, 64) + " " +
-                                        offset + ") (bvslt " + offset + " " +
-                                        upto + ")) " +
-                                        initvOf(version, offset) + ")");
+    return define({true, 1, false}, "(or (and (bvsle " + from + " " + offset +
+                                        ") (bvslt " + offset + " " + upto +
+                                        ")) " + initvOf(version, offset) + ")");
   }
 
   /// Whether `width` elements from `offset` are initialized.
@@ -3200,11 +3204,11 @@ private:
                                int64_t width, State &state) {
     Sort i64{false, 64, true};
     if (width > 16) {
+      std::string from = load(Loc{a.place.root, "/from"}, state, i64);
       std::string upto = load(Loc{a.place.root, "/upto"}, state, i64);
-      return define({true, 1, false}, "(and (bvsle " + bvConst(0, 64) + " " +
-                                          offset + ") (bvsle (bvadd " + offset +
-                                          " " + bvConst(width, 64) + ") " +
-                                          upto + "))");
+      return define({true, 1, false},
+                    "(and (bvsle " + from + " " + offset + ") (bvsle (bvadd " +
+                        offset + " " + bvConst(width, 64) + ") " + upto + "))");
     }
     std::string all = "true";
     for (int64_t k = 0; k < width; ++k)
@@ -3223,7 +3227,9 @@ private:
     if (!a.storage.empty() || inContract)
       return;
     Sort i64{false, 64, true};
-    Loc uptoLoc{a.place.root, "/upto"}, versionLoc{a.place.root, "/initv"};
+    Loc fromLoc{a.place.root, "/from"}, uptoLoc{a.place.root, "/upto"},
+        strayLoc{a.place.root, "/stray"}, versionLoc{a.place.root, "/initv"};
+    std::string from = load(fromLoc, state, i64);
     std::string upto = load(uptoLoc, state, i64);
     std::string version = load(versionLoc, state, Sort{false, 64, false});
     std::string next = declare({false, 64, false}, "iv");
@@ -3233,15 +3239,124 @@ private:
                     ")) (= " + initvOf(next, "x") + " " +
                     initvOf(version, "x") + ")) :pattern ((initv " + next +
                     " x))))");
-    // In order, a write extends the prefix; a move out cuts it.
-    std::string nextUpto = init ? "(ite (= " + offset + " " + upto +
-                                      ") (bvadd " + upto + " " +
-                                      bvConst(1, 64) + ") " + upto + ")"
-                                : "(ite (bvslt " + offset + " " + upto + ") " +
-                                      offset + " " + upto + ")";
-    noteCondition(define({true, 1, false}, "(= " + offset + " " + upto + ")"));
-    store(uptoLoc, state, define(i64, nextUpto));
+    std::string one = bvConst(1, 64);
+    std::string atUpto = "(= " + offset + " " + upto + ")";
+    std::string atFrom = "(= " + offset + " " + from + ")";
+    if (init) {
+      // In order, a write extends the window `[from, upto)`; one outside
+      // it is a stray element, which only `initv` knows about.
+      std::string inWindow = "(and (bvsle " + from + " " + offset +
+                             ") (bvsle " + offset + " " + upto + "))";
+      noteCondition(define({true, 1, false}, atUpto));
+      noteCondition(define({true, 1, false}, inWindow));
+      store(uptoLoc, state,
+            define(i64, "(ite " + atUpto + " (bvadd " + upto + " " + one +
+                            ") " + upto + ")"));
+      std::string stray = load(strayLoc, state, i64);
+      noteCondition(
+          define({true, 1, false}, "(= " + stray + " " + bvConst(0, 64) + ")"));
+      store(strayLoc, state,
+            define(i64, "(ite " + inWindow + " " + stray + " " + one + ")"));
+    } else {
+      // A move out or destruction at the front advances the window; one
+      // inside cuts it there (the elements above are still in `initv`).
+      noteCondition(define({true, 1, false}, atFrom));
+      noteCondition(define({true, 1, false}, atUpto));
+      std::string inside = "(and (bvslt " + from + " " + offset + ") (bvslt " +
+                           offset + " " + upto + "))";
+      store(fromLoc, state,
+            define(i64, "(ite (and " + atFrom + " (bvslt " + from + " " + upto +
+                            ")) (bvadd " + from + " " + one + ") " + from +
+                            ")"));
+      store(uptoLoc, state,
+            define(i64, "(ite " + inside + " " + offset + " " + upto + ")"));
+    }
     store(versionLoc, state, next);
+  }
+
+  /// Whether no element of heap memory is left initialized: the window
+  /// is empty and no stray element was written (or, element by element,
+  /// `initv` says so); or the pointer was handed to a function, which may
+  /// have destroyed them (nothing is known then).
+  std::string destroyedOf(const Allocation &a, State &state) {
+    Sort i64{false, 64, true};
+    std::string from = load(Loc{a.place.root, "/from"}, state, i64);
+    std::string upto = load(Loc{a.place.root, "/upto"}, state, i64);
+    std::string stray = load(Loc{a.place.root, "/stray"}, state, i64);
+    std::string handed = load(Loc{a.place.root, "/handed"}, state, i64);
+    std::string version =
+        load(Loc{a.place.root, "/initv"}, state, Sort{false, 64, false});
+    std::string zero = bvConst(0, 64);
+    // Nothing was initialized at allocation: the frame axioms of the
+    // writes and destructions since build on this.
+    std::string base = "(forall ((x (_ BitVec 64))) (! (not " +
+                       initvOf(a.initv0, "x") + ") :pattern ((initv " +
+                       a.initv0 + " x))))";
+    return define({true, 1, false},
+                  "(=> " + base + " (or (not (= " + handed + " " + zero +
+                      ")) (and (bvsle " + upto + " " + from +
+                      ") (or (= " + stray + " " + zero +
+                      ") (forall ((x (_ BitVec 64))) (! (not " +
+                      initvOf(version, "x") + ") :pattern ((initv " + version +
+                      " x))))))))");
+  }
+
+  /// At `free` or `dealloc` of memory whose elements have a destructor to
+  /// run: every element must have been destroyed or moved out.
+  void checkDestroyed(Location at, StringRef callee, const Allocation &a,
+                      Type element, State &state) {
+    if (!a.storage.empty() || a.stack || !needsDestroy(element))
+      return;
+    checkClaim(at, callee,
+               "that every element the pointer points into was destroyed "
+               "or moved out",
+               destroyedOf(a, state), state);
+  }
+
+  /// Whether values of `type` have a destructor that does something: a
+  /// struct whose `__deinit__` is written out (not synthesized), or one
+  /// with a field of such a type. A type that cannot be looked at (a
+  /// parameter) is taken to have one.
+  bool needsDestroy(Type type, unsigned depth = 0) {
+    auto st = dyn_cast<LIT::StructType>(type);
+    if (!st)
+      return false; // A builtin (`!pop.simd`, a raw pointer).
+    auto decl = dyn_cast_or_null<LIT::StructDeclOp>(
+        symbols.lookupSymbolIn(module, st.getSymbol()));
+    if (!decl)
+      return true;
+    if (decl.isRegisterPassableTrivial())
+      return false;
+    for (auto fn : decl.getBody()->getOps<LIT::FnOp>()) {
+      std::optional<StringRef> name = fn.getSymName();
+      if (name &&
+          (name->starts_with("__deinit__(") || name->starts_with("__del__(")) &&
+          !fn.isSynthetic())
+        return true;
+    }
+    if (depth >= 6)
+      return true;
+    for (Region &region : decl->getRegions())
+      for (Block &block : region)
+        for (auto field : block.getOps<LIT::StructFieldOp>()) {
+          Type fieldType = field.getType();
+          if (isa<LIT::StructType>(fieldType)
+                  ? needsDestroy(fieldType, depth + 1)
+                  : StringRef(printed(fieldType)).contains("param.decl.ref"))
+            return true;
+        }
+    return false;
+  }
+
+  /// The type parameter `index` of a struct type (`T` of `Pointer`, at 2;
+  /// of `Allocation`, at 0), if it resolves to a type.
+  Type typeParamOf(Type type, unsigned index) {
+    auto st = dyn_cast<LIT::StructType>(type);
+    if (!st || st.getParamValues().size() <= index)
+      return {};
+    auto param = dyn_cast<TypeParamAttr>(
+        unwrapValue(resolveParam(st.getParamValues()[index])));
+    return param ? param.getTypeValue() : Type();
   }
 
   /// The allocation a pointer value (or the pointer a reference holds)
@@ -3406,6 +3521,9 @@ private:
                                 ? "/_alloc/_ptr"
                                 : "/_alloc/_alloc/_ptr")) {
         checkAlive(at, "dealloc", *a, state);
+        if (std::optional<Loc> self = placeOf(ops[0]))
+          checkDestroyed(at, "dealloc", *a, typeParamOf(placeType(*self), 0),
+                         state);
         store(Loc{a->place.root, "/alive"}, state, "false");
       }
       return;
@@ -3428,9 +3546,16 @@ private:
             !isPointerType(operand.getType()))
           continue;
         if (std::optional<Allocation> a = allocationOf(operand, state);
-            a && a->storage.empty())
+            a && a->storage.empty()) {
+          Loc handed{a->place.root, "/handed"};
+          noteCondition(
+              define({true, 1, false}, "(= " + load(handed, state, i64) + " " +
+                                           bvConst(0, 64) + ")"));
+          store(Loc{a->place.root, "/from"}, state, bvConst(0, 64));
           store(Loc{a->place.root, "/upto"}, state,
                 define(i64, extentOf(a->base)));
+          store(handed, state, bvConst(1, 64));
+        }
       }
       return;
     }
@@ -3485,6 +3610,8 @@ private:
         return;
       }
       checkAlive(at, "Pointer.free", *a, state);
+      checkDestroyed(at, "Pointer.free", *a, typeParamOf(ops[0].getType(), 2),
+                     state);
       if (a->storage.empty())
         store(Loc{a->place.root, "/alive"}, state, "false");
     } else if (path.starts_with("load[") || path.starts_with("unsafe_load[")) {
@@ -3523,11 +3650,16 @@ private:
     // `stack_allocation`.
     auto allocated = [&](const std::string &pointer, bool stack) {
       Loc place{result, ""};
+      std::string version = declare(handle, "iv");
       storeFields(place, state,
                   {{"/alive", "true"},
+                   {"/from", bvConst(0, 64)},
                    {"/upto", bvConst(0, 64)},
-                   {"/initv", declare(handle, "iv")}});
-      pointerBases[pointer] = {place, bvConst(0, 64), "", pointer, stack};
+                   {"/stray", bvConst(0, 64)},
+                   {"/handed", bvConst(0, 64)},
+                   {"/initv", version}});
+      pointerBases[pointer] = {place,   bvConst(0, 64), "",
+                               pointer, stack,          version};
       allocationRoots.push_back(result);
     };
     if (path.starts_with("std::memory::alloc::unsafe_alloc[") ||
@@ -3664,6 +3796,76 @@ private:
     return touches;
   }
 
+  /// Whether `root` hands a pointer by value to a function other than
+  /// the pointer's own methods.
+  bool handsPointersIn(Operation *root) {
+    bool hands = false;
+    root->walk([&](LIT::CallOp call) {
+      std::optional<CalleeName> n = calleeName(call.getCallee());
+      StringRef path = n ? StringRef(n->path) : StringRef();
+      if (path.starts_with("std::memory::pointer::Pointer::") ||
+          path.starts_with("std::builtin::"))
+        return;
+      for (Value operand : call.getOperands())
+        if (!isa<LIT::RefType>(operand.getType()) &&
+            isPointerType(operand.getType()))
+          hands = true;
+    });
+    return hands;
+  }
+
+  /// Whether `root` destroys or moves out an element through a pointer.
+  bool destroysIn(Operation *root) {
+    bool destroys = false;
+    root->walk([&](LIT::CallOp call) {
+      std::optional<CalleeName> n = calleeName(call.getCallee());
+      if (!n)
+        return;
+      StringRef path(n->path);
+      if (path.consume_front("std::memory::pointer::Pointer::") &&
+          (path.contains("take_pointee") || path.contains("deinit_pointee") ||
+           path.contains("swap_pointees")))
+        destroys = true;
+    });
+    return destroys;
+  }
+
+  /// Whether `root` writes an element through a pointer: by its writing
+  /// methods, or by a store through the reference `__getitem__` returns.
+  bool writesElementsIn(Operation *root) {
+    bool writes = false;
+    root->walk([&](Operation *op) {
+      if (auto call = dyn_cast<LIT::CallOp>(op)) {
+        std::optional<CalleeName> n = calleeName(call.getCallee());
+        if (!n)
+          return;
+        StringRef path(n->path);
+        if (path.consume_front("std::memory::pointer::Pointer::") &&
+            (path.contains("unsafe_write") || path.starts_with("store") ||
+             path.starts_with("unsafe_store") ||
+             path.contains("swap_pointees")))
+          writes = true;
+        return;
+      }
+      if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
+        Value dest = store->getOperand(1);
+        while (Operation *def = dest.getDefiningOp()) {
+          if (auto call = dyn_cast<LIT::CallOp>(def)) {
+            std::optional<CalleeName> n = calleeName(call.getCallee());
+            if (n && StringRef(n->path).starts_with(
+                         "std::memory::pointer::Pointer::__getitem__"))
+              writes = true;
+            return;
+          }
+          if (!isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp>(def))
+            return;
+          dest = def->getOperand(0);
+        }
+      }
+    });
+    return writes;
+  }
+
   bool freesIn(Operation *root) {
     bool frees = false;
     root->walk([&](LIT::CallOp call) {
@@ -3706,12 +3908,24 @@ private:
   /// (the invariant search is about integers, which a flag is not); a
   /// list's storage keeps its version unless the loop may reallocate it.
   void keepAllocationState(Operation *loop, State &before, State &head) {
-    bool frees = freesIn(loop);
+    bool frees = freesIn(loop), hands = handsPointersIn(loop),
+         destroys = destroysIn(loop), writes = writesElementsIn(loop);
     for (Value root : allocationRoots) {
-      Loc alive{root, "/alive"};
-      if (auto it = before.env.find(alive);
-          it != before.env.end() && !frees && !head.env.count(alive))
-        head.env[alive] = it->second;
+      // What the loop cannot change holds its value from before it (a
+      // field of the allocation's value, where a loop before left it).
+      auto keep = [&](const char *field, bool changed, Sort sort) {
+        Loc loc{root, field};
+        if (!changed && !head.env.count(loc) && before.env.count(Loc{root, ""}))
+          head.env[loc] = load(loc, before, sort);
+      };
+      Sort i64{false, 64, true};
+      keep("/alive", frees, {true, 1, false});
+      // The window's start moves at a destruction (and a function handed
+      // the pointer resets it); a stray element comes from a write; a
+      // pointer is handed out by a call.
+      keep("/from", destroys || hands, i64);
+      keep("/stray", writes, i64);
+      keep("/handed", hands, i64);
     }
     for (auto &[list, version] : before.storage)
       head.storage[list] = reallocatesIn(loop, list)

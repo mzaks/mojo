@@ -12,9 +12,10 @@
 # ===----------------------------------------------------------------------=== #
 # Allocations for `verify-contracts`: memory this function allocates
 # (`unsafe_alloc`, `alloc`, `stack_allocation`) must still be allocated when
-# it is read, written or freed, and an element must be written before it is
-# read; a pointer taken from a list must not outlive a reallocation of the
-# list. See README.md.
+# it is read, written or freed, an element must be written before it is
+# read, and elements with a destructor must be destroyed (or moved out)
+# before the memory is freed; a pointer taken from a list must not outlive
+# a reallocation of the list. See README.md.
 
 
 from std.memory import stack_allocation
@@ -40,8 +41,66 @@ def ok_list_pointee() -> Int:
     var p = unsafe_alloc[List[Int]](1)
     p.unsafe_write([1, 2, 3])
     var n = len(p[])
+    p.unsafe_deinit_pointee()  # a `List` has a destructor to run
     p.unsafe_free()
     return n
+
+
+def ok_moved_out() -> List[Int]:
+    var p = unsafe_alloc[List[Int]](1)
+    p.unsafe_write([1, 2, 3])
+    var xs = p.unsafe_take_pointee()  # moved out: nothing left to destroy
+    p.unsafe_free()
+    return xs^
+
+
+def ok_destroyed_in_loop(n: Int) requires 0 <= n < 1000:
+    var p = unsafe_alloc[List[Int]](n)
+    for i in range(n):
+        p.unsafe_offset(i).unsafe_write(List[Int]())
+    for i in range(n):
+        p.unsafe_offset(i).unsafe_deinit_pointee()  # front to back
+    p.unsafe_free()
+
+
+def destroy_all(p: Pointer[List[Int], MutUntrackedOrigin], n: Int):
+    for i in range(n):
+        p.unsafe_offset(i).unsafe_deinit_pointee()
+
+
+def ok_handed_then_freed(n: Int) requires 0 <= n < 1000:
+    var p = unsafe_alloc[List[Int]](n)
+    for i in range(n):
+        p.unsafe_offset(i).unsafe_write(List[Int]())
+    destroy_all(p, n)  # a function handed the pointer may destroy them
+    p.unsafe_free()
+
+
+def ok_stray_destroyed():
+    var p = unsafe_alloc[List[Int]](2)
+    p.unsafe_offset(1).unsafe_write([1])  # out of order
+    p.unsafe_write([2])
+    p.unsafe_deinit_pointee()
+    p.unsafe_offset(1).unsafe_deinit_pointee()  # each one on its own
+    p.unsafe_free()
+
+
+def ok_allocation_destroyed() -> Int:
+    var a = alloc(Layout[List[Int]](length=1))
+    var p = a.unsafe_ptr()
+    p.unsafe_write([1, 2, 3])
+    var n = len(p[])
+    p.unsafe_deinit_pointee()
+    dealloc(a^)
+    return n
+
+
+def ok_trivial_free() -> Int:
+    var p = unsafe_alloc[Int](2)
+    p.unsafe_write(1)
+    var t = p[]
+    p.unsafe_free()  # `Int` has nothing to destroy
+    return t
 
 
 def ok_any_order() -> Int:
@@ -183,7 +242,42 @@ def bad_list_pointee() -> Int:
     var p = unsafe_alloc[List[Int]](1)
     var n = len(p[])  # uninitialized
     p.unsafe_write([1, 2, 3])
+    p.unsafe_deinit_pointee()
     p.unsafe_free()
+    return n
+
+
+def bad_list_leak_pointee() -> Int:
+    var p = unsafe_alloc[List[Int]](1)
+    p.unsafe_write([1, 2, 3])
+    var n = len(p[])
+    p.unsafe_free()  # the list is leaked
+    return n
+
+
+def bad_destroyed_all_but_last(n: Int) requires 1 <= n < 1000:
+    var p = unsafe_alloc[List[Int]](n)
+    for i in range(n):
+        p.unsafe_offset(i).unsafe_write(List[Int]())
+    for i in range(n - 1):
+        p.unsafe_offset(i).unsafe_deinit_pointee()
+    p.unsafe_free()  # the last one is leaked
+
+
+def bad_stray_left():
+    var p = unsafe_alloc[List[Int]](2)
+    p.unsafe_offset(1).unsafe_write([1])
+    p.unsafe_write([2])
+    p.unsafe_deinit_pointee()
+    p.unsafe_free()  # element 1 is leaked
+
+
+def bad_allocation_leak() -> Int:
+    var a = alloc(Layout[List[Int]](length=1))
+    var p = a.unsafe_ptr()
+    p.unsafe_write([1, 2, 3])
+    var n = len(p[])
+    dealloc(a^)  # the list is leaked
     return n
 
 
