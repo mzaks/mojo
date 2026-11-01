@@ -19,7 +19,12 @@
 # it. See README.md.
 
 
-from std.builtin._verification import _allocated, _initialized, _uninitialized
+from std.builtin._verification import (
+    _allocated,
+    _initialized,
+    _same_elements,
+    _uninitialized,
+)
 from std.memory import (
     Allocation,
     Layout,
@@ -143,9 +148,20 @@ def destroy_tail(p: Pointer[List[Int], MutUntrackedOrigin])
 def ok_shift_down(p: Pointer[List[Int], MutUntrackedOrigin])
     requires _allocated(p) and _initialized(p, 0, 3)
     requires _uninitialized(p, 3, p._extent())
-    ensures _initialized(p, 0, 2) and _uninitialized(p, 2, p._extent()):
+    ensures _initialized(p, 0, 2) and _uninitialized(p, 2, p._extent())
+    ensures _same_elements(p, old(p).unsafe_offset(1), 2):
     p.unsafe_deinit_pointee()
     # The two above the gap move down over it; the last is moved out.
+    unsafe_uninit_move_n[overlapping=True](
+        dest=p, src=p.unsafe_offset(1), count=2
+    )
+
+
+def bad_shift_claims_kept(p: Pointer[List[Int], MutUntrackedOrigin])
+    requires _allocated(p) and _initialized(p, 0, 3)
+    requires _uninitialized(p, 3, p._extent())
+    ensures _same_elements(p, old(p), 2):  # they moved down by one
+    p.unsafe_deinit_pointee()
     unsafe_uninit_move_n[overlapping=True](
         dest=p, src=p.unsafe_offset(1), count=2
     )

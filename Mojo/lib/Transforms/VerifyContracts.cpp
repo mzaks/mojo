@@ -3320,6 +3320,20 @@ private:
     return "(initv " + version + " " + offset + ")";
   }
 
+  /// `hv(version, index)`: the bits of element `index` of heap memory,
+  /// by the version of its values (`/valv`: new at every write, which
+  /// keeps the elements not written; a move or copy of a range gives the
+  /// bits of the source). What `_same_elements` compares.
+  std::string hvOf(const std::string &version, const std::string &index) {
+    if (!hvDeclared) {
+      prelude +=
+          "(declare-fun hv ((_ BitVec 64) (_ BitVec 64)) (_ BitVec 64))\n";
+      hvDeclared = true;
+    }
+    return "(hv " + version + " " + index + ")";
+  }
+  bool hvDeclared = false;
+
   /// The version of a list's storage: a new one at each call that may
   /// reallocate it (`append`, `reserve`, ...).
   std::string storageOf(const Loc &list, State &state) {
@@ -3516,20 +3530,37 @@ private:
   /// After a write to (`init`) or a move out of `n` elements from
   /// `offset` of heap memory.
   void markRange(const Allocation &a, const std::string &offset,
-                 const std::string &n, bool init, State &state) {
+                 const std::string &n, bool init, State &state,
+                 const std::optional<std::pair<std::string, std::string>>
+                     &copied = std::nullopt) {
     if (!a.storage.empty() || inContract)
       return;
-    Sort i64{false, 64, true};
-    std::string version =
-        load(slot(a, "/initv"), state, Sort{false, 64, false});
-    std::string next = declare({false, 64, false}, "iv");
+    Sort i64{false, 64, true}, handle{false, 64, false};
+    std::string version = load(slot(a, "/initv"), state, handle);
+    std::string next = declare(handle, "iv");
     std::string end = define(i64, "(bvadd " + offset + " " + n + ")");
+    std::string in = "(and (bvsle " + offset + " x) (bvslt x " + end + "))";
     facts.push_back("(forall ((x (_ BitVec 64))) (! (= " + initvOf(next, "x") +
-                    " (ite (and (bvsle " + offset + " x) (bvslt x " + end +
-                    ")) " + (init ? "true" : "false") + " " +
+                    " (ite " + in + " " + (init ? "true" : "false") + " " +
                     initvOf(version, "x") + ")) :pattern ((initv " + next +
                     " x))))");
     store(slot(a, "/initv"), state, next);
+    // The values: those written are unknown, unless `copied` from the
+    // elements from `second` of the memory whose values are `first`.
+    if (init) {
+      std::string values = load(slot(a, "/valv"), state, handle);
+      std::string written = declare(handle, "vv");
+      facts.push_back("(forall ((x (_ BitVec 64))) (! (=> (not " + in +
+                      ") (= " + hvOf(written, "x") + " " + hvOf(values, "x") +
+                      ")) :pattern ((hv " + written + " x))))");
+      if (copied)
+        facts.push_back("(forall ((x (_ BitVec 64))) (! (=> " + in +
+                        " (= " + hvOf(written, "x") + " " +
+                        hvOf(copied->first, "(bvadd (bvsub x " + offset + ") " +
+                                                copied->second + ")") +
+                        ")) :pattern ((hv " + written + " x))))");
+      store(slot(a, "/valv"), state, written);
+    }
     // Memory tracked from entry: an element outside the hull of what the
     // preconditions name is one the function promised not to touch.
     if (auto hull = hulls.find(a.base); hull != hulls.end()) {
@@ -3638,6 +3669,7 @@ private:
     // and a function proves it of what it leaves (`proveMemoryFrame`).
     store(slot(a, "/stray"), state, bvConst(0, 64));
     store(slot(a, "/initv"), state, declare({false, 64, false}, "iv"));
+    store(slot(a, "/valv"), state, declare({false, 64, false}, "vv"));
     if (alive)
       store(slot(a, "/alive"), state, declare({true, 1, false}, "al"));
   }
@@ -3947,17 +3979,26 @@ private:
                  "are contiguous",
                  contiguous, state);
     auto [from0, upto0] = theWindow(a, before);
+    Sort handle{false, 64, false};
+    std::string values0 = load(slot(a, "/valv"), before, handle);
     unknownMemoryState(a, allocated, state);
     std::string from = load(slot(a, "/from"), state, i64);
     std::string upto = load(slot(a, "/upto"), state, i64);
+    std::string values = load(slot(a, "/valv"), state, handle);
     std::optional<std::pair<std::string, std::string>> hull =
         hullOf(a.base, ranges);
     if (!hull) {
       facts.push_back("(= " + from + " " + from0 + ")");
       facts.push_back("(= " + upto + " " + upto0 + ")");
+      facts.push_back("(= " + values + " " + values0 + ")");
       return;
     }
     const std::string &lo = hull->first, &hi = hull->second;
+    // The values outside the hull are kept.
+    facts.push_back("(forall ((x (_ BitVec 64))) (! (=> (not (and (bvsle " +
+                    lo + " x) (bvslt x " + hi + "))) (= " + hvOf(values, "x") +
+                    " " + hvOf(values0, "x") + ")) :pattern ((hv " + values +
+                    " x))))");
     std::string empty = "(= " + from + " " + upto + ")";
     std::string minFrom =
         "(ite (bvslt " + from0 + " " + lo + ") " + from0 + " " + lo + ")";
@@ -4220,9 +4261,12 @@ private:
                  : "that the elements copied are initialized",
             initializedWindow(*src, bvConst(0, 64), *count, false, state),
             state);
+        std::string values =
+            load(slot(*src, "/valv"), state, Sort{false, 64, false});
         if (move)
           markRange(*src, src->offset, *count, false, state);
-        markRange(*dest, dest->offset, *count, true, state);
+        markRange(*dest, dest->offset, *count, true, state,
+                  std::make_pair(values, src->offset));
         return;
       }
     }
@@ -4317,6 +4361,7 @@ private:
           store(slot(*a, "/upto"), state, extent);
           store(slot(*a, "/from2"), state, extent);
           store(slot(*a, "/upto2"), state, extent);
+          store(slot(*a, "/valv"), state, declare({false, 64, false}, "vv"));
           store(handed, state, bvConst(1, 64));
         }
       }
@@ -4430,7 +4475,8 @@ private:
                    {"/upto2", bvConst(0, 64)},
                    {"/stray", bvConst(0, 64)},
                    {"/handed", bvConst(0, 64)},
-                   {"/initv", version}});
+                   {"/initv", version},
+                   {"/valv", declare(handle, "vv")}});
       pointerBases[pointer] = {place,   bvConst(0, 64), "",
                                pointer, stack,          version};
       allocationPlaces.push_back(place);
@@ -4567,6 +4613,11 @@ private:
         ops.size() == 2) {
       if (std::optional<Allocation> at = moved(ops[1]))
         pointerBases[term(result, state)] = *at;
+    } else if ((path.starts_with("bitcast[") ||
+                path.starts_with("unsafe_bitcast[")) &&
+               ops.size() == 1) {
+      // The same memory (elements of the same size: `MaybeUninit[T]`).
+      pointerBases[term(result, state)] = *a;
     } else if (path.starts_with("__getitem__(") && ops.size() == 1) {
       pointeeRefs[result] = *a;
     } else if (path.starts_with("__getitem__[") && ops.size() == 2) {
@@ -4753,6 +4804,7 @@ private:
       keep("/from2", destroys || hands || writes, i64);
       keep("/upto2", destroys || hands || writes, i64);
       keep("/stray", destroys || hands || writes, i64);
+      keep("/valv", hands || writes, {false, 64, false});
       keep("/handed", hands, i64);
     }
     for (auto &[list, version] : before.storage)
@@ -9090,7 +9142,29 @@ private:
   /// read so far. Anything else is unknown (nothing when assumed, false to
   /// prove).
   std::string sameElements(const std::string &dst, const std::string &src,
-                           const std::string &count) {
+                           const std::string &count, State &state) {
+    // Pointers into memory the function tracks, in a postcondition: the
+    // bits of the elements, as the call left them and as they were at
+    // entry.
+    auto dstA = pointerBases.find(dst), srcA = pointerBases.find(src);
+    if (oldState && dstA != pointerBases.end() && srcA != pointerBases.end() &&
+        dstA->second.storage.empty() && srcA->second.storage.empty()) {
+      Sort i64{false, 64, true}, handle{false, 64, false};
+      std::string now = load(slot(dstA->second, "/valv"), state, handle);
+      std::string then = load(slot(srcA->second, "/valv"), *oldState, handle);
+      std::string k = declare(i64, "k");
+      std::string equal =
+          "(= " + hvOf(now, "(bvadd " + dstA->second.offset + " " + k + ")") +
+          " " + hvOf(then, "(bvadd " + srcA->second.offset + " " + k + ")") +
+          ")";
+      std::string range = "(and (bvsle " + bvConst(0, 64) + " " + k +
+                          ") (bvslt " + k + " " + count + "))";
+      if (!assuming)
+        return define({true, 1, false}, "(=> " + range + " " + equal + ")");
+      return define({true, 1, false}, "(forall ((" + k +
+                                          " (_ BitVec 64))) (=> " + range +
+                                          " " + equal + "))");
+    }
     auto dstField = fieldOwners.find(dst), srcField = fieldOwners.find(src);
     if (dstField == fieldOwners.end() || srcField == fieldOwners.end() ||
         !(StringRef(dstField->second.second).contains("_data") ||
@@ -12612,7 +12686,7 @@ private:
         call.getNumOperands() == 3) {
       values[result] = sameElements(term(call.getOperands()[0], state),
                                     term(call.getOperands()[1], state),
-                                    term(call.getOperands()[2], state));
+                                    term(call.getOperands()[2], state), state);
       return true;
     }
     if (path.starts_with("std::builtin::_verification::_elements_kept[") &&

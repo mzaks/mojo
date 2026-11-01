@@ -624,7 +624,13 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   over a gap joins the windows again, a shift up opens one, which the
   write into it closes (`Strs.ok_remove`, `Strs.ok_insert`,
   `ok_shift_down`; `bad_remove_leaves_gap`, `bad_insert_no_gap`), and
-  `unsafe_write_move_from` leaves its source uninitialized. A
+  `unsafe_write_move_from` leaves its source uninitialized. The bits
+  of the elements are a version of the memory's values, new at every
+  write (which keeps the elements not written) and, for a move or copy
+  of a range, those of the source; `_same_elements(dst, src, n)` of
+  pointers into memory the function tracks, in a postcondition, says
+  the `n` elements at `dst` as it returns are those that were at `src`
+  on entry (`ok_shift_down`, `bad_shift_claims_kept`; `List.pop(i)`). A
   pointer's `_extent()` is taken to be below a quarter of the address
   space, so a length below it plus a few does not wrap.
   What a call changes is bounded by the hull of the ranges its
@@ -649,9 +655,9 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   and bitcast pointers), and `List.shrink` and `List._unchecked_grow`
   gained the preconditions the invariant needs (`new_length >= 0`).
   `List.insert` and `List.pop(i)` are proven through their overlapping
-  moves; `pop(i)`'s `_same_elements` postcondition and
-  `extend(Span)` (a span's length is not bounded, so the new length may
-  wrap) are not.
+  moves; `extend(Span)` (a span's length is not bounded, so the new
+  length may wrap), `_realloc` and `append` (`_element_is` is only
+  stated) are not.
 - A struct with a single integer field and no parameters (an enum-like
   wrapper: `GEMVAlgorithm`, a mode) is represented by that integer: its
   field is the value, `Wrapper(n)` (a constructor that only stores its
