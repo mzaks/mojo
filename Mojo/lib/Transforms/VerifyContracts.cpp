@@ -5691,6 +5691,20 @@ private:
     return any;
   }
 
+  /// The list whose element `ref` is, when `ref` is what `List.__getitem__`
+  /// returns for a list at a known place.
+  std::optional<Loc> listElementOf(Value ref) {
+    auto access = ref.getDefiningOp<LIT::CallOp>();
+    if (!access || access.getNumOperands() < 1 || access->getNumResults() != 1)
+      return std::nullopt;
+    std::optional<CalleeName> name = calleeName(access.getCallee());
+    if (!name ||
+        !StringRef(name->path)
+             .starts_with("std::collections::list::List::__getitem__["))
+      return std::nullopt;
+    return placeOf(access.getOperands()[0]);
+  }
+
   /// The roots code may write; nullopt if it may write any of them.
   std::optional<llvm::DenseSet<Value>> writtenRoots(Operation *root) {
     llvm::DenseSet<Value> written;
@@ -5754,10 +5768,23 @@ private:
           if (callee && StringRef(callee->path).contains("::__deinit__(") &&
               call.getNumOperands() >= 1)
             destroyed = placeOf(call.getOperands()[0]);
-          for (auto [index, operand] : llvm::enumerate(call.getOperands()))
-            if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
-                ref && !ref.isMutableKnown(false) && !(destroyed && index == 0))
-              addRef(operand);
+          for (auto [index, operand] : llvm::enumerate(call.getOperands())) {
+            auto ref = dyn_cast<LIT::RefType>(operand.getType());
+            if (!ref || ref.isMutableKnown(false) || (destroyed && index == 0))
+              continue;
+            // An element of a list, reached through `xs[i]` (the mutable
+            // reference `__getitem__` returns): the callee writes the
+            // element, which lives in the list's storage, not the list's
+            // own fields (`xs[i].append(0)` keeps `xs._len`). The loop
+            // then keeps the fields and forgets the elements, as a call
+            // that writes what its argument owns does.
+            if (std::optional<Loc> list = listElementOf(operand)) {
+              written.insert(list->root);
+              storedPaths[list->root].insert(list->path + "/*");
+              continue;
+            }
+            addRef(operand);
+          }
           // Keep the printed list alive while its elements are used.
           std::string origins = printed(call.getImplicitOriginsAttr());
           for (StringRef origin : topLevelElements(origins)) {
@@ -5792,6 +5819,36 @@ private:
     if (all)
       return std::nullopt;
     return written;
+  }
+
+  /// A struct's invariant (a `requires` of this function with the
+  /// `invariant` attribute, about an argument) holds again at a loop's
+  /// head when the loop changes the argument only as a whole, through
+  /// calls (the struct's methods ensure it, so does any other function
+  /// given it `mut`), or in its elements: not one a field of which the
+  /// loop writes (`xs._len = 0`), which may break it.
+  void assumeInvariantsAtHead(State &head,
+                              const llvm::DenseSet<Value> &written) {
+    for (Operation &op : fn.getFunctionBody().front()) {
+      auto req = dyn_cast<RequiresOp>(&op);
+      if (!req || !req.getInvariant())
+        continue;
+      bool changed = false, safe = true;
+      for (Value arg : req.getArgs()) {
+        if (!written.count(arg))
+          continue;
+        changed = true;
+        if (auto paths = storedPaths.find(arg); paths != storedPaths.end())
+          for (const std::string &path : paths->second)
+            if (!path.empty() && path != "/*")
+              safe = false;
+      }
+      if (!changed || !safe)
+        continue;
+      if (MaybeTerm cond = instantiate(req.getBody(), req.getArgs(), head, {},
+                                       {}, nullptr, /*assumed=*/true))
+        facts.push_back(*cond);
+    }
   }
 
   void walkLoop(HLCF::LoopOp loop, State &state) {
@@ -6072,13 +6129,16 @@ private:
       if (auto was = state.env.find(loc);
           was != state.env.end() && was->second == value)
         continue;
-      // A struct holding such an array: checked below.
-      if (updates.count(value)) {
-        holders.push_back({loc, value});
-        continue;
-      }
       auto stored = elementStores.find(value);
-      if (stored == elementStores.end() || stored->second.index != k)
+      if (stored == elementStores.end()) {
+        // A struct holding such an array: checked below.
+        if (updates.count(value)) {
+          holders.push_back({loc, value});
+          continue;
+        }
+        return fail();
+      }
+      if (stored->second.index != k)
         return fail();
       State entry = state;
       if (load(loc, entry, placeType(loc)) != stored->second.old)
@@ -6405,6 +6465,8 @@ private:
       head.refs = std::move(keptRefs);
       keepAllocationState(loop, before, head);
     }
+    if (written)
+      assumeInvariantsAtHead(head, *written);
     State headAtEntry = head;
     LoopFrame frame{labelOf(loop), comptime, {}, {}, {}, {}, {}};
     loops.push_back(&frame);
@@ -8605,6 +8667,63 @@ private:
     return true;
   }
 
+  /// The depth of `__invariant__` bodies being walked: a clause of a method
+  /// the predicate calls (`len(self)` in `Deque`'s) calls the predicate
+  /// again, which is not followed.
+  unsigned predicateDepth = 0;
+
+  /// A call of a struct's `__invariant__` predicate, the conjunction of its
+  /// `invariant` clauses, which the parser synthesizes for the functions
+  /// outside the struct that take its values (their clauses call it): the
+  /// value its body computes from the argument here, as `evalTransparent`
+  /// takes an expression helper's. The clauses are then read as they are in
+  /// the struct's own methods, except for the memory they state
+  /// (`_initialized` of the list's storage), which `memoryClauses` reads
+  /// from clause bodies only: outside the struct it is not checked.
+  bool evalInvariantPredicate(LIT::CallOp call, const CalleeName &name,
+                              LIT::FnOp callee, ParamFrame &frame,
+                              State &state) {
+    if (predicateDepth || !callee || callee.getFunctionBody().empty() ||
+        call->getNumResults() != 1 || call.getNumOperands() != 1 ||
+        !StringRef(name.path).contains("::__invariant__"))
+      return false;
+    Block &entry = callee.getFunctionBody().front();
+    if (entry.getNumArguments() != 1 || entry.empty() ||
+        entry.back().getNumOperands() != 1)
+      return false;
+    BlockArgument arg = entry.getArgument(0);
+    Value operand = call.getOperand(0);
+    if (isa<LIT::RefType>(arg.getType())) {
+      refArgs.erase(arg);
+      if (std::optional<Loc> loc = placeOf(operand))
+        refArgs[arg] = *loc;
+    } else {
+      values[arg] = term(operand, state);
+    }
+    // Its parameter expressions are this call's.
+    callee->walk([&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
+    size_t recorded = obligations.size();
+    ParamFrame *saved = params;
+    params = &frame;
+    SmallVector<State> exits;
+    closureExits.push_back(&exits);
+    ++predicateDepth;
+    State body = state;
+    body.yields.clear();
+    walkBlock(entry, body);
+    --predicateDepth;
+    closureExits.pop_back();
+    params = saved;
+    obligations.truncate(recorded);
+    if (exits.size() != 1)
+      return false;
+    std::string value = term(entry.back().getOperand(0), exits[0]);
+    if (!sortOfTerm(value).isBool)
+      return false;
+    values[call->getResult(0)] = value;
+    return true;
+  }
+
   void evalCall(LIT::CallOp call, State &state) {
     if (inlineClosure(call, state) || inlineClosureWitness(call, state))
       return;
@@ -8662,6 +8781,8 @@ private:
     }
     if (name && !inContract)
       checkPointerCall(call, *name, contract, state);
+    if (name && evalInvariantPredicate(call, *name, callee, frame, state))
+      return;
     if (inlineHigherOrder(call, callee, frame, state))
       return;
     if (name && evalReversedRange(call, *name, state))
@@ -12490,6 +12611,9 @@ private:
                      " j))) :pattern ((" + fn + " " + updated + " j))))")
                         .str());
     elementStores[updated] = {old, index.str(), value.str()};
+    // The collection's own fields (`_len`, `_storage`) are as before: only
+    // an element changed.
+    updates[updated] = {old, "/*"};
     store(list, state, updated);
   }
   /// While a store loads the value it replaces a part of, or a field's
