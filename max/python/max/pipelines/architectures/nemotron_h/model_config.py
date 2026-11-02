@@ -22,8 +22,8 @@ from typing import ClassVar
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.graph.weights import WeightData
-from max.nn.kv_cache import KVCacheParams
-from max.nn.quant_config import (
+from max.nn.legacy.kv_cache import KVCacheParams
+from max.nn.legacy.quant_config import (
     InputScaleSpec,
     QuantConfig,
     QuantFormat,
@@ -31,6 +31,7 @@ from max.nn.quant_config import (
     ScaleOrigin,
     WeightScaleSpec,
 )
+from max.nn.legacy.transformer import ReturnLogits
 from max.pipelines.kv_cache import cache_dtype_for_encoding
 from max.pipelines.lib import KVCacheConfig, MAXModelConfig, PipelineConfig
 from max.pipelines.lib.config.model_config import _select_quantization_encoding
@@ -38,6 +39,7 @@ from max.pipelines.lib.interfaces import (
     ArchConfigWithKVCache,
     ArchConfigWithStoredKVParams,
 )
+from max.pipelines.lib.interfaces.arch_config import ModelOutputConfig
 from max.pipelines.modeling.config_enums import (
     SupportedEncoding,
     supported_encoding_dtype,
@@ -227,12 +229,20 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
 
     quantization_encoding: SupportedEncoding | None = None
 
+    quant_config: QuantConfig | None = None
+    """The per-tensor static FP8 scheme of the FP8 layers, from the
+    checkpoint (:meth:`finalize`)."""
+
+    return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN
+
     @property
     def mamba_intermediate_size(self) -> int:
+        """The mixer's width, from the head count and the head width."""
         return self.mamba_num_heads * self.mamba_head_dim
 
     @property
     def conv_dim(self) -> int:
+        """The width the causal convolution runs at."""
         return (
             self.mamba_intermediate_size
             + 2 * self.n_groups * self.ssm_state_size
@@ -240,6 +250,7 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
 
     @property
     def mamba_in_proj_out(self) -> int:
+        """The width the mixer's input projection produces."""
         # [gate=intermediate, hidden_states_B_C=conv_dim, dt=nheads]
         return (
             self.mamba_intermediate_size + self.conv_dim + self.mamba_num_heads
@@ -247,18 +258,22 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
 
     @property
     def attention_q_dim(self) -> int:
+        """The query width across all attention heads."""
         return self.num_attention_heads * self.attention_head_dim
 
     @property
     def attention_kv_dim(self) -> int:
+        """The key and value width across all key/value heads."""
         return self.num_key_value_heads * self.attention_head_dim
 
     @property
     def mamba_layer_indices(self) -> list[int]:
+        """The indices of the layers whose mixer is Mamba-2."""
         return [i for i, k in enumerate(self.layer_kinds) if k == "mamba"]
 
     @property
     def attention_layer_indices(self) -> list[int]:
+        """The indices of the layers whose mixer is attention."""
         return [i for i, k in enumerate(self.layer_kinds) if k == "attention"]
 
     def populate_fp8_layers(self, state_dict: Mapping[str, WeightData]) -> None:
@@ -304,8 +319,26 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
             f" {len(fp8_attention)} attention layers quantized"
         )
 
+    def finalize(
+        self,
+        huggingface_config: AutoConfig,
+        state_dict: Mapping[str, WeightData],
+        outputs: ModelOutputConfig,
+    ) -> None:
+        """Completes the config in place from the checkpoint.
+
+        Records which layers are FP8 and their scheme, from the checkpoint's
+        ``weight_scale`` tensors, and the logits the pipeline returns.
+        """
+        self.populate_fp8_layers(state_dict)
+        self.quant_config = build_fp8_quant_config(
+            huggingface_config, state_dict
+        )
+        self.return_logits = outputs.return_logits
+
     @staticmethod
     def get_num_layers(huggingface_config: AutoConfig) -> int:
+        """The checkpoint's hidden layer count."""
         return huggingface_config.num_hidden_layers
 
     @classmethod
@@ -314,6 +347,7 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
         huggingface_config: AutoConfig,
         model_config: MAXModelConfig,
     ) -> int:
+        """The configured maximum length, capped at the model's default."""
         max_seq_len = model_config.max_length
         if max_seq_len:
             return max_seq_len
@@ -419,6 +453,7 @@ class NemotronHConfig(ArchConfigWithStoredKVParams, ArchConfigWithKVCache):
         *,
         max_seq_len: int,
     ) -> NemotronHConfig:
+        """Builds the config from the checkpoint's ``config.json``."""
         # The model (activation / embedding / norm / attention) dtype is always
         # bf16; FP8 is applied PER-MODULE to specific Linears via quant_config,
         # NOT model-wide. So ignore an fp8 resolved encoding for the model dtype

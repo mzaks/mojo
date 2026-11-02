@@ -26,18 +26,21 @@ import math
 
 import numpy as np
 from max.dtype import DType
-from max.graph import DeviceRef, TensorType, TensorValue, ops
-from max.nn.activation import activation_function_from_name
-from max.nn.embedding import Embedding
-from max.nn.layer import Module
-from max.nn.linear import Linear
-from max.nn.norm import LayerNorm
-from max.nn.sequential import Sequential
+from max.graph import DeviceRef, TensorValue, ops
+from max.nn.legacy.activation import activation_function_from_name
+from max.nn.legacy.embedding import Embedding
+from max.nn.legacy.layer import Module
+from max.nn.legacy.linear import Linear
+from max.nn.legacy.norm import LayerNorm
+from max.nn.legacy.sequential import Sequential
+from max.pipelines.lib.registration_encoder import EncoderInputs
 
 from .model_config import BertModelConfig
 
 
 class BertEmbeddings(Module):
+    """Token, position, and token-type embeddings."""
+
     def __init__(self, config: BertModelConfig) -> None:
         hf_config = config.huggingface_config
         dtype = config.dtype
@@ -73,6 +76,7 @@ class BertEmbeddings(Module):
         input_ids: TensorValue,
         token_type_ids: TensorValue | None = None,
     ) -> TensorValue:
+        """Builds the embedding sequence for the input ids."""
         seq_length = input_ids.shape[1]
 
         position_ids = ops.range(
@@ -96,6 +100,8 @@ class BertEmbeddings(Module):
 
 
 class BertSelfAttention(Module):
+    """Multi-head self-attention with a transposed head layout."""
+
     def __init__(self, config: BertModelConfig) -> None:
         hf_config = config.huggingface_config
         dtype = config.dtype
@@ -129,6 +135,7 @@ class BertSelfAttention(Module):
         )
 
     def transpose_for_scores(self, x: TensorValue) -> TensorValue:
+        """Splits the last axis into attention heads."""
         new_x_shape = x.shape[:-1] + [
             self.num_attention_heads,
             self.attention_head_size,
@@ -139,6 +146,7 @@ class BertSelfAttention(Module):
     def __call__(
         self, hidden_states: TensorValue, attention_mask: TensorValue
     ) -> TensorValue:
+        """Runs self-attention over the hidden states."""
         query_layer = self.transpose_for_scores(self.query(hidden_states))
         key_layer = self.transpose_for_scores(self.key(hidden_states))
         value_layer = self.transpose_for_scores(self.value(hidden_states))
@@ -162,6 +170,8 @@ class BertSelfAttention(Module):
 
 
 class BertSelfOutput(Module):
+    """Dense projection and norm after self-attention."""
+
     def __init__(self, config: BertModelConfig) -> None:
         hf_config = config.huggingface_config
         dtype = config.dtype
@@ -184,12 +194,15 @@ class BertSelfOutput(Module):
     def __call__(
         self, hidden_states: TensorValue, input_tensor: TensorValue
     ) -> TensorValue:
+        """Projects the attention output and adds the residual."""
         hidden_states = self.dense(hidden_states)
         hidden_states = self.layer_norm(hidden_states + input_tensor)
         return hidden_states
 
 
 class BertAttention(Module):
+    """Self-attention block with its output projection."""
+
     def __init__(self, config: BertModelConfig) -> None:
         self.self = BertSelfAttention(config)
         self.output = BertSelfOutput(config)
@@ -197,12 +210,15 @@ class BertAttention(Module):
     def __call__(
         self, hidden_states: TensorValue, attention_mask: TensorValue
     ) -> TensorValue:
+        """Runs the attention block over the hidden states."""
         self_output = self.self(hidden_states, attention_mask)
         attention_output = self.output(self_output, hidden_states)
         return attention_output
 
 
 class BertIntermediate(Module):
+    """The feed-forward expansion layer."""
+
     def __init__(self, config: BertModelConfig) -> None:
         hf_config = config.huggingface_config
         dtype = config.dtype
@@ -219,12 +235,15 @@ class BertIntermediate(Module):
         )
 
     def __call__(self, hidden_states: TensorValue) -> TensorValue:
+        """Runs the intermediate dense layer and its activation."""
         hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
 
 class BertOutput(Module):
+    """The feed-forward output projection."""
+
     def __init__(self, config: BertModelConfig) -> None:
         hf_config = config.huggingface_config
         dtype = config.dtype
@@ -247,12 +266,15 @@ class BertOutput(Module):
     def __call__(
         self, hidden_states: TensorValue, input_tensor: TensorValue
     ) -> TensorValue:
+        """Projects the feed-forward output and adds the residual."""
         hidden_states = self.dense(hidden_states)
         hidden_states = self.layer_norm(hidden_states + input_tensor)
         return hidden_states
 
 
 class BertLayer(Module):
+    """One BERT encoder layer."""
+
     def __init__(
         self,
         config: BertModelConfig,
@@ -266,6 +288,7 @@ class BertLayer(Module):
         hidden_states: TensorValue,
         attention_mask: TensorValue,
     ) -> TensorValue:
+        """Runs attention and feed-forward for one layer."""
         attention_output = self.attention(hidden_states, attention_mask)
         intermediate_output = self.intermediate(attention_output)
         layer_output = self.output(intermediate_output, attention_output)
@@ -273,6 +296,8 @@ class BertLayer(Module):
 
 
 class BertEncoder(Module):
+    """The stack of BERT layers."""
+
     def __init__(
         self,
         config: BertModelConfig,
@@ -286,12 +311,23 @@ class BertEncoder(Module):
     def __call__(
         self, hidden_states: TensorValue, attention_mask: TensorValue
     ) -> TensorValue:
+        """Runs every layer over the hidden states."""
         for layer in self.layer.layers:
             hidden_states = layer(hidden_states, attention_mask)
         return hidden_states
 
 
 class BertModel(Module):
+    """The BERT encoder with its embeddings, registered for ``ENCODER``.
+
+    It takes a padded batch and returns each sequence's embeddings, pooled
+    over its tokens when the pipeline pools embeddings.
+    """
+
+    graph_name = "bert"
+    """The name the graph compiled under before registration, which keys
+    precompiled MEFs."""
+
     def __init__(
         self,
         config: BertModelConfig,
@@ -301,28 +337,11 @@ class BertModel(Module):
         self.pool_outputs = config.pool_embeddings
         self.device = config.device
 
-    def input_types(self) -> tuple[TensorType, TensorType]:
-        """Returns the graph's input types: input IDs and attention mask."""
-        return (
-            TensorType(
-                DType.int64, shape=["batch_size", "seq_len"], device=self.device
-            ),
-            TensorType(
-                DType.float32,
-                shape=["batch_size", "seq_len"],
-                device=self.device,
-            ),
-        )
-
-    def __call__(
-        self,
-        input_ids: TensorValue,
-        attention_mask: TensorValue,
-        token_type_ids: TensorValue | None = None,
-    ) -> TensorValue:
-        embedding_output = self.embeddings(
-            input_ids=input_ids, token_type_ids=token_type_ids
-        )
+    def __call__(self, inputs: EncoderInputs[TensorValue]) -> TensorValue:
+        """Runs the model over the batch's token IDs."""
+        attention_mask = inputs.attention_mask
+        assert attention_mask is not None
+        embedding_output = self.embeddings(input_ids=inputs.tokens)
 
         extended_attention_mask = ops.reshape(
             attention_mask, ("batch_size", 1, 1, "seq_len")

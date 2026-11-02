@@ -17,7 +17,7 @@ from std.memory.alloc import unsafe_alloc
 from std.testing import *
 
 
-def kernel(res: MutPointer[UInt32, MutAnyOrigin]):
+def kernel(res: MutPointer[UInt32, MutUntrackedOrigin]):
     res[] = 0
 
 
@@ -30,7 +30,7 @@ def test_function_error(ctx: DeviceContext) raises:
         var ptr = unsafe_alloc[UInt32](1)
         var ptr_owned = OwnedPointer[UInt32](unsafe_from_raw_pointer=ptr)
         var res_host = DeviceBuffer[.uint32](
-            ctx, ptr_owned.unsafe_ptr(), 1, owning=False
+            ctx, ptr_owned.ptr(), 1, owning=False
         )
         ctx.enqueue_function[kernel](res_host, block_dim=(1), grid_dim=(1))
         ctx.synchronize()

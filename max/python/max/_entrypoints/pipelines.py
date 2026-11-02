@@ -65,7 +65,7 @@ def check_model_flag_conflict(args: list[str]) -> None:
 
 
 class WithLazyPipelineOptions(click.Command):
-    """Command wrapper that defers loading pipeline configuration options
+    """Command wrapper that defers loading pipeline configuration options.
 
     Lazily applies pipeline_config_options to the callback only when
     command help or execution is actually requested, improving startup time.
@@ -165,7 +165,6 @@ def _handle_import_error(
         subcommand: The subcommand that was run (that is, "serve" for `max serve`)
         suggestion: Which package to install, first item is when using conda, second is for wheels.
     """
-
     if sys.version_info < (3, 11):
         # Backport `add_note()`
         import exceptiongroup  # noqa: F401
@@ -850,6 +849,18 @@ def cli_pipeline(
     ),
 )
 @click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Print the patched module before the quantizer count.",
+)
+@click.option(
+    "--export-path",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="After generation, write an NVFP4 checkpoint to this directory.",
+)
+@click.option(
     "--prompt",
     type=str,
     default="I believe the meaning of life is",
@@ -905,6 +916,8 @@ def cli_pipeline(
 def quantize(
     targets: list[str],
     quantization_format: str,
+    verbose: bool,
+    export_path: Path | None,
     prompt: str,
     image_url: list[str],
     num_warmups: int,
@@ -927,10 +940,10 @@ def quantize(
     seed: int,
     **config_kwargs: Any,
 ) -> None:
-    """Quantize the specified model.
+    """Quantize the specified model and run text generation.
 
-    This command runs text generation using the loaded model, optionally
-    accepting image inputs for multimodal models.
+    If ``--export-path`` is set, write an NVFP4 checkpoint afterwards from
+    the same module the generate graph ran.
     """
     from max._entrypoints.cli.quantize import quantize_pipeline
     from max.pipelines.context import SamplingParams, SamplingParamsInput
@@ -976,10 +989,12 @@ def quantize(
         targets=targets,
         prompt=prompt,
         quantization_format=quantization_format,
+        verbose=verbose,
         image_urls=image_url,
         num_warmups=num_warmups,
         profile=profile,
         profile_top_n=profile_top_n,
+        export_path=export_path,
     )
 
 
@@ -1064,12 +1079,24 @@ def cli_warm_cache(target: str | None, **config_kwargs) -> None:
         " if missing. The path must not exist."
     ),
 )
-def cli_export(output: Path, **config_kwargs: Any) -> None:
+@click.option(
+    "--format-spec",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "The FormatSpec document to store in the artifact, in place of the"
+        " one the architecture names for the checkpoint."
+    ),
+)
+def cli_export(
+    output: Path, format_spec: Path | None, **config_kwargs: Any
+) -> None:
     """Build the pipeline and export it as a ``.m`` pipeline artifact.
 
     Takes the same pipeline options as ``serve`` and ``generate`` and builds
     the pipeline the same way, so the artifact holds the graphs a served
-    pipeline compiles, keyed by role.
+    pipeline compiles, keyed by role. For an architecture with weight rules,
+    it also holds the rules its checkpoint loads through.
     """
     from max._artifact import ArtifactError
     from max._artifact.export import export_pipeline
@@ -1079,7 +1106,7 @@ def cli_export(output: Path, **config_kwargs: Any) -> None:
         PipelineArgs.from_flat_kwargs(**config_kwargs)
     )
     try:
-        dest = export_pipeline(pipeline_config, output)
+        dest = export_pipeline(pipeline_config, output, format_spec)
     except ArtifactError as e:
         raise click.ClickException(str(e)) from e
     click.echo(f"Exported pipeline artifact to {dest}")

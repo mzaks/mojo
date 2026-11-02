@@ -21,7 +21,7 @@ from algorithm.reduce_op import ReduceOp
 from algorithm.rowwise import launch, pick_simd_width
 from algorithm.rowwise_types import RowBody
 
-from extensibility import StaticTensorSpec
+from extensibility import GridBlockLaunchConfig, StaticTensorSpec
 from extensibility import (
     ComputeOutputFusion,
     ComputeOutputFusionTile,
@@ -43,8 +43,19 @@ from max.gpu.host import (
     StableAddr,
 )
 from max.gpu.host import _DeviceContextPtr
+
+# A target can add `DeviceContext` methods as `__extension`s, which only an
+# import of a name brings in, and `mogg_launch_declarative` calls them.
+# TODO(DRIV-491): These are the legacy context's extensions, which don't apply
+# when `DeviceContext` is the HAL context. Once targets launch through the HAL
+# context, import their extensions through `max.gpu.host`, or drop this import
+# if HAL launches need none.
+from max.gpu.host._legacy.device_context import (
+    DeviceContext as _DeviceContextExtensions,
+)
 from max.gpu.host.info import is_accelerator, is_cpu, is_gpu
 from std.memory import OwnedPointer, MaybeUninit, alloc
+from std.builtin.device_passable import DevicePassable
 from std.os import abort
 from layout import (
     Coord,
@@ -305,13 +316,13 @@ struct OwnedTensor[
     def shape_only() -> Bool:
         return Self.kind == DeviceGraphInputKind.shape_only
 
-    def unsafe_ptr(self) -> Pointer[Scalar[Self.dtype], MutAnyOrigin]:
+    def unsafe_ptr(self) -> Pointer[Scalar[Self.dtype], MutUntrackedOrigin]:
         """Returns the view's raw device data pointer.
 
         Returns:
             The non-owning device data pointer of the view.
         """
-        return self.tensor.unsafe_ptr()
+        return self.tensor._ptr
 
     def shape(self) -> IndexList[Self.rank]:
         """Returns the tensor view's shape.
@@ -502,7 +513,7 @@ def unpack_buffer_ref(
     var size: UInt64 = 0
     var data_ptr = external_call[
         "MGP_RT_GetDataFromBuffer",
-        OpaquePointer[MutAnyOrigin],
+        OpaquePointer[MutUntrackedOrigin],
     ](value, Pointer(to=size))
     var shape = IndexList[1](Int(size))
     var view = MutByteBuffer(data_ptr.unsafe_bitcast[Int8](), shape)
@@ -527,7 +538,7 @@ def unpack_tensor[
     var shapes = IndexList[buffer_rank]()
     var buffer_ptr = external_call[
         "MGP_RT_GetShapeAndDataFromTensor",
-        OpaquePointer[MutAnyOrigin],
+        OpaquePointer[MutUntrackedOrigin],
     ](Pointer(to=shapes.data), value)
 
     comptime if tensor_rank == 0:
@@ -618,7 +629,7 @@ def mgp_device_graph_stable_tensor[
     """
     var ptr = (
         addr.ptr.unsafe_bitcast[Scalar[dtype]]()
-        .unsafe_origin_cast[MutAnyOrigin]()
+        .unsafe_origin_cast[MutUntrackedOrigin]()
         .unsafe_mut_cast[target_mut=True]()
     )
     comptime if spec_rank == 0:
@@ -995,21 +1006,12 @@ def mgp_buffer_concat[
     inputs: Array[OwnedByteBuffer, ...],
     call_ctx: DeviceContext,
 ) raises:
-    var output_lt = TileTensor(
-        output.unsafe_ptr(),
-        row_major(output.size()),
-    )
+    var output_lt = output.view.to_tile_tensor()
     var input_tensors = StaticTuple[_, inputs.length](
-        TileTensor(inputs[0].unsafe_ptr(), row_major(inputs[0].size()))
-        .as_unsafe_any_origin()
-        .as_imm()
+        inputs[0].view.to_tile_tensor().as_imm()
     )
     for i in range(1, len(inputs)):
-        input_tensors[i] = (
-            TileTensor(inputs[i].unsafe_ptr(), row_major(inputs[i].size()))
-            .as_unsafe_any_origin()
-            .as_imm()
-        )
+        input_tensors[i] = inputs[i].view.to_tile_tensor().as_imm()
     concat[.int8, bDevice](output_lt, 0, input_tensors, context=call_ctx)
 
 
@@ -1365,7 +1367,7 @@ comptime _StateContextPtr[
     mut: Bool,
     //,
     origin: Origin[mut=mut] = UntrackedOrigin[mut=mut],
-] = OptionalPointer[_StateContextCpp, origin]
+] = Optional[Pointer[_StateContextCpp, origin]]
 
 # `StateContextRef` is the pointer representation passed across the FFI boundary;
 # Mojo never dereferences it directly.
@@ -1431,7 +1433,7 @@ struct StateContext(ImplicitlyCopyable, RegisterPassable):
             of this reference.
         """
         var buffer_size: UInt64 = 0
-        var buffer_data = Optional[OpaquePointer[MutAnyOrigin]]()
+        var buffer_data = Optional[OpaquePointer[MutUntrackedOrigin]]()
 
         var async_value = external_call[
             "MGP_RT_GetCachedBuffer", _AsyncValuePtr[mut=True]
@@ -1469,7 +1471,7 @@ struct StateContext(ImplicitlyCopyable, RegisterPassable):
         def create() -> Pointer[DeviceGraphCache, MutUntrackedOrigin]:
             # Leaked because the state context takes over ownership; `destroy`
             # below pairs the pointer back up with this layout to release it.
-            var cache = OwnedPointer(value=DeviceGraphCache())
+            var cache = OwnedPointer(DeviceGraphCache())
             return cache^.unsafe_take_allocation().unsafe_leak()
 
         # The corresponding desructor function. Convert the raw pointer back to
@@ -1488,6 +1490,38 @@ struct StateContext(ImplicitlyCopyable, RegisterPassable):
 # ===-----------------------------------------------------------------------===#
 
 
+@always_inline
+def mogg_launch_declarative[
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(*args: *declared_arg_types) thin -> None,
+    *Ts: DevicePassable,
+](ctx: DeviceContext, config: Some[GridBlockLaunchConfig], *args: *Ts) raises:
+    """Compiles a declarative kernel's device function and launches it with
+    the grid and block dims of `config`.
+
+    Parameters:
+        declared_arg_types: The argument types the device function declares.
+        func: The device function.
+        Ts: The types of the arguments the launch passes.
+
+    Args:
+        ctx: The device context to launch on.
+        config: The kernel's launch configuration.
+        args: The arguments the launch passes to the device function.
+
+    Raises:
+        If compiling or enqueuing the device function fails.
+    """
+    var compiled = ctx.compile_function[func]()
+    ctx.enqueue_function(
+        compiled,
+        *args,
+        grid_dim=config.get_grid_dim(),
+        block_dim=config.get_block_dim(),
+    )
+
+
 @register_internal("mogg.as_scalar")
 @inline(.always)
 def mogg_as_scalar(tensor: ManagedTensorSlice) -> Scalar[tensor.dtype]:
@@ -1503,7 +1537,7 @@ def mogg_async_unpack[
     Returns the value stored in the AnyAsyncValueRef.
     """
     var ptr = external_call[
-        "MGP_RT_GetValueFromAsync", OpaquePointer[MutAnyOrigin]
+        "MGP_RT_GetValueFromAsync", OpaquePointer[MutUntrackedOrigin]
     ](async_ref.get_handle()).unsafe_bitcast[T]()
 
     return ptr[]

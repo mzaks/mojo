@@ -186,12 +186,12 @@ def test_matches_unfused[
         TileTensor(
             q_ref.unsafe_ptr().unsafe_bitcast[Scalar[OUT_DTYPE]](),
             row_major(m, Idx[q_cols]),
-        ).as_unsafe_any_origin(),
+        ),
         TileTensor(
             sf_ref.unsafe_ptr().unsafe_bitcast[Scalar[MXFP8_SF_DTYPE]](),
             scales_layout,
-        ).as_unsafe_any_origin(),
-        TileTensor(q_normed, row_major(m, Idx[q_cols])).as_unsafe_any_origin(),
+        ),
+        TileTensor(q_normed, row_major(m, Idx[q_cols])).as_imm(),
         num_cols=q_cols,
         num_cols_padded=q_cols,
     )
@@ -200,18 +200,18 @@ def test_matches_unfused[
         TileTensor(
             q_fused.unsafe_ptr().unsafe_bitcast[Scalar[OUT_DTYPE]](),
             row_major(m, Idx[q_cols]),
-        ).as_unsafe_any_origin(),
+        ),
         TileTensor(
             sf_fused.unsafe_ptr().unsafe_bitcast[Scalar[MXFP8_SF_DTYPE]](),
             scales_layout,
-        ).as_unsafe_any_origin(),
+        ),
         TileTensor(
             kv_fused_bytes.unsafe_ptr().unsafe_bitcast[Scalar[IN_DTYPE]](),
             row_major(m, Idx[kv_cols]),
-        ).as_unsafe_any_origin(),
-        TileTensor(x, row_major(m, Idx[width])).as_unsafe_any_origin(),
-        TileTensor(gamma_q, row_major(Idx[q_cols])).as_unsafe_any_origin(),
-        TileTensor(gamma_kv, row_major(Idx[kv_cols])).as_unsafe_any_origin(),
+        ),
+        TileTensor(x, row_major(m, Idx[width])).as_imm(),
+        TileTensor(gamma_q, row_major(Idx[q_cols])).as_imm(),
+        TileTensor(gamma_kv, row_major(Idx[kv_cols])).as_imm(),
         EPS,
         ctx,
     )
@@ -259,19 +259,9 @@ def test_matches_unfused[
             kv_bad * 500 <= m * kv_cols, String("M = ", m, ", kv elements")
         )
     print(
-        "fused matches unfused:",
-        "M =",
-        m,
-        "q_cols =",
-        q_cols,
-        "kv_cols =",
-        kv_cols,
-        "exact =",
-        exact,
-        "mismatches q/scales/kv =",
-        q_bad,
-        sf_bad,
-        kv_bad,
+        t"fused matches unfused: M = {m} q_cols = {q_cols} kv_cols ="
+        t" {kv_cols} exact = {exact} mismatches q/scales/kv ="
+        t" {q_bad} {sf_bad} {kv_bad}"
     )
 
 

@@ -18,15 +18,17 @@ the binding constraint depending on context length:
 * **The KDA state pools.** 146 MiB per sequence at float32 -- 136 MiB of
   recurrent state plus 9.6 MiB of conv state across 34 layers -- and
   *independent of context length*. Below roughly 12K context this dominates a
-  sequence's cost and caps concurrency before the KV pool fills. SGLang says
-  the same thing operationally: "the KDA state pool can limit concurrency
-  before the KV pool is full."
+  sequence's cost and caps concurrency before the KV pool fills.
 * **The 4x mHC residual widening.** A prefill chunk of ``T`` tokens holds
   ``T * hc_mult * hidden_size`` elements per live residual tensor, so the chunk
   size that fits a given activation budget drops by roughly ``hc_mult``
   relative to a single-stream model of the same width -- 268 MB at ``T`` =
   8192. Folded in here rather than discovered as an out-of-memory error at the
   first long prefill.
+
+On gfx950 a third cost appears: the ``kda_chunk`` prefill launch allocates its
+workspaces on every call, outside the graph memory planner, so
+:func:`amd_kda_chunk_workspace_bytes` reserves them here instead.
 
 Everything the V3 family already accounts for -- the MLA up-projection, the
 expert-parallel routing buffers and the persistent EP SHMEM buffers -- comes
@@ -48,6 +50,7 @@ from typing import Any
 
 from max.driver import Device
 from max.graph import DeviceRef
+from max.nn.legacy.state_space.kimi_delta import amd_kda_chunk_workspace_bytes
 from max.pipelines.lib import PipelineConfig
 from transformers import AutoConfig
 from typing_extensions import override
@@ -81,6 +84,11 @@ class Glm5NextMemoryPlanner(DeepseekV3MemoryPlanner):
     """Adds the KDA state pools and the widened mHC residual to V3's estimate."""
 
     _always_signal_buffers = True
+
+    _inferred_max_batch_size: int | None = None
+    """The batch size :meth:`infer_max_batch_size` chose, which planning does
+    not write back to ``runtime.max_batch_size`` before it asks
+    :meth:`estimate_activation_memory`."""
 
     @override
     def estimate_weights_size(self, pipeline_config: PipelineConfig) -> int:
@@ -118,6 +126,7 @@ class Glm5NextMemoryPlanner(DeepseekV3MemoryPlanner):
                 pipeline_config.model.kv_cache.device_memory_utilization
             ),
         )
+        self._inferred_max_batch_size = inferred
         return inferred
 
     @override
@@ -126,7 +135,7 @@ class Glm5NextMemoryPlanner(DeepseekV3MemoryPlanner):
         pipeline_config: PipelineConfig,
         huggingface_config: AutoConfig,
     ) -> int:
-        """Adds the widened residual and the vision tower to V3's estimate.
+        """Adds the mHC residual, the vision tower and gfx950 chunk workspaces.
 
         The conv and recurrent pools are leaves of the multi-cache, so the
         cache allocation already pays for their pages --
@@ -143,13 +152,29 @@ class Glm5NextMemoryPlanner(DeepseekV3MemoryPlanner):
         splits the token axis, which is what makes the inherited per-rank
         estimate right without an override here. The vision tower's
         activations are :meth:`_vision_activation_bytes`.
+
+        On gfx950 the ``kda_chunk`` prefill workspaces are an activation too;
+        see :func:`amd_kda_chunk_workspace_bytes`.
         """
         config = self._config
         assert isinstance(config, Glm5NextConfig)
 
+        runtime = pipeline_config.runtime
         residual_bytes = (
-            pipeline_config.runtime.max_batch_input_tokens
-            * config.activation_bytes_per_token()
+            runtime.max_batch_input_tokens * config.activation_bytes_per_token()
+        )
+        chunk_workspace_bytes = amd_kda_chunk_workspace_bytes(
+            num_heads=config.linear_num_heads,
+            head_dim=config.linear_head_dim,
+            lower_bound=config.linear_lower_bound,
+            state_dtype=config.state_dtype,
+            decode_only=runtime.pipeline_role == "decode_only",
+            max_batch_input_tokens=runtime.max_batch_input_tokens,
+            enable_chunked_prefill=runtime.enable_chunked_prefill,
+            max_batch_size=(
+                runtime.max_batch_size or self._inferred_max_batch_size
+            ),
+            max_length=pipeline_config.model.max_length,
         )
         return (
             super().estimate_activation_memory(
@@ -157,6 +182,7 @@ class Glm5NextMemoryPlanner(DeepseekV3MemoryPlanner):
             )
             + residual_bytes
             + self._vision_activation_bytes(pipeline_config)
+            + chunk_workspace_bytes
         )
 
     def _vision_activation_bytes(self, pipeline_config: PipelineConfig) -> int:

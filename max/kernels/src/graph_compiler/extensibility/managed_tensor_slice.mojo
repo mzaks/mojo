@@ -944,7 +944,7 @@ def simd_store_into_tensor_pointer[
     simd_width: SIMDLength,
     element_alignment: Int = 1,
 ](
-    ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    ptr: MutPointer[Scalar[dtype], _],
     shape: IndexList[rank],
     strides: IndexList[rank],
     indices: IndexList[rank],
@@ -992,7 +992,7 @@ def simd_load_from_tensor_pointer[
     simd_width: Int,
     element_alignment: Int = 1,
 ](
-    ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    ptr: MutPointer[Scalar[dtype], _],
     shape: IndexList[rank],
     strides: IndexList[rank],
     indices: IndexList[rank],
@@ -1026,6 +1026,13 @@ def simd_load_from_tensor_pointer[
     return simd_load_from_managed_tensor_slice[
         simd_width=simd_width, element_alignment=element_alignment
     ](tensor, indices)
+
+
+def _strided_lanes_mask[width: Int, stride: Int]() -> IndexList[width]:
+    var mask = IndexList[width]()
+    for i in range(width):
+        mask[i] = i * stride
+    return mask
 
 
 @doc_hidden
@@ -1101,6 +1108,52 @@ def simd_load_from_managed_tensor_slice[
             case 1:
                 return load_stride1()
             case _:
+                # `strided_load` lowers to a gather on CPU, which is slow for
+                # the small strides that permute views produce (e.g. NHWC ->
+                # NCHW has an innermost stride of C). Load one contiguous
+                # window covering all lanes and shuffle the lanes out instead.
+                # Gated to CPU: the GPU path is unmeasured.
+                comptime if (
+                    not is_gpu()
+                    and dtype != .bool
+                    and simd_width > 1
+                    and _last_stride_value > 1
+                    and _last_stride_value <= 8
+                ):
+                    # Round the stride up to a power of two to keep the window
+                    # width a power of two. Lane `i` sits at `i * stride`, so
+                    # the last lane stays inside the window.
+                    comptime window_stride = (
+                        2 if _last_stride_value
+                        <= 2 else (4 if _last_stride_value <= 4 else 8)
+                    )
+                    comptime window = window_stride * simd_width
+
+                    # Highest offset the view addresses. Negative strides
+                    # contribute 0, as their maximum is at index 0. Every
+                    # offset between `flat_index` and `last` is inside the
+                    # underlying buffer, so a window ending at or before
+                    # `last` cannot read out of bounds.
+                    var last = 0
+                    comptime for d in range(rank):
+                        last += max(
+                            0,
+                            (tensor.dim_size[d]() - 1)
+                            * tensor.stride_length[d](),
+                        )
+
+                    if flat_index + window - 1 <= last:
+                        # The lanes between the strided ones are loaded and
+                        # discarded, which is harmless since this is a read.
+                        var v = tensor._ptr.unsafe_load[
+                            width=window, invariant=invariant
+                        ](flat_index)
+                        comptime mask = _strided_lanes_mask[
+                            simd_width, _last_stride_value
+                        ]()
+                        return v._shuffle_list[
+                            simd_width, mask.as_index_tuple()
+                        ](v)
                 return load_strided(_last_stride_value)
 
 
@@ -2050,7 +2103,9 @@ struct ManagedTensorSlice[
         self,
         new_runtime_shape: IndexList[new_layout.rank],
         new_runtime_strides: IndexList[new_layout.rank],
-        offset_ptr: Optional[Pointer[Scalar[Self.dtype], MutAnyOrigin]] = None,
+        offset_ptr: Optional[
+            Pointer[Scalar[Self.dtype], MutUntrackedOrigin]
+        ] = None,
         out result: ManagedTensorSlice[
             rank=new_layout.rank,
             io_spec=Self.io_spec,
@@ -2058,7 +2113,7 @@ struct ManagedTensorSlice[
         ],
     ):
         return type_of(result)(
-            offset_ptr.or_else(self._ptr.as_unsafe_any_origin()),
+            offset_ptr.or_else(self._ptr),
             new_runtime_shape,
             new_runtime_strides,
         )
@@ -2291,13 +2346,8 @@ struct ManagedTensorSlice[
         for i in range(Self.rank):
             shape.append(self.shape()[i])
 
-        # Pin the argument to a concrete-origin optional pointer so this call
-        # stays origin-exact across the `_serialize` safe-Pointer flip.
-        var serialize_ptr = OptionalPointer[Scalar[Self.dtype], ImmutAnyOrigin](
-            self._ptr.as_imm().unsafe_origin_cast[ImmutAnyOrigin]()
-        )
         # TODO(1937): make this work with all valid strides
-        _serialize[serialize_end_line=False](serialize_ptr, shape, serialize)
+        _serialize[serialize_end_line=False](self._ptr, shape, serialize)
 
         writer.write("){")
         writer.write("static_shape = ", self._static_shape_tuple)

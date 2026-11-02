@@ -698,9 +698,8 @@ static constexpr StringLiteral kCABIFuncAttr = "kgen.c_abi";
 /// The callee may be a kgen.func (not yet converted) or an llvm.func already
 /// stamped with kCABIFuncAttr by ConvertKGENFunc, depending on conversion
 /// order.
-static bool isCABICallee(Operation *callOp, FlatSymbolRefAttr sym) {
-  auto module = callOp->getParentOfType<mlir::ModuleOp>();
-  auto *calleeOp = mlir::SymbolTable::lookupSymbolIn(module, sym);
+static bool isCABICallee(const SymbolTable &symtab, FlatSymbolRefAttr sym) {
+  Operation *calleeOp = symtab.lookup(sym.getAttr());
   if (auto kgenFunc = dyn_cast_or_null<FuncOp>(calleeOp))
     return kgenFunc.getFuncTypeGenerator().getBody().getFnEffects().isCABI();
   if (auto llvmFunc = dyn_cast_or_null<LLVM::LLVMFuncOp>(calleeOp))
@@ -801,7 +800,8 @@ private:
 /// For callees marked with the `abi("C")` effect, C ABI coercion is applied
 /// via CABICallHelper (same mechanism as for abi("C") indirect calls).
 struct ConvertKGENCall : public ConvertPOPToLLVMPattern<CallOp> {
-  ConvertKGENCall(mlir::LLVMTypeConverter &tc) : ConvertPOPToLLVMPattern(tc) {}
+  ConvertKGENCall(mlir::LLVMTypeConverter &tc, const SymbolTable &symtab)
+      : ConvertPOPToLLVMPattern(tc), symtab(symtab) {}
 
   LogicalResult matchAndRewrite(CallOp op, CallOpAdaptor adaptor,
                                 DirectRewriter &rewriter) const override {
@@ -826,7 +826,7 @@ struct ConvertKGENCall : public ConvertPOPToLLVMPattern<CallOp> {
 
     // If the callee is a abi("C") function definition, apply C ABI coercion
     // at the call site so that struct args/returns are passed correctly.
-    if (isCABICallee(op, flatSymbol)) {
+    if (isCABICallee(symtab, flatSymbol)) {
       CABICallHelper cabi(getTypeConverter(), getContext(), op.getOperation());
       Location loc = op.getLoc();
       Type origRetTy = types.empty() ? Type{} : types.front();
@@ -856,6 +856,9 @@ struct ConvertKGENCall : public ConvertPOPToLLVMPattern<CallOp> {
     replaceCallWithLLVMCall(rewriter, op, llvmCall);
     return success();
   }
+
+private:
+  const SymbolTable &symtab;
 };
 
 //===----------------------------------------------------------------------===//
@@ -1038,9 +1041,8 @@ private:
 struct ConvertKGENObligation : ConvertPOPToLLVMPattern<ObligationOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
-  LogicalResult
-  matchAndRewrite(ObligationOp op, ObligationOpAdaptor adaptor,
-                  DirectRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(ObligationOp op, ObligationOpAdaptor adaptor,
+                                DirectRewriter &rewriter) const override {
     rewriter.eraseOp(op);
     return success();
   }
@@ -1050,9 +1052,8 @@ struct ConvertKGENObligation : ConvertPOPToLLVMPattern<ObligationOp> {
 struct ConvertKGENAssume : ConvertPOPToLLVMPattern<AssumeOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
-  LogicalResult
-  matchAndRewrite(AssumeOp op, AssumeOpAdaptor adaptor,
-                  DirectRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(AssumeOp op, AssumeOpAdaptor adaptor,
+                                DirectRewriter &rewriter) const override {
     rewriter.eraseOp(op);
     return success();
   }
@@ -1062,9 +1063,8 @@ struct ConvertKGENAssume : ConvertPOPToLLVMPattern<AssumeOp> {
 struct ConvertKGENCopyMarker : ConvertPOPToLLVMPattern<CopyMarkerOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
-  LogicalResult
-  matchAndRewrite(CopyMarkerOp op, CopyMarkerOpAdaptor adaptor,
-                  DirectRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(CopyMarkerOp op, CopyMarkerOpAdaptor adaptor,
+                                DirectRewriter &rewriter) const override {
     rewriter.eraseOp(op);
     return success();
   }
@@ -1075,9 +1075,8 @@ struct ConvertKGENCopyMarker : ConvertPOPToLLVMPattern<CopyMarkerOp> {
 struct ConvertKGENRequires : ConvertPOPToLLVMPattern<RequiresOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
-  LogicalResult
-  matchAndRewrite(RequiresOp op, RequiresOpAdaptor adaptor,
-                  DirectRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(RequiresOp op, RequiresOpAdaptor adaptor,
+                                DirectRewriter &rewriter) const override {
     rewriter.eraseOp(op);
     return success();
   }
@@ -1087,9 +1086,8 @@ struct ConvertKGENRequires : ConvertPOPToLLVMPattern<RequiresOp> {
 struct ConvertKGENEnsures : ConvertPOPToLLVMPattern<EnsuresOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
-  LogicalResult
-  matchAndRewrite(EnsuresOp op, EnsuresOpAdaptor adaptor,
-                  DirectRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(EnsuresOp op, EnsuresOpAdaptor adaptor,
+                                DirectRewriter &rewriter) const override {
     rewriter.eraseOp(op);
     return success();
   }
@@ -1099,9 +1097,8 @@ struct ConvertKGENEnsures : ConvertPOPToLLVMPattern<EnsuresOp> {
 struct ConvertKGENOld : ConvertPOPToLLVMPattern<OldOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
-  LogicalResult
-  matchAndRewrite(OldOp op, OldOpAdaptor adaptor,
-                  DirectRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(OldOp op, OldOpAdaptor adaptor,
+                                DirectRewriter &rewriter) const override {
     rewriter.eraseOp(op);
     return success();
   }
@@ -1111,9 +1108,8 @@ struct ConvertKGENOld : ConvertPOPToLLVMPattern<OldOp> {
 struct ConvertKGENForall : ConvertPOPToLLVMPattern<ForallOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
-  LogicalResult
-  matchAndRewrite(ForallOp op, ForallOpAdaptor adaptor,
-                  DirectRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(ForallOp op, ForallOpAdaptor adaptor,
+                                DirectRewriter &rewriter) const override {
     rewriter.eraseOp(op);
     return success();
   }
@@ -1123,9 +1119,9 @@ struct ConvertKGENForall : ConvertPOPToLLVMPattern<ForallOp> {
 struct ConvertKGENSameElements : ConvertPOPToLLVMPattern<SameElementsOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
-  LogicalResult
-  matchAndRewrite(SameElementsOp op, SameElementsOpAdaptor adaptor,
-                  DirectRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(SameElementsOp op,
+                                SameElementsOpAdaptor adaptor,
+                                DirectRewriter &rewriter) const override {
     rewriter.eraseOp(op);
     return success();
   }
@@ -1136,9 +1132,9 @@ struct ConvertKGENSameElements : ConvertPOPToLLVMPattern<SameElementsOp> {
 struct ConvertKGENContractEntry : ConvertPOPToLLVMPattern<ContractEntryOp> {
   using ConvertPOPToLLVMPattern::ConvertPOPToLLVMPattern;
 
-  LogicalResult
-  matchAndRewrite(ContractEntryOp op, ContractEntryOpAdaptor adaptor,
-                  DirectRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(ContractEntryOp op,
+                                ContractEntryOpAdaptor adaptor,
+                                DirectRewriter &rewriter) const override {
     llvm::SetVector<Operation *> contracts;
     for (Operation *user : op->getUsers()) {
       Operation *outer = nullptr;
@@ -1308,7 +1304,6 @@ static void populateKGENToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
   patterns.insert<
       // clang-format off
       ConvertKGENAssume,
-      ConvertKGENCall,
       ConvertKGENContractEntry,
       ConvertKGENCopyMarker,
       ConvertKGENEnsures,
@@ -1326,6 +1321,7 @@ static void populateKGENToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
       ConvertKGENUnreachable
       // clang-format on
       >(typeConverter);
+  patterns.insert<ConvertKGENCall>(typeConverter, symtab);
   patterns.insert<ConvertKGENFunc>(typeConverter, symtab, ids);
   patterns.insert<ConvertKGENParamConstant, ConvertKGENParamMaterialize>(
       typeConverter, imc, passFailed);

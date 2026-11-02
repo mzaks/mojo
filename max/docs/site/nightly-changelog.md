@@ -19,6 +19,11 @@ This version is still a work in progress.
   recommends it for coding and agent workloads. Pass `clear_thinking=True` in
   the chat template options to drop earlier reasoning.
 
+- FLUX.2 models now generate more than one image per request, so
+  `num_images` above 1 in `max serve` and `num_images_per_prompt` in
+  `generate_images()` and `AutoModel.generate()` work for them. Such a
+  request used to fail in the first denoising step.
+
 - InternVL and Gemma 3 multimodal models now return log probabilities, so
   `logprobs` in `max serve` and `output_logprobs` in `generate()` work for
   them.
@@ -34,7 +39,34 @@ This version is still a work in progress.
   are now all resolved per layer, so `poolside/Laguna-M.1-NVFP4` keeps its
   uniform layout.
 
+- Added support for
+  [`LiquidAI/LFM3-1.7B`](https://huggingface.co/LiquidAI/LFM3-1.7B) and
+  [`LiquidAI/LFM3-1.7B-Base`](https://huggingface.co/LiquidAI/LFM3-1.7B-Base)
+  on the new `Lfm3ForCausalLM` architecture.
+
+- Added support for
+  [`LiquidAI/LFM3-VL-2B`](https://huggingface.co/LiquidAI/LFM3-VL-2B) on the
+  `Lfm3VlForConditionalGeneration` architecture, with image and video input.
+
+- Added support for
+  [`LiquidAI/LFM3-Omni-2B`](https://huggingface.co/LiquidAI/LFM3-Omni-2B) on
+  the `Lfm3OmniForConditionalGeneration` architecture, with text, image and
+  video input.
+
 ## Inference server
+
+- Serving metric names now use `max.*` instead of `maxserve.*`. Batch
+  instruments use `max.batch.*`, such as `max.batch.size`. Prometheus
+  exposes the corresponding `max_*` families. Update collector allowlists,
+  dashboards, and alerts with the deployment; existing metric history stays
+  under its previous names. Units, labels, histogram boundaries, and
+  benchmark result fields are unchanged.
+
+- `max serve` now rejects an image generation request that asks for more
+  than 4 images with a 422 error naming `num_images`, the same response as
+  other out-of-range image options. `generate_images()` and
+  `AutoModel.generate()` raise a `ValueError` for `num_images_per_prompt`
+  above 4 before any prompt runs. A request had no upper limit before.
 
 - `/v1/completions` now returns a 400 error for `echo` with `logprobs` on a
   server started without `--enable-echo`, when the model computes log
@@ -90,6 +122,13 @@ This version is still a work in progress.
 
 ## Python API
 
+- The eager `Module` framework moved from `max.experimental.nn` to `max.nn`,
+  and the graph-based layers that `max.nn` held moved to `max.nn.legacy`.
+  `max.nn.legacy` is deprecated and will be removed in MAX 27.1. Code that
+  uses it gets a `DeprecationWarning` naming the line that used it. To keep
+  using the graph-based layers until then, change `from max.nn import ...` to
+  `from max.nn.legacy import ...`.
+
 - A custom op whose Mojo kernel is registered wrong, or doesn't match its
   call, now raises `max.graph.KernelRegistrationError`, a `ValueError`
   subclass. The message points at the Mojo code the way the Mojo compiler
@@ -106,9 +145,10 @@ This version is still a work in progress.
   `RuntimeError` subclass that is also a `ValueError`, so existing
   `except ValueError` handlers keep working.
 
-- `max.nn.Transformer`, `DistributedTransformer`, `logits_postprocess()` and
-  `distributed_logits_postprocess()` return a
-  `max.nn.graph_groups.DecoderOutputs` of named groups instead of a tuple.
+- `max.nn.legacy.Transformer`, `DistributedTransformer`,
+  `logits_postprocess()` and `distributed_logits_postprocess()` return a
+  `max.nn.legacy.graph_groups.DecoderOutputs` of named groups instead of a
+  tuple.
   Read the logits as
   `outputs.logits["logits"]` rather than `outputs[1]`, and pass the outputs to
   `Graph.output(outputs)` rather than unpacking them. The graph's outputs keep
@@ -118,20 +158,39 @@ This version is still a work in progress.
   dtype. The inputs keep their own dtypes and are no longer cast to a common
   one, so `bfloat16` inputs with `out_dtype=DType.float32` keep the float32
   accumulator. Without `out_dtype`, `ops.matmul()`, the `@` operator and
-  `max.experimental.functional`'s `matmul()` require both inputs to share a
-  dtype, which the result keeps, so `max.nn.Linear` raises when its input and
-  weight dtypes differ.
-  `max.experimental.nn.Linear` casts its input to the weight's dtype, so a
+  `max.functional`'s `matmul()` require both inputs to share a dtype, which
+  the result keeps, so `max.nn.legacy.Linear` raises when its input and weight
+  dtypes differ. `max.nn.Linear` casts its input to the weight's dtype, so a
   float32 input to a bfloat16 `Linear` now gives bfloat16 instead of float32.
 
 - Added `max.driver.Buffer.memset(value)` to fill a contiguous buffer or
   slice in place with a byte value, without allocating a source buffer.
 
+- Added `max.driver.Buffer.memset(value)` to fill a contiguous buffer or
+  slice in place with a byte value, without allocating a source buffer.
+
+- Added `ops.allreduce_rms_norm` and `max.functional.allreduce_rms_norm`, a
+  fused allreduce + RMSNorm collective for bfloat16 2-D tensors: every device
+  ends up with the RMS norm of the summed tensor, computed in one launch. The
+  norm runs on the unrounded float32 sum, so it is not bit-identical to
+  `allreduce_sum` followed by `rms_norm`, which reads the sum rounded back to
+  bfloat16. The `max.functional` form falls back to that two-launch path for
+  inputs that are not 2-D bfloat16 and for meshes without signal buffers.
+
 - Added the `ops.CoordinateTransformMode` and `ops.RoundMode` enums.
-  `ops.resize_linear`, `ops.resize_nearest`, and their `max.experimental`
-  functional counterparts take them for `coordinate_transform_mode` and
+  `ops.resize_linear`, `ops.resize_nearest`, and their `max.functional`
+  counterparts take them for `coordinate_transform_mode` and
   `round_mode` in place of the integer codes 0-3. The integer codes still
   work.
+
+- `ops.resize_bicubic()` and its `max.functional` counterpart
+  take an `antialias` keyword argument. With `antialias=True`, the resize
+  uses the filter of Pillow's `BICUBIC` and matches PyTorch's
+  `interpolate(mode="bicubic", antialias=True)` to float32 rounding. The
+  antialiased resize runs on the CPU, on a float32 input, or on a uint8 input
+  that it resizes to uint8, rounding and clamping once at the end.
+  `ops.resize_bicubic()` also takes its output size as a runtime int64
+  tensor, with `out_dims` declaring the output's dimensions.
 
 - Added `max.driver.float32_to_bfloat16_as_uint16()`,
   `max.driver.bfloat16_as_uint16_to_float32()`, and
@@ -151,9 +210,9 @@ This version is still a work in progress.
   `after` event and no longer syncs implicitly. Mojo's `reassign_ownership_to()`
   is removed; use `enqueue_wait_for()` and keep buffers alive until synced.
 
-- Removed `max.nn.FusedMLP`. Use `max.nn.MLP`, which takes the separate
-  `gate_proj` and `up_proj` weights a checkpoint ships and fuses their matmuls
-  in the graph.
+- Removed `max.nn.legacy.FusedMLP`. Use `max.nn.legacy.MLP`, which takes the
+  separate `gate_proj` and `up_proj` weights a checkpoint ships and fuses their
+  matmuls in the graph.
 
 - Removed `max_single_alloc_size()` and `run_healthcheck()` from the Mojo
   `DeviceContext`. On NVIDIA and AMD GPUs the health check still runs when a
@@ -224,9 +283,26 @@ This version is still a work in progress.
   from the Mojo `DeviceContext.create_event()`, along with `EventFlags`. Events
   never record timing; use `DeviceContext.execution_time()` to time kernels.
 
+- Removed the `per_layer_buffers` KV cache option, which gave each layer its
+  own buffer to get past a device's per-allocation size limit, along with the
+  `kv_blocks_per_layer` and `kv_scales_per_layer` fields of
+  `KVCacheInputsPerDevice`. A KV cache is again one buffer per device, capped
+  at that limit.
+
 ## C API
 
 ## Kernels and GPU programming
+
+- On AMD MI355X (CDNA4), the fused gated activation now quantizes to MXFP4 as
+  well as MXFP8, so a `uint8` / `float8_e8m0fnu` request from
+  `swiglu_quantize_dynamic_block_scaled` runs as one kernel. Such a request
+  was rejected on AMD before; quantizing MXFP4 without the fusion writes the
+  bfloat16 `[M, N]` activation of the `[gate | up]` input out with a SwiGLU
+  kernel and reads it back in an ungated quantize, and the fused kernel never
+  materializes it.
+
+- Enabled automatic fusion of eligible bfloat16 matrix multiplications and
+  SwiGLU activations on NVIDIA B200 GPUs.
 
 - The deprecated `LayoutTensor` and `LayoutTensorIter` types have been removed
   from the `layout` package, along with the `to_layout_tensor()` and
@@ -256,6 +332,20 @@ This version is still a work in progress.
   per row. The `Span` overloads and the 1-D `sum` and `mean` overloads that
   take a length and an `input_fn` are unchanged.
 
+- Added `DeviceContext.device()`, which returns a `Device` view of the
+  accelerator with an `id` field and `get_name()`, `get_attribute()`,
+  `is_host_unified()`, `get_arch()` and `can_access_peer()` methods.
+  `DeviceContext.id()`, `name()`, `get_attribute()`, `is_host_unified()` and
+  `can_access()` are deprecated: write `ctx.device().id`,
+  `ctx.device().get_name()`, `ctx.device().can_access_peer(peer.device())`
+  and so on.
+
+- `DeviceContext.enqueue_function()` accepts a `GridBlockLaunchConfig` (grid,
+  block, dynamic shared memory) or `ClusterLaunchConfig` (plus thread block
+  clusters) from `max.gpu.host` as its first argument. A cluster launch on a
+  GPU without clusters fails to compile; generic code checks
+  `conforms_to(DeviceContext.ExecutionConfigType, ClusterExecutionConfig)`.
+
 ## Tools
 
 - Added the ability to install `max-serve` and `max-benchmark` as Conda extras,
@@ -263,6 +353,11 @@ This version is still a work in progress.
   `max[extras=[all]]` installs both plus `mojo`.
 
 ## Fixes
+
+- Loading a model on a device that reports no free memory now fails with a
+  "Model size exceeds available memory" error. Memory planning used to treat
+  0 as unmeasured and size against the device's total memory, so a full host
+  could crash during loading instead.
 
 - `max serve` now runs prompts given as token ids, with no images, on Gemma 3,
   InternVL, Idefics3, Pixtral and Qwen 2.5 VL. These requests used to fail in
@@ -274,6 +369,10 @@ This version is still a work in progress.
   `generate()`, `GenerateIterator` and `AutoModel.generate()` raise
   `InputError` for such an id in `input_ids`. Embeddings requests the
   tokenizer rejects, such as a too-long prompt, now return a 400, not a 500.
+
+- The free memory that CPU and Apple GPU devices report now accounts for
+  memory used by other processes. Before, MAX could start a model that didn't
+  fit in memory, which on macOS could exhaust swap and crash the machine.
 
 ## Mojo language
 

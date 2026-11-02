@@ -36,6 +36,7 @@ from layout import (
 )
 from std.logger import Logger
 
+from std.utils.coord import Coord
 from std.utils.index import Index
 from std.collections import OptionalReg
 
@@ -181,6 +182,7 @@ def _small_MN_gemms_impl[
                 unroll_factor=config.unroll_factor,
                 check_bounds_m=check_bounds_m,
                 check_bounds_n=check_bounds_n,
+                pdl_level=pdl_level,
             ]
             ctx.enqueue_function[kernel](
                 c,
@@ -216,6 +218,7 @@ def _small_MN_gemms_impl[
                 unroll_factor=config.unroll_factor,
                 check_bounds_m=check_bounds_m,
                 check_bounds_n=check_bounds_n,
+                pdl_level=pdl_level,
             ]
             ctx.enqueue_function[kernel](
                 c,
@@ -250,6 +253,7 @@ def _small_MN_gemms_impl[
                 unroll_factor=config.unroll_factor,
                 check_bounds_m=check_bounds_m,
                 check_bounds_n=check_bounds_n,
+                pdl_level=pdl_level,
             ]
             ctx.enqueue_function[kernel](
                 c,
@@ -306,7 +310,7 @@ def dispatch_gemv[
         transpose_b: Whether `b` is stored transposed (defaults to
             `False`).
         pdl_level: Programmatic dependent launch level for the
-            dispatched kernel (defaults to `PDLLevel()`).
+            dispatched kernel (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
         has_epilogue_fn: Whether `epilogue_fn` stores the output
             (defaults to `False`).
         has_compute_fn: Whether to apply `compute_fn` (defaults to
@@ -398,7 +402,7 @@ def matmul_dispatch_sm100[
             for float32 instead of requiring IEEE-fp32 precision
             (defaults to `True`).
         pdl_level: Programmatic dependent launch level for the
-            dispatched kernel (defaults to `PDLLevel()`).
+            dispatched kernel (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
     Args:
         c: Output matrix as a rank-2 mutable `TileTensor` of shape
             `[M, N]`.
@@ -454,7 +458,7 @@ def matmul_dispatch_sm100[
             for float32 instead of requiring IEEE-fp32 precision
             (defaults to `True`).
         pdl_level: Programmatic dependent launch level for the
-            dispatched kernel (defaults to `PDLLevel()`).
+            dispatched kernel (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
         has_compute_fn: Whether to apply `compute_fn`. When False,
             `compute_fn` is ignored (defaults to `True`).
     Args:
@@ -514,7 +518,7 @@ def matmul_dispatch_sm100[
             for float32 instead of requiring IEEE-fp32 precision
             (defaults to `True`).
         pdl_level: Programmatic dependent launch level for the
-            dispatched kernel (defaults to `PDLLevel()`).
+            dispatched kernel (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
     Args:
         c: Output matrix as a rank-2 mutable `TileTensor` of shape
             `[M, N]`.
@@ -587,9 +591,7 @@ def _matmul_dispatch_sm100_impl[
         comptime CLUSTER_DIM_X = get_defined_int["TUNE_CLUSTER_DIM_X", 2]()
         comptime CLUSTER_DIM_Y = get_defined_int["TUNE_CLUSTER_DIM_Y", 1]()
         comptime CLUSTER_DIM_Z = get_defined_int["TUNE_CLUSTER_DIM_Z", 1]()
-        comptime CLUSTER_DIM = Index(
-            CLUSTER_DIM_X, CLUSTER_DIM_Y, CLUSTER_DIM_Z
-        )
+        comptime CLUSTER_DIM = (CLUSTER_DIM_X, CLUSTER_DIM_Y, CLUSTER_DIM_Z)
         comptime BLOCK_SWIZZLE_SIZE = get_defined_int[
             "TUNE_BLOCK_SWIZZLE_SIZE", 0
         ]()
@@ -602,10 +604,14 @@ def _matmul_dispatch_sm100_impl[
         comptime NUM_ACCUM = get_defined_int["TUNE_NUM_ACCUM", 2]()
         comptime NUM_CLC = get_defined_int["TUNE_NUM_CLC", 2]()
 
-        comptime umma_shape = Index(BM * CTA_GROUP, BN * CTA_GROUP, MMA_K)
+        comptime umma_shape = (BM * CTA_GROUP, BN * CTA_GROUP, MMA_K)
 
         comptime config = MatmulConfig[a_type, b_type, c_type, transpose_b](
-            mma_shape=(umma_shape[0], umma_shape[1], umma_shape[2]),
+            mma_shape=(
+                Int(umma_shape[0]),
+                Int(umma_shape[1]),
+                Int(umma_shape[2]),
+            ),
             cluster_shape=CLUSTER_DIM,
             block_swizzle_size=BLOCK_SWIZZLE_SIZE,
             raster_order=RasterOrder(Int32(RASTERIZE_ORDER)),
@@ -993,11 +999,7 @@ def matmul_dispatch_sm100_fp8[
     @inline(.nodebug)
     def _dispatch[entry: TuningConfigSM100]() raises {imm}:
         comptime config = MatmulConfig[a_type, b_type, c_type, transpose_b](
-            mma_shape=(
-                entry.mma_shape[0],
-                entry.mma_shape[1],
-                entry.mma_shape[2],
-            ),
+            mma_shape=entry.mma_shape,
             cluster_shape=entry.cluster_shape,
             block_swizzle_size=entry.block_swizzle_size,
         )
@@ -1129,7 +1131,7 @@ def _outlier_fits_device[
         tuning_config.cluster_shape[1],
         tuning_config.num_split_k,
     )
-    return grid[0] * grid[1] * grid[2] <= ctx.get_attribute(
+    return grid[0] * grid[1] * grid[2] <= ctx.device().get_attribute(
         DeviceAttribute.MULTIPROCESSOR_COUNT
     )
 
@@ -1234,11 +1236,7 @@ def select_and_launch_sm100_config[
                     comptime matmul_config = MatmulConfig[
                         a_type, b_type, c_type, transpose_b
                     ](
-                        mma_shape=(
-                            tuning_config.mma_shape[0],
-                            tuning_config.mma_shape[1],
-                            tuning_config.mma_shape[2],
-                        ),
+                        mma_shape=tuning_config.mma_shape,
                         cta_group=tuning_config.cta_group,
                         cluster_shape=tuning_config.cluster_shape,
                         block_swizzle_size=tuning_config.block_swizzle_size,
@@ -1348,7 +1346,7 @@ def matmul_dispatch_sm100_bf16[
         transpose_b: Whether `b` is stored transposed (defaults to
             `True`).
         pdl_level: Programmatic dependent launch level for the
-            dispatched kernel (defaults to `PDLLevel()`).
+            dispatched kernel (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
         has_epilogue_fn: Whether `epilogue_fn` stores the output
             (defaults to `False`).
         has_compute_fn: Whether to apply `compute_fn` (defaults to
@@ -1466,7 +1464,7 @@ def matmul_dispatch_sm100_fp32[
         transpose_b: Whether `b` is stored transposed (defaults to
             `True`).
         pdl_level: Programmatic dependent launch level for the
-            dispatched kernel (defaults to `PDLLevel()`).
+            dispatched kernel (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
         has_epilogue_fn: Whether `epilogue_fn` stores the output
             (defaults to `False`).
         has_compute_fn: Whether to apply `compute_fn` (defaults to
@@ -1686,7 +1684,7 @@ def dispatch_sm100_batched_matmul[
     a_type: DType,
     b_type: DType,
     transpose_b: Bool,
-    pdl_level: PDLLevel = PDLLevel.OFF,
+    pdl_level: PDLLevel = PDLLevel.OVERLAP_AT_BEGINNING,
 ](
     c: TileTensor[mut=True, c_type, ...],
     a: TileTensor[mut=False, a_type, ...],
@@ -1704,7 +1702,7 @@ def dispatch_sm100_batched_matmul[
         b_type: Element type of the RHS operand `b`.
         transpose_b: Whether `b` is stored transposed.
         pdl_level: Programmatic dependent launch level for the dispatched
-            kernel (defaults to `PDLLevel.OFF`).
+            kernel (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
     Args:
         c: Output batched matrix as a rank-3 mutable `TileTensor` of
             shape `[batch, M, N]`.
@@ -1751,11 +1749,7 @@ def dispatch_sm100_batched_matmul[
                 comptime matmul_config = MatmulConfig[
                     a_type, b_type, c_type, transpose_b
                 ](
-                    mma_shape=(
-                        tuning_config.mma_shape[0],
-                        tuning_config.mma_shape[1],
-                        tuning_config.mma_shape[2],
-                    ),
+                    mma_shape=tuning_config.mma_shape,
                     cta_group=tuning_config.cta_group,
                     cluster_shape=tuning_config.cluster_shape,
                     block_swizzle_size=tuning_config.block_swizzle_size,
@@ -1906,7 +1900,7 @@ def sm100_heuristic_and_outliers_dispatch[
         transpose_b: Whether `b` is stored transposed (defaults to
             `True`).
         pdl_level: Programmatic dependent launch level for the
-            dispatched kernel (defaults to `PDLLevel()`).
+            dispatched kernel (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
         has_epilogue_tensor: Whether an epilogue tensor is supplied for
             the TMA epilogue load path (defaults to `False`).
         epilogue_is_1d: Whether the epilogue tensor is treated as
@@ -1959,11 +1953,15 @@ def sm100_heuristic_and_outliers_dispatch[
             ]
         ],
     ) raises {var epilogue_fn, var compute_fn}:
+        comptime assert (
+            config.a_type == a_type
+            and config.b_type == b_type
+            and config.c_type == c_type
+            and config.transpose_b == transpose_b
+        ), "Selected matmul config must match the dispatched operands"
         _blackwell_matmul_with_epilogues[
-            transpose_b,
-            config=rebind[MatmulConfig[a_type, b_type, c_type, transpose_b]](
-                config
-            ),
+            config.transpose_b,
+            config=config,
             pdl_level=pdl_level,
             EpilogueEngine=EpilogueEngine,
             has_epilogue_fn=has_epilogue_fn,
@@ -1975,7 +1973,16 @@ def sm100_heuristic_and_outliers_dispatch[
             epilogue_fn,
             compute_fn,
             dispatch_ctx,
-            epilogue_tensor=dispatch_epilogue_tensor,
+            epilogue_tensor=rebind[
+                OptionalReg[
+                    TileTensor[
+                        config.c_type,
+                        RowMajorLayout[Int64, Int64],
+                        ImmutAnyOrigin,
+                        Engine=EpilogueEngine,
+                    ]
+                ]
+            ](dispatch_epilogue_tensor),
         )
 
     return select_and_launch_sm100_config[

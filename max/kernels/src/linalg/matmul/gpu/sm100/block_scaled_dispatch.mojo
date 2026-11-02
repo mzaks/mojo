@@ -367,11 +367,7 @@ def _heuristic_and_outliers_dispatch_impl[
                 a_type, b_type, c_type, scales_dtype, scales_dtype, transpose_b
             ](
                 scaling_kind=scaling_kind,
-                mma_shape=(
-                    tuning_config.mma_shape[0],
-                    tuning_config.mma_shape[1],
-                    tuning_config.mma_shape[2],
-                ),
+                mma_shape=tuning_config.mma_shape,
                 cta_group=tuning_config.cta_group,
                 cluster_shape=tuning_config.cluster_shape,
                 block_swizzle_size=tuning_config.block_swizzle_size,
@@ -576,7 +572,7 @@ def block_scaled_matmul_block_diagonal[
     *,
     groups: Int,
     SF_VECTOR_SIZE: Int,
-    pdl_level: PDLLevel = PDLLevel(),
+    pdl_level: PDLLevel = PDLLevel.ON,
 ](
     c: TileTensor[mut=True, c_type, ...],
     a: TileTensor[a_type, ...],

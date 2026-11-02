@@ -57,7 +57,6 @@ from ....utils import (
     no_compute_fn,
     no_epilogue_fn,
 )
-from std.utils.index import IndexList
 from std.utils.coord import Coord, DynamicCoord
 from std.sys import align_of, size_of
 from layout.tile_io import copy_local_to_dram
@@ -679,7 +678,7 @@ struct RegisterToGMemWriter[
     dst_engine: TensorEngine,
     dst_linear_idx_type: DType,
     //,
-    wgmma_shape: Coord,
+    wgmma_shape: Tuple[Int, Int, Int],
     num_consumer: Int,
     N: Int,  # Matrix N dimension
     check_runtime_bounds: Bool = False,  # New parameter for N-dimension bounds checking

@@ -23,7 +23,6 @@ architectures cannot size their caches or batches differently.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -31,8 +30,12 @@ from typing import Any, ClassVar
 from max.driver import Device
 from max.dtype import DType
 from max.graph import DeviceRef
-from max.nn.kv_cache import KVCacheParamInterface, spec_decode_cache_slack
-from max.nn.quant_config import QuantConfig
+from max.nn.legacy.kv_cache import (
+    KVCacheParamInterface,
+    spec_decode_cache_slack,
+)
+from max.nn.legacy.quant_config import QuantConfig
+from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
 from max.pipelines.architectures.glm5_next.model_config import (
     LINEAR_ATTENTION,
     MLA_KERNEL_LATENT_WIDTH,
@@ -47,11 +50,11 @@ from max.pipelines.architectures.glm5_next.model_config import (
 )
 from max.pipelines.architectures.glm5_next.quantization import (
     Glm5NextQuantScheme,
-    parse_quant_scheme,
 )
 from max.pipelines.kv_cache import cache_dtype_for_encoding
 from max.pipelines.lib import KVCacheConfig, MAXModelConfig, PipelineConfig
 from max.pipelines.lib.config.model_config import _select_quantization_encoding
+from max.pipelines.lib.interfaces.arch_config import ModelOutputConfig
 from max.pipelines.modeling.config_enums import (
     SupportedEncoding,
     supported_encoding_dtype,
@@ -61,15 +64,13 @@ from transformers import AutoConfig
 from typing_extensions import Self, override
 
 from ..deepseekV3_2_modulev3.model_config import DeepseekV3_2Config
-
-__all__ = ["Glm5NextConfig"]
-
-# A ModuleV3 FP8 weight's scale, as the adapter names it.
-_V3_SCALE = re.compile(
-    r"^language_model\.(layers\.\d+\.(?:mlp|self_attn)\..+?)"
-    r"\.weight_scale_inv$"
+from .checkpoint import (
+    _hc_fn_dtype,
+    _stored_hc_fn_dtype,
+    checkpoint_quant_scheme,
 )
 
+__all__ = ["Glm5NextConfig"]
 
 _DECLARED_DTYPES = {
     "bfloat16": DType.bfloat16,
@@ -107,6 +108,8 @@ class Glm5NextConfig(DeepseekV3_2Config):
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+    hc_fn_dtype: DType = DType.float32
+    """Storage dtype of the mHC stream projections."""
 
     index_kpool: int = 4
     index_kpool_compress: bool = True
@@ -123,6 +126,36 @@ class Glm5NextConfig(DeepseekV3_2Config):
     quant_scheme: Glm5NextQuantScheme | None = None
     declared_dtype: DType | None = None
     """The dtype the checkpoint declares for its unquantized tensors."""
+
+    ep_dispatch_token_layout: ClassVar[str] = "tp_sharded"
+
+    def finalize(
+        self,
+        huggingface_config: AutoConfig,
+        state_dict: Mapping[str, Any],
+        outputs: ModelOutputConfig,
+    ) -> Self:
+        """Resolves checkpoint precision and validates the supported output mode."""
+        if (
+            outputs.return_logits is not ReturnLogits.LAST_TOKEN
+            or outputs.return_hidden_states is not ReturnHiddenStates.NONE
+        ):
+            raise NotImplementedError(
+                "GLM-5.3-Flash on ModuleV3 supports only last-token logits without hidden-state outputs"
+            )
+        self.quant_config = self.resolve_quant_scheme(state_dict)
+        for name, weight in state_dict.items():
+            if name.endswith("e_score_correction_bias"):
+                self.correction_bias_dtype = weight.dtype
+                break
+        self.hc_fn_dtype = _hc_fn_dtype(
+            _stored_hc_fn_dtype(state_dict),
+            self.hc_mult,
+            self.hidden_size,
+            self.compute_dtype,
+            self.devices[0].to_device(),
+        )
+        return self
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -172,6 +205,7 @@ class Glm5NextConfig(DeepseekV3_2Config):
 
     @staticmethod
     def get_num_layers(huggingface_config: AutoConfig) -> int:
+        """How many layers the text tower has."""
         return _GraphGlm5NextConfig.get_num_layers(huggingface_config)
 
     @staticmethod
@@ -200,21 +234,16 @@ class Glm5NextConfig(DeepseekV3_2Config):
         derivation the graph-API model uses; only the names differ, so they are
         mapped to the ones that derivation reads.
         """
-        renamed: dict[str, Any] = {}
-        for name, weight in state_dict.items():
-            match = _V3_SCALE.match(name)
-            if match is not None:
-                renamed[f"{match.group(1)}.weight_scale"] = weight
-        self.quant_scheme = parse_quant_scheme(
-            self.hf_quantization_config,
-            renamed,
-            self.declared_dtype or DType.bfloat16,
+        self.quant_scheme = checkpoint_quant_scheme(
+            self.hf_quantization_config, self.declared_dtype, state_dict
         )
         return self.quant_scheme.config if self.quant_scheme else None
 
     def per_request_state_bytes(self) -> int:
-        """Returns GPU bytes one request's recurrent state occupies, summed
-        over every device."""
+        """Returns the GPU bytes one request's recurrent state occupies.
+
+        The count is summed over every device.
+        """
         return recurrent_state_bytes(self.kv_params, len(self.devices))
 
     def activation_bytes_per_token(self) -> int:
@@ -230,8 +259,11 @@ class Glm5NextConfig(DeepseekV3_2Config):
         weights_size: int,
         device_memory_utilization: float,
     ) -> int:
-        """Returns a memory-safe default ``max_batch_size``; see
-        :func:`~max.pipelines.architectures.glm5_next.model_config.state_bounded_batch_size`."""
+        """Returns a memory-safe default ``max_batch_size``.
+
+        See
+        :func:`~max.pipelines.architectures.glm5_next.model_config.state_bounded_batch_size`.
+        """
         return state_bounded_batch_size(
             self.per_request_state_bytes(),
             devices,

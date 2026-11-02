@@ -69,11 +69,11 @@ static LogicalResult verifyParamValueOp(OpT op) {
                           << " does not match result type " << op.getType();
 }
 
-/// Return true if the parameter value contains symbol constants, making the
+/// Return true if the parameter value contains function symbols, making the
 /// operation implicit parametric.
-static bool containsSymbolConstants(TypedAttr value) {
+static bool containsFuncSymbols(TypedAttr value) {
   mlir::AttrTypeWalker walker;
-  walker.addWalk([](SymbolConstantAttr) { return WalkResult::interrupt(); });
+  walker.addWalk([](FuncSymbolAttr) { return WalkResult::interrupt(); });
   return walker.walk(value).wasInterrupted();
 }
 
@@ -100,7 +100,7 @@ void ParamConstantOp::getAsmResultNames(
 }
 
 bool ParamConstantOp::isImplicitlyParametric() {
-  return containsSymbolConstants(getValue());
+  return containsFuncSymbols(getValue());
 }
 
 void ParamConstantOp::walkDefinitions(
@@ -260,7 +260,7 @@ void ContractEntryOp::getEffects(
 LogicalResult ParamMaterializeOp::verify() { return verifyParamValueOp(*this); }
 
 bool ParamMaterializeOp::isImplicitlyParametric() {
-  return containsSymbolConstants(getValue());
+  return containsFuncSymbols(getValue());
 }
 
 void ParamMaterializeOp::walkDefinitions(
@@ -787,7 +787,7 @@ static void printStructInstanceSpec(OpAsmPrinter &p, Operation *op,
 //===----------------------------------------------------------------------===//
 
 static ParseResult
-parseCallOp(OpAsmParser &p, SymbolConstantAttr &calleeCst,
+parseCallOp(OpAsmParser &p, TypedAttr &calleeAttr,
             SmallVectorImpl<OpAsmParser::UnresolvedOperand> &operands,
             SmallVectorImpl<Type> &operandTypes,
             SmallVectorImpl<Type> &resultTypes) {
@@ -802,31 +802,32 @@ parseCallOp(OpAsmParser &p, SymbolConstantAttr &calleeCst,
   FunctionType functionType;
   if (parseKGENFuncTypeGenerator(p, functionType, signature))
     return failure();
-  calleeCst = SymbolConstantAttr::get(callee, signature, paramValues);
+  calleeAttr = FuncSymbolGenerator::get(
+      {},
+      FuncSymbolAttr::get(callee, signature.getInstantiatedBody(),
+                          paramValues.getValue()),
+      signature.getParamListAttrs());
   llvm::append_range(operandTypes, functionType.getInputs());
   llvm::append_range(resultTypes, functionType.getResults());
   return success();
 }
 
-static void printCallOp(OpAsmPrinter &p, Operation *op,
-                        SymbolConstantAttr calleeCst, ValueRange operands,
-                        TypeRange operandTypes, TypeRange resultTypes) {
-  p << calleeCst.getSymbol();
-  printParameterValues(p, calleeCst.getParamValues());
+static void printCallOp(OpAsmPrinter &p, Operation *op, TypedAttr calleeAttr,
+                        ValueRange operands, TypeRange operandTypes,
+                        TypeRange resultTypes) {
+  FuncSymbolGenerator callee(calleeAttr);
+  p << callee.getSymbol();
+  printParameterValues(p, callee.getParamValues());
   p << '(';
   p.printOperands(operands);
   p << ") : ";
   printSignatureValues(
       p, FunctionType::get(op->getContext(), operandTypes, resultTypes),
-      calleeCst.getType());
+      callee.getType());
 }
 
-void CallOp::concretizeCallee(IRRewriter &b, SymbolConstantAttr callee) {
+void CallOp::concretizeCallee(IRRewriter &b, FuncSymbolGenerator callee) {
   setCalleeAttr(callee);
-}
-
-void CallOp::setCalleeAttr(TypedAttr callee) {
-  setCalleeAttr(cast<SymbolConstantAttr>(callee));
 }
 
 FailureOr<InlineResult> CallOp::prepInline(mlir::RewriterBase &b) {
@@ -847,6 +848,8 @@ static LogicalResult verifyCallOp(Operation *op, ValueRange args,
 }
 
 LogicalResult CallOp::verify() {
+  if (!FuncSymbolGenerator::dynCast(getCallee()))
+    return emitOpError("expected callee to be a function symbol generator");
   return verifyCallOp(*this, getOperands(), getCalleeType().getBody());
 }
 
@@ -862,7 +865,7 @@ LogicalResult CallIndirectOp::verify() {
 // CallParamOp
 //===----------------------------------------------------------------------===//
 
-void CallParamOp::concretizeCallee(IRRewriter &b, SymbolConstantAttr callee) {
+void CallParamOp::concretizeCallee(IRRewriter &b, FuncSymbolGenerator callee) {
   b.replaceOpWithNewOp<CallOp>(*this, getResultTypes(), callee, getOperands());
 }
 

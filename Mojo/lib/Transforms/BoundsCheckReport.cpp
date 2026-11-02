@@ -468,7 +468,7 @@ public:
     auto call = dyn_cast<CallOp>(op);
     if (modular == Modular::Off || !call || !symbols || isAllocation(call))
       return false;
-    auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto callee = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!callee)
       return false;
     auto fn = symbols->lookup<FuncOp>(callee.getSymbol().getRootReference());
@@ -606,7 +606,7 @@ private:
     if (Operation *def = value.getDefiningOp()) {
       os << def->getName().getStringRef();
       if (auto call = dyn_cast<CallOp>(def))
-        if (auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee()))
+        if (auto callee = FuncSymbolGenerator::dynCast(call.getCallee()))
           os << " "
              << callee.getSymbol()
                     .getRootReference()
@@ -784,7 +784,7 @@ private:
   }
 
   static std::string calleeName(CallOp call) {
-    if (auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee()))
+    if (auto callee = FuncSymbolGenerator::dynCast(call.getCallee()))
       return callee.getSymbol()
           .getRootReference()
           .getValue()
@@ -797,7 +797,7 @@ private:
   /// of its entry block, matching the call's operands and results.
   std::optional<std::pair<FuncOp, HLCF::ReturnOp>>
   singleReturnCallee(CallOp call) const {
-    auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto callee = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!callee || !symbols)
       return std::nullopt;
     auto fn = symbols->lookup<FuncOp>(callee.getSymbol().getRootReference());
@@ -1970,7 +1970,7 @@ private:
   /// unconditionally makes such a call. Decided on the elaborated body, so it
   /// follows compile-time choices (a `debug_assert` in "warn" mode returns).
   bool neverReturns(CallOp call, unsigned depth = 0) {
-    auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto callee = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!callee || !symbols || depth > kMaxNesting)
       return false;
     auto fn = symbols->lookup<FuncOp>(callee.getSymbol().getRootReference());
@@ -2841,8 +2841,8 @@ private:
   std::string frameValue(Operation *op, const HeapRead &r, std::string value) {
     auto call = dyn_cast<CallOp>(op);
     CallContext *callee = call ? callContexts.lookup(call) : nullptr;
-    auto symbol =
-        call ? dyn_cast<SymbolConstantAttr>(call.getCallee()) : nullptr;
+    auto symbol = call ? FuncSymbolGenerator::dynCast(call.getCallee())
+                       : FuncSymbolGenerator();
     FuncOp fn =
         symbol && symbols
             ? symbols->lookup<FuncOp>(symbol.getSymbol().getRootReference())
@@ -3964,7 +3964,7 @@ private:
   void instantiateContracts(CallOp call, StringRef reach) {
     if (ctx || !symbols)
       return;
-    auto callee = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto callee = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!callee)
       return;
     auto fn = symbols->lookup<FuncOp>(callee.getSymbol().getRootReference());
@@ -4775,8 +4775,8 @@ struct BoundsCheckReportPass
       if (isa<EnsuresOp>(op))
         return true;
       auto call = dyn_cast<CallOp>(op);
-      auto callee =
-          call ? dyn_cast<SymbolConstantAttr>(call.getCallee()) : nullptr;
+      auto callee = call ? FuncSymbolGenerator::dynCast(call.getCallee())
+                         : FuncSymbolGenerator();
       return callee && withPreconditions.contains(symbols.lookup(
                            callee.getSymbol().getRootReference()));
     };

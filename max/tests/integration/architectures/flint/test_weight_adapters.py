@@ -27,10 +27,9 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from max import functional as F
 from max.driver import Buffer, DeviceSpec
 from max.dtype import DType
-from max.experimental import functional as F
-from max.experimental.tensor import default_dtype
 from max.graph.weights import SafetensorWeights, WeightData
 from max.pipelines.architectures import hf_config_shims  # noqa: F401
 from max.pipelines.architectures.flint import FlintConfig
@@ -39,6 +38,7 @@ from max.pipelines.architectures.flint.weight_adapters import (
     convert_safetensor_state_dict,
 )
 from max.pipelines.lib import KVCacheConfig
+from max.tensor import default_dtype
 from transformers import AutoConfig
 
 TESTDATA = Path(__file__).parent / "testdata"
@@ -78,7 +78,7 @@ def config() -> FlintConfig:
 @pytest.fixture(scope="module")
 def expected_names(config: FlintConfig) -> set[str]:
     with F.lazy(), default_dtype(DType.bfloat16):
-        model = Flint(config, config.kv_params)
+        model = Flint(config)
     return {name for name, _ in model.parameters}
 
 

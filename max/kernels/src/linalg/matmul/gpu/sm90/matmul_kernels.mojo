@@ -32,11 +32,6 @@ from max.gpu.primitives.cluster import (
     elect_one_sync,
 )
 from max.gpu.globals import WARPGROUP_SIZE
-from max.gpu.primitives.grid_controls import (
-    PDLLevel,
-    launch_dependent_grids,
-    wait_on_dependent_grids,
-)
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu import (
     block_id_in_cluster,
@@ -245,9 +240,9 @@ struct HopperMatmulSM90Kernel[
     b_layout: TensorLayout,
     c_layout: TensorLayout,
     c_smem_layout: Layout,
-    block_tile_shape: IndexList[3],
-    wgmma_shape: IndexList[3],
-    cluster_shape: StaticTuple[Int32, 3],
+    block_tile_shape: Tuple[Int, Int, Int],
+    wgmma_shape: Tuple[Int, Int, Int],
+    cluster_shape: Tuple[Int, Int, Int],
     num_pipeline_stages: Int,
     num_threads: Int = 128,
     transpose_b: Bool = True,
@@ -257,7 +252,6 @@ struct HopperMatmulSM90Kernel[
     partitioned_multicast: Bool = False,
     use_tma_store: Bool = False,
     promotion_frequency: Int = 1,
-    pdl_level: PDLLevel = PDLLevel(),
     hilbert_swizzle: Bool = False,
     k_group_size: Int = 1,
     swapAB: Bool = False,
@@ -300,7 +294,6 @@ struct HopperMatmulSM90Kernel[
             regular stores).
         promotion_frequency: How often FP8 accumulation is promoted to
             higher precision.
-        pdl_level: Programmatic Dependency Launch (PDL) level.
         hilbert_swizzle: Whether Hilbert-curve thread block scheduling is
             used.
         k_group_size: Number of K-dimension tiles loaded and consumed per
@@ -385,7 +378,7 @@ struct HopperMatmulSM90Kernel[
         Self.accum_type,
         Self.a_type,
         Self.b_type,
-        (Self.wgmma_shape[0], Self.wgmma_shape[1], Self.wgmma_shape[2]),
+        Self.wgmma_shape,
         Self.a_swizzle,
         Self.b_swizzle,
         Self.transpose_b,
@@ -448,9 +441,6 @@ struct HopperMatmulSM90Kernel[
     def finalize_kernel():
         """Common finalization for all kernel variants."""
 
-        comptime if Self.pdl_level >= PDLLevel.OVERLAP_AT_END:
-            launch_dependent_grids()
-
         # Synchronize all thread blocks in the cluster before kernel exit
         # to ensure shared memory isn't deallocated while other blocks are still using it
         comptime if Self.cluster_size > 1:
@@ -459,8 +449,8 @@ struct HopperMatmulSM90Kernel[
     @staticmethod
     @inline(.always)
     def multicast_mask(rank_m: Int, rank_n: Int) -> Tuple[Int32, Int32]:
-        comptime CLUSTER_N = Self.cluster_shape[0]
-        comptime CLUSTER_M = Self.cluster_shape[1]
+        comptime CLUSTER_N = Int(Self.cluster_shape[0])
+        comptime CLUSTER_M = Int(Self.cluster_shape[1])
 
         # Setup multicast masks for cluster-wide data distribution
         var multicast_column_mask = 0
@@ -469,10 +459,8 @@ struct HopperMatmulSM90Kernel[
             multicast_column_mask |= Int(1 << (i * CLUSTER_N))
         multicast_column_mask <<= rank_n
 
-        var multicast_row_mask = ((1 << CLUSTER_N) - 1) << (
-            Int32(rank_m) * CLUSTER_N
-        )
-        return (multicast_row_mask, Int32(multicast_column_mask))
+        var multicast_row_mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N)
+        return (Int32(multicast_row_mask), Int32(multicast_column_mask))
 
     @staticmethod
     @inline(.always)
@@ -720,7 +708,7 @@ struct HopperMatmulSM90Kernel[
             a_tile_shape,
             a_desc_shape,
             BK=Self.BK,
-            cluster_size=Self.cluster_shape[0],
+            cluster_size=Int32(Self.cluster_shape[0]),
             use_partitioned_multicast=Self.partitioned_multicast,
         ],
         TileLoaderTMA[
@@ -729,7 +717,7 @@ struct HopperMatmulSM90Kernel[
             b_tile_shape,
             b_desc_shape,
             BK=Self.BK,
-            cluster_size=Self.cluster_shape[1],
+            cluster_size=Int32(Self.cluster_shape[1]),
             use_partitioned_multicast=Self.partitioned_multicast,
         ],
     ]:
@@ -743,12 +731,12 @@ struct HopperMatmulSM90Kernel[
         )
         var a_loader = TileLoaderTMA[
             BK=Self.BK,
-            cluster_size=Self.cluster_shape[0],
+            cluster_size=Int32(Self.cluster_shape[0]),
             use_partitioned_multicast=Self.partitioned_multicast,
         ](Pointer(to=a_tma_op), rank_n, UInt16(a_multicast_mask))
         var b_loader = TileLoaderTMA[
             BK=Self.BK,
-            cluster_size=Self.cluster_shape[1],
+            cluster_size=Int32(Self.cluster_shape[1]),
             use_partitioned_multicast=Self.partitioned_multicast,
         ](Pointer(to=b_tma_op), rank_m, UInt16(b_multicast_mask))
         return (a_loader, b_loader)
@@ -890,7 +878,11 @@ struct HopperMatmulSM90Kernel[
         MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
             Int32(Self.num_threads)
         ),
-        `nvvm.cluster_dim`=Self.cluster_shape,
+        `nvvm.cluster_dim`=StaticTuple[Int32, 3](
+            Int32(Self.cluster_shape[0]),
+            Int32(Self.cluster_shape[1]),
+            Int32(Self.cluster_shape[2]),
+        ),
     )
     @__name(
         t"sm90_matmul_{Self.a_type}_{Self.b_type}_{Self.c_type}_{Self.transpose_b}",
@@ -1015,13 +1007,6 @@ struct HopperMatmulSM90Kernel[
         if warp_group_idx == 0:
             # Producer warp group
 
-            # Check and wait for PDL grids if needed
-            comptime if (
-                Self.pdl_level > PDLLevel.OFF
-                and Self.pdl_level != PDLLevel.NO_WAIT_OVERLAP_AT_END
-            ):
-                wait_on_dependent_grids()
-
             _ = Self.setup_producer()
 
             if warp_id == 0 and lane_predicate:
@@ -1083,7 +1068,11 @@ struct HopperMatmulSM90Kernel[
         MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
             Int32(Self.num_threads)
         ),
-        `nvvm.cluster_dim`=Self.cluster_shape,
+        `nvvm.cluster_dim`=StaticTuple[Int32, 3](
+            Int32(Self.cluster_shape[0]),
+            Int32(Self.cluster_shape[1]),
+            Int32(Self.cluster_shape[2]),
+        ),
     )
     @__name(
         t"sm90_matmul_split_k_{Self.a_type}_{Self.b_type}_{Self.c_type}_{Self.transpose_b}",
@@ -1203,8 +1192,8 @@ struct HopperMatmulSM90Kernel[
         comptime workspace_layout = row_major[NUM_TILES, Self.BM, Self.BN]()
         var reduction_workspace = TileTensor(workspace_ptr, workspace_layout)
 
-        comptime CLUSTER_N = Self.cluster_shape[0]
-        comptime CLUSTER_M = Self.cluster_shape[1]
+        comptime CLUSTER_N = Int(Self.cluster_shape[0])
+        comptime CLUSTER_M = Int(Self.cluster_shape[1])
 
         var scheduler = SplitKTileScheduler[
             Index(N, K),
@@ -1212,7 +1201,7 @@ struct HopperMatmulSM90Kernel[
             UInt32(splits),
             UInt32(Self.num_consumer),
             UInt32(Self.num_pipeline_stages),
-            Index(CLUSTER_M, CLUSTER_N),
+            (Int(CLUSTER_M), Int(CLUSTER_N)),
             raster_order,
         ](
             problem_shape,
@@ -1319,7 +1308,11 @@ struct HopperMatmulSM90Kernel[
         MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
             Int32(Self.num_threads)
         ),
-        `nvvm.cluster_dim`=Self.cluster_shape,
+        `nvvm.cluster_dim`=StaticTuple[Int32, 3](
+            Int32(Self.cluster_shape[0]),
+            Int32(Self.cluster_shape[1]),
+            Int32(Self.cluster_shape[2]),
+        ),
     )
     @__name(
         t"sm90_matmul_grouped_{Self.a_type}_{Self.b_type}_{Self.c_type}_{Self.transpose_b}",
@@ -1466,8 +1459,8 @@ struct HopperMatmulSM90Kernel[
         comptime N = Self.c_layout.static_shape[1]
         var b_start_row = expert * Int32(N)
 
-        comptime CLUSTER_N = Self.cluster_shape[0]
-        comptime CLUSTER_M = Self.cluster_shape[1]
+        comptime CLUSTER_N = Int(Self.cluster_shape[0])
+        comptime CLUSTER_M = Int(Self.cluster_shape[1])
 
         # Split thread blocks into producer and consumer warp groups
         if warp_group_idx == 0:

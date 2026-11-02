@@ -29,7 +29,6 @@ from linalg.matmul.gpu.sm100_structured.default.matmul import (
 from linalg.matmul.gpu.sm100_structured.structured_kernels.config import (
     MatmulConfig,
 )
-from std.utils.coord import DynamicCoord
 from std.testing import assert_equal
 
 from std.utils.index import Index, IndexList
@@ -39,8 +38,8 @@ def test_epilogue_fn[
     N: Int,
     K: Int,
     *,
-    mma_shape: DynamicCoord[.int, 3],
-    cluster_shape: IndexList[3],
+    mma_shape: Tuple[Int, Int, Int],
+    cluster_shape: Tuple[Int, Int, Int],
     cta_group: Int,
     register_based_epilogue: Bool = True,
     swapAB: Bool = False,
@@ -49,20 +48,9 @@ def test_epilogue_fn[
     the kernel itself leaves `c` untouched."""
     comptime dtype = DType.bfloat16
     print(
-        "epilogue_fn: M=",
-        m,
-        " N=",
-        N,
-        " K=",
-        K,
-        " mma_shape=",
-        mma_shape,
-        " cta_group=",
-        cta_group,
-        " register_based_epilogue=",
-        register_based_epilogue,
-        " swapAB=",
-        swapAB,
+        t"epilogue_fn: M= {m}  N= {N}  K= {K}  mma_shape= {mma_shape} "
+        t" cta_group= {cta_group}  register_based_epilogue="
+        t" {register_based_epilogue}  swapAB= {swapAB}"
     )
     comptime config = MatmulConfig[dtype, dtype, dtype, True](
         cluster_shape=cluster_shape,
@@ -123,24 +111,24 @@ def main() raises:
             test_epilogue_fn[
                 1024,
                 1024,
-                mma_shape=(256, 128, 16),
-                cluster_shape=Index(2, 1, 1),
+                mma_shape=(Int(256), Int(128), Int(16)),
+                cluster_shape=(Int(2), Int(1), Int(1)),
                 cta_group=2,
                 register_based_epilogue=register_based_epilogue,
             ](ctx, 1000)
             test_epilogue_fn[
                 1024,
                 1024,
-                mma_shape=(128, 128, 16),
-                cluster_shape=Index(2, 1, 1),
+                mma_shape=(Int(128), Int(128), Int(16)),
+                cluster_shape=(Int(2), Int(1), Int(1)),
                 cta_group=1,
                 register_based_epilogue=register_based_epilogue,
             ](ctx, 1000)
             test_epilogue_fn[
                 2560,
                 1024,
-                mma_shape=(256, 128, 16),
-                cluster_shape=Index(4, 4, 1),
+                mma_shape=(Int(256), Int(128), Int(16)),
+                cluster_shape=(Int(4), Int(4), Int(1)),
                 cta_group=2,
                 register_based_epilogue=register_based_epilogue,
                 swapAB=True,
@@ -150,8 +138,8 @@ def main() raises:
             test_epilogue_fn[
                 128,
                 128,
-                mma_shape=(64, 88, 16),
-                cluster_shape=Index(2, 1, 1),
+                mma_shape=(Int(64), Int(88), Int(16)),
+                cluster_shape=(Int(2), Int(1), Int(1)),
                 cta_group=1,
                 swapAB=swapAB,
             ](ctx, 64)

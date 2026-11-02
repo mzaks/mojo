@@ -63,13 +63,15 @@ mojo_test(
 )
 
 _GPU_MEMORY = {
-    "test_p2p_ep_combine.mojo": "3",
+    "test_p2p_ep_combine.mojo": "4",
     "test_p2p_ep_dispatch.mojo": "3",
+    "test_ep_combine_reuse.mojo": "2",
     "test_allreduce_residual_rmsnorm_fp8.mojo": "9",
     "test_p2p_copy.mojo": "2",
     "test_allreduce.mojo": "4",
     "test_allgather_rmsnorm_mxfp8.mojo": "6",
     "test_allgather.mojo": "3",
+    "test_allgather_rows_slice.mojo": "3",
     "test_allgather_rmsnorm.mojo": "3",
     "test_broadcast.mojo": "3",
     "test_kernel_load_gate_nested.mojo": "2",
@@ -81,15 +83,19 @@ _GPU_MEMORY = {
     "test_scatter.mojo": "3",
     "test_broadcast_subgroup.mojo": "2",
     "test_ep_ord_r_completion.mojo": "2",
-    # On four GPUs the 8,168-token case holds 9.1 GiB a GPU, 8.5 of it the
-    # receive buffer.
-    "test_ep_dispatch_prefill_send.mojo": "11",
     "test_kernel_load_gate.mojo": "2",
 }
 
 # Platform constraints for tests that do not run on every multi-GPU host; the
 # rest take the glob's default.
 _TARGET_COMPATIBLE_WITH = {
+    # PDL is NVIDIA-only (SM90+), and the producer's delay is an NVIDIA
+    # intrinsic.
+    "test_allgather_rmsnorm_pdl.mojo": select({
+        "//:b200_gpu": ["//:has_multi_gpu"],
+        "//:h100_gpu": ["//:has_multi_gpu"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
     # The warp-per-token dispatch it tests is NVIDIA-only, and its NVFP4
     # quantize needs SM100.
     "test_ep_dispatch_prefill_send.mojo": select({
@@ -194,6 +200,7 @@ mojo_test(
             "test_multimem_reducescatter.mojo",
             "test_allreduce_residual_rmsnorm.mojo",  # Has its own standalone rule above
             "test_enum_like_conformance.mojo",  # Has its own standalone rule below
+            "test_allreduce_peer_load_codegen.mojo",  # Host-only rule below
             "test_bundled_allreduce_build_graph.mojo",  # Has its own standalone rule above
             "test_blocking_driver_calls.mojo",  # One rule per round, below
         ],
@@ -262,6 +269,27 @@ mojo_test(
         "//max:linalg",
         "//max:nn",
         "//max:pipeline",
+        "@mojo//:std",
+    ],
+)
+
+# Host-only: compiles the allreduce peer-load helper for gfx950 and checks the
+# asm, so it needs no GPU. Under ASan the test is compiled by the instrumented
+# Mojo compiler, whose gfx950 backend overruns the 900 s compile timeout even
+# for one kernel (all eight take about 5 s uninstrumented). The test checks
+# codegen, not host memory, so ASan has nothing to add. A `skip-ci-asan` tag is
+# not enough: the asan job builds with `--build_tests_only`, which ignores
+# `--build_tag_filters`, so the compile still runs.
+mojo_test(
+    name = "test_allreduce_peer_load_codegen.mojo.test",
+    srcs = ["test_allreduce_peer_load_codegen.mojo"],
+    target_compatible_with = select({
+        "//:asan": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//max:comm",
+        "//max:max_mojo",
         "@mojo//:std",
     ],
 )

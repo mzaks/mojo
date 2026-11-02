@@ -16,7 +16,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "Mojo/MojoTooling/ParserDriver.h"
-#include "Mojo/KGENDialect/ParameterEvaluator.h"
 #include "Mojo/LITDialect/LITOps.h"
 #include "Mojo/MojoParser/ASTDecl.h"
 #include "Mojo/MojoParser/DeclResolver.h"
@@ -25,12 +24,11 @@
 #include "Mojo/MojoParser/Lexer.h"
 #include "Mojo/MojoParser/ModuleLoader.h"
 #include "Mojo/MojoParser/SharedState.h"
-#include "Mojo/MojoTooling/PublicASTDecl.h"
 #include "Mojo/POPDialect/POPDialect.h"
 #include "Mojo/Support/CompilerProfiling.h"
 #include "Mojo/ToolCommon/CompilationOptions.h"
 
-#include "ParserDriverImpl.h"
+#include "MojoToolingInternals.h"
 #include "Support/DebugInfoDialect/IR/DIBuilder.h"
 #include "Support/Filesystem/Paths.h"
 #include "Support/Telemetry/Telemetry.h"
@@ -55,8 +53,11 @@ using llvm::SourceMgr;
 // MojoParserContext::Impl
 //===----------------------------------------------------------------------===//
 
-MojoParserContext::Impl::Impl(llvm::SourceMgr &sourceMgr, ParserConfig &config)
-    : sharedState(sourceMgr, config), replLocMapper(sourceMgr) {
+MojoParserContext::Impl::Impl(llvm::SourceMgr &sourceMgr, MLIRContext *context,
+                              const KGEN::CompilationOptions &options,
+                              const FrontendOptions &frontendOptions)
+    : sharedState(sourceMgr, context, options, frontendOptions),
+      replLocMapper(sourceMgr) {
   // Create the top-level outer decl, which will contain all things we parse.
   module = ModuleOp::create(UnknownLoc::get(sharedState.getContext()));
   topLevelDecl = &cast<TopLevelModuleASTDecl>(sharedState.declResolver->addDecl(
@@ -70,8 +71,11 @@ MojoParserContext::Impl::Impl(llvm::SourceMgr &sourceMgr, ParserConfig &config)
 // MojoParserContext
 //===----------------------------------------------------------------------===//
 
-MojoParserContext::MojoParserContext(SourceMgr &sourceMgr, ParserConfig &config)
-    : impl(std::make_unique<Impl>(sourceMgr, config)) {}
+MojoParserContext::MojoParserContext(SourceMgr &sourceMgr, MLIRContext *context,
+                                     const KGEN::CompilationOptions &options,
+                                     const FrontendOptions &frontendOptions)
+    : impl(std::make_unique<Impl>(sourceMgr, context, options,
+                                  frontendOptions)) {}
 
 MojoParserContext::~MojoParserContext() {
   // Finalize any imported bytecode now that we've resolved everything. This
@@ -102,21 +106,8 @@ const KGEN::CompilationOptions &MojoParserContext::getCompilationOptions() {
   return impl->sharedState.options;
 }
 
-ASTDecl *MojoParserContext::getTraitDecl(KGEN::TraitSymbolAttr traitSymbol) {
-  return &impl->sharedState.declResolver->getDeclForTypeSymbol(
-      traitSymbol.getSymbol());
-}
-
-ASTType MojoParserContext::concretizeType(ASTType base,
-                                          ArrayRef<TypedAttr> params,
-                                          ASTType type) {
-  KGEN::ParameterEvaluator evaluator(
-      cast<StructASTDecl>(base.getDecl(getSharedState()))
-          ->getOp()
-          .getInputParams(),
-      params);
-
-  return ASTType(evaluator.replace(evaluator.getReboundType(type.mlirType)));
+const FrontendOptions &MojoParserContext::getFrontendOptions() {
+  return impl->sharedState.frontendOptions;
 }
 
 //===----------------------------------------------------------------------===//

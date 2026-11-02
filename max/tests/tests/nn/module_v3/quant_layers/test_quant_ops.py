@@ -26,11 +26,11 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+from max import functional as F
 from max.driver import CPU, Device
 from max.dtype import DType
-from max.experimental import functional as F
-from max.experimental.nn.common_layers import quant_ops
-from max.experimental.nn.common_layers.quant_tensor import (
+from max.nn.common_layers import quant_ops
+from max.nn.common_layers.quant_tensor import (
     FP8BlockActivation,
     FP8BlockTensor,
     MXFP4Quantizer,
@@ -40,10 +40,11 @@ from max.experimental.nn.common_layers.quant_tensor import (
     NVFP4Activation,
     NVFP4Tensor,
     NVFP4TensorQuantizer,
+    QuantAwareTensor,
 )
-from max.experimental.tensor import Tensor, default_dtype
-from max.nn.comm.ep import EPConfig
-from max.nn.quant_config import QuantConfig, QuantFormat
+from max.nn.legacy.comm.ep import EPConfig
+from max.nn.legacy.quant_config import QuantConfig, QuantFormat
+from max.tensor import Tensor, default_dtype
 
 _HIDDEN_DIM = 256
 _MOE_DIM = 128
@@ -265,6 +266,43 @@ def test_concat_nvfp4_shares_the_global_scales() -> None:
         assert fused.input_scale is gate.input_scale
 
 
+def test_concat_nvfp4_quantizers_pin_the_max_amax(sm100_arch: None) -> None:
+    """Fake-quant gate||up shares one global amax before the packed concat.
+
+    Each member still quantizes its own values. The pinned amax is the max
+    across the group, and the fused tensor keeps the first member's scale,
+    which was encoded with that same amax.
+    """
+    del sm100_arch
+    with F.lazy():
+        gate = NVFP4TensorQuantizer(
+            Tensor.zeros((128, 64), dtype=DType.bfloat16)
+        )
+        up = NVFP4TensorQuantizer(Tensor.zeros((128, 64), dtype=DType.bfloat16))
+
+        fused = quant_ops.concat_nvfp4(gate, up)
+
+        assert isinstance(fused, NVFP4Tensor)
+        assert not isinstance(fused, NVFP4TensorQuantizer)
+        assert gate._pinned_amax is up._pinned_amax
+        assert gate._pinned_amax is not None
+        assert fused.weight_scale_2 is gate.weight_scale_2
+        assert fused.input_scale is gate.input_scale
+        assert list(fused.weight.shape) == [256, 32]
+        assert list(fused.weight_scale.shape) == [256, 4]
+
+
+def test_concat_nvfp4_rejects_mixed_quantizer_and_packed() -> None:
+    """A packed checkpoint scale and a fake-quant amax cannot share one scale."""
+    with F.lazy():
+        packed = _nvfp4_weight(rows=16, cols=32)
+        quantizer = NVFP4TensorQuantizer(
+            Tensor.zeros((16, 32), dtype=DType.bfloat16)
+        )
+        with pytest.raises(TypeError, match="cannot mix"):
+            quant_ops.concat_nvfp4(packed, quantizer)
+
+
 def test_concat_nvfp4_rejects_non_row_axis() -> None:
     with F.lazy():
         with pytest.raises(ValueError, match="only supports axis=0"):
@@ -323,6 +361,46 @@ def test_sigma_permute_interleaves_gate_and_up_rows() -> None:
     assert permuted.weight_scale_2 is weight.weight_scale_2
     assert permuted.input_scale is weight.input_scale
     assert permuted.block_size == weight.block_size
+
+
+@pytest.mark.parametrize("experts, halves", [(3, 1), (10, 2)])
+def test_stack_blockwise_mega_ffn_permutes_each_expert(
+    experts: int, halves: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Joined from one projection or two, stacked in one group or several,
+    each expert's bytes go through the preshuffle once and the scales stack
+    row-major.
+
+    The preshuffle is stubbed with a visible byte change: the eager
+    interpreter this suite runs on has no rank-7 transpose, and the permute's
+    byte order is pinned by ``test_blockwise_fp8_lane_is_two_16_byte_planes``.
+    """
+    monkeypatch.setattr(
+        quant_ops, "preshuffle_blockwise_fp8_b", lambda w: w + 1
+    )
+    n, k = 32, 256
+    rng = np.random.default_rng(5)
+    data = rng.integers(0, 256, (experts, n, k), dtype=np.uint8)
+    scales = rng.random((experts, n // 16, k // 128)).astype(np.float32)
+    rows, scale_rows = n // halves, n // 16 // halves
+    items: list[list[QuantAwareTensor]] = [
+        [
+            FP8BlockTensor(
+                weight=Tensor(data[e, h * rows : (h + 1) * rows], device=CPU()),
+                weight_scale_inv=Tensor(
+                    scales[e, h * scale_rows : (h + 1) * scale_rows],
+                    device=CPU(),
+                ),
+            )
+            for h in range(halves)
+        ]
+        for e in range(experts)
+    ]
+
+    stacked = quant_ops.stack_blockwise_mega_ffn(items, CPU())
+
+    np.testing.assert_array_equal(stacked.weight.to_numpy(), data + 1)
+    np.testing.assert_array_equal(stacked.weight_scale_inv.to_numpy(), scales)
 
 
 # --------------------------------------------------------------------------- #

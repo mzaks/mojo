@@ -22,9 +22,8 @@
 #include "Mojo/MojoParser/ASTDecl.h"
 #include "Mojo/MojoParser/DeclResolver.h"
 #include "Mojo/MojoTooling/CodeComplete.h"
-#include "Mojo/MojoTooling/PublicASTDecl.h"
 #include "Mojo/POPDialect/POPOps.h"
-#include "ParserDriverImpl.h"
+#include "MojoToolingInternals.h"
 #include "Support/DebugInfoDialect/IR/DIBuilder.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Verifier.h"
@@ -1058,9 +1057,8 @@ StringRef MojoParserContext::prepareCompletionCache(ASTDecl *replDecl) {
   if (!canExtend) {
     // Full rebuild: cache doesn't exist, replDecl changed, target set shrank,
     // or stale module threshold exceeded.
-    impl->completionCache = std::make_unique<Impl::CompletionCache>(
-        impl->sharedState.getContext(), impl->sharedState.options,
-        mainSourceMgr);
+    impl->completionCache =
+        std::make_unique<Impl::CompletionCache>(impl->sharedState);
     impl->completionCache->replDeclKey = replDecl;
   }
 
@@ -1108,7 +1106,7 @@ MojoParserContext::codeCompleteREPLExpression(
   // Run completion in the cached context. Each request adds a new module, but
   // lastResolvedDecl always points to the last *real* REPL module, so stale
   // completion modules are harmless.
-  auto results = MojoParserContext::codeCompleteInContext(
+  auto results = Mojo::codeCompleteInContext(
       *cache.context, llvm::MemoryBufferRef(wrappedExprText, bufferIdentifier),
       completionPosition, [&](int fileId) {
         const auto *buf = cache.context->getSourceMgr().getMemoryBuffer(fileId);
@@ -1141,7 +1139,7 @@ MojoParserContext::signatureHelpREPLExpression(
       prepareCompletionExpr(position, exprText, *locMapper.exprMappers.back(),
                             replVariables, !cache.lastResolvedDecl);
 
-  auto result = MojoParserContext::signatureHelpInContext(
+  auto result = Mojo::signatureHelpInContext(
       *cache.context, llvm::MemoryBufferRef(wrappedExprText, bufferIdentifier),
       position, [&](int fileId) {
         const auto *buf = cache.context->getSourceMgr().getMemoryBuffer(fileId);

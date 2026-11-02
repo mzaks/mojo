@@ -16,29 +16,31 @@ from __future__ import annotations
 
 import functools
 import math
+from typing import ClassVar
 
+from max import functional as F
 from max import tree
 from max.driver import CPU
 from max.dtype import DType
-from max.experimental import functional as F
-from max.experimental.nn import Module
-from max.experimental.nn.common_layers.mlp import MLP
-from max.experimental.nn.common_layers.moe import MoE
-from max.experimental.nn.common_layers.multi_latent_attention import (
+from max.nn import Module
+from max.nn.common_layers.mlp import MLP
+from max.nn.common_layers.moe import MoE
+from max.nn.common_layers.multi_latent_attention import (
     LatentAttentionWithRope,
 )
-from max.experimental.nn.embedding import Embedding
-from max.experimental.nn.linear import Linear
-from max.experimental.nn.norm import RMSNorm
-from max.experimental.nn.sequential import ModuleList
-from max.experimental.tensor import Tensor
-from max.nn.kv_cache import (
+from max.nn.embedding import Embedding
+from max.nn.legacy.kv_cache import (
     KVCacheInputsPerDevice,
     KVCacheParamInterface,
     PagedCacheValues,
 )
-from max.nn.rotary_embedding import DeepseekYarnRopeScalingParams
+from max.nn.legacy.rotary_embedding import DeepseekYarnRopeScalingParams
+from max.nn.linear import Linear
+from max.nn.norm import RMSNorm
+from max.nn.sequential import ModuleList
 from max.pipelines.lib import ModuleV3Outputs
+from max.pipelines.lib.role_contracts import DecoderInputs, DecoderOutputs
+from max.tensor import Tensor
 
 from .layers.moe_gate import DeepSeekV2MoEGate
 from .layers.rotary_embedding import DeepseekYarnRotaryEmbedding
@@ -169,6 +171,7 @@ class DeepseekV2TextModel(
         return_n_logits: Tensor,
         input_row_offsets: Tensor,
     ) -> ModuleV3Outputs:
+        """Runs the embedding and decoder stack over the tokens."""
         h = self.embed_tokens(tokens)
 
         freqs_cis = F.cast(self.rope.freqs_cis, h.dtype).to(h.device)
@@ -212,6 +215,7 @@ class DeepseekV2(Module[..., ModuleV3Outputs]):
         input_row_offsets: Tensor,
         *variadic_args: Tensor,
     ) -> ModuleV3Outputs:
+        """Runs the model over its variadic graph inputs."""
         kv_inputs = iter(x._graph_value for x in variadic_args)
         symbolic_inputs = self.kv_params.unflatten_kv_inputs(kv_inputs)
         kv_collections = tree.leaves(
@@ -219,4 +223,33 @@ class DeepseekV2(Module[..., ModuleV3Outputs]):
         )
         return self.language_model(
             tokens, kv_collections[0], return_n_logits, input_row_offsets
+        )
+
+
+class DeepseekV2Decoder(Module[[DecoderInputs], DecoderOutputs]):
+    """The DeepSeek-V2 decoder, registered for the ``DECODER`` role.
+
+    It runs on one GPU.
+    """
+
+    graph_name: ClassVar[str] = "DeepseekV2"
+
+    def __init__(self, config: DeepseekV2Config) -> None:
+        super().__init__()
+        self.language_model = DeepseekV2TextModel(config)
+        self.config = config
+        self.kv_params = config.kv_params
+
+    def forward(self, inputs: DecoderInputs) -> DecoderOutputs:
+        """Unflattens the KV leaves, then runs the text model."""
+        kv_inputs = iter(x._graph_value for x in tree.leaves(inputs.kv))
+        kv_collections = tree.leaves(
+            self.kv_params.unflatten_kv_inputs(kv_inputs),
+            leaf=KVCacheInputsPerDevice,
+        )
+        return self.language_model(
+            inputs.tokens,
+            kv_collections[0],
+            inputs.return_n_logits,
+            inputs.input_row_offsets,
         )

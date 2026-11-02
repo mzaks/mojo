@@ -216,12 +216,12 @@ def mha_sm90_dispatch[
     ) if decoding else config
     comptime BM = new_config.block_m()
     comptime BK = new_config.padded_depth
-    comptime assert BM % 64 == 0, "SM90 requires BM%64==0, but BM==" + String(
-        BM
+    comptime assert BM % 64 == 0, String(
+        t"SM90 requires BM%64==0, but BM=={BM}"
     )
-    comptime assert (
-        BK % 64 == 0
-    ), "H100 requires BK%64==0 as it uses 128B swizzles, but BK==" + String(BK)
+    comptime assert BK % 64 == 0, String(
+        t"H100 requires BK%64==0 as it uses 128B swizzles, but BK=={BK}"
+    )
     comptime BN = new_config.block_n()
     # we add smem use for SharedMemBarrier synchronization
     # add the number of producer threads (i.e. 1 WARP_GROUP_SIZE)
@@ -1389,6 +1389,16 @@ def _mha_sm90[
     # The persistent kernels limit the grid size.
     # initial_seq_info = scheduler.unsafe_get_current_work_info(tile_summary, state)
 
+    if tid == 0:
+        comptime for i in range(pipeline_stages):
+            produced_mbar_kv[i].init(1)
+            consumed_mbar_kv[i].init(Int32(num_consumer_threads))
+
+        comptime if persistent:
+            comptime for i in range(2):
+                produced_mbar_q[i].init(1)
+                consumed_mbar_q[i].init(Int32(num_consumer_threads))
+
     var initial_seq_info = scheduler.unsafe_seq_info(tile_summary, state)
 
     comptime if not decoding:
@@ -1401,16 +1411,6 @@ def _mha_sm90[
                     return
             else:
                 return
-
-    if tid == 0:
-        comptime for i in range(pipeline_stages):
-            produced_mbar_kv[i].init(1)
-            consumed_mbar_kv[i].init(Int32(num_consumer_threads))
-
-        comptime if persistent:
-            comptime for i in range(2):
-                produced_mbar_q[i].init(1)
-                consumed_mbar_q[i].init(Int32(num_consumer_threads))
 
     comptime PositionType = MHAPosition[
         BM,
@@ -2003,7 +2003,8 @@ def _mha_sm90[
                 p_frag.copy_from(
                     p_reg_tile.reshape(
                         row_major[
-                            num_m_mmas * num_n_mmas * frag_ratio, a_frag_size
+                            num_m_mmas * num_n_mmas * frag_ratio,
+                            a_frag_size,
                         ]()
                     )
                 )

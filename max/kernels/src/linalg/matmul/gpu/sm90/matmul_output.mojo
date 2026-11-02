@@ -67,7 +67,7 @@ struct MatmulTileWriter[
     BM: Int,
     BN: Int,
     swizzle: TensorMapSwizzle,
-    wgmma_shape: Coord,
+    wgmma_shape: Tuple[Int, Int, Int],
     num_consumer: Int = 1,
     use_tma_store: Bool = False,
     swapAB: Bool = False,
@@ -95,8 +95,7 @@ struct MatmulTileWriter[
         BN: Column (N) dimension of the matmul output tile per block.
         swizzle: TMA swizzle mode applied to shared memory for TMA async
             stores.
-        wgmma_shape: Shape of each WGMMA instruction as a 3-element index
-            list `(M, N, K)`.
+        wgmma_shape: Shape of each WGMMA instruction as `(M, N, K)`.
         num_consumer: Number of consumer warp groups sharing the output
             tile (defaults to 1).
         use_tma_store: Whether to use TMA async stores for shared memory
@@ -377,11 +376,9 @@ struct MatmulTileWriter[
 
         comptime assert needs_x2 == (
             Self.frag_size % 4 == 0 and Self.frag_size % 8 != 0
-        ), (
-            "stmatrix and wgmma register count conflict: needs_x2 = "
-            + String(needs_x2)
-            + " frag_size ="
-            + String(Self.frag_size)
+        ), String(
+            t"stmatrix and wgmma register count conflict: needs_x2 = "
+            t"{needs_x2} frag_size ={Self.frag_size}"
         )
 
         comptime fragment_writer_type[

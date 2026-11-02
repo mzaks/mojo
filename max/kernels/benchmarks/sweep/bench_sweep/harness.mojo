@@ -335,7 +335,7 @@ struct SweepHarness(Movable):
             )
         var fields = Fields()
         fields.add("tag", self.tag)
-        fields.add("device", ctx.name())
+        fields.add("device", ctx.device().get_name())
         fields.add("api", ctx.api())
         self.policy.write_fields(fields)
         fields.add("evict_bytes", self.evict_bytes)
@@ -375,7 +375,7 @@ struct SweepHarness(Movable):
         var state = self.backend.throttle_state(ctx)
         fields.add(key, state)
         if state.startswith("active"):
-            print("WARNING: device is hardware-throttled (", key, "): ", state)
+            print(t"WARNING: device is hardware-throttled ( {key} ):  {state}")
             if (
                 self.policy.throttle_check == "fail"
                 and key == "throttle_before"

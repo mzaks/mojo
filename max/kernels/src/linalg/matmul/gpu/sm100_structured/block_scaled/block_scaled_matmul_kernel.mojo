@@ -62,7 +62,7 @@ from max.gpu.primitives.grid_controls import (
 )
 from max.gpu.sync import syncwarp
 from max.gpu.compute.arch.tcgen05 import *
-from layout import Layout
+from layout import Layout, Coord
 from layout.tensor_core_async import (
     tile_layout_k_major_typed,
     tile_layout_mn_major_typed,
@@ -143,7 +143,7 @@ struct BlackwellBlockScaledMatmulKernel[
         a_type, b_type, c_type, sfa_dtype, sfb_dtype, transpose_b
     ],
     # Cluster shape (for LLVM metadata)
-    cluster_shape: StaticTuple[Int32, 3] = StaticTuple[Int32, 3](1),
+    cluster_shape: Coord[Int, Int, Int] = Coord[Int, Int, Int](1, 1, 1),
     # Optional features
     pdl_level: PDLLevel = PDLLevel(),
     max_profiled_tiles_per_SM: UInt32 = 0,
@@ -166,7 +166,7 @@ struct BlackwellBlockScaledMatmulKernel[
         cluster_shape: CTA cluster dimensions `(M, N, batch)` for LLVM
             cluster metadata (defaults to `(1, 1, 1)`).
         pdl_level: Programmatic dependency launch level controlling
-            inter-grid synchronization (defaults to `PDLLevel.OFF`).
+            inter-grid synchronization (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
         max_profiled_tiles_per_SM: Maximum number of tiles to profile per
             SM; `0` disables profiling (defaults to `0`).
     """
@@ -445,11 +445,7 @@ struct BlackwellBlockScaledMatmulKernel[
     # ========== Tile Scheduler Type ==========
     comptime Scheduler = StructuredTileScheduler[
         num_stages=Self.num_clc_pipeline_stages,
-        cluster_shape=Index[dtype=DType.uint32](
-            Self.config.cluster_shape[0],
-            Self.config.cluster_shape[1],
-            Self.config.cluster_shape[2],
-        ),
+        cluster_shape=Self.config.cluster_shape,
         block_swizzle_size=Self.config.block_swizzle_size,
         rasterize_order=Self.config.raster_order,
     ]
@@ -913,7 +909,13 @@ struct BlackwellBlockScaledMatmulKernel[
 
     @staticmethod
     @inline(.always)
-    @__llvm_metadata(`nvvm.cluster_dim`=Self.cluster_shape)
+    @__llvm_metadata(
+        `nvvm.cluster_dim`=StaticTuple[Int32, 3](
+            Int32(Self.cluster_shape[0]),
+            Int32(Self.cluster_shape[1]),
+            Int32(Self.cluster_shape[2]),
+        )
+    )
     @__llvm_arg_metadata(a_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(b_tma_op, `nvvm.grid_constant`)
     @__llvm_arg_metadata(c_tma_op, `nvvm.grid_constant`)

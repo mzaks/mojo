@@ -73,6 +73,7 @@ from max.gpu import (
     thread_idx,
 )
 from layout import Coord, TensorEngine, TensorLayout, TileTensor, row_major
+from state_space.gated_delta import pdl_enter, pdl_exit
 
 
 # Upper bound on the runtime `tokens_per_block`; the host shrinks it to the
@@ -135,7 +136,14 @@ def gated_delta_conv1d_fwd_gpu[
     unchanged. With `CAPTURE_INPUT` every thread also copies the input it
     owns to `qkv_window`, which has the output's shape; otherwise
     `qkv_window` is never touched.
+
+    Every thread waits for the preceding grid before it reads any operand,
+    since each of them (the input, the weight, the offsets) can be that
+    grid's output. The launch must carry `pdl_launch_attributes`; the grid
+    releases its dependent after the last store.
     """
+    pdl_enter()
+
     comptime KERNEL_SIZE_MINUS_ONE = KERNEL_SIZE - 1
 
     var _total_seq_len = Int(total_seq_len)
@@ -414,3 +422,5 @@ def gated_delta_conv1d_fwd_gpu[
                     conv_state.store(
                         (slot, conv_channel_idx, state_slot_j), state_value
                     )
+
+    pdl_exit()

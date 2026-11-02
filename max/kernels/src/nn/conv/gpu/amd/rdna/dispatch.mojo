@@ -28,7 +28,6 @@ from max.gpu import global_idx, WARP_SIZE
 from max.gpu.host import DeviceContext
 from layout import Coord, TileTensor, row_major
 from linalg.matmul.gpu import _matmul_gpu
-from std.utils.index import IndexList
 from linalg.utils import (
     ElementwiseComputeFn,
     ElementwiseEpilogueFn,
@@ -180,9 +179,9 @@ def dispatch_rdna_conv2d[
     input: TileTensor[input_type, ...],
     filter: TileTensor[filter_type, ...],
     output: TileTensor[mut=True, output_type, ...],
-    stride: IndexList[2],
-    dilation: IndexList[2],
-    symmetric_padding: IndexList[2],
+    stride: Coord[Int, Int],
+    dilation: Coord[Int, Int],
+    symmetric_padding: Coord[Int, Int],
     num_groups: Int,
     ctx: DeviceContext,
     source_ptr: MutPointer[Scalar[output_type], MutAnyOrigin] = MutPointer[
@@ -231,7 +230,7 @@ def dispatch_rdna_conv2d[
         symmetric_padding: Symmetric spatial padding `[pad_h, pad_w]`
             applied to the input.
         num_groups: Number of convolution groups; only `1` is supported.
-        ctx: `DeviceContext` used to enqueue kernels and synchronize.
+        ctx: `DeviceContext` used to enqueue kernels.
         source_ptr: NHWC-contiguous residual source with the same shape as
             `output`; read only when `has_residual=True` (defaults to a
             dangling pointer).
@@ -549,9 +548,9 @@ def dispatch_rdna_conv2d[
                 no_epilogue_fn, no_compute_fn
             )
 
-        # Full sync required to keep filter_buf alive until the kernel completes.
-        # TODO: attach buffer to a stream callback to allow pipelining.
-        ctx.synchronize()
+        # Same lifetime argument as `dispatch_im2col_matmul_conv2d`: every
+        # kernel that reads this scratch was enqueued earlier on this stream,
+        # so the free does not cut its reads short and needs no drain.
         _ = filter_buf^
         return True
 

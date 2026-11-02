@@ -17,7 +17,7 @@ from std.memory.alloc import unsafe_alloc
 from std.testing import *
 
 
-def kernel(res: MutPointer[UInt32, MutAnyOrigin]):
+def kernel[res_origin: MutOrigin](res: MutPointer[UInt32, res_origin]):
     res[] = 0
 
 
@@ -32,9 +32,11 @@ def test_function_error(ctx: DeviceContext) raises:
             unsafe_from_raw_pointer=res_ptr
         )
         var res_host = DeviceBuffer[.uint32](
-            ctx, res_ptr_owned.unsafe_ptr(), 1, owning=False
+            ctx, res_ptr_owned.ptr(), 1, owning=False
         )
-        ctx.enqueue_function[kernel](res_host, block_dim=(1), grid_dim=(1))
+        ctx.enqueue_function[kernel[origin_of(res_host)]](
+            res_host, block_dim=(1), grid_dim=(1)
+        )
         ctx.synchronize()
 
         # Don't allow early dealloc.

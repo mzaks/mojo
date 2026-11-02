@@ -77,6 +77,7 @@ from max.gpu.sync import (
     schedule_barrier,
     schedule_group_barrier,
 )
+from std.utils.coord import Coord
 from layout import (
     Coord,
     Idx,
@@ -88,7 +89,7 @@ from layout.tile_layout import row_major, col_major
 from layout.tile_tensor import stack_allocation
 from layout.swizzle import Swizzle
 
-from std.utils import IndexList, StaticTuple
+from std.utils import StaticTuple
 from linalg.arch.amd.block_scaled_mma import (
     CDNA4F8F6F4MatrixFormat,
     cdna4_block_scaled_mfma,
@@ -215,7 +216,7 @@ def _swizzled_smem_off[
 
 
 struct BlockScaledMmaOp[
-    mma_shape: IndexList[3],  # (16, 16, 128) for MXFP4 and MXFP8 alike
+    mma_shape: Coord[Int, Int, Int],  # (16, 16, 128) for MXFP4 and MXFP8 alike
     num_m_mmas: Int,
     num_n_mmas: Int,
     num_k_tiles: Int,
@@ -1330,7 +1331,7 @@ struct BlockScaledMatmulAMD[
 
         # === MMA operator ===
         var mma_op = BlockScaledMmaOp[
-            mma_shape=IndexList[3](Self.MMA_M, Self.MMA_N, Self.MMA_K),
+            mma_shape=(Self.MMA_M, Self.MMA_N, Self.MMA_K),
             num_m_mmas=num_m_mmas,
             num_n_mmas=num_n_mmas,
             num_k_tiles=num_k_tiles,
@@ -2030,6 +2031,7 @@ def _launch_block_scaled_split_k[
         CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1 if lane_bytes
         == 16 else CDNA4F8F6F4MatrixFormat.FLOAT8_E4M3
     ),
+    b_matrix_format: CDNA4F8F6F4MatrixFormat = matrix_format,
 ](
     c: TileTensor[mut=True, ...],
     a: TileTensor,
@@ -2054,6 +2056,7 @@ def _launch_block_scaled_split_k[
         MMA_N=MMA_N,
         MMA_K=MMA_K,
         matrix_format=matrix_format,
+        b_matrix_format=b_matrix_format,
         has_epilogue_fn=False,
         has_compute_fn=False,
     ](
@@ -2083,6 +2086,7 @@ def _launch_block_scaled_split_k_impl[
     MMA_N: Int = 16,
     MMA_K: Int = 128,
     matrix_format: CDNA4F8F6F4MatrixFormat = CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1,
+    b_matrix_format: CDNA4F8F6F4MatrixFormat = matrix_format,
     *,
     has_epilogue_fn: Bool,
     has_compute_fn: Bool,
@@ -2124,6 +2128,7 @@ def _launch_block_scaled_split_k_impl[
         WM=WM,
         WN=WN,
         matrix_format=matrix_format,
+        b_matrix_format=b_matrix_format,
     ]
     comptime N = type_of(c).static_shape[1]
     comptime c_dtype = type_of(c).dtype
@@ -2301,6 +2306,7 @@ def block_scaled_matmul_amd[
     MMA_N: Int = 16,
     MMA_K: Int = 128,
     lane_bytes: Int = 16,
+    b_lane_bytes: Int = 0,
 ](
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, .uint8, ...],
@@ -2329,6 +2335,10 @@ def block_scaled_matmul_amd[
         MMA_K: MFMA K-depth in logical FP4 elements. Default 128.
         lane_bytes: Operand bytes per lane per MFMA: 16 (MXFP4, default) or
             32 (MXFP8), which selects the operand format and byte extents.
+        b_lane_bytes: Operand bytes per lane for B only. 0 (default) uses
+            `lane_bytes`, i.e. A and B share an encoding; 16 against
+            `lane_bytes=32` selects the mixed E4M3 A x E2M1 B pair, where
+            B's K extent is half of A's.
 
     Args:
         c: Output [M, N] (any float dtype, e.g. float32 or bfloat16).
@@ -2343,6 +2353,7 @@ def block_scaled_matmul_amd[
         MMA_N=MMA_N,
         MMA_K=MMA_K,
         lane_bytes=lane_bytes,
+        b_lane_bytes=b_lane_bytes,
         has_epilogue_fn=False,
         has_compute_fn=False,
     ](c, a, b, a_scales, b_scales, no_epilogue_fn, no_compute_fn, ctx)
@@ -2355,6 +2366,7 @@ def block_scaled_matmul_amd[
     MMA_N: Int = 16,
     MMA_K: Int = 128,
     lane_bytes: Int = 16,
+    b_lane_bytes: Int = 0,
 ](
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, .uint8, ...],
@@ -2376,6 +2388,8 @@ def block_scaled_matmul_amd[
         MMA_N: MFMA tile cols.
         MMA_K: MFMA K-depth in logical elements.
         lane_bytes: 16 (MXFP4) or 32 (MXFP8).
+        b_lane_bytes: Operand bytes per lane for B only (see the other
+            overload); 0 shares A's encoding.
 
     Args:
         c: Output [M, N]. Only its shape is read.
@@ -2391,6 +2405,7 @@ def block_scaled_matmul_amd[
         MMA_N=MMA_N,
         MMA_K=MMA_K,
         lane_bytes=lane_bytes,
+        b_lane_bytes=b_lane_bytes,
         has_epilogue_fn=True,
         has_compute_fn=False,
     ](c, a, b, a_scales, b_scales, epilogue_fn, no_compute_fn, ctx)
@@ -2403,6 +2418,7 @@ def block_scaled_matmul_amd[
     MMA_N: Int = 16,
     MMA_K: Int = 128,
     lane_bytes: Int = 16,
+    b_lane_bytes: Int = 0,
 ](
     c: TileTensor[mut=True, ...],
     a: TileTensor[mut=False, .uint8, ...],
@@ -2423,6 +2439,8 @@ def block_scaled_matmul_amd[
         MMA_N: MFMA tile cols.
         MMA_K: MFMA K-depth in logical elements.
         lane_bytes: 16 (MXFP4) or 32 (MXFP8).
+        b_lane_bytes: Operand bytes per lane for B only (see the other
+            overload); 0 shares A's encoding.
 
     Args:
         c: Output [M, N].
@@ -2438,6 +2456,7 @@ def block_scaled_matmul_amd[
         MMA_N=MMA_N,
         MMA_K=MMA_K,
         lane_bytes=lane_bytes,
+        b_lane_bytes=b_lane_bytes,
         has_epilogue_fn=False,
         has_compute_fn=True,
     ](c, a, b, a_scales, b_scales, no_epilogue_fn, compute_fn, ctx)
@@ -2452,6 +2471,7 @@ def _block_scaled_matmul_amd_impl[
     MMA_N: Int,
     MMA_K: Int,
     lane_bytes: Int,
+    b_lane_bytes: Int,
     has_epilogue_fn: Bool,
     has_compute_fn: Bool,
 ](
@@ -2484,6 +2504,21 @@ def _block_scaled_matmul_amd_impl[
     comptime _fmt = (
         CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1 if lane_bytes
         == 16 else CDNA4F8F6F4MatrixFormat.FLOAT8_E4M3
+    )
+    # B's encoding. `b_lane_bytes` defaults to `lane_bytes` (equal encodings);
+    # 16 against A's 32 selects the mixed pair the MFMA also consumes natively,
+    # E4M3 activations against nibble-packed E2M1 weights, so a weight-only
+    # quantized GEMM does not have to widen B to one byte per element first.
+    # Nothing below changes: `lane_bytes` stays A's, and every K rule is
+    # expressed in A's bytes (== logical elements at E4M3).
+    comptime assert b_lane_bytes == 0 or (
+        lane_bytes == 32 and b_lane_bytes == 16
+    ), (
+        "b_lane_bytes must be 0 (same encoding as A) or 16 with lane_bytes=32"
+        " (E4M3 A x E2M1 B); the kernel only validates that mixed pair"
+    )
+    comptime _bfmt = (
+        CDNA4F8F6F4MatrixFormat.FLOAT4_E2M1 if b_lane_bytes == 16 else _fmt
     )
     comptime _elems_per_byte = 32 // lane_bytes
     comptime _bk_256_bytes = 256 // _elems_per_byte
@@ -2654,6 +2689,7 @@ def _block_scaled_matmul_amd_impl[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
+                b_matrix_format=_bfmt,
                 has_epilogue_fn=has_epilogue_fn,
                 has_compute_fn=has_compute_fn,
             ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2672,6 +2708,7 @@ def _block_scaled_matmul_amd_impl[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
+                b_matrix_format=_bfmt,
                 has_epilogue_fn=has_epilogue_fn,
                 has_compute_fn=has_compute_fn,
             ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2686,6 +2723,7 @@ def _block_scaled_matmul_amd_impl[
                 WM=16,
                 WN=16,
                 matrix_format=_fmt,
+                b_matrix_format=_bfmt,
                 has_epilogue_fn=has_epilogue_fn,
                 has_compute_fn=has_compute_fn,
             ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2706,6 +2744,7 @@ def _block_scaled_matmul_amd_impl[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
+                b_matrix_format=_bfmt,
                 has_epilogue_fn=has_epilogue_fn,
                 has_compute_fn=has_compute_fn,
             ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2720,6 +2759,7 @@ def _block_scaled_matmul_amd_impl[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
+                b_matrix_format=_bfmt,
                 has_epilogue_fn=has_epilogue_fn,
                 has_compute_fn=has_compute_fn,
             ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2734,6 +2774,7 @@ def _block_scaled_matmul_amd_impl[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
+                b_matrix_format=_bfmt,
                 has_epilogue_fn=has_epilogue_fn,
                 has_compute_fn=has_compute_fn,
             ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2751,6 +2792,7 @@ def _block_scaled_matmul_amd_impl[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
+                    b_matrix_format=_bfmt,
                     has_epilogue_fn=has_epilogue_fn,
                     has_compute_fn=has_compute_fn,
                 ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2766,6 +2808,75 @@ def _block_scaled_matmul_amd_impl[
                     WM=64,
                     WN=32,
                     num_splits=_sk_splits,
+                    MMA_M=MMA_M,
+                    MMA_N=MMA_N,
+                    MMA_K=MMA_K,
+                    matrix_format=_fmt,
+                    b_matrix_format=_bfmt,
+                    has_epilogue_fn=has_epilogue_fn,
+                    has_compute_fn=has_compute_fn,
+                ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
+                return
+        # Wide-N short-K, M > 16: keep the split route's own tile (BM=64,
+        # BN=128, BK=256) and drop the split. A split does not add blocks -- it
+        # re-runs K in shorter bands and then pays a workspace round trip of
+        # `(s + 1) * M * N` float32 (80 MiB at M=256, N=16384, s=4) plus a
+        # second launch, which a wide N does not need: the plain launch already
+        # supplies the blocks.
+        # The crossover tracks the block count
+        # (`blocks = ceildiv(N, SK_BN) * ceildiv(M, SK_BM)`), not N. Measured
+        # on MI355X at MXFP4, K=2048, this tile against the split the
+        # heuristic picks (medians of interleaved rounds):
+        #    32 blocks (M= 64, N=4096)   0.93x   plain loses
+        #    36 blocks (M=128, N=2304)   1.06x   ~neutral
+        #    54 blocks (M=192, N=2304)   1.17x
+        #    56 blocks (M= 64, N=7168)   1.17x
+        #    64 blocks (M=128, N=4096)   1.23x
+        #    72 blocks (M=256, N=2304)   1.45x
+        #   112 blocks (M=128, N=7168)   1.70x
+        #   128 blocks (M= 64, N=16384)  1.49x
+        #   512 blocks (M=256, N=16384)  2.14x
+        # hence a floor of 3/16 of the CUs (48 blocks here): above the neutral
+        # 36-block point, below the 54-block point worth 17%.
+        # Long K keeps the split at every block count: with the plain tile
+        # forced on, N=4096 K=7168 at 32 blocks is 29.2 us against the split's
+        # 17.6 us (1.66x), at 64 blocks 28.0 us against 26.1 us, and N=2304
+        # K=8192 at 18 blocks 31.0 us against 14.8 us (2.1x). That is the same
+        # short-K bound the decode gate above measured, reused for M > 16.
+        # `_sk_band_splits > 1` keeps this a replacement for a split, not for
+        # the BK512/narrow plain fallbacks below, which are unmeasured against
+        # this tile.
+        # MXFP8 is excluded: its crossover is not measured, and its production
+        # shapes are covered by the o_projection gate above.
+        #
+        # TODO: both constants are measured heuristics with known limits that
+        # someone should lift rather than widen blindly. The block floor comes
+        # from one MI355X sweep (36 blocks neutral, 54 blocks worth 17%); a
+        # per-shape tile that keeps the coalesced epilogue would move it, and
+        # the short-K bound is inherited from the decode gate rather than
+        # re-measured for M > 16. Re-run the sweep in
+        # `bench_block_scaled_matmul_amd_splitk.yaml` (the gate forced open on
+        # both sides) before changing either number.
+        comptime _plain_min_blocks = 3 * _gpu.sm_count // 16
+        comptime _plain_wide_n = (
+            lane_bytes == 16
+            and can_use_bk_256
+            and _sk_band_splits > 1
+            and _sk_n_aligned
+            and _mma_is_default
+            and K_BYTES * _elems_per_byte <= 3072
+        )
+        comptime if _plain_wide_n:
+            if (
+                M <= _sk_route_max_m
+                and ceildiv(N, SK_BN) * ceildiv(M, SK_BM) >= _plain_min_blocks
+            ):
+                _launch_block_scaled_impl[
+                    BM=SK_BM,
+                    BN=SK_BN,
+                    BK_ELEMS=SK_BK_ELEMS,
+                    WM=SK_WM,
+                    WN=SK_WN,
                     MMA_M=MMA_M,
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
@@ -2793,6 +2904,7 @@ def _block_scaled_matmul_amd_impl[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
+                    b_matrix_format=_bfmt,
                     has_epilogue_fn=has_epilogue_fn,
                     has_compute_fn=has_compute_fn,
                 ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2807,6 +2919,7 @@ def _block_scaled_matmul_amd_impl[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
+                    b_matrix_format=_bfmt,
                     has_epilogue_fn=has_epilogue_fn,
                     has_compute_fn=has_compute_fn,
                 ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2840,6 +2953,7 @@ def _block_scaled_matmul_amd_impl[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
+                    b_matrix_format=_bfmt,
                     has_epilogue_fn=has_epilogue_fn,
                     has_compute_fn=has_compute_fn,
                 ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2854,6 +2968,7 @@ def _block_scaled_matmul_amd_impl[
                     MMA_N=MMA_N,
                     MMA_K=MMA_K,
                     matrix_format=_fmt,
+                    b_matrix_format=_bfmt,
                     has_epilogue_fn=has_epilogue_fn,
                     has_compute_fn=has_compute_fn,
                 ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -2868,6 +2983,7 @@ def _block_scaled_matmul_amd_impl[
                 MMA_N=MMA_N,
                 MMA_K=MMA_K,
                 matrix_format=_fmt,
+                b_matrix_format=_bfmt,
                 has_epilogue_fn=has_epilogue_fn,
                 has_compute_fn=has_compute_fn,
             ](c, a, b, a_scales, b_scales, M, epilogue_fn, compute_fn, ctx)
@@ -3144,7 +3260,7 @@ def _preshuffle_a_scale_4d_kernel[
     preshuffled once at load time), so this has to run once per matmul call.
     Pad rows (`mn >= M`) get zero, matching the CPU version's zero-fill.
     """
-    var idx = Int(global_idx.x)
+    var idx = global_idx.x
     var total = Int(padded_M) * K_SCALES
     if idx >= total:
         return

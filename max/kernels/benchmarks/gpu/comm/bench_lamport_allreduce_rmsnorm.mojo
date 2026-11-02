@@ -85,7 +85,7 @@ def _run_rms_norm[
     K: Int,
     ctx: DeviceContext,
 ) raises:
-    var shape = Index(M, K)
+    var shape = (M, K)
     var in_view = TileTensor(in_ptr, row_major(Coord(shape)))
     var out_view = TileTensor(out_ptr, row_major(Coord(shape)))
     var gamma_view = TileTensor(gamma_ptr, row_major(Coord(K)))
@@ -181,7 +181,7 @@ def _verify_results[
     )
     ctx0.synchronize()
 
-    # ---- Fused path on GPU 0 (PDL off for clean comparison). ----
+    # ---- Fused path on GPU 0. ----
     # Both ranks must call so the Lamport pushes complete; otherwise GPU 0's
     # poll blocks waiting for peers.
     group_start()
@@ -189,7 +189,7 @@ def _verify_results[
         var out_ptr = v_fused_dev.unsafe_ptr() if g == 0 else cb_inputs[
             g
         ].offset_ptr(0)
-        lamport_allreduce_rmsnorm[dtype, ngpus, pdl=False](
+        lamport_allreduce_rmsnorm[dtype, ngpus](
             g,
             rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                 cb_inputs[g].offset_ptr(0)
@@ -403,7 +403,7 @@ def bench_fused_lamport_allreduce_rmsnorm[
     ) raises {imm}:
         @inline(.always)
         def call_fn(ctx_inner: DeviceContext, cache_iter: Int) raises {imm}:
-            lamport_allreduce_rmsnorm[dtype, ngpus, pdl=False](
+            lamport_allreduce_rmsnorm[dtype, ngpus](
                 ctx_idx,
                 rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                     cb_inputs[ctx_idx].offset_ptr(cache_iter)
@@ -510,13 +510,7 @@ def main() raises:
 
     var num_devices = DeviceContext.number_of_devices()
     if num_devices < num_gpus:
-        print(
-            "Need",
-            num_gpus,
-            "GPUs but only found",
-            num_devices,
-            "- skipping.",
-        )
+        print(t"Need {num_gpus} GPUs but only found {num_devices} - skipping.")
         return
 
     _ = enable_p2p()
@@ -530,21 +524,15 @@ def main() raises:
     comptime atomic_width = 16 // size_of[dtype]()
     comptime if num_cols % atomic_width != 0:
         print(
-            "num_cols=",
-            num_cols,
-            " not a multiple of atomic_width=",
-            atomic_width,
-            " (bf16 needs cols % 8 == 0); skipping.",
+            t"num_cols= {num_cols}  not a multiple of atomic_width="
+            t" {atomic_width}  (bf16 needs cols % 8 == 0); skipping."
         )
         return
     comptime BLOCK_SIZE_MAX = 1024
     comptime if num_cols // atomic_width > BLOCK_SIZE_MAX:
         print(
-            "num_cols=",
-            num_cols,
-            " exceeds BLOCK_SIZE*atomic_width=",
-            BLOCK_SIZE_MAX * atomic_width,
-            " (kernel cap); skipping.",
+            t"num_cols= {num_cols}  exceeds BLOCK_SIZE*atomic_width="
+            t" {BLOCK_SIZE_MAX * atomic_width}  (kernel cap); skipping."
         )
         return
 
@@ -553,14 +541,8 @@ def main() raises:
         list_of_ctx.append(DeviceContext(device_id=i))
 
     print(
-        "Benchmarking fused vs unfused Lamport allreduce + RMSNorm:",
-        num_gpus,
-        "GPUs,",
-        dtype,
-        ",",
-        num_rows,
-        "x",
-        num_cols,
+        t"Benchmarking fused vs unfused Lamport allreduce + RMSNorm:"
+        t" {num_gpus} GPUs, {dtype} , {num_rows} x {num_cols}"
     )
 
     var m = Bench(BenchConfig(num_repetitions=1))

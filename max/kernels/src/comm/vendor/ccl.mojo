@@ -37,7 +37,7 @@ from comm.reducescatter import CollectiveEpilogueFn
 from max.gpu.primitives.grid_controls import PDLLevel
 from std.utils.coord import Coord
 
-comptime ncclComm_t = OptionalPointer[NoneType, MutUntrackedOrigin]
+comptime ncclComm_t = Optional[Pointer[NoneType, MutUntrackedOrigin]]
 
 
 @fieldwise_init
@@ -274,7 +274,7 @@ def _ccl_broadcast(
 @inline(.always)
 def _ccl_stream_ptr(
     ctx: DeviceContext,
-) raises -> OptionalPointer[NoneType, UntrackedOrigin[mut=True]]:
+) raises -> Optional[Pointer[NoneType, UntrackedOrigin[mut=True]]]:
     comptime if ctx.target.is_amd_gpu():
         return unsafe_cast[Type=NoneType](HIP(ctx.stream()))
     else:
@@ -402,7 +402,7 @@ def allreduce[
         not use_multimem
     ), "vendor_ccl allreduce does not support multimem path"
     # Determine this device's rank from its context id.
-    var device_rank = Int(ctx.id())
+    var device_rank = Int(ctx.device().id)
     var count = input_tensors[0].num_elements()
     var dtype_ccl = _dtype_to_ccl[dtype]()
     var op = ncclRedOp_t.ncclSum
@@ -459,7 +459,7 @@ def allreduce[
     comptime assert (
         not use_multimem
     ), "vendor_ccl allreduce does not support multimem path"
-    var device_rank = Int(ctx.id())
+    var device_rank = Int(ctx.device().id)
     var count = input_tensors[0].num_elements()
     var comms = _get_global_comms(ngpus)
 
@@ -673,7 +673,7 @@ def broadcast[
         not use_multimem
     ), "vendor_ccl broadcast does not support multimem path"
     # Determine this device's rank from its context id.
-    var device_rank = Int(ctx.id())
+    var device_rank = Int(ctx.device().id)
     var count = output_tensor.num_elements()
     var dtype_ccl = _dtype_to_ccl[dtype]()
     var comms = _get_global_comms(ngpus)

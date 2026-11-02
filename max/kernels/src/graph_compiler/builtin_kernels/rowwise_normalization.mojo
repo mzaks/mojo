@@ -19,6 +19,7 @@ from std.sys import size_of
 from std.sys.info import align_of
 
 from max.gpu.host import DeviceContext
+from max.gpu.primitives.grid_controls import PDLLevel
 from layout import Coord, CoordLike, TileTensor
 from std.utils.numerics import get_accum_type
 from internal_utils.fp8_utils import compute_dynamic_fp8_scale, fp8_quantize
@@ -173,6 +174,9 @@ def rms_norm[
         num_phases=2,
         dtype_size=size_of[dtype](),
         computationally_expensive=True,
+        # Wait on the predecessor grid, then release dependents early so a
+        # following GEMM overlaps its prologue with the norm.
+        pdl_level=PDLLevel.OVERLAP_AT_BEGINNING,
     ](body, shape, context)
 
 

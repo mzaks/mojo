@@ -70,7 +70,8 @@ from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.builtin.format_int import _write_int
 from std.builtin.simd_length import SIMDLength
 from std.builtin.int import _FromInt
-from std.math import DivModable, Powable
+from std.ffi import c_double, c_long, c_size_t, c_ssize_t
+from std.math import DivModable
 from std.memory import bitcast, unsafe_memcpy, pack_bits
 from std.os import abort
 from std.python import (
@@ -466,6 +467,7 @@ struct SIMD[dtype: DType, length: SIMDLength](
     Ceilable,
     Comparable,
     ConvertibleFromPython,
+    ConvertibleToPython,
     CoordLike,
     Defaultable,
     DevicePassable,
@@ -476,7 +478,6 @@ struct SIMD[dtype: DType, length: SIMDLength](
     Indexer,
     Intable,
     IntervalElement,
-    Powable,
     Roundable,
     Sized,
     TrivialRegisterPassable,
@@ -617,6 +618,23 @@ struct SIMD[dtype: DType, length: SIMDLength](
         Self.dtype._mlir_value,
         `>`,
     ]
+
+    comptime _storage_bit_width = size_of[Self.dtype]() * 8
+    """The number of bits used to store each element."""
+
+    comptime _to_int_vector = (
+        __mlir_deferred_type[
+            `i`, +Self._storage_bit_width.__mlir_index__()
+        ] if Self.length
+        == 1 else __mlir_deferred_type[
+            `vector<`,
+            +Self.length._mlir_value,
+            `xi`,
+            +Self._storage_bit_width.__mlir_index__(),
+            `>`,
+        ]
+    )
+    """The builtin integer MLIR type that represents this SIMD's storage."""
 
     var _mlir_value: Self._mlir_type
     """The underlying storage for the vector."""
@@ -2012,6 +2030,31 @@ struct SIMD[dtype: DType, length: SIMDLength](
         """
         comptime assert Self.dtype.is_integral(), "must be an integral type"
         return value >> self
+
+    def to_python_object(var self) -> PythonObject:
+        """Converts this value to a `PythonObject`. If the scalar
+        value type is bool, it is converted to a boolean. Otherwise, it is
+        converted to the appropriate integer or floating point type.
+
+        Returns:
+            A Python object representing this SIMD vector.
+        """
+        comptime assert Self.length == 1, "only work with scalar values"
+        var scalar = self._refine[new_size=1]()
+        ref cpy = Python().cpython()
+
+        comptime if Self.dtype == DType.bool:
+            var val = c_long(Int(scalar))
+            return PythonObject(from_owned=cpy.PyBool_FromLong(val))
+        elif Self.dtype.is_unsigned():
+            var val = c_size_t(scalar.cast[DType.uint]())
+            return PythonObject(from_owned=cpy.PyLong_FromSize_t(val))
+        elif Self.dtype.is_integral():
+            var val = c_ssize_t(scalar.cast[DType.int]())
+            return PythonObject(from_owned=cpy.PyLong_FromSsize_t(val))
+        else:
+            var val = c_double(scalar.cast[DType.float64]())
+            return PythonObject(from_owned=cpy.PyFloat_FromDouble(val))
 
     # ===------------------------------------------------------------------=== #
     # Trait implementations

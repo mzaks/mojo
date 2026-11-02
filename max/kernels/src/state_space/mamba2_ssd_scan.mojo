@@ -16,7 +16,7 @@
 This is the varlen (ragged, `query_start_loc`) Mamba-2 SSD forward op, matching
 `mamba_chunk_scan_combined` semantics for the `NemotronHMamba2Mixer`
 (Nemotron-H). It serves both prefill and decode. It differs from the Mamba-1
-ops in `varlen_selective_scan.mojo` in three ways that the math requires:
+per-channel `A` `(dim, dstate)` diagonal in three ways that the math requires:
 
   - `A` is a per-head SCALAR `(nheads,)` (shared across all head_dim channels
     and all dstate), not a per-channel `(dim, dstate)` diagonal.
@@ -57,28 +57,20 @@ from max.gpu import (
     thread_idx,
 )
 from max.gpu.host import DeviceContext
+from max.gpu.primitives.grid_controls import launch_dependent_grids
 from max.gpu.primitives.warp import shuffle_xor
 from max.gpu.sync import barrier
 from max.algorithm import sync_parallelize
 from std.math import ceildiv, exp2, fma
 from std.memory import unsafe_stack_allocation
 from std.sys.info import align_of
-from std.utils.index import IndexList
 from std.utils.static_tuple import StaticTuple
 from layout import TensorLayout, TensorEngine, TileTensor
+from state_space.pdl_wait import wait_on_producers
 from state_space.selective_scan import softplus
 
 # exp(x) == exp2(x * LOG2E), and exp2 is the faster GPU instruction.
 comptime LOG2E = 1.4426950408889634
-
-
-@inline(.always)
-def _strides[rank: Int](t: TileTensor[...]) -> IndexList[rank]:
-    """Returns the strides of `t`, read from its layout."""
-    var result = IndexList[rank]()
-    comptime for i in range(rank):
-        result[i] = Int(t.dynamic_stride(i))
-    return result
 
 
 @fieldwise_init
@@ -202,6 +194,37 @@ def _scatter_sum[
 # 128-thread block (production kernels.mojo and the unit test both use
 # `block_dim=(DSTATE_SPLIT, 128 // DSTATE_SPLIT, 1)`), so `.maxntid 128` is
 # exact.
+
+
+def ssd_scan_tile_split(
+    dstate: Int, prefill: Bool, nvidia: Bool, amd: Bool
+) -> Int:
+    """Returns the `DSTATE_SPLIT` the production launch picks for the
+    cooperative split kernel.
+
+    `prefill` is the staged multi-token instantiation, which also serves
+    speculative verify; single-token decode reads no B/C row twice, so its
+    tile is tuned apart.
+    """
+    if dstate == 128 and nvidia:
+        return 16
+    if dstate == 128 and amd and not prefill:
+        return 32
+    return 8
+
+
+def ssd_scan_tile_channels(
+    dstate: Int, prefill: Bool, nvidia: Bool, amd: Bool
+) -> Int:
+    """Returns the `CH_PER_THREAD` the production launch picks for the
+    cooperative split kernel; see `ssd_scan_tile_split`."""
+    if dstate == 128 and nvidia:
+        return 4 if prefill else 2
+    if dstate == 128 and amd and not prefill:
+        return 4
+    return 1
+
+
 #
 # The kernel is latency-bound, so resident CTAs matter. The floor depends on
 # the `L * CH_PER_THREAD` state elements a thread holds. At 16 (the split-8,
@@ -341,7 +364,6 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
         CH_PER_THREAD: Number of head_dim channels each thread carries. The B/C
             vectors of a token depend only on the group and dstate slice, so
             each load feeds this many channels.
-
     Args:
         ngroups: Number of `B`/`C` groups; `nheads // ngroups` heads share
             each group.
@@ -396,6 +418,14 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
     # need every lane of the warp. Only their loads and stores are guarded.
     var n_base = tx * L
     var group_id = _group_id(y, ngroups, h)
+
+    # Everything below reads the sequence table, the state pool, the
+    # activations or `A`, `D` and `dt_bias`, which the graph derives from the
+    # model parameters (cast, negate, exp) in kernels that can run right before
+    # this one, so all of it waits. Every CTA waits before any early exit so
+    # this grid cannot finish ahead of its predecessor. The grid releases its
+    # dependents once it completes.
+    wait_on_producers()
 
     var seq_start = Int(query_start_loc[b])
     var seq_end = Int(query_start_loc[b + 1])
@@ -578,6 +608,8 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
                 ssm_pool.store[alignment=pool_align](
                     (slot, h, p0 + i * NY, n_base), state[i].cast[state_dtype]()
                 )
+
+    launch_dependent_grids()
 
 
 def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_apple[

@@ -95,6 +95,7 @@ from std.utils.coord import DynamicCoord
 from std.testing import assert_almost_equal
 from std.utils.index import Index, IndexList
 from std.utils.numerics import get_accum_type
+from std.utils.coord import Coord
 
 
 # Core-matrix row count for the WGMMA/UMMA descriptor canonical layout. Matches
@@ -203,7 +204,7 @@ def pv_mma_kernel[
     v_tile_shape: Coord,
     v_desc_shape: Coord,
     c_layout: TensorLayout,
-    block_tile_shape: IndexList[3],
+    block_tile_shape: Coord[Int, Int, Int],
     mma_shape: DynamicCoord[.int, 3],
     swizzle_mode: TensorMapSwizzle,
     use_native_mn: Bool,
@@ -439,20 +440,8 @@ def run_pv_spike[
     comptime gran = swizzle_mode.bytes() // size_of[ab_type]()
 
     print(
-        "pv_mnmajor_spike native="
-        + String(use_native_mn)
-        + " "
-        + String(swizzle_mode)
-        + " MNK="
-        + String(M)
-        + "x"
-        + String(N)
-        + "x"
-        + String(K)
-        + " gran="
-        + String(gran)
-        + " num_chunks(BK/gran)="
-        + String(BK // gran)
+        t"pv_mnmajor_spike"
+        t" native={use_native_mn} {swizzle_mode} MNK={M}x{N}x{K} gran={gran} num_chunks(BK/gran)={BK // gran}"
     )
 
     var p = HostDeviceTileTensor[ab_type](row_major[M, K](), ctx)
@@ -580,14 +569,8 @@ def run_pv_spike[
             except e:
                 if mismatches < 8:
                     print(
-                        "  MISMATCH ["
-                        + String(m)
-                        + ","
-                        + String(n)
-                        + "] got="
-                        + String(o_host[m, n])
-                        + " ref="
-                        + String(o_host_ref[m, n])
+                        t"  MISMATCH [{m},{n}]"
+                        t" got={o_host[m, n]} ref={o_host_ref[m, n]}"
                     )
                 mismatches += 1
     if mismatches == 0:
@@ -621,7 +604,7 @@ def _print_layouts[mn: Int, k: Int]():
     comptime cur_lbo = type_of(cur).static_stride[1] * 2
     comptime nat_sbo = type_of(nat).static_stride[3] * 2
     comptime nat_lbo = type_of(nat).static_stride[1] * 2
-    print("---- mn-major layout diagnostics (mn=", mn, " k=", k, ") ----")
+    print(t"---- mn-major layout diagnostics (mn= {mn}  k= {k} ) ----")
     print("current SBO,LBO=", cur_sbo, cur_lbo)
     print("native  SBO,LBO=", nat_sbo, nat_lbo)
     print("per-MMA_K(16) elem offsets (mn=0): k, cur, nat")

@@ -16,34 +16,36 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from typing import ClassVar
 
+from max import functional as F
 from max import tree
 from max.driver import CPU
 from max.dtype import DType
-from max.experimental import functional as F
-from max.experimental.nn import Module, as_subgraph
-from max.experimental.nn.common_layers.embedding import VocabParallelEmbedding
-from max.experimental.nn.common_layers.kv_cache import PagedCacheValues
-from max.experimental.nn.common_layers.linear import ColumnParallelLinear
-from max.experimental.nn.common_layers.mesh_axis import DP
-from max.experimental.nn.common_layers.quant_moe import QuantizedMoE
-from max.experimental.nn.common_layers.rotary_embedding import RotaryEmbedding
-from max.experimental.nn.sequential import ModuleList
-from max.experimental.sharding import (
+from max.graph import TensorValue
+from max.nn import Module, as_subgraph
+from max.nn.common_layers.embedding import VocabParallelEmbedding
+from max.nn.common_layers.kv_cache import PagedCacheValues
+from max.nn.common_layers.linear import ColumnParallelLinear
+from max.nn.common_layers.mesh_axis import DP
+from max.nn.common_layers.quant_moe import QuantizedMoE
+from max.nn.common_layers.rotary_embedding import RotaryEmbedding
+from max.nn.legacy.comm.ep import EPBatchManager, EPCommBuffers
+from max.nn.legacy.kv_cache import KVCacheInputsPerDevice, KVCacheParamInterface
+from max.nn.legacy.rotary_embedding import DeepseekYarnRopeScalingParams
+from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
+from max.nn.sequential import ModuleList
+from max.pipelines.lib import ModuleV3Outputs
+from max.pipelines.lib.role_contracts import DecoderInputs, DecoderOutputs
+from max.pipelines.speculative.driver import gather_variable_rows
+from max.tensor import Tensor, default_dtype
+from max.tensor.sharding import (
     DeviceMapping,
     DeviceMesh,
     Replicated,
     Sharded,
     Unknown,
 )
-from max.experimental.tensor import Tensor
-from max.graph import TensorValue
-from max.nn.comm.ep import EPBatchManager, EPCommBuffers
-from max.nn.kv_cache import KVCacheInputsPerDevice, KVCacheParamInterface
-from max.nn.rotary_embedding import DeepseekYarnRopeScalingParams
-from max.nn.transformer import ReturnHiddenStates, ReturnLogits
-from max.pipelines.lib import ModuleV3Outputs
-from max.pipelines.speculative.driver import gather_variable_rows
 
 from ..deepseekV2_modulev3.layers.rotary_embedding import (
     DeepseekYarnRotaryEmbedding,
@@ -77,6 +79,44 @@ def mask_padded_tail(
     return logits + F.cast(F.concat([keep, drop]), logits.dtype)
 
 
+def rotary_embedding(config: DeepseekV3_2Config) -> RotaryEmbedding:
+    """Returns the rotary embedding the config's layers attend with."""
+    if config.rope_scaling is not None:
+        scaling_params = DeepseekYarnRopeScalingParams(
+            scaling_factor=config.rope_scaling["factor"],
+            original_max_position_embeddings=config.rope_scaling[
+                "original_max_position_embeddings"
+            ],
+            beta_fast=config.rope_scaling["beta_fast"],
+            beta_slow=config.rope_scaling["beta_slow"],
+            mscale=config.rope_scaling["mscale"],
+            mscale_all_dim=config.rope_scaling["mscale_all_dim"],
+        )
+        return DeepseekYarnRotaryEmbedding(
+            dim=config.qk_rope_head_dim,
+            n_heads=config.num_attention_heads,
+            theta=config.rope_theta,
+            max_seq_len=config.max_position_embeddings,
+            device=config.devices[0].to_device(),
+            interleaved=config.rope_interleave,
+            scaling_params=scaling_params,
+        )
+    # GLM-5.x declares rope_type "default"; only DeepSeek proper uses
+    # YaRN. Sized by ``max_seq_len`` rather than the model's
+    # ``max_position_embeddings`` (1M for GLM): plain RoPE frequencies
+    # depend only on position, so the shorter table is equivalent and
+    # avoids materializing hundreds of MB of unused rows.
+    return RotaryEmbedding(
+        dim=config.qk_rope_head_dim,
+        n_heads=config.num_attention_heads,
+        theta=config.rope_theta,
+        max_seq_len=config.max_seq_len,
+        device=config.devices[0].to_device(),
+        head_dim=config.qk_rope_head_dim,
+        interleaved=config.rope_interleave,
+    )
+
+
 class DeepseekV3_2TextModel(
     Module[
         [
@@ -106,42 +146,7 @@ class DeepseekV3_2TextModel(
     ) -> None:
         self.ep_batch_manager = ep_batch_manager
 
-        self.rope: RotaryEmbedding
-        if config.rope_scaling is not None:
-            scaling_params = DeepseekYarnRopeScalingParams(
-                scaling_factor=config.rope_scaling["factor"],
-                original_max_position_embeddings=config.rope_scaling[
-                    "original_max_position_embeddings"
-                ],
-                beta_fast=config.rope_scaling["beta_fast"],
-                beta_slow=config.rope_scaling["beta_slow"],
-                mscale=config.rope_scaling["mscale"],
-                mscale_all_dim=config.rope_scaling["mscale_all_dim"],
-            )
-            self.rope = DeepseekYarnRotaryEmbedding(
-                dim=config.qk_rope_head_dim,
-                n_heads=config.num_attention_heads,
-                theta=config.rope_theta,
-                max_seq_len=config.max_position_embeddings,
-                device=config.devices[0].to_device(),
-                interleaved=config.rope_interleave,
-                scaling_params=scaling_params,
-            )
-        else:
-            # GLM-5.x declares rope_type "default"; only DeepSeek proper uses
-            # YaRN. Sized by ``max_seq_len`` rather than the model's
-            # ``max_position_embeddings`` (1M for GLM): plain RoPE frequencies
-            # depend only on position, so the shorter table is equivalent and
-            # avoids materializing hundreds of MB of unused rows.
-            self.rope = RotaryEmbedding(
-                dim=config.qk_rope_head_dim,
-                n_heads=config.num_attention_heads,
-                theta=config.rope_theta,
-                max_seq_len=config.max_seq_len,
-                device=config.devices[0].to_device(),
-                head_dim=config.qk_rope_head_dim,
-                interleaved=config.rope_interleave,
-            )
+        self.rope = rotary_embedding(config)
 
         # Override the tensor parallel axis if data parallelism is enabled.
         tp_axis = DP if config.data_parallel_degree > 1 else None
@@ -202,6 +207,7 @@ class DeepseekV3_2TextModel(
         input_row_offsets_i64: Tensor | None = None,
         comm_buffers: EPCommBuffers | None = None,
     ) -> tuple[Tensor, ...]:
+        """Runs the embedding and decoder stack over the tokens."""
         if self.mesh is not None:
             if self.mesh.num_devices > 1:
                 tokens = F.distributed_broadcast(tokens, self.mesh)
@@ -430,6 +436,7 @@ class DeepseekV3_2(Module[..., ModuleV3Outputs]):
         input_row_offsets: Tensor,
         *variadic_args: Tensor,
     ) -> ModuleV3Outputs:
+        """Runs the model over its graph inputs."""
         mesh = self.config.mesh
         assert mesh is not None
 
@@ -492,6 +499,104 @@ class DeepseekV3_2(Module[..., ModuleV3Outputs]):
             return_n_logits,
             input_row_offsets,
             batch_context_lengths_tensor,
+            data_parallel_splits,
+            input_row_offsets_i64,
+            comm_buffers,
+        )
+        return self.language_model.module_outputs(outputs)
+
+
+class DeepseekV3_2Decoder(Module[[DecoderInputs], DecoderOutputs]):
+    """DeepSeek-V3.2's sparse-MLA decoder, registered for the ``DECODER`` role.
+
+    It runs tensor-parallel attention over a ``tp`` mesh, or one attention
+    replica per device over a ``dp`` mesh, with its experts tensor-parallel
+    or, under expert parallelism, spread across the devices.
+    """
+
+    graph_name: ClassVar[str] = "DeepseekV3_2"
+    supports_data_parallel: ClassVar[bool] = True
+
+    def __init__(self, config: DeepseekV3_2Config) -> None:
+        super().__init__()
+        if config.mesh is None:
+            raise ValueError(
+                "DeepSeek-V3.2 needs a mesh: apply the runtime first"
+            )
+        self.ep_batch_manager = (
+            None
+            if config.ep_config is None
+            else EPBatchManager(config.ep_config)
+        )
+        # Quantized checkpoints keep norms, biases and embeddings in bf16.
+        dtype = (
+            DType.bfloat16 if config.quant_config is not None else config.dtype
+        )
+        with default_dtype(dtype):
+            self.language_model = DeepseekV3_2TextModel(
+                config, self.ep_batch_manager
+            )
+        self.config = config
+        self.kv_params = config.kv_params
+
+    def forward(self, inputs: DecoderInputs) -> DecoderOutputs:
+        """Runs the decoder over the batch."""
+        mesh = self.config.mesh
+        assert mesh is not None
+        assert inputs.batch_context_lengths is not None
+
+        data_parallel_splits: Tensor | None = None
+        input_row_offsets_i64: Tensor | None = None
+        dp_degree = self.config.data_parallel_degree
+        if dp_degree > 1:
+            assert dp_degree == mesh.num_devices
+            assert inputs.host_input_row_offsets is not None
+            cpu_mesh = DeviceMesh(
+                tuple(CPU() for _ in range(dp_degree)), (dp_degree,), ("dp",)
+            )
+            batch_context_length = Tensor.from_shard_values(
+                [TensorValue(shard) for shard in inputs.batch_context_lengths],
+                DeviceMapping(cpu_mesh, (Replicated(),) * mesh.ndim),
+            )
+            data_parallel_splits = inputs.data_parallel_splits
+            input_row_offsets_i64 = F.cast(
+                inputs.host_input_row_offsets, DType.int64
+            )
+        else:
+            batch_context_length = inputs.batch_context_lengths[0]
+
+        kv_inputs = iter(x._graph_value for x in tree.leaves(inputs.kv))
+        # A ``MultiKVCacheParams`` tree unflattens to a dict keyed by child
+        # name, so the two caches are addressed by name rather than position.
+        kv_tree = self.kv_params.unflatten_kv_inputs(kv_inputs)
+        assert isinstance(kv_tree, dict)
+        # Replicas serve different requests, so their caches vary;
+        # tensor-parallel devices all store the same latent cache.
+        kv_mapping = DeviceMapping(
+            mesh,
+            tuple(
+                Unknown() if name == DP else Replicated()
+                for name in mesh.axis_names
+            ),
+        )
+
+        def collection(name: str) -> PagedCacheValues:
+            leaves = tree.leaves(kv_tree[name], leaf=KVCacheInputsPerDevice)
+            return PagedCacheValues.from_upstream(leaves, kv_mapping)
+
+        comm_buffers: EPCommBuffers | None = None
+        if self.ep_batch_manager is not None:
+            assert inputs.ep is not None
+            comm_buffers = self.ep_batch_manager.comm_buffers(
+                [x._graph_value for x in tree.leaves(inputs.ep)]
+            )
+        outputs = self.language_model(
+            inputs.tokens,
+            collection("mla"),
+            collection("indexer"),
+            inputs.return_n_logits,
+            inputs.input_row_offsets,
+            batch_context_length,
             data_parallel_splits,
             input_row_offsets_i64,
             comm_buffers,

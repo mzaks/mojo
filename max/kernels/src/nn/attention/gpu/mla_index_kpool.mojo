@@ -37,6 +37,7 @@ from layout import TensorEngine, TensorLayout, TileTensor, row_major
 
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.primitives import block
+from max.gpu.primitives.grid_controls import wait_on_dependent_grids
 
 # Threads per `kpool_expand_topk_kernel` block. The kernel compacts the selected
 # pools with block-wide scans, so every launch must use exactly this width.
@@ -151,7 +152,6 @@ def kpool_compress_kernel[
         OutEngine: Engine of `pooled`.
         head_dim: Channels per key; also the block width.
         kpool: Tokens per pool.
-
     Args:
         pooled: Output `[total_pools, head_dim]`, where `total_pools` is the
             last entry of `pool_row_offsets`.
@@ -166,6 +166,12 @@ def kpool_compress_kernel[
             pool covers absolute positions, so this is what places the call's
             tokens on the pool grid.
     """
+    # Every k-pool kernel reads buffers an earlier grid wrote: the
+    # layer-normed keys, the gate scores, the tail ring, the selected pool
+    # ids. The wait comes before any global read and before any early return,
+    # so a block that exits early still orders this grid after its
+    # predecessor. The grid releases its own dependent when its blocks exit.
+    wait_on_dependent_grids()
     var pool_row = block_idx.x
     # The last offset is the exact pool count, so an over-sized grid is
     # harmless.
@@ -464,7 +470,6 @@ def kpool_seed_tail_kernel[
         SlotEngine: Engine of `slot_idx`.
         head_dim: Channels per key; also the block width.
         kpool: Tokens per pool.
-
     Args:
         tail: Per-slot ring, `[max_slots, 2, kpool, head_dim]`. Index 0 holds
             keys, index 1 holds gate scores.
@@ -475,6 +480,12 @@ def kpool_seed_tail_kernel[
         slot_idx: Ring slot owned by each batch row, `[num_requests]`, `uint32`.
         num_requests: Requests actually present.
     """
+    # Every k-pool kernel reads buffers an earlier grid wrote: the
+    # layer-normed keys, the gate scores, the tail ring, the selected pool
+    # ids. The wait comes before any global read and before any early return,
+    # so a block that exits early still orders this grid after its
+    # predecessor. The grid releases its own dependent when its blocks exit.
+    wait_on_dependent_grids()
     var r = block_idx.x
     if r >= Int(num_requests):
         return
@@ -618,7 +629,6 @@ def kpool_ring_close_kernel[
         SlotEngine: Engine of `slot_idx`.
         head_dim: Channels per key; also the block width.
         kpool: Tokens per pool.
-
     Args:
         pooled: Output `[batch, head_dim]`, meaningful only where
             `closed_pool` is non-negative.
@@ -637,6 +647,12 @@ def kpool_ring_close_kernel[
         slot_idx: Ring slot owned by each batch row, `[batch]`, `uint32`.
         num_requests: Requests actually present.
     """
+    # Every k-pool kernel reads buffers an earlier grid wrote: the
+    # layer-normed keys, the gate scores, the tail ring, the selected pool
+    # ids. The wait comes before any global read and before any early return,
+    # so a block that exits early still orders this grid after its
+    # predecessor. The grid releases its own dependent when its blocks exit.
+    wait_on_dependent_grids()
     var r = block_idx.x
     if r >= Int(num_requests):
         return
@@ -777,7 +793,6 @@ def kpool_expand_topk_kernel[
         kpool: Tokens per pool.
         pool_topk: Selected pools per token, `index_topk // kpool`.
         always_select_tail: Whether to append the incomplete trailing pool.
-
     Args:
         out_indices: Output `[total_seq_len, pool_topk * kpool + tail]`, where
             `tail` is `kpool - 1` when `always_select_tail` and 0 otherwise.
@@ -795,6 +810,12 @@ def kpool_expand_topk_kernel[
         block_dim.x == KPOOL_EXPAND_BLOCK_SIZE,
         "kpool_expand_topk_kernel needs KPOOL_EXPAND_BLOCK_SIZE threads",
     )
+    # Every k-pool kernel reads buffers an earlier grid wrote: the
+    # layer-normed keys, the gate scores, the tail ring, the selected pool
+    # ids. The wait comes before any global read and before any early return,
+    # so a block that exits early still orders this grid after its
+    # predecessor. The grid releases its own dependent when its blocks exit.
+    wait_on_dependent_grids()
     # Uniform across the block, so returning before the block scans is safe.
     var token_idx = block_idx.x
     if token_idx >= Int(total_seq_len):

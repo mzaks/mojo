@@ -107,6 +107,10 @@ from max.gpu import (
     warp_id,
 )
 from max.gpu.primitives import warp
+from max.gpu.primitives.grid_controls import (
+    launch_dependent_grids,
+    wait_on_dependent_grids,
+)
 from max.gpu.sync import barrier
 from std.math import ceildiv, fma, rsqrt
 from std.memory import unsafe_stack_allocation
@@ -116,6 +120,23 @@ from layout import Idx, TensorEngine, TensorLayout, TileTensor, row_major
 comptime _SharedF32 = Pointer[
     Float32, MutUntrackedOrigin, address_space=.SHARED
 ]
+
+
+@always_inline
+def pdl_enter():
+    """Waits for the grid before this one, before the kernel reads any operand.
+
+    Every operand of these kernels (the conv output, the decay and beta, the
+    offsets, the slot indices) can be the preceding grid's output, so nothing
+    is read ahead of the wait. The launch carries `pdl_launch_attributes`.
+    """
+    wait_on_dependent_grids()
+
+
+@always_inline
+def pdl_exit():
+    """Releases the dependent grid once this thread has issued its stores."""
+    launch_dependent_grids()
 
 
 @always_inline
@@ -325,6 +346,8 @@ def gated_delta_recurrence_fwd_gpu[
         KEY_HEAD_DIM == VALUE_HEAD_DIM
     ), "gated_delta_recurrence_fwd_gpu requires KEY_HEAD_DIM == VALUE_HEAD_DIM"
 
+    pdl_enter()
+
     var tid = thread_idx.x
     var block = block_idx.x
 
@@ -409,6 +432,8 @@ def gated_delta_recurrence_fwd_gpu[
             (final_slot, value_head_idx, kd, tid),
             Scalar[state_dtype](state_col[kd]),
         )
+
+    pdl_exit()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -564,8 +589,6 @@ def gated_delta_recurrence_verify_ring_gpu[
             out, which keeps the state column from being live to the
             exit and costs the recording path about 30% of its time
             in spills.
-
-
     Args:
         batch_size: Number of sequences in the ragged batch.
         num_value_heads: Number of value heads (`nv`).
@@ -591,6 +614,8 @@ def gated_delta_recurrence_verify_ring_gpu[
         "gated_delta_recurrence_verify_ring_gpu requires KEY_HEAD_DIM =="
         " VALUE_HEAD_DIM"
     )
+
+    pdl_enter()
 
     var tid = thread_idx.x
     var block = block_idx.x
@@ -727,6 +752,8 @@ def gated_delta_recurrence_verify_ring_gpu[
                     Scalar[state_dtype](state_col[kd]),
                 )
 
+    pdl_exit()
+
 
 def gated_delta_state_fold_gpu[
     state_dtype: DType,
@@ -786,7 +813,6 @@ def gated_delta_state_fold_gpu[
         Engine: Engine shared by all tile operands.
         KEY_DIM_TILE: Key-dim elements a thread holds in registers at once.
             Must divide `KEY_HEAD_DIM`.
-
     Args:
         batch_size: Number of sequences the verify covered.
         num_layers: Number of layers, each with its own pool row.
@@ -809,6 +835,8 @@ def gated_delta_state_fold_gpu[
     comptime assert (
         KEY_HEAD_DIM % KEY_DIM_TILE == 0
     ), "gated_delta_state_fold_gpu requires KEY_DIM_TILE to divide KEY_HEAD_DIM"
+
+    pdl_enter()
 
     var tid = thread_idx.x
     var block = block_idx.x
@@ -910,3 +938,5 @@ def gated_delta_state_fold_gpu[
                 (pool_head, Idx[tile_base + i], tid),
                 Scalar[state_dtype](state_tile[i]),
             )
+
+    pdl_exit()

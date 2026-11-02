@@ -27,6 +27,7 @@ from std.ffi import external_call, _get_global_or_null
 
 from shmem import shmem_module_init, shmem_my_pe
 from shmem.ep_comm import (
+    EP_PDL_MAX_RANKS,
     EPLocalSyncCounters,
     TokenFormat,
     dispatch_async_kernel,
@@ -151,6 +152,24 @@ def pack_ptrs_array[
     var ptr_arr = Array[_, n_gpus_per_node](fill_with=ptr_arr_init)
 
     return ptr_arr^
+
+
+@inline(.always)
+def ep_token_recv[n_nodes: Int]() -> Bool:
+    """Returns whether the dispatch receives each token once per rank.
+
+    Within one node every rank stores straight into its peers' receive
+    buffers, so a token is copied to a rank once and listed under each of its
+    experts there. Across nodes SHMEM puts publish each expert through its own
+    channel, so each routed pair keeps its own message slot.
+
+    Parameters:
+        n_nodes: Number of physical nodes.
+
+    Returns:
+        The `token_recv` parameter of the dispatch kernels.
+    """
+    return n_nodes == 1
 
 
 # ===-----------------------------------------------------------------------===#
@@ -327,7 +346,7 @@ def ep_dispatch_async_kernel_api[
     comptime n_ranks = n_gpus_per_node * n_nodes
     comptime hw_info = gpu_ctx.default_device_info
 
-    var gpu_id = Int(gpu_ctx.id())
+    var gpu_id = Int(gpu_ctx.device().id)
     var my_rank = Int32(gpu_id)
 
     comptime if n_nodes > 1:
@@ -347,6 +366,7 @@ def ep_dispatch_async_kernel_api[
         InputScalesFnType=InputScalesFnType,
         has_input_scales=has_input_scales,
         use_shmem=use_shmem,
+        token_recv=ep_token_recv[n_nodes](),
     ]
 
     @inline(.always)
@@ -408,6 +428,9 @@ def ep_dispatch_async_kernel_api[
             host_args=(input_scales_fn,),
             grid_dim=hw_info.sm_count,
             block_dim=hw_info.max_thread_block_size,
+            attributes=pdl_launch_attributes(
+                PDLLevel.ON if n_ranks <= EP_PDL_MAX_RANKS else PDLLevel.OFF
+            ),
         )
 
 
@@ -488,7 +511,7 @@ def ep_dispatch_wait_kernel_api[
     ), "Receive count pointers must be a 1D tensor."
 
     var gpu_ctx = context
-    var gpu_id = Int(gpu_ctx.id())
+    var gpu_id = Int(gpu_ctx.device().id)
     var my_rank = Int32(gpu_id)
 
     comptime if n_nodes > 1:
@@ -507,6 +530,7 @@ def ep_dispatch_wait_kernel_api[
         n_ranks,
         max_token_per_rank,
         token_fmt_type,
+        token_recv=ep_token_recv[n_nodes](),
     ]
 
     @inline(.always)
@@ -820,7 +844,7 @@ def ep_fused_dispatch_kernel_api[
     )
 
     var gpu_ctx = context
-    var gpu_id = Int(gpu_ctx.id())
+    var gpu_id = Int(gpu_ctx.device().id)
     var my_rank = Int32(gpu_id)
 
     comptime if n_nodes > 1:
@@ -850,6 +874,7 @@ def ep_fused_dispatch_kernel_api[
         use_shmem=use_shmem,
         allreduce_world_size=allreduce_world_size,
         warp_min_tokens=dispatch_warp_min_tokens,
+        token_recv=ep_token_recv[n_nodes](),
         InputTokensEngine=input_tokens.Engine,
         TopkIdsEngine=topk_ids.Engine,
         RowOffsetsEngine=row_offsets.Engine,
@@ -1028,7 +1053,7 @@ def ep_combine_async_kernel_api[
     ), "Send pointers must be a 1D tensor."
 
     var gpu_ctx = context
-    var gpu_id = Int(gpu_ctx.id())
+    var gpu_id = Int(gpu_ctx.device().id)
     var my_rank = Int32(gpu_id)
 
     comptime if n_nodes > 1:
@@ -1115,6 +1140,9 @@ def ep_combine_async_kernel_api[
             my_rank,
             grid_dim=hw_info.sm_count,
             block_dim=hw_info.max_thread_block_size,
+            attributes=pdl_launch_attributes(
+                PDLLevel.ON if n_ranks <= EP_PDL_MAX_RANKS else PDLLevel.OFF
+            ),
         )
 
 
@@ -1281,7 +1309,7 @@ def ep_combine_wait_kernel_api[
     ), "Receive count pointers must be a 1D tensor."
 
     var gpu_ctx = context
-    var gpu_id = Int(gpu_ctx.id())
+    var gpu_id = Int(gpu_ctx.device().id)
     var my_rank = Int32(gpu_id)
 
     comptime if n_nodes > 1:
@@ -1363,6 +1391,9 @@ def ep_combine_wait_kernel_api[
             host_args=(store_fn, router_weights_fn),
             grid_dim=grid_dim_x,
             block_dim=hw_info.max_thread_block_size,
+            attributes=pdl_launch_attributes(
+                PDLLevel.ON if n_ranks <= EP_PDL_MAX_RANKS else PDLLevel.OFF
+            ),
         )
 
 
@@ -1605,7 +1636,7 @@ def ep_fused_combine_kernel_api[
     ), "Send pointers must be a 1D tensor."
 
     var gpu_ctx = context
-    var gpu_id = Int(gpu_ctx.id())
+    var gpu_id = Int(gpu_ctx.device().id)
     var my_rank = Int32(gpu_id)
 
     comptime if n_nodes > 1:

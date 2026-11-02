@@ -12,14 +12,13 @@
 # ===----------------------------------------------------------------------=== #
 """HAL Execution Config traits and structs for NVIDIA Products."""
 
-from .. import (
+from max.gpu.host import (
     ExecutionConfig,
     BlockExecutionConfig,
-    ConstantMemoryMappingExecutionConfig,
-    ExecutionConfig,
     GridBlockExecutionConfig,
     NearComputeGeneralPurposeScratchpadExecutionConfig,
 )
+from .. import ConstantMemoryMappingExecutionConfig
 from std.collections.type_dict import TypeDict
 from max.gpu.host import ConstantMemoryMapping, Dim, LaunchAttribute
 
@@ -60,6 +59,8 @@ comptime _ExecutionConfigDictForTarget = TypeDict[
         "nvidia:sm_120a",
         "nvidia:sm_121a",
         "nvidia:sm_110a",
+        "nvidia:sm_103a",
+        "nvidia:sm_121",
     ],
     MaxwellConsumerExecutionConfiguration,
     TeslaP100ExecutionConfiguration,
@@ -77,6 +78,8 @@ comptime _ExecutionConfigDictForTarget = TypeDict[
     BlackwellConsumerExecutionConfiguration,
     DgxSparkExecutionConfiguration,
     JetsonThorExecutionConfiguration,
+    BlackwellDatacenterExecutionConfiguration,
+    DgxSparkExecutionConfiguration,
 ]
 
 comptime ExecutionConfigForTarget[

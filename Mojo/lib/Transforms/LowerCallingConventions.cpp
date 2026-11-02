@@ -109,12 +109,12 @@ static void lowerCreateRegStubOp(IRRewriter &b, CreateRegStubOp op,
                                  SymbolTable &symtab) {
   FuncTypeGeneratorType resSigGen = op.getResult().getType();
   auto calleeSigGen = cast<FuncTypeGeneratorType>(op.getCallee().getType());
-  SymbolConstantAttr callee = cast<SymbolConstantAttr>(op.getCallee());
+  FuncSymbolGenerator callee = FuncSymbolGenerator::dynCast(op.getCallee());
 
   if (calleeSigGen == resSigGen) {
     // Signatures are equal, no need to transform the arguments.
     // Directly lower to CreateFuncPtrOp.
-    b.replaceOpWithNewOp<CreateFuncPtrOp>(op, callee);
+    b.replaceOpWithNewOp<CreateFuncPtrOp>(op, op.getCallee());
     return;
   }
 
@@ -177,7 +177,7 @@ static void lowerCreateRegStubOp(IRRewriter &b, CreateRegStubOp op,
 
   b.setInsertionPoint(op);
   b.replaceOpWithNewOp<CreateFuncPtrOp>(
-      op, SymbolConstantAttr::get(wrapper.getSymNameAttr(), resSigGen));
+      op, FuncSymbolGenerator::get(wrapper.getSymNameAttr(), resSigGen));
 }
 
 /// We need to roll our own walk function because we are converting types and

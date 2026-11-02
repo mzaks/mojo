@@ -71,7 +71,7 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
-class JSONType(click.ParamType):
+class JSONType(click.ParamType[Any]):
     """Click parameter type for JSON input."""
 
     name = "json"
@@ -259,7 +259,6 @@ def get_fields_from_pydantic_model(
 
     Returns a list of Field objects compatible with dataclass Field API.
     """
-
     # Try to import PydanticUndefined to detect unset defaults
     try:
         from pydantic import PydanticUndefined

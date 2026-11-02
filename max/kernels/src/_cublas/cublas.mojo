@@ -10,18 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# ===----------------------------------------------------------------------=== #
-# Copyright (c) 2026, Modular Inc. All rights reserved.
-#
-# Licensed under the Apache License v2.0 with LLVM Exceptions:
-# https://llvm.org/LICENSE.txt
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ===----------------------------------------------------------------------=== #
 
 from std.os import abort
 from std.pathlib import Path
@@ -35,7 +23,9 @@ from .dtype import DataType
 from .result import Result
 
 comptime cublasContext = NoneType
-comptime cublasHandle_t = OptionalPointer[cublasContext, _]
+comptime cublasHandle_t[mut: Bool, //, origin: Origin[mut=mut]] = Optional[
+    Pointer[cublasContext, origin]
+]
 
 # ===-----------------------------------------------------------------------===#
 # Library Load
@@ -428,7 +418,7 @@ def cublasGemmEx(
     _btype: DataType,
     ldb: Int32,
     beta: OpaquePointer[ImmutAnyOrigin],
-    _c: OptionalPointer[NoneType, MutAnyOrigin],
+    _c: Optional[Pointer[NoneType, MutAnyOrigin]],
     _ctype: DataType,
     ldc: Int32,
     compute_type: ComputeType,
@@ -484,7 +474,7 @@ def cublasLoggerConfigure(
     log_is_on: Int16,
     log_to_std_out: Int16,
     log_to_std_err: Int16,
-    log_file_name: OptionalPointer[Int8, _],
+    log_file_name: Optional[Pointer[Int8, _]],
 ) raises -> Result:
     return _get_dylib_function[
         "cublasLoggerConfigure",

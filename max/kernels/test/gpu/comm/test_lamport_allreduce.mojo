@@ -243,7 +243,7 @@ def lamport_allreduce_test[
 
             _allreduce_lamport_p2p[
                 ngpus=ngpus,
-                pdl_level=PDLLevel(),
+                pdl_level=PDLLevel.OFF,
             ](
                 in_tensors,
                 out_tensors[i].layout,
@@ -281,16 +281,8 @@ def lamport_allreduce_test[
                     assert_equal(lam_bits, exp_bits)
                 except e:
                     print(
-                        "Mismatch at iter",
-                        it,
-                        "GPU",
-                        i,
-                        "index",
-                        j,
-                        "lamport=",
-                        host_buffers[i][j],
-                        "expected=",
-                        expected,
+                        t"Mismatch at iter {it} GPU {i} index {j} lamport="
+                        t" {host_buffers[i][j]} expected= {expected}"
                     )
                     raise e^
 
@@ -438,7 +430,7 @@ def lamport_mixed_size_test[
 
                 _allreduce_lamport_p2p[
                     ngpus=ngpus,
-                    pdl_level=PDLLevel(),
+                    pdl_level=PDLLevel.OFF,
                 ](
                     in_tensors,
                     out_tensors[i].layout,
@@ -454,7 +446,7 @@ def lamport_mixed_size_test[
             # Expected per-call sum, accumulated in fp32 (the kernel's accum
             # type) and cast to dtype, exactly as the kernel does.
             var expected_accum = Float32(0)
-            comptime for i in range(ngpus):
+            for i in range(ngpus):
                 expected_accum += Float32(i + 1) + Float32(call_idx % 5)
             var expected = Scalar[dtype](expected_accum)
 
@@ -469,18 +461,9 @@ def lamport_mixed_size_test[
                         assert_equal(host[i][j], expected)
                     except e:
                         print(
-                            "Mixed-size mismatch at flag",
-                            call_idx,
-                            "length",
-                            length,
-                            "GPU",
-                            i,
-                            "index",
-                            j,
-                            "got",
-                            host[i][j],
-                            "expected",
-                            expected,
+                            t"Mixed-size mismatch at flag {call_idx} length"
+                            t" {length} GPU {i} index {j} got"
+                            t" {host[i][j]} expected {expected}"
                         )
                         raise e^
             call_idx += 1
@@ -574,17 +557,8 @@ def _lamport_random_call[
                 assert_equal(host[i][j], expected[j])
             except e:
                 print(
-                    "Mixed-dtype mismatch at flag",
-                    call_idx,
-                    dtype,
-                    "GPU",
-                    i,
-                    "index",
-                    j,
-                    "got",
-                    host[i][j],
-                    "expected",
-                    expected[j],
+                    t"Mixed-dtype mismatch at flag {call_idx} {dtype} GPU"
+                    t" {i} index {j} got {host[i][j]} expected {expected[j]}"
                 )
                 raise e^
 
@@ -703,7 +677,7 @@ def _lamport_rmsnorm_random_call[
             expected[j] = expected[j] * norm * gamma[c].cast[DType.float64]()
 
     comptime for i in range(ngpus):
-        lamport_allreduce_rmsnorm[dtype, ngpus, pdl=False](
+        lamport_allreduce_rmsnorm[dtype, ngpus](
             i,
             rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                 in_dev[i].unsafe_ptr()
@@ -735,17 +709,9 @@ def _lamport_rmsnorm_random_call[
             # Written so a NaN output fails the check.
             if not (abs(got - expected[j]) <= tol * (1.0 + abs(expected[j]))):
                 print(
-                    "Mixed-dtype RMSNorm mismatch at flag",
-                    call_idx,
-                    dtype,
-                    "GPU",
-                    i,
-                    "index",
-                    j,
-                    "got",
-                    got,
-                    "expected",
-                    expected[j],
+                    t"Mixed-dtype RMSNorm mismatch at flag"
+                    t" {call_idx} {dtype} GPU {i} index {j} got {got} expected"
+                    t" {expected[j]}"
                 )
                 raise Error("fused Lamport RMSNorm output mismatch")
 
@@ -953,7 +919,7 @@ def lamport_coexist_test[
 
             _allreduce_lamport_p2p[
                 ngpus=ngpus,
-                pdl_level=PDLLevel(),
+                pdl_level=PDLLevel.OFF,
             ](
                 sin_tensors,
                 sout_tensors[i].layout,
@@ -967,7 +933,7 @@ def lamport_coexist_test[
             list_of_ctx[i].synchronize()
 
         var expected_accum = Float32(0)
-        comptime for i in range(ngpus):
+        for i in range(ngpus):
             expected_accum += Float32(i + 1) + Float32(call_idx % 5)
         var expected = Scalar[dtype](expected_accum)
 
@@ -982,17 +948,9 @@ def lamport_coexist_test[
                     assert_equal(shost[i][j], expected)
                 except e:
                     print(
-                        "Coexist mismatch at flag",
-                        call_idx,
-                        "GPU",
-                        i,
-                        "index",
-                        j,
-                        "got",
-                        shost[i][j],
-                        "expected",
-                        expected,
-                        "(2-stage interleaving corrupted the Lamport region)",
+                        t"Coexist mismatch at flag {call_idx} GPU {i} index"
+                        t" {j} got {shost[i][j]} expected {expected} (2-stage"
+                        t" interleaving corrupted the Lamport region)"
                     )
                     raise e^
         call_idx += 1
@@ -1123,7 +1081,7 @@ def lamport_unsynced_skew_test[
 
             _allreduce_lamport_p2p[
                 ngpus=ngpus,
-                pdl_level=PDLLevel(),
+                pdl_level=PDLLevel.OFF,
             ](
                 in_tensors,
                 out_capture[i].layout,
@@ -1143,7 +1101,7 @@ def lamport_unsynced_skew_test[
 
     for it in range(NUM_UNSYNCED_ITERS):
         var expected_accum = Float32(0)
-        comptime for i in range(ngpus):
+        for i in range(ngpus):
             expected_accum += Float32(i + 1) + Float32(it % 5)
         var expected = Scalar[dtype](expected_accum)
 
@@ -1154,17 +1112,9 @@ def lamport_unsynced_skew_test[
                     assert_equal(got, expected)
                 except e:
                     print(
-                        "Unsynced-skew mismatch at iter",
-                        it,
-                        "GPU",
-                        i,
-                        "index",
-                        j,
-                        "got",
-                        got,
-                        "expected",
-                        expected,
-                        "(generation rotation skew exceeded its slack)",
+                        t"Unsynced-skew mismatch at iter {it} GPU {i} index"
+                        t" {j} got {got} expected {expected} (generation"
+                        t" rotation skew exceeded its slack)"
                     )
                     raise e^
 
@@ -1291,7 +1241,7 @@ def lamport_wrap_test[
 
             _allreduce_lamport_p2p[
                 ngpus=ngpus,
-                pdl_level=PDLLevel(),
+                pdl_level=PDLLevel.OFF,
             ](
                 in_tensors,
                 out_tensors[i].layout,
@@ -1305,7 +1255,7 @@ def lamport_wrap_test[
             list_of_ctx[i].synchronize()
 
         var expected_accum = Float32(0)
-        comptime for i in range(ngpus):
+        for i in range(ngpus):
             expected_accum += Float32(16 * (call + 1) + (i + 1))
         var expected = Scalar[dtype](expected_accum)
 
@@ -1320,17 +1270,9 @@ def lamport_wrap_test[
                     assert_equal(host[i][j], expected)
                 except e:
                     print(
-                        "Wrap mismatch at call",
-                        call,
-                        "GPU",
-                        i,
-                        "index",
-                        j,
-                        "got",
-                        host[i][j],
-                        "expected",
-                        expected,
-                        "(generation counter wrapped and reused a generation)",
+                        t"Wrap mismatch at call {call} GPU {i} index {j} got"
+                        t" {host[i][j]} expected {expected} (generation counter"
+                        t" wrapped and reused a generation)"
                     )
                     raise e^
 

@@ -188,7 +188,12 @@ static std::tuple<bool, int> resolutionRank(KernelDeclOp decl) {
 ErrorOr<KernelDeclOp>
 MojoRegistry::getResolvedKernel(llvm::StringRef name,
                                 DeviceRefAttr device) const {
-  DeviceInfoAttr deviceInfo = deviceInfoMapping.get(device);
+  return getResolvedKernel(name, deviceInfoMapping.get(device));
+}
+
+ErrorOr<KernelDeclOp>
+MojoRegistry::getResolvedKernel(llvm::StringRef name,
+                                DeviceInfoAttr deviceInfo) const {
   auto it = kernelByName.find(name);
   ASSERT_STREAM(it != kernelByName.end(),
                 "no kernel registered for '" << name << "'");
@@ -274,7 +279,7 @@ namespace {
 class LITModuleResolver {
 public:
   explicit LITModuleResolver(mlir::MLIRContext *ctx)
-      : config(ctx, options), sharedState(sourceMgr, config) {}
+      : sharedState(sourceMgr, ctx, options, KGEN::FrontendOptions()) {}
 
   /// Resolve `moduleName` to the path of its precompiled binary package.
   ErrorOr<std::string> resolveBinaryPackagePath(llvm::StringRef moduleName) {
@@ -298,10 +303,9 @@ public:
   KGEN::LIT::SharedState &getSharedState() { return sharedState; }
 
 private:
-  // Order matters: `config` refers to `options`, `sharedState` to both.
+  // Order matters: `sharedState` refers to `sourceMgr` and `options`.
   llvm::SourceMgr sourceMgr;
   KGEN::CompilationOptions options;
-  KGEN::LIT::ParserConfig config;
   KGEN::LIT::SharedState sharedState;
 };
 
@@ -446,6 +450,21 @@ static StringAttr getParamTypeName(MLIRContext *ctx, Type paramType) {
                                   .str());
 }
 
+// A registry built over a module of kernel decls alone, like the one behind
+// Python's `Analysis`, has no `mo.device_info_mapping`, so it knows a device
+// only by its label. The graph module holding `op` carries the full device
+// info, which a registration scoped by `api`, `arch`, or `model` needs.
+static ErrorOr<KernelDeclOp> resolveKernelForOp(const MojoRegistry &registry,
+                                                llvm::StringRef name,
+                                                mlir::Operation *op,
+                                                DeviceRefAttr device) {
+  auto module = op->getParentOfType<mlir::ModuleOp>();
+  if (module && module->hasAttr(MO::DeviceInfoMapping::kAttrName))
+    return registry.getResolvedKernel(
+        name, MO::DeviceInfoMapping(module).get(device));
+  return registry.getResolvedKernel(name, device);
+}
+
 static ErrorOrSuccess validateCustomOpParameters(const MojoRegistry &registry,
                                                  MO::CustomOp customOp) {
   if (!registry.containsKernel(customOp.getSymbol())) {
@@ -453,8 +472,8 @@ static ErrorOrSuccess validateCustomOpParameters(const MojoRegistry &registry,
         llvm::formatv("no kernel registered for '{}'", customOp.getSymbol())
             .str());
   }
-  auto declOpOr =
-      registry.getResolvedKernel(customOp.getSymbol(), customOp.getDevice());
+  auto declOpOr = resolveKernelForOp(registry, customOp.getSymbol(), customOp,
+                                     customOp.getDevice());
   if (declOpOr.isError())
     return declOpOr.takeError();
   KernelDeclOp declOp = *declOpOr;
@@ -684,7 +703,7 @@ ErrorOrSuccess M::MOGG::verifyCustomOp(const MojoRegistry &registry,
 
   // Catch MO-vs-kernel operand type mismatches before lowering emits Mojo.
   DeviceRefAttr device = MojoRegistry::getDeviceRefForOp(op);
-  auto declOpOr = registry.getResolvedKernel(info.operationName, device);
+  auto declOpOr = resolveKernelForOp(registry, info.operationName, op, device);
   if (declOpOr.isError())
     return declOpOr.takeError();
   KernelDeclOp declOp = *declOpOr;

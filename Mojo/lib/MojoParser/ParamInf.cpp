@@ -241,7 +241,7 @@ ParamInf::inferCValue(ASTExprAnd<AnyValue> operand, size_t argIdx,
 
   // If the expected type is concrete, then we can filter the overload set down
   // to a single entry and emit errors if not.
-  if (!paramFinder.hasReferences(expectedType)) {
+  if (!hasReferences(expectedType)) {
     auto emitError = [&](SMLoc loc) -> MojoInflightDiag & {
       return getMojoDiag(loc);
     };
@@ -322,7 +322,7 @@ ParamInf::inferFromRVType(ASTExprAnd<AnyValue> operand, size_t argIdx,
   // We have a non-parametric expected type, and a wildcard type, we can
   // match any operand.
   if (sugarIsa<NameLookupArgWildcardType>(argType) &&
-      !paramFinder.hasReferences(expectedType))
+      !hasReferences(expectedType))
     return success();
 
   // TODO: Optionally compute fitness metrics (# implicit conversions,
@@ -393,7 +393,7 @@ ParamInf::inferFromRVType(ASTExprAnd<AnyValue> operand, size_t argIdx,
   // If the expected type has been fully resolved, check it for implicit
   // conversions using the normal type machinery.  This will handle things like
   // function pointer conversions that the code below doesn't.
-  if (!paramFinder.hasReferences(expectedType)) {
+  if (!hasReferences(expectedType)) {
     auto conversion = IREmitter::classifyImplicitConversionWithDetails(
         {argVal, operand.expr}, expectedType, getDeclScope(),
         /*additionalAssumptions=*/{}, /*deferralCtx=*/nullptr);
@@ -633,7 +633,7 @@ ParamInf::inferAndEmitOneParam(ASTExprAnd<AnyValue> binding,
   // argument.  This is a non-trivial operation because we support inferring
   // from the value directly, but also inferring as a result of implicit
   // conversions.
-  if (paramFinder.hasReferences(expectedType)) {
+  if (hasReferences(expectedType)) {
     OperandsNeedingOriginsList paramOrigins;
     if (failed(inferFromRVType(binding, paramIdx, expectedType,
                                declaredParamPogs, CallSyntax::kParamBindings,
@@ -647,7 +647,7 @@ ParamInf::inferAndEmitOneParam(ASTExprAnd<AnyValue> binding,
       // If we take the implicit conversion path and need to turn the value into
       // a reference. The expected type must have be fully concretized in order
       // for conversion to be successful.
-      assert(!paramFinder.hasReferences(expectedType));
+      assert(!hasReferences(expectedType));
 
       if (paramOrigins.front().getArgConvention() != ArgConvention::OwnedMem)
         binding.ir = PMBValue::getFromPValue(binding.ir.getIfPValue());
@@ -662,7 +662,7 @@ ParamInf::inferAndEmitOneParam(ASTExprAnd<AnyValue> binding,
     }
   }
 
-  if (paramFinder.hasReferences(expectedType)) {
+  if (hasReferences(expectedType)) {
     deferredGivenParams.set(paramIdx);
     return TypedAttr(); // Deferred.
   }
@@ -836,7 +836,7 @@ LogicalResult ParamInf::inferFromParamList() {
       }
 
       Type mergedTypeBound;
-      if (paramFinder.hasReferences(varArgsEltType) &&
+      if (hasReferences(varArgsEltType) &&
           sugarIsa<AnyTraitType>(ASTType(varArgsEltType).extractMetaType())) {
         if (pogAssignment.posVariadicIdxs.empty()) {
           // TODO: The correct thing is to infer to `NeverTrait` such that an
@@ -934,6 +934,17 @@ VerifiedParamBindings ParamInf::inferForStruct() {
   CrashReporter handler(paramBindings.getExprLoc(), "ParamInf::inferForStruct",
                         getShared());
 
+  // A failed binding drops everything it deferred. Declared first so it runs
+  // after `attachNoteOnError`.
+  DeferredTypingContext::Checkpoint deferralCheckpoint;
+  if (deferredTypingContext)
+    deferralCheckpoint = deferredTypingContext->getCheckpoint();
+  bool succeeded = false;
+  auto rollbackOnFailure = llvm::scope_exit([&]() {
+    if (!succeeded && deferredTypingContext)
+      deferredTypingContext->rollback(deferralCheckpoint);
+  });
+
   auto attachNoteOnError = llvm::scope_exit([&]() {
     if (diag.hasErrorEmitted() && declIfKnown) {
       auto *defDecl = llvm::dyn_cast<DefASTDecl>(declIfKnown);
@@ -954,10 +965,8 @@ VerifiedParamBindings ParamInf::inferForStruct() {
       // the body-unprovable constraints there and suppress the error.
       // Otherwise, fall back to the existing hard-error path.
       if (deferredTypingContext) {
-        SMLoc deferralLoc = paramBindings.getExprLoc();
         for (ConstraintAttr c : bodyUnprovableConstraints)
-          deferredTypingContext->deferredConstraints.push_back(
-              {c, deferralLoc});
+          deferredTypingContext->addInconclusive(c, paramBindings.getExprLoc());
       } else {
         emitUnprovableConstraintsFromFitness(
             bodyUnprovableConstraints, paramBindings.shared,
@@ -985,6 +994,7 @@ VerifiedParamBindings ParamInf::inferForStruct() {
   if (failed(checkBodyConstraints()))
     return {};
 
+  succeeded = true;
   ParameterExprArrayAttr rawBindings = ParameterExprArrayAttr::get(
       getShared().getContext(), evaluator.getIndexBindings());
   return VerifiedParamBindings(rawBindings,
@@ -1008,7 +1018,7 @@ LogicalResult ParamInf::inferFromDefaults() {
     //
     // TODO: If the references points to a `_` parameter, we might still want to
     // install it without erasing the index reference.
-    if (paramFinder.hasReferences(value))
+    if (hasReferences(value))
       return success();
 
     ASTType argType = evaluator.getReboundType(declaredParamTypes[idx]);
@@ -1181,7 +1191,7 @@ void ParamInf::inferOriginParams() {
 
         paramType = cast<LIT::StructType>(evaluator.getReboundType(paramType));
         // Make sure the origin type is fully resolved before instantiating it.
-        if (paramFinder.hasReferences(paramType))
+        if (hasReferences(paramType))
           continue;
 
         auto origin = // Get the Origin value.
@@ -1252,8 +1262,8 @@ LogicalResult ParamInf::inferFromBodyConstraints() {
     // has unbound parameters.
     TypedAttr lhs = evaluator.getReboundAttribute(eq.first);
     TypedAttr rhs = evaluator.getReboundAttribute(eq.second);
-    bool lhsOpen = paramFinder.hasReferences(lhs);
-    bool rhsOpen = paramFinder.hasReferences(rhs);
+    bool lhsOpen = hasReferences(lhs);
+    bool rhsOpen = hasReferences(rhs);
     if (lhsOpen == rhsOpen)
       continue;
 
@@ -1364,6 +1374,16 @@ LogicalResult ParamInf::finalizeWithUnbound() {
     if (installUnbound) {
       Type targetType =
           evaluator.getReboundType(getCanonicalType(declaredParamTypes[idx]));
+      // Declare an implicit parameter for the hole if supported.
+      if (deferredTypingContext &&
+          deferredTypingContext->canDeclareImplicitParams()) {
+        ParamDeclAttr implicitParam =
+            deferredTypingContext->declareImplicitParam(
+                targetType, pog.getName(), paramBindings.getExprLoc());
+        evaluator.overwriteIndexBinding(idx,
+                                        ParamDeclRefAttr::get(implicitParam));
+        continue;
+      }
       evaluator.overwriteIndexBinding(idx, UnboundAttr::get(targetType));
       continue;
     }
@@ -1518,7 +1538,7 @@ LogicalResult CallParamInf::inferOneOperand(ASTExprAnd<AnyValue> operand,
       // here (instead of in matchTypes) because function arguments can be
       // rebound when origins disagree, but this isn't correct/possible in
       // arbitrary nested positions.
-      if (!paramFinder.hasReferences(expectedType)) {
+      if (!hasReferences(expectedType)) {
         if (!IREmitter::canZeroCostConvert(valueRefType, expectedType,
                                            getShared(), getDeclScope())
                  .isTrue()) {
@@ -1669,9 +1689,8 @@ LogicalResult CallParamInf::inferResultSlot(RefType expectedRef, size_t argIdx,
                               getShared()))
     ++numMismatchedConventions;
 
-  bool needsAddrSpace =
-      paramFinder.hasReferences(expectedRef.getAddressSpace());
-  bool needsOrigin = paramFinder.hasReferences(expectedRef.getOrigin());
+  bool needsAddrSpace = hasReferences(expectedRef.getAddressSpace());
+  bool needsOrigin = hasReferences(expectedRef.getOrigin());
   if (!needsAddrSpace && !needsOrigin)
     return success(); // Nothing to do.
 

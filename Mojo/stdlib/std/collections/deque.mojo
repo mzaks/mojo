@@ -536,7 +536,7 @@ struct Deque[ElementType: Movable](
         comptime assert (
             IntLiteral[idx.value]() >= 0
         ), "negative indexing is not supported, use e.g. `x[len(x) - 1]`"
-        check_bounds(idx, len(self))
+        check_bounds(idx, length=len(self))
         return self._unchecked_get(idx)
 
     @__unsafe_nested_origins_read_only
@@ -553,7 +553,7 @@ struct Deque[ElementType: Movable](
         Returns:
             A reference to the element at the given index.
         """
-        check_bounds(idx, len(self))
+        check_bounds(idx, length=len(self))
         return self._unchecked_get(idx)
 
     @__unsafe_nested_origins_read_only
@@ -855,7 +855,7 @@ struct Deque[ElementType: Movable](
         if deque_len == self._maxlen:
             raise "IndexError: Deque is already at its maximum size"
 
-        check_bounds(idx, deque_len + 1)
+        check_bounds(idx, length=deque_len + 1)
 
         if idx <= deque_len // 2:
             for i in range(idx):

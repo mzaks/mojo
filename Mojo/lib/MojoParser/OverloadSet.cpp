@@ -83,12 +83,24 @@ SMLoc OverloadSet::getExprLoc() const { return getExpr()->getLoc(); }
 static ParamBindings getBindingsForDeclaredType(ASTDecl &declScope,
                                                 ASTType type,
                                                 const ExprNode *expr) {
-  // We need to do extra work to forward a generator's parameters.
-  assert(!sugarIsa<GeneratorType>(type.extractMetaType()));
-
   ParamBindings paramBindings(declScope, expr);
-  ASTDecl *decl = type.getDecl(declScope.getShared());
+  // We need to do extra work to forward a generator's parameters.
+  if (auto genAttr = sugarDynCast<GeneratorAttr>(PValue(type));
+      genAttr && sugarIsa<LIT::StructType>(ASTType(genAttr.getBody()))) {
+    auto genType = cast<GeneratorType>(genAttr.getType());
+    auto pogs = genType.getParamListAttrs().getPogs();
+    // The generator's inputs are prepended to the callee's full signature,
+    // so its constraints (e.g. `comptime A[c: Bool] where c = S[c]`) index
+    // them without adjustment.
+    paramBindings.addConstraints(genType.getBodyConstraints());
+    for (auto [type, pog] :
+         llvm::zip_equal(genAttr.getInputParamTypes(), pogs)) {
+      paramBindings.add(expr, UnboundAttr::get(type), pog.getName());
+    }
+    return paramBindings;
+  }
 
+  ASTDecl *decl = type.getDecl(declScope.getShared());
   auto traitSelfName = StringAttr::get(decl->getContext(), "_Self");
   // When binding a trait function, add the self type bindings.
   if (isa_and_nonnull<TraitASTDecl>(decl)) {
@@ -157,30 +169,8 @@ ASTType OverloadSet::getContextualType(ASTDecl *candidate) const {
 
 ParamBindings OverloadSet::getParamBindings(ASTDecl *candidate) const {
   ParamBindings result(getDeclScope(), getExpr());
-  ASTType contextualType = getContextualType(candidate);
-  /// FIXME: this is very bad, this has to be keep in sync with how full
-  /// signature is computed during overload resolution.
-  if (contextualType) {
-    if (auto genAttr = sugarDynCast<GeneratorAttr>(PValue(contextualType));
-        genAttr && sugarIsa<StructType>(ASTType(genAttr.getBody()))) {
-      auto genType = cast<GeneratorType>(genAttr.getType());
-      auto pogs = genType.getParamListAttrs().getPogs();
-      // The generator's inputs are prepended to the callee's full signature,
-      // so its constraints (e.g. `comptime A[c: Bool] where c = S[c]`) index
-      // them without adjustment.
-      result.addConstraints(genType.getBodyConstraints());
-      for (auto [type, pog] :
-           llvm::zip_equal(genAttr.getInputParamTypes(), pogs)) {
-        // TODO: We really should unify `getBindingsForDeclaredType` with
-        // `getFullSig`.
-        result.add(getExpr(), UnboundAttr::get(type), pog.getName());
-      }
-    } else {
-      result =
-          getBindingsForDeclaredType(getDeclScope(), contextualType, getExpr());
-    }
-  }
-
+  if (ASTType ctxType = getContextualType(candidate))
+    result = getBindingsForDeclaredType(getDeclScope(), ctxType, getExpr());
   result.append(explicitParamBindings);
   return result;
 }
@@ -535,7 +525,7 @@ PValue OverloadSet::filterOverloadSetForParamBindings(
         bestFitness.getValidity() ==
             OverloadFitness::Validity::kFunctionConstraintInconclusive) {
       for (ConstraintAttr c : bestFitness.getUnprovableConstraints())
-        deferredTypingContext->deferredConstraints.push_back({c, getExprLoc()});
+        deferredTypingContext->addInconclusive(c, getExprLoc());
     }
 
     // On success, wrap things up into one callee, we know that the best fitness
@@ -1019,7 +1009,7 @@ CalleeResult OverloadSet::filterOverloadSet(
       if (bestFitness.getValidity() ==
           OverloadFitness::Validity::kFunctionConstraintInconclusive) {
         for (ConstraintAttr c : bestFitness.getUnprovableConstraints())
-          context->deferredConstraints.push_back({c, getExprLoc()});
+          context->addInconclusive(c, getExprLoc());
       }
     }
 
@@ -1081,6 +1071,7 @@ CalleeAndDeclResult OverloadSet::filterOverloadSetForValueType(
     // may have unbound parameters that we are trying to match, e.g. when in a
     // parameter expression context.
     ParamBindings paramBindings = getParamBindings(candidate);
+    // TODO(MOCO-5244): Speculative trials install no DeferredTypingContext.
     ParamInf inference(paramBindings, candidateType.getInputParamTypes(),
                        candidateType.getParamListAttrs(),
                        /*allowImplicitConversions=*/true,
@@ -1248,7 +1239,7 @@ CalleeAndDeclResult OverloadSet::filterOverloadSetForValueType(
 }
 
 /// Perform substitutions of the specified bindings into the symbol, returning
-/// the resultant LITSymbolConstant attr or producing an error message and
+/// the resultant function reference or producing an error message and
 /// returning null. This allows producing a reference to a parameterized
 /// function without the parameters specified.  They can be bound later.
 TypedAttr OverloadSet::getBoundConstantAttr() const {
@@ -1646,7 +1637,7 @@ CValue IREmitter::emitIndirectCall(CValue callee, CallOperands &&operands) {
           sugarDynCast<FuncLiteralTypeGeneratorType>(callee.getRValueType())) {
     // An indirect call to a function literal typed candidate becomes a direct
     // call to the literal itself.
-    auto target = calleeSig.getSymbolConstantAttr();
+    auto target = calleeSig.getFuncSymbolAttr();
     return emitIndirectCall(target, std::move(operands));
   }
 

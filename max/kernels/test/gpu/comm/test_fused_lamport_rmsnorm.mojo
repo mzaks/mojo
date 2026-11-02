@@ -89,7 +89,7 @@ def _run_rms_norm_unfused[
     `out_ptr`. Wraps `rms_norm_gpu` with the minimal input/output lambdas it
     requires. Takes raw pointers (not DeviceBuffer) so callers can pass slice
     offsets into a larger buffer."""
-    var shape = Index(M, K)
+    var shape = (M, K)
     var in_view = TileTensor(in_ptr, row_major(Coord(shape)))
     var out_view = TileTensor(out_ptr, row_major(Coord(shape)))
     var gamma_view = TileTensor(gamma_ptr, row_major(Coord(Index(K))))
@@ -140,14 +140,8 @@ def rmsnorm_test[
     not launch, so the generation rotation stays in step and every real call
     still matches the reference."""
     print(
-        "==== fused Lamport AR+RMSNorm  ngpus=",
-        ngpus,
-        " M=",
-        M,
-        " K=",
-        K,
-        " iters=",
-        iters,
+        t"==== fused Lamport AR+RMSNorm  ngpus= {ngpus}  M= {M}  K= {K}  iters="
+        t" {iters}"
     )
 
     var act_size = M * K
@@ -292,7 +286,7 @@ def rmsnorm_test[
     for it in range(iters):
         comptime if interleave_zero_rows:
             comptime for g in range(ngpus):
-                lamport_allreduce_rmsnorm[dtype, ngpus, pdl=False](
+                lamport_allreduce_rmsnorm[dtype, ngpus](
                     g,
                     rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                         act_in[g].unsafe_ptr()
@@ -311,7 +305,7 @@ def rmsnorm_test[
                 )
         group_start()
         comptime for g in range(ngpus):
-            lamport_allreduce_rmsnorm[dtype, ngpus, pdl=False](
+            lamport_allreduce_rmsnorm[dtype, ngpus](
                 g,
                 rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                     act_in[g].unsafe_ptr()
@@ -501,7 +495,7 @@ def unsynced_skew_test[
     for it in range(NUM_UNSYNCED_ITERS):
         var base = it * slice_size
         comptime for g in range(ngpus):
-            lamport_allreduce_rmsnorm[dtype, ngpus, pdl=False](
+            lamport_allreduce_rmsnorm[dtype, ngpus](
                 g,
                 rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                     act_big[g].unsafe_ptr().unsafe_offset(base)

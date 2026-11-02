@@ -225,6 +225,8 @@ constexpr llvm::StringLiteral kStructDeviceContext =
     "max.gpu.host.DeviceContext";
 constexpr llvm::StringLiteral kStructDeviceContextArray =
     "max.gpu.host.DeviceContextArray";
+/// `DeviceContext.assert_cpu_target()`: this context as a `DeviceContext.CPU`.
+constexpr llvm::StringLiteral kFnAssertCpuTarget = "assert_cpu_target";
 constexpr llvm::StringLiteral kStructDeviceGraph = "max.gpu.host.DeviceGraph";
 constexpr llvm::StringLiteral kStructDeviceGraphBuilder =
     "max.gpu.host.DeviceGraphBuilder";
@@ -347,6 +349,8 @@ constexpr llvm::StringLiteral kFnUnpackTensor =
     "builtin_primitives.primitives.unpack_tensor";
 constexpr llvm::StringLiteral kFnAllZeros =
     "builtin_primitives.primitives.all_zeros";
+constexpr llvm::StringLiteral kFnMoggLaunchDeclarative =
+    "builtin_primitives.primitives.mogg_launch_declarative";
 constexpr llvm::StringLiteral kFnMoggAsyncPackValue =
     "builtin_primitives.primitives.mogg_async_pack_value";
 constexpr llvm::StringLiteral kFnMoggAsyncPackOwnedTensorValue =

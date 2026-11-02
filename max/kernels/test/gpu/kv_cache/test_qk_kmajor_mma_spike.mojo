@@ -106,6 +106,7 @@ from std.utils.coord import DynamicCoord
 from std.testing import assert_almost_equal
 from std.utils.index import Index, IndexList
 from std.utils.numerics import get_accum_type
+from std.utils.coord import Coord
 
 
 # Core-matrix row count for the WGMMA/UMMA descriptor canonical layout. Matches
@@ -251,7 +252,7 @@ def qk_mma_kernel[
     k_tile_shape: Coord,
     k_desc_shape: Coord,
     c_layout: TensorLayout,
-    block_tile_shape: IndexList[3],
+    block_tile_shape: Coord[Int, Int, Int],
     mma_shape: DynamicCoord[.int, 3],
     swizzle_mode: TensorMapSwizzle,
     use_native: Bool,
@@ -484,20 +485,8 @@ def run_qk_spike[
     comptime gran = swizzle_mode.bytes() // size_of[ab_type]()
 
     print(
-        "qk_kmajor_spike native="
-        + String(use_native)
-        + " "
-        + String(swizzle_mode)
-        + " MNK="
-        + String(M)
-        + "x"
-        + String(N)
-        + "x"
-        + String(K)
-        + " gran="
-        + String(gran)
-        + " num_chunks(BK/gran)="
-        + String(BK // gran)
+        t"qk_kmajor_spike"
+        t" native={use_native} {swizzle_mode} MNK={M}x{N}x{K} gran={gran} num_chunks(BK/gran)={BK // gran}"
     )
 
     # Q is M x D, K is N x D (both row-major, D = head_size = contraction).
@@ -629,14 +618,8 @@ def run_qk_spike[
             except e:
                 if mismatches < 8:
                     print(
-                        "  MISMATCH ["
-                        + String(m)
-                        + ","
-                        + String(n)
-                        + "] got="
-                        + String(o_host[m, n])
-                        + " ref="
-                        + String(o_host_ref[m, n])
+                        t"  MISMATCH [{m},{n}]"
+                        t" got={o_host[m, n]} ref={o_host_ref[m, n]}"
                     )
                 mismatches += 1
     if mismatches == 0:
@@ -674,7 +657,7 @@ def _print_layouts[mn: Int, k: Int]():
     comptime pdns_lbo = type_of(pdns).static_stride[3] * 2
     comptime cinr_sbo = type_of(cinr).static_stride[1] * 2
     comptime cinr_lbo = type_of(cinr).static_stride[3] * 2
-    print("---- k-major layout diagnostics (mn=", mn, " k=", k, ") ----")
+    print(t"---- k-major layout diagnostics (mn= {mn}  k= {k} ) ----")
     print("baseline    SBO,LBO=", base_sbo, base_lbo)
     print("pagedense   SBO,LBO=", pdns_sbo, pdns_lbo)
     print("chunkinner  SBO,LBO=", cinr_sbo, cinr_lbo)
@@ -688,12 +671,8 @@ def _print_layouts[mn: Int, k: Int]():
     comptime pdns_mn = Int(pdns(Coord(Idx[8], Idx[0])))
     comptime cinr_mn = Int(cinr(Coord(Idx[8], Idx[0])))
     print(
-        "mn=8,k=0 (next 8-row page) base=",
-        base_mn,
-        " pdns=",
-        pdns_mn,
-        " cinr=",
-        cinr_mn,
+        t"mn=8,k=0 (next 8-row page) base= {base_mn}  pdns= {pdns_mn}  cinr="
+        t" {cinr_mn}"
     )
 
 

@@ -16,11 +16,12 @@
 #include "Mojo/LITDialect/LITOps.h"
 #include "Mojo/MojoParser/CallOperands.h"
 #include "Mojo/MojoParser/DeclResolver.h"
+#include "Mojo/MojoParser/DeclSignaturePrinter.h"
 #include "Mojo/MojoParser/EntryPoint.h"
 #include "Mojo/MojoParser/ExprNode.h"
 #include "Mojo/MojoParser/SharedState.h"
+#include "Mojo/MojoTooling/DeclRendering.h"
 #include "Mojo/MojoTooling/ParserDriver.h"
-#include "Mojo/MojoTooling/PublicASTDecl.h"
 #include "Support/Filesystem/Paths.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
@@ -119,12 +120,16 @@ struct CodeCompletionListener : public BaseCompletionListener {
       // Grab the documentation for the import. Do this out of the current
       // context to avoid pulling in a bunch of unwanted state.
       MLIRContext ctx{MLIRContext::Threading::DISABLED};
-      ParserConfig config(&ctx, parserContext->getCompilationOptions());
-      MojoParserContext importContext(sourceMgr, config);
+      FrontendOptions frontendOptions = parserContext->getFrontendOptions();
+      frontendOptions.autoFixItHandler = nullptr;
+      frontendOptions.useMLIRDiagnostics = false;
+      frontendOptions.parserListener = nullptr;
+      MojoParserContext importContext(sourceMgr, &ctx,
+                                      parserContext->getCompilationOptions(),
+                                      frontendOptions);
       if (auto module = importContext.parseFileOrPackageNonRecursive(path)) {
-        if (auto decl = getPublicDecl(module))
-          results.back().documentation =
-              decl->getFullMarkdownString(*parserContext);
+        if (!module->getToolingKindName().empty())
+          results.back().documentation = getDeclFullMarkdownString(*module);
       }
     };
 
@@ -322,11 +327,8 @@ struct CodeCompletionListener : public BaseCompletionListener {
     }
 
     CodeCompletionResult result(name, kind);
-    if (auto *function = dyn_cast<DefASTDecl>(decl))
-      result.documentation =
-          getFunctionFullMarkdownString(*function, *parserContext);
-    else if (auto publicDecl = getPublicDecl(decl))
-      result.documentation = publicDecl->getFullMarkdownString(*parserContext);
+    if (!decl->getToolingKindName().empty())
+      result.documentation = getDeclFullMarkdownString(*decl);
     results.emplace_back(result);
   }
 
@@ -397,14 +399,12 @@ struct SignatureHelpListener : public BaseCompletionListener {
       SignatureHelpResult::Signature signature;
       SmallVector<std::pair<unsigned, unsigned>> argOffsets;
       signature.label = getFunctionDeclarationSnippet(
-          *function, *parserContext,
-          /*parameterOffsets=*/nullptr, &argOffsets);
-      signature.documentation =
-          getFunctionFullMarkdownString(*function, *parserContext);
+          *function, /*parameterOffsets=*/nullptr, &argOffsets);
+      signature.documentation = getDeclFullMarkdownString(*function);
       for (const auto &[argumentDecl, offset] :
            llvm::zip(argumentDecls, argOffsets))
         signature.parameters.push_back(
-            {offset, ArgumentInfo::getMarkdownDocString(*argumentDecl)});
+            {offset, getDeclMarkdownDocString(*argumentDecl)});
       result.signatures.emplace_back(std::move(signature));
     }
   }
@@ -431,20 +431,18 @@ struct SignatureHelpListener : public BaseCompletionListener {
     // Collect the signatures for each of the decls.
     for (ASTDecl *decl : decls) {
       if (auto *function = dyn_cast<DefASTDecl>(decl)) {
-        SmallVector<ParameterInfo, kTypicalParameterCount> functionParameters =
-            getFunctionParameters(*function);
+        auto functionParameters = function->getUserParamDecls();
         if (parameters.size() > functionParameters.size())
           continue;
         SignatureHelpResult::Signature signature;
         SmallVector<std::pair<unsigned, unsigned>> paramOffsets;
-        signature.label = getFunctionDeclarationSnippet(
-            *function, *parserContext, &paramOffsets);
-        signature.documentation =
-            getFunctionFullMarkdownString(*function, *parserContext);
+        signature.label =
+            getFunctionDeclarationSnippet(*function, &paramOffsets);
+        signature.documentation = getDeclFullMarkdownString(*function);
         for (const auto &[parameter, offset] :
              llvm::zip(functionParameters, paramOffsets))
           signature.parameters.push_back(
-              {offset, parameter.getMarkdownDocString()});
+              {offset, getDeclMarkdownDocString(*parameter)});
         result.signatures.emplace_back(std::move(signature));
         continue;
       }
@@ -452,18 +450,13 @@ struct SignatureHelpListener : public BaseCompletionListener {
       auto *structDecl = dyn_cast<StructASTDecl>(decl);
       if (!structDecl)
         continue;
-      std::unique_ptr<PublicDecl> publicDecl = getPublicDecl(decl);
-      if (!publicDecl)
-        continue;
-      SmallVector<ParameterInfo, kTypicalParameterCount> structParameters =
-          getStructParameters(*structDecl);
+      auto structParameters = structDecl->getUserParamDecls();
       if (parameters.size() > structParameters.size())
         continue;
       SignatureHelpResult::Signature signature;
       SmallVector<std::pair<unsigned, unsigned>> paramOffsets;
-      signature.label = getStructDeclarationSnippet(*structDecl, *parserContext,
-                                                    &paramOffsets);
-      addDeclDocAndParametersToSignature(*parserContext, signature, *publicDecl,
+      signature.label = getStructDeclarationSnippet(*structDecl, &paramOffsets);
+      addDeclDocAndParametersToSignature(signature, *structDecl,
                                          structParameters, paramOffsets);
       result.signatures.emplace_back(std::move(signature));
     }
@@ -473,12 +466,11 @@ struct SignatureHelpListener : public BaseCompletionListener {
   /// form the given decl to a signature.
   template <typename RangeT>
   static void addDeclDocAndParametersToSignature(
-      MojoParserContext &ctx, SignatureHelpResult::Signature &signature,
-      PublicDecl &publicDecl, RangeT &&range,
+      SignatureHelpResult::Signature &signature, ASTDecl &decl, RangeT &&range,
       ArrayRef<std::pair<unsigned, unsigned>> offsets) {
-    signature.documentation = publicDecl.getFullMarkdownString(ctx);
+    signature.documentation = getDeclFullMarkdownString(decl);
     for (const auto &[arg, offset] : llvm::zip(range, offsets))
-      signature.parameters.push_back({offset, arg.getMarkdownDocString()});
+      signature.parameters.push_back({offset, getDeclMarkdownDocString(*arg)});
   }
 
   /// The result that has been collected so far.
@@ -535,11 +527,12 @@ static void parseCompletionImpl(
   // Suppress diagnostics during completion.
   listener.sourceMgr.setDiagHandler([](const llvm::SMDiagnostic &, void *) {});
 
-  ParserConfig config(context, options);
-  config.parserListener = &listener;
-  config.maxNotesPerDiagnostic = 0;
+  FrontendOptions frontendOptions;
+  frontendOptions.parserListener = &listener;
+  frontendOptions.maxNotesPerDiagnostic = 0;
 
-  MojoParserContext parserContext(listener.sourceMgr, config);
+  MojoParserContext parserContext(listener.sourceMgr, context, options,
+                                  frontendOptions);
   listener.parserContext = &parserContext;
 
   computeCompletionRange(parserContext.getSharedState(), buffer,
@@ -551,15 +544,16 @@ static void parseCompletionImpl(
 //===----------------------------------------------------------------------===//
 // Code Completion
 
-std::vector<CodeCompletionResult> MojoParserContext::codeComplete(
-    llvm::MemoryBufferRef buffer, uint64_t completionPosition,
-    MLIRContext *context, const KGEN::CompilationOptions &options) {
+std::vector<CodeCompletionResult>
+M::KGEN::Mojo::codeComplete(llvm::MemoryBufferRef buffer,
+                            uint64_t completionPosition, MLIRContext *context,
+                            const KGEN::CompilationOptions &options) {
   return codeComplete(
       buffer, completionPosition, context, options,
       [](MojoParserContext &ctx, int fileID) { ctx.parseFileForLSP(fileID); });
 }
 
-std::vector<CodeCompletionResult> MojoParserContext::codeComplete(
+std::vector<CodeCompletionResult> M::KGEN::Mojo::codeComplete(
     llvm::MemoryBufferRef buffer, uint64_t completionPosition,
     MLIRContext *context, const KGEN::CompilationOptions &options,
     function_ref<void(MojoParserContext &, int)> parserCallback,
@@ -576,15 +570,15 @@ std::vector<CodeCompletionResult> MojoParserContext::codeComplete(
 // Signature Help
 
 std::optional<SignatureHelpResult>
-MojoParserContext::signatureHelp(llvm::MemoryBufferRef buffer,
-                                 uint64_t position, MLIRContext *context,
-                                 const KGEN::CompilationOptions &options) {
+M::KGEN::Mojo::signatureHelp(llvm::MemoryBufferRef buffer, uint64_t position,
+                             MLIRContext *context,
+                             const KGEN::CompilationOptions &options) {
   return signatureHelp(
       buffer, position, context, options,
       [](MojoParserContext &ctx, int fileID) { ctx.parseFileForLSP(fileID); });
 }
 
-std::optional<SignatureHelpResult> MojoParserContext::signatureHelp(
+std::optional<SignatureHelpResult> M::KGEN::Mojo::signatureHelp(
     llvm::MemoryBufferRef buffer, uint64_t completionPosition,
     MLIRContext *context, const KGEN::CompilationOptions &options,
     function_ref<void(MojoParserContext &, int)> parserCallback,
@@ -630,7 +624,7 @@ static void parseCompletionInContextImpl(
   parserCallback(bufId);
 }
 
-std::vector<CodeCompletionResult> MojoParserContext::codeCompleteInContext(
+std::vector<CodeCompletionResult> M::KGEN::Mojo::codeCompleteInContext(
     MojoParserContext &context, llvm::MemoryBufferRef buffer,
     uint64_t completionPosition, function_ref<void(int)> parserCallback) {
   std::vector<CodeCompletionResult> results;
@@ -640,7 +634,7 @@ std::vector<CodeCompletionResult> MojoParserContext::codeCompleteInContext(
   return results;
 }
 
-std::optional<SignatureHelpResult> MojoParserContext::signatureHelpInContext(
+std::optional<SignatureHelpResult> M::KGEN::Mojo::signatureHelpInContext(
     MojoParserContext &context, llvm::MemoryBufferRef buffer, uint64_t position,
     function_ref<void(int)> parserCallback) {
   SignatureHelpResult result;

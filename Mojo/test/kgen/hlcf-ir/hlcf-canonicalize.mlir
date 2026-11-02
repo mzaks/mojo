@@ -396,6 +396,142 @@ kgen.func @remove_unused_if_results(%arg0: !kgen.scalar<bool>, %arg1: i32, %arg2
   hlcf.return %0#1 : i32
 }
 
+// CHECK-LABEL: kgen.func @flatten_nested_else_if(
+// CHECK-NEXT: hlcf.if %arg0 {
+// CHECK-NEXT:   "test.then0"()
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   hlcf.if.elifcond.yield %arg1
+// CHECK-NEXT: } then {
+// CHECK-NEXT:   "test.then1"()
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   "test.else"()
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: }
+// CHECK-NEXT: hlcf.return
+kgen.func @flatten_nested_else_if(%c0: !kgen.scalar<bool>, %c1: !kgen.scalar<bool>) {
+  hlcf.if %c0 {
+    "test.then0"() : () -> ()
+    hlcf.yield
+  } else {
+    hlcf.if %c1 {
+      "test.then1"() : () -> ()
+      hlcf.yield
+    } else {
+      "test.else"() : () -> ()
+      hlcf.yield
+    }
+    hlcf.yield
+  }
+  hlcf.return
+}
+
+// Flatten the complete tail in one rewrite rather than one nesting level per
+// canonicalizer iteration.
+// CHECK-LABEL: kgen.func @flatten_nested_else_if_results(
+// CHECK-NEXT: %[[RESULT:.*]] = hlcf.if %arg0 -> index {
+// CHECK-NEXT:   hlcf.yield %arg3 : index
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   hlcf.if.elifcond.yield %arg1
+// CHECK-NEXT: } then {
+// CHECK-NEXT:   hlcf.yield %arg4 : index
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   hlcf.if.elifcond.yield %arg2
+// CHECK-NEXT: } then {
+// CHECK-NEXT:   hlcf.yield %arg5 : index
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   hlcf.yield %arg6 : index
+// CHECK-NEXT: }
+// CHECK-NEXT: hlcf.return %[[RESULT]] : index
+kgen.func @flatten_nested_else_if_results(
+    %c0: !kgen.scalar<bool>, %c1: !kgen.scalar<bool>,
+    %c2: !kgen.scalar<bool>, %a: index, %b: index, %c: index,
+    %d: index) -> index {
+  %result = hlcf.if %c0 -> index {
+    hlcf.yield %a : index
+  } else {
+    %inner = hlcf.if %c1 -> index {
+      hlcf.yield %b : index
+    } else {
+      %innermost = hlcf.if %c2 -> index {
+        hlcf.yield %c : index
+      } else {
+        hlcf.yield %d : index
+      }
+      hlcf.yield %innermost : index
+    }
+    hlcf.yield %inner : index
+  }
+  hlcf.return %result : index
+}
+
+// Values defined while computing an elif condition are carried to both the
+// paired then arm and the false successor.
+// CHECK-LABEL: kgen.func @flatten_nested_else_if_carries(
+// CHECK-NEXT: %[[RESULT:.*]] = hlcf.if %arg0 -> index {
+// CHECK-NEXT:   hlcf.yield %arg1 : index
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   %[[VALUE:.*]] = "test.value"()
+// CHECK-NEXT:   %[[COND:.*]] = "test.condition"(%[[VALUE]])
+// CHECK-NEXT:   hlcf.if.elifcond.yield %[[COND]], %[[VALUE]] : index
+// CHECK-NEXT: } then (%[[THEN_ONE:.*]]: index){
+// CHECK-NEXT:   %[[THEN:.*]] = index.add %arg1, %[[THEN_ONE]]
+// CHECK-NEXT:   hlcf.yield %[[THEN]] : index
+// CHECK-NEXT: } else (%[[ELSE_ONE:.*]]: index){
+// CHECK-NEXT:   %[[ELSE:.*]] = index.add %arg2, %[[ELSE_ONE]]
+// CHECK-NEXT:   hlcf.yield %[[ELSE]] : index
+// CHECK-NEXT: }
+// CHECK-NEXT: hlcf.return %[[RESULT]] : index
+kgen.func @flatten_nested_else_if_carries(
+    %c0: !kgen.scalar<bool>, %a: index, %b: index) -> index {
+  %result = hlcf.if %c0 -> index {
+    hlcf.yield %a : index
+  } else {
+    %value = "test.value"() : () -> index
+    %c1 = "test.condition"(%value) : (index) -> !kgen.scalar<bool>
+    %inner = hlcf.if %c1 -> index {
+      %then = index.add %a, %value
+      hlcf.yield %then : index
+    } else {
+      %else = index.add %b, %value
+      hlcf.yield %else : index
+    }
+    hlcf.yield %inner : index
+  }
+  hlcf.return %result : index
+}
+
+// Scoped stack allocations are pointer values, so keep pointer-carrying
+// boundaries nested rather than hiding their allocation behind a block
+// argument.
+// CHECK-LABEL: kgen.func @preserve_nested_pointer_capture(
+// CHECK: hlcf.if %arg0 {
+// CHECK: } else {
+// CHECK:   %[[PTR:.*]] = "test.pointer"()
+// CHECK:   hlcf.if %arg1 {
+// CHECK:     "test.use"(%[[PTR]])
+// CHECK:   } else {
+// CHECK:     "test.use"(%[[PTR]])
+kgen.func @preserve_nested_pointer_capture(
+    %c0: !kgen.scalar<bool>, %c1: !kgen.scalar<bool>) {
+  hlcf.if %c0 {
+    "test.then0"() : () -> ()
+    hlcf.yield
+  } else {
+    %ptr = "test.pointer"() : () -> !kgen.pointer<index>
+    hlcf.if %c1 {
+      "test.use"(%ptr) : (!kgen.pointer<index>) -> ()
+      hlcf.yield
+    } else {
+      "test.use"(%ptr) : (!kgen.pointer<index>) -> ()
+      hlcf.yield
+    }
+    hlcf.yield
+  }
+  hlcf.return
+}
+
 // Multi-arm if with a statically-false first condition promotes the first
 // elif arm; the constant-true elif then folds away the else.
 // CHECK-LABEL: @fold_multiarms_elif_false
@@ -730,13 +866,18 @@ kgen.func @if_cond_same(%arg0: !kgen.scalar<bool>) -> !kgen.scalar<bool> {
 // https://github.com/modular/modular/issues/5137:
 // Tail call optimization doesn't happen for tail recursive functions with raises
 // CHECK-LABEL: @tail_call_error_fn
-// CHECK-NEXT:   %[[C:.*]] = kgen.param.constant: scalar<bool> = <false>
+// CHECK-NEXT:   %[[TRUE:.*]] = kgen.param.constant: scalar<bool> = <true>
+// CHECK-NEXT:   %[[FALSE:.*]] = kgen.param.constant: scalar<bool> = <false>
 // CHECK-NEXT:    %[[R:.*]] = hlcf.if %arg0 -> !kgen.scalar<bool> {
 // CHECK-NEXT:      pop.store %arg2, %arg4 : !kgen.pointer<index>
-// CHECK-NEXT:      hlcf.yield %[[C]] : !kgen.scalar<bool>
+// CHECK-NEXT:      hlcf.yield %[[FALSE]] : !kgen.scalar<bool>
 // CHECK-NEXT:    } else {
 // CHECK-NEXT:      %[[REC:.*]] = kgen.call @tail_call_error_fn
-// CHECK-NEXT:      hlcf.yield %[[REC]] : !kgen.scalar<bool>
+// CHECK-NEXT:      hlcf.if.elifcond.yield %[[REC]]
+// CHECK-NEXT:    } then {
+// CHECK-NEXT:      hlcf.yield %[[TRUE]] : !kgen.scalar<bool>
+// CHECK-NEXT:    } else {
+// CHECK-NEXT:      hlcf.yield %[[FALSE]] : !kgen.scalar<bool>
 // CHECK-NEXT:    }
 // CHECK-NEXT:    hlcf.return %[[R]]
 kgen.generator export @tail_call_error_fn(%cond: !kgen.scalar<bool>, %arg0: index, %arg1: index, %arg2: !kgen.pointer<struct<() memoryOnly>> byref_error, %arg3: !kgen.pointer<index> byref_result) throws -> !kgen.scalar<bool> attributes {sourceName = "factorial"} {
@@ -756,4 +897,123 @@ kgen.generator export @tail_call_error_fn(%cond: !kgen.scalar<bool>, %arg0: inde
     hlcf.yield %1 : !kgen.scalar<bool>
   }
   hlcf.return %4 : !kgen.scalar<bool>
+}
+
+
+// CHECK-LABEL: kgen.func @preserve_elif_side_effects(
+// CHECK-SAME: [[C0:%.*]]: !kgen.scalar<bool>, [[C1:%.*]]: !kgen.scalar<bool>) {
+// CHECK-NEXT: hlcf.if [[C0]] {
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   hlcf.if.elifcond.yield [[C1]]
+// CHECK-NEXT: } then {
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   [[C2:%.*]] = "test.condition"() : () -> !kgen.scalar<bool>
+// CHECK-NEXT:   hlcf.if.elifcond.yield [[C2]]
+// CHECK-NEXT: } then {
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: }
+// CHECK-NEXT: hlcf.return
+// CHECK-NEXT: }
+kgen.func @preserve_elif_side_effects(%c0: !kgen.scalar<bool>, %c1: !kgen.scalar<bool>) {
+  hlcf.if %c0 {
+    hlcf.yield
+  } else {
+    hlcf.if.elifcond.yield %c1
+  } then {
+    hlcf.yield
+  } else {
+    %c2 = "test.condition"() : () -> !kgen.scalar<bool>
+    hlcf.if.elifcond.yield %c2
+  } then {
+    hlcf.yield
+  } else {
+    hlcf.yield
+  }
+  hlcf.return
+}
+
+
+// CHECK-LABEL: kgen.func @preserve_elif_side_effects_with_results(
+// CHECK-SAME: [[COND:%.*]]: !kgen.scalar<bool>, [[VALUE:%.*]]: index) -> index {
+// CHECK-NEXT: hlcf.if [[COND]] {
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   [[ELIF_COND:%.*]] = "test.condition"() : () -> !kgen.scalar<bool>
+// CHECK-NEXT:   hlcf.if.elifcond.yield [[ELIF_COND]]
+// CHECK-NEXT: } then {
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: }
+// CHECK-NEXT: hlcf.return [[VALUE]] : index
+// CHECK-NEXT: }
+kgen.func @preserve_elif_side_effects_with_results(%c0: !kgen.scalar<bool>, %value: index) -> index {
+  %result = hlcf.if %c0 -> index {
+    hlcf.yield %value : index
+  } else {
+    %c1 = "test.condition"() : () -> !kgen.scalar<bool>
+    hlcf.if.elifcond.yield %c1
+  } then {
+    hlcf.yield %value : index
+  } else {
+    hlcf.yield %value : index
+  }
+  hlcf.return %result : index
+}
+
+
+// CHECK-LABEL: kgen.func @empty_if_elif(
+// CHECK-SAME: [[COND:%.*]]: !kgen.scalar<bool>, [[LHS:%.*]]: !kgen.scalar<index>, [[RHS:%.*]]: !kgen.scalar<index>) -> !kgen.scalar<index> {
+// CHECK-NEXT: hlcf.return [[LHS]] : !kgen.scalar<index>
+// CHECK-NEXT: }
+kgen.func @empty_if_elif(%cond: !kgen.scalar<bool>, %lhs: !kgen.scalar<index>, %rhs: !kgen.scalar<index>) -> !kgen.scalar<index> {
+  %result = hlcf.if %cond -> !kgen.scalar<index> {
+    hlcf.yield %lhs : !kgen.scalar<index>
+  } else {
+    %constant = kgen.param.constant: scalar<bool> = <false>
+    hlcf.if.elifcond.yield %constant
+  } then {
+    hlcf.yield %lhs : !kgen.scalar<index>
+  } else {
+    %equal = pop.cmp eq(%lhs, %rhs) : <1, index>
+    hlcf.if.elifcond.yield %equal
+  } then {
+    hlcf.yield %lhs : !kgen.scalar<index>
+  } else {
+    hlcf.yield %lhs : !kgen.scalar<index>
+  }
+  hlcf.return %result : !kgen.scalar<index>
+}
+
+
+// CHECK-LABEL: kgen.func @empty_if_volatile_elif(
+// CHECK-SAME: [[COND:%.*]]: !kgen.scalar<bool>, [[PTR:%.*]]: !kgen.pointer<scalar<bool>>) {
+// CHECK-NEXT: hlcf.if [[COND]] {
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   [[LOADED:%.*]] = pop.load volatile [[PTR]] : !kgen.pointer<scalar<bool>>
+// CHECK-NEXT:   hlcf.if.elifcond.yield [[LOADED]]
+// CHECK-NEXT: } then {
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: } else {
+// CHECK-NEXT:   hlcf.yield
+// CHECK-NEXT: }
+// CHECK-NEXT: hlcf.return
+// CHECK-NEXT: }
+kgen.func @empty_if_volatile_elif(%cond: !kgen.scalar<bool>, %ptr: !kgen.pointer<scalar<bool>>) {
+  hlcf.if %cond {
+    hlcf.yield
+  } else {
+    %loaded = pop.load volatile %ptr : !kgen.pointer<scalar<bool>>
+    hlcf.if.elifcond.yield %loaded
+  } then {
+    hlcf.yield
+  } else {
+    hlcf.yield
+  }
+  hlcf.return
 }

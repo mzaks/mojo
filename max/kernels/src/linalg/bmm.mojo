@@ -40,6 +40,7 @@ from max.gpu import (
 from max.gpu.host import DeviceContext, FuncAttribute
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu.host.info import A100, is_cpu, is_valid_target
+from max.gpu.primitives.grid_controls import PDLLevel
 from layout import (
     coord,
     ComptimeInt,
@@ -546,8 +547,16 @@ def _batched_matmul_cpu_impl[
                     c_view,
                     a_packed,
                     b_view,
-                    GemmShape(sub_matmul_config.shape),
-                    GemmShape(sub_matmul_config.offset),
+                    GemmShape(
+                        sub_matmul_config.shape[0],
+                        sub_matmul_config.shape[1],
+                        sub_matmul_config.shape[2],
+                    ),
+                    GemmShape(
+                        sub_matmul_config.offset[0],
+                        sub_matmul_config.offset[1],
+                        sub_matmul_config.offset[2],
+                    ),
                     epilogue_2d,
                     compute_2d,
                 )
@@ -564,8 +573,16 @@ def _batched_matmul_cpu_impl[
                     c_view,
                     a_view,
                     b_view,
-                    GemmShape(sub_matmul_config.shape),
-                    GemmShape(sub_matmul_config.offset),
+                    GemmShape(
+                        sub_matmul_config.shape[0],
+                        sub_matmul_config.shape[1],
+                        sub_matmul_config.shape[2],
+                    ),
+                    GemmShape(
+                        sub_matmul_config.offset[0],
+                        sub_matmul_config.offset[1],
+                        sub_matmul_config.offset[2],
+                    ),
                     epilogue_2d,
                     compute_2d,
                 )
@@ -866,6 +883,7 @@ def _batched_matmul_gpu[
     //,
     *,
     transpose_b: Bool = False,
+    pdl_level: PDLLevel = PDLLevel(),
 ](
     c_buf: TileTensor[mut=True, c_type, ...],
     a_buf: TileTensor[mut=False, a_type, ...],
@@ -873,7 +891,10 @@ def _batched_matmul_gpu[
     ctx: DeviceContext,
 ) raises:
     _batched_matmul_gpu_impl[
-        transpose_b=transpose_b, has_epilogue_fn=False, has_compute_fn=False
+        transpose_b=transpose_b,
+        has_epilogue_fn=False,
+        has_compute_fn=False,
+        pdl_level=pdl_level,
     ](c_buf, a_buf, b_buf, no_epilogue_fn, no_compute_fn, ctx)
 
 
@@ -886,6 +907,7 @@ def _batched_matmul_gpu[
     //,
     *,
     transpose_b: Bool = False,
+    pdl_level: PDLLevel = PDLLevel(),
 ](
     c_buf: TileTensor[mut=True, c_type, ...],
     a_buf: TileTensor[mut=False, a_type, ...],
@@ -894,7 +916,10 @@ def _batched_matmul_gpu[
     ctx: DeviceContext,
 ) raises:
     _batched_matmul_gpu_impl[
-        transpose_b=transpose_b, has_epilogue_fn=True, has_compute_fn=False
+        transpose_b=transpose_b,
+        has_epilogue_fn=True,
+        has_compute_fn=False,
+        pdl_level=pdl_level,
     ](c_buf, a_buf, b_buf, epilogue_fn, no_compute_fn, ctx)
 
 
@@ -907,6 +932,7 @@ def _batched_matmul_gpu[
     //,
     *,
     transpose_b: Bool = False,
+    pdl_level: PDLLevel = PDLLevel(),
 ](
     c_buf: TileTensor[mut=True, c_type, ...],
     a_buf: TileTensor[mut=False, a_type, ...],
@@ -915,7 +941,10 @@ def _batched_matmul_gpu[
     ctx: DeviceContext,
 ) raises:
     _batched_matmul_gpu_impl[
-        transpose_b=transpose_b, has_epilogue_fn=False, has_compute_fn=True
+        transpose_b=transpose_b,
+        has_epilogue_fn=False,
+        has_compute_fn=True,
+        pdl_level=pdl_level,
     ](c_buf, a_buf, b_buf, no_epilogue_fn, compute_fn, ctx)
 
 
@@ -931,6 +960,7 @@ def _batched_matmul_gpu_impl[
     transpose_b: Bool,
     has_epilogue_fn: Bool,
     has_compute_fn: Bool,
+    pdl_level: PDLLevel = PDLLevel(),
 ](
     c_buf: TileTensor[mut=True, c_type, ...],
     a_buf: TileTensor[mut=False, a_type, ...],
@@ -974,6 +1004,12 @@ def _batched_matmul_gpu_impl[
         with Trace[TraceLevel.OP]("batched_matmul_via_matmul"):
             # If the batch size is 1, then this is just a matmul and we can use the
             # matmul kernel directly.
+            #
+            # B may be an activation here, outside the constant-weight
+            # contract of the PDL weight prefetch. The rank-2 views below
+            # take their dims from runtime ints, so N and K are dynamic and
+            # neither the prefetching SM100 configs (keyed on static N and K)
+            # nor the split-K GEMV's weight prefetch (static N) is selected.
 
             # batch_size==1, so flatten (1, X, Y) → (X, Y)
             # by constructing rank-2 TileTensors directly.
@@ -1059,7 +1095,9 @@ def _batched_matmul_gpu_impl[
             and a_k * size_of[a_type]() % 16 == 0
             and transpose_b
         ):
-            dispatch_sm100_batched_matmul[c_type, a_type, b_type, transpose_b](
+            dispatch_sm100_batched_matmul[
+                c_type, a_type, b_type, transpose_b, pdl_level=pdl_level
+            ](
                 c_tensor_reshaped,
                 a_tensor_reshaped,
                 b_tensor_reshaped,
@@ -1175,8 +1213,8 @@ def _batched_matmul_gpu_impl[
         def kernel_helper[block_m: Int, block_n: Int]() raises {imm}:
             comptime block_k = 64
             comptime config = MatmulConfig[a_type, b_type, c_type, transpose_b](
-                block_tile_shape=Index(block_m, block_n, block_k),
-                warp_tile_shape=Index(block_m // 2, block_n // 2, block_k),
+                block_tile_shape=(block_m, block_n, block_k),
+                warp_tile_shape=(block_m // 2, block_n // 2, block_k),
                 mma_shape=_amdgpu_get_mma_shape[a_type, transpose_b](),
                 num_pipeline_stages=1,
                 num_k_partitions=1,
@@ -1259,6 +1297,7 @@ def batched_matmul[
     transpose_b: Bool = False,
     saturated_vnni: Bool = False,
     target: StaticString = "cpu",
+    pdl_level: PDLLevel = PDLLevel.OVERLAP_AT_BEGINNING,
 ](
     c_buf: TileTensor[mut=True, address_space=.GENERIC, ...],
     a_buf: TileTensor[mut=False, address_space=.GENERIC, ...],
@@ -1276,6 +1315,15 @@ def batched_matmul[
         saturated_vnni: Whether to use saturated VNNI accumulation on CPU
             (defaults to `False`; not applicable on GPU).
         target: Target hardware for the operation (defaults to `"cpu"`).
+        pdl_level: Programmatic dependent launch level for the SM100 GPU
+            kernels; other targets ignore it. `OVERLAP_AT_BEGINNING`
+            releases dependent grids at kernel entry, so every dependent must
+            wait before reading the output. The SM100 plain matmul may prefetch
+            its B operand ahead of that wait, because B is a weight read
+            straight from the checkpoint by contract. A value the graph
+            computes each call (a cast, concat, derived parameter or sharded
+            view) is not one, so this op's output must not feed it as B
+            (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
 
     Args:
         c_buf: Output tensor of shape `(..., m, n)`; rank must be at least
@@ -1293,6 +1341,7 @@ def batched_matmul[
         has_compute_fn=False,
         saturated_vnni=saturated_vnni,
         target=target,
+        pdl_level=pdl_level,
     ](c_buf, a_buf, b_buf, no_epilogue_fn, no_compute_fn, context)
 
 
@@ -1305,6 +1354,7 @@ def batched_matmul[
     transpose_b: Bool = False,
     saturated_vnni: Bool = False,
     target: StaticString = "cpu",
+    pdl_level: PDLLevel = PDLLevel.OVERLAP_AT_BEGINNING,
 ](
     c_buf: TileTensor[mut=True, address_space=.GENERIC, ...],
     a_buf: TileTensor[mut=False, address_space=.GENERIC, ...],
@@ -1324,6 +1374,15 @@ def batched_matmul[
         saturated_vnni: Whether to use saturated VNNI accumulation on CPU
             (defaults to `False`; not applicable on GPU).
         target: Target hardware for the operation (defaults to `"cpu"`).
+        pdl_level: Programmatic dependent launch level for the SM100 GPU
+            kernels; other targets ignore it. `OVERLAP_AT_BEGINNING`
+            releases dependent grids at kernel entry, so every dependent must
+            wait before reading the output. The SM100 plain matmul may prefetch
+            its B operand ahead of that wait, because B is a weight read
+            straight from the checkpoint by contract. A value the graph
+            computes each call (a cast, concat, derived parameter or sharded
+            view) is not one, so this op's output must not feed it as B
+            (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
 
     Args:
         c_buf: Tensor of shape `(..., m, n)` giving the output shape; rank
@@ -1345,6 +1404,7 @@ def batched_matmul[
         has_compute_fn=False,
         saturated_vnni=saturated_vnni,
         target=target,
+        pdl_level=pdl_level,
     ](c_buf, a_buf, b_buf, epilogue_fn, no_compute_fn, context)
 
 
@@ -1357,6 +1417,7 @@ def batched_matmul[
     transpose_b: Bool = False,
     saturated_vnni: Bool = False,
     target: StaticString = "cpu",
+    pdl_level: PDLLevel = PDLLevel.OVERLAP_AT_BEGINNING,
 ](
     c_buf: TileTensor[mut=True, address_space=.GENERIC, ...],
     a_buf: TileTensor[mut=False, address_space=.GENERIC, ...],
@@ -1377,6 +1438,15 @@ def batched_matmul[
         saturated_vnni: Whether to use saturated VNNI accumulation on CPU
             (defaults to `False`; not applicable on GPU).
         target: Target hardware for the operation (defaults to `"cpu"`).
+        pdl_level: Programmatic dependent launch level for the SM100 GPU
+            kernels; other targets ignore it. `OVERLAP_AT_BEGINNING`
+            releases dependent grids at kernel entry, so every dependent must
+            wait before reading the output. The SM100 plain matmul may prefetch
+            its B operand ahead of that wait, because B is a weight read
+            straight from the checkpoint by contract. A value the graph
+            computes each call (a cast, concat, derived parameter or sharded
+            view) is not one, so this op's output must not feed it as B
+            (defaults to `PDLLevel.OVERLAP_AT_BEGINNING`).
 
     Args:
         c_buf: Output tensor of shape `(..., m, n)`; rank must be at least
@@ -1397,6 +1467,7 @@ def batched_matmul[
         has_compute_fn=True,
         saturated_vnni=saturated_vnni,
         target=target,
+        pdl_level=pdl_level,
     ](c_buf, a_buf, b_buf, no_epilogue_fn, compute_fn, context)
 
 
@@ -1412,6 +1483,7 @@ def _batched_matmul[
     has_compute_fn: Bool,
     saturated_vnni: Bool,
     target: StaticString,
+    pdl_level: PDLLevel = PDLLevel(),
 ](
     c_buf: TileTensor[mut=True, address_space=.GENERIC, ...],
     a_buf: TileTensor[mut=False, address_space=.GENERIC, ...],
@@ -1487,6 +1559,7 @@ def _batched_matmul[
                 transpose_b=transpose_b,
                 has_epilogue_fn=has_epilogue_fn,
                 has_compute_fn=has_compute_fn,
+                pdl_level=pdl_level,
             ](c_buf, a_buf, b_buf, epilogue_fn, compute_fn, context.value())
 
 
@@ -1537,7 +1610,13 @@ def batched_matmul_shape[
     return output_shape
 
 
-@__llvm_metadata(`nvvm.cluster_dim`=cluster_shape)
+@__llvm_metadata(
+    `nvvm.cluster_dim`=StaticTuple[Int32, 3](
+        Int32(cluster_shape[0]),
+        Int32(cluster_shape[1]),
+        Int32(cluster_shape[2]),
+    )
+)
 @__llvm_arg_metadata(a_tma_op, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma_op, `nvvm.grid_constant`)
 @__llvm_arg_metadata(a_scales_tma_op, `nvvm.grid_constant`)
@@ -1560,10 +1639,10 @@ def _bmm_sm100_blockwise_scaled_fp8_kernel[
     b_desc_shape: Coord,
     a_scales_tile_shape: Coord,
     a_scales_desc_shape: Coord,
-    block_tile_shape: IndexList[3],
-    mma_shape: IndexList[3],
+    block_tile_shape: Tuple[Int, Int, Int],
+    mma_shape: Tuple[Int, Int, Int],
     transpose_b: Bool = True,
-    cluster_shape: StaticTuple[Int32, 3] = StaticTuple[Int32, 3](1, 1, 1),
+    cluster_shape: Coord[Int, Int, Int] = Coord[Int, Int, Int](1, 1, 1),
     a_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
     b_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
     num_threads: Int = 128,
@@ -1666,8 +1745,8 @@ def bmm_sm100_blockwise_scaled_fp8[
     b_scales_type: DType,
     *,
     transpose_b: Bool,
-    umma_shape: Coord,
-    block_tile_shape: IndexList[3],
+    umma_shape: Tuple[Int, Int, Int],
+    block_tile_shape: Tuple[Int, Int, Int],
     a_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
     b_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
     b_scaling_block_n: Int = 128,
@@ -1726,8 +1805,8 @@ def bmm_sm100_blockwise_scaled_fp8[
     //,
     *,
     transpose_b: Bool,
-    umma_shape: Coord,
-    block_tile_shape: IndexList[3],
+    umma_shape: Tuple[Int, Int, Int],
+    block_tile_shape: Tuple[Int, Int, Int],
     a_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
     b_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
     b_scaling_block_n: Int = 128,
@@ -1789,8 +1868,8 @@ def _bmm_sm100_blockwise_scaled_fp8_impl[
     //,
     *,
     transpose_b: Bool,
-    umma_shape: Coord,
-    block_tile_shape: IndexList[3],
+    umma_shape: Tuple[Int, Int, Int],
+    block_tile_shape: Tuple[Int, Int, Int],
     a_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
     b_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B,
     b_scaling_block_n: Int = 128,
@@ -1932,7 +2011,7 @@ def _bmm_sm100_blockwise_scaled_fp8_impl[
         type_of(a_scales_tma_op).tile_shape,
         type_of(a_scales_tma_op).desc_shape,
         block_tile_shape,
-        (umma_shape[0], umma_shape[1], umma_shape[2]),
+        umma_shape,
         transpose_b=True,
         a_swizzle=a_swizzle,
         b_swizzle=b_swizzle,
@@ -2131,7 +2210,7 @@ def blockwise_scaled_fp8_matmul_amd_batched[
     b_scales_type: DType,
     //,
     *,
-    scales_granularity_mnk: IndexList[3],
+    scales_granularity_mnk: Coord[Int, Int, Int],
     transpose_b: Bool = False,
 ](
     c_: TileTensor[mut=True, c_type, ...],
@@ -2287,7 +2366,7 @@ def _batched_matmul_dynamic_scaled_fp8_amd_tiled[
     b_scales_type: DType,
     //,
     *,
-    scales_granularity_mnk: IndexList[3],
+    scales_granularity_mnk: Coord[Int, Int, Int],
     transpose_b: Bool = False,
 ](
     c_: TileTensor[mut=True, c_type, ...],
@@ -2457,7 +2536,7 @@ def batched_matmul_dynamic_scaled_fp8_naive[
     b_scales_type: DType,
     //,
     *,
-    scales_granularity_mnk: IndexList[3],
+    scales_granularity_mnk: Coord[Int, Int, Int],
     transpose_b: Bool = False,
 ](
     c: TileTensor[mut=True, c_type, ...],
@@ -2513,7 +2592,9 @@ def batched_matmul_dynamic_scaled_fp8_naive[
         naive_blockwise_scaled_fp8_matmul[
             BLOCK_DIM=16,
             transpose_b=transpose_b,
-            scales_granularity_mnk=Index(1, BLOCK_SCALE_N, BLOCK_SCALE_K),
+            scales_granularity_mnk=Coord[Int, Int, Int](
+                1, BLOCK_SCALE_N, BLOCK_SCALE_K
+            ),
         ](
             c[batch, :, :].address_space_cast[.GENERIC](),
             a[batch, :, :].address_space_cast[.GENERIC](),
@@ -2652,9 +2733,11 @@ def _batched_matmul_dynamic_scaled_fp8_impl[
         # exactly one B-scale block; BK_kernel tracks k_scale_granularity.
         # K-tile bytes = BK * sizeof(fp8) = BK. SWIZZLE_128B requires a
         # 128-byte K-tile, so BK=64 needs SWIZZLE_64B instead.
-        comptime umma_shape = Index(64, n_scale_granularity, 32)
-        comptime block_tile_shape = Index(
-            umma_shape[0], umma_shape[1], k_scale_granularity
+        comptime umma_shape = (64, n_scale_granularity, 32)
+        comptime block_tile_shape = (
+            umma_shape[0],
+            umma_shape[1],
+            k_scale_granularity,
         )
         comptime swizzle = (
             TensorMapSwizzle.SWIZZLE_128B if k_scale_granularity
@@ -2663,7 +2746,7 @@ def _batched_matmul_dynamic_scaled_fp8_impl[
 
         bmm_sm100_blockwise_scaled_fp8[
             transpose_b=transpose_b,
-            umma_shape=(umma_shape[0], umma_shape[1], umma_shape[2]),
+            umma_shape=umma_shape,
             block_tile_shape=block_tile_shape,
             a_swizzle=swizzle,
             b_swizzle=swizzle,
@@ -2677,8 +2760,10 @@ def _batched_matmul_dynamic_scaled_fp8_impl[
         and type_of(a).static_shape[2] > 0
     ):
         return _batched_matmul_dynamic_scaled_fp8_amd_tiled[
-            scales_granularity_mnk=Index(
-                m_scale_granularity, n_scale_granularity, k_scale_granularity
+            scales_granularity_mnk=(
+                m_scale_granularity,
+                n_scale_granularity,
+                k_scale_granularity,
             ),
             transpose_b=transpose_b,
         ](
@@ -2691,8 +2776,10 @@ def _batched_matmul_dynamic_scaled_fp8_impl[
         )
     else:
         return batched_matmul_dynamic_scaled_fp8_naive[
-            scales_granularity_mnk=Index(
-                m_scale_granularity, n_scale_granularity, k_scale_granularity
+            scales_granularity_mnk=(
+                m_scale_granularity,
+                n_scale_granularity,
+                k_scale_granularity,
             ),
             transpose_b=transpose_b,
         ](

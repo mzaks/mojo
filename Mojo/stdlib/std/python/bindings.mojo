@@ -574,7 +574,7 @@ struct PythonTypeBuilder(Copyable):
     var basicsize: Int
     """The required allocation size to hold an instance of this type as a Python object."""
 
-    var _slots: Dict[Int, OptionalPointer[NoneType, MutUntrackedOrigin]]
+    var _slots: Dict[Int, Optional[Pointer[NoneType, MutUntrackedOrigin]]]
     """Dictionary of Python type slots that define the behavior of the type, mapping slot number to function pointer."""
 
     var methods: List[PyMethodDef]
@@ -681,13 +681,11 @@ struct PythonTypeBuilder(Copyable):
             0,
             Py_TPFLAGS_DEFAULT,
             # Note: This pointer is only "read-only" by PyType_FromSpec.
-            slots.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
+            slots.unsafe_ptr(),
         )
 
         # Construct a Python 'type' object from our type spec.
-        var type_obj_ptr = cpython.PyType_FromSpec(
-            Pointer(to=type_spec).as_unsafe_any_origin()
-        )
+        var type_obj_ptr = cpython.PyType_FromSpec(Pointer(to=type_spec))
 
         if not type_obj_ptr:
             raise cpython.get_error()
@@ -1192,7 +1190,7 @@ def _set_python_error(
     var error_type = cpython.get_error_global(exc_type.global_name)
     cpython.PyErr_SetString(
         error_type,
-        error_message.as_c_string_span().ptr().as_unsafe_any_origin(),
+        error_message.as_c_string_span().ptr(),
     )
 
 
@@ -1245,13 +1243,11 @@ def _py_init_function_nonregistered(
 ) abi("C") -> c_int:
     ref cpython = Python().cpython()
     var error_type = cpython.get_error_global("PyExc_TypeError")
-    cpython.PyErr_SetString(
-        error_type,
+    comptime message = (
         "No initializer registered for this type. Use def_py_init() or"
-        " def_init_defaultable() to register an initializer.".as_c_string_span()
-        .ptr()
-        .as_unsafe_any_origin(),
+        " def_init_defaultable() to register an initializer."
     )
+    cpython.PyErr_SetString(error_type, message.as_c_string_span().ptr())
     return -1
 
 
@@ -1520,7 +1516,7 @@ def _py_function_fastcall_wrapper[
         # non-null for every METH_FASTCALL invocation, including the
         # `nargs == 0` case (CPython hands the callee a pointer into a
         # cached empty tuple). `_dispatch_fast` therefore accepts a plain
-        # `Pointer` rather than `OptionalPointer`.
+        # `Pointer` rather than `Optional[Pointer]`.
         return _dispatch_python_object_function[func](
             args, Int(nargs)
         ).steal_data()

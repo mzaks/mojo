@@ -179,7 +179,7 @@ def stable_broadcast_test[
     def run_and_check(alt: Bool) raises {imm}:
         comptime for i in range(ngpus):
             comptime if force_2stage:
-                broadcast_2stage[ngpus=ngpus, pdl_level=PDLLevel()](
+                broadcast_2stage[ngpus=ngpus, pdl_level=PDLLevel.OFF](
                     in_tile, out_tiles[i], rank_sigs, ctxs[i], root, rank=i
                 )
             else:
@@ -241,28 +241,16 @@ def main() raises:
             comptime length = rebind[Int](test_lengths[length_idx])
             for root in range(ngpus):
                 print(
-                    "====broadcast-stable-addr",
-                    dtype,
-                    "ngpus",
-                    ngpus,
-                    "root",
-                    root,
-                    "nelems",
-                    length,
+                    t"====broadcast-stable-addr {dtype} ngpus {ngpus} root"
+                    t" {root} nelems {length}"
                 )
                 stable_broadcast_test[
                     ngpus, force_2stage=False, in_place=False
                 ](ctxs, length, root)
 
                 print(
-                    "====broadcast-stable-addr-2stage",
-                    dtype,
-                    "ngpus",
-                    ngpus,
-                    "root",
-                    root,
-                    "nelems",
-                    length,
+                    t"====broadcast-stable-addr-2stage {dtype} ngpus"
+                    t" {ngpus} root {root} nelems {length}"
                 )
                 stable_broadcast_test[ngpus, force_2stage=True, in_place=False](
                     ctxs, length, root
@@ -272,14 +260,8 @@ def main() raises:
                 # aliases the input; with slot-backed inputs that check
                 # reads the pointer through the slot.
                 print(
-                    "====broadcast-stable-addr-2stage-inplace",
-                    dtype,
-                    "ngpus",
-                    ngpus,
-                    "root",
-                    root,
-                    "nelems",
-                    length,
+                    t"====broadcast-stable-addr-2stage-inplace {dtype} ngpus"
+                    t" {ngpus} root {root} nelems {length}"
                 )
                 stable_broadcast_test[ngpus, force_2stage=True, in_place=True](
                     ctxs, length, root

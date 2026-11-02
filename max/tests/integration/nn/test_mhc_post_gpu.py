@@ -24,7 +24,7 @@ import torch
 from max.dtype import DType
 from max.engine import InferenceSession, Model
 from max.graph import DeviceRef, Graph, TensorType, ops
-from max.nn.kernels import mhc_post
+from max.nn.legacy.kernels import mhc_post
 from torch.utils.dlpack import from_dlpack
 
 _HC_MULT = 4
@@ -140,6 +140,12 @@ def test_post_128_thread_blocks(compile_post_128: Model, tokens: int) -> None:
 
     assert actual.shape == (tokens, _HC_MULT, _HIDDEN_128)
     _assert_rounded_once(actual, streams, y, post, comb)
+
+
+def test_post_accepts_no_tokens(compile_post: Model) -> None:
+    """A data-parallel replica with no rows in the batch runs the op."""
+    (out,) = compile_post.execute(*_inputs(0))
+    assert from_dlpack(out).shape == (0, _HC_MULT, _HIDDEN)
 
 
 def test_post_contracts_over_the_first_stream_axis(

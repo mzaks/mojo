@@ -220,6 +220,13 @@ bool isWidthOne(StringRef text) {
 /// The sort of a value of `type`: an integer (`Int`, `SIMD` of an integer
 /// dtype and width 1, `index`, `kgen.scalar<index>`), a Boolean, or else an
 /// opaque 64-bit handle (structs, references).
+/// The struct type `type` names: itself, or the one a parameter type that
+/// keeps an alias (`!kgen.param<:meta<...> sugar_preserved(...)>`, the
+/// `MutPointer` a method's `self` is declared as) stands for.
+LIT::StructType structTypeOf(Type type) {
+  return dyn_cast_or_null<LIT::StructType>(KGEN::getCanonicalType(type));
+}
+
 Sort sortOf(Type type) {
   std::string text = printed(type);
   StringRef t(text);
@@ -283,7 +290,7 @@ LIT::StructDeclOp closureStructOf(LIT::FnOp fn) {
 LIT::StructType closureTypeOf(Type type) {
   if (auto ref = dyn_cast<LIT::RefType>(type))
     type = ref.getElementType();
-  auto st = dyn_cast<LIT::StructType>(type);
+  auto st = structTypeOf(type);
   if (!st)
     return {};
   StringRef leaf = st.getSymbol().getLeafReference().getValue();
@@ -337,8 +344,17 @@ struct CalleeName {
   SmallVector<std::string> params;
 };
 
+/// The parameter values `symbol` binds, as the scope enclosing it sees
+/// them. A generator with input parameters left (a function passed on with
+/// some of its parameters unbound) gives its body's, which name those
+/// inputs.
+static ArrayRef<TypedAttr> boundParamValues(FuncSymbolGenerator symbol) {
+  return symbol.isFullyBound() ? symbol.getParamValues()
+                               : symbol.getFuncSymbol().getParamValues();
+}
+
 std::optional<CalleeName> calleeName(Attribute callee) {
-  auto symbol = dyn_cast<SymbolConstantAttr>(callee);
+  auto symbol = FuncSymbolGenerator::dynCast(callee);
   if (!symbol)
     return std::nullopt;
   CalleeName name;
@@ -346,7 +362,7 @@ std::optional<CalleeName> calleeName(Attribute callee) {
   name.path = ref.getRootReference().str();
   for (FlatSymbolRefAttr nested : ref.getNestedReferences())
     name.path += "::" + nested.getValue().str();
-  for (TypedAttr param : symbol.getParamValues())
+  for (TypedAttr param : boundParamValues(symbol))
     name.params.push_back(printed(param));
   return name;
 }
@@ -357,11 +373,11 @@ std::optional<CalleeName> calleeName(Attribute callee) {
 /// that converts it to the declared `def` type (a function of its own,
 /// named `def[...]`, whose parameters hold the kernel). `resolve` resolves
 /// a parameter in the caller's scope.
-std::pair<LIT::FnOp, SymbolConstantAttr>
-launchedKernel(SymbolConstantAttr call, ModuleOp module,
+std::pair<LIT::FnOp, FuncSymbolGenerator>
+launchedKernel(FuncSymbolGenerator call, ModuleOp module,
                SymbolTableCollection &symbols,
                llvm::function_ref<TypedAttr(TypedAttr)> resolve) {
-  std::pair<LIT::FnOp, SymbolConstantAttr> found;
+  std::pair<LIT::FnOp, FuncSymbolGenerator> found;
   std::function<void(TypedAttr, int)> search = [&](TypedAttr param, int depth) {
     if (found.first || depth > 3)
       return;
@@ -371,7 +387,7 @@ launchedKernel(SymbolConstantAttr call, ModuleOp module,
         return;
       param = resolve(expr.getOperands()[0]);
     }
-    auto symbol = dyn_cast<SymbolConstantAttr>(param);
+    auto symbol = FuncSymbolGenerator::dynCast(param);
     if (!symbol)
       return;
     auto fn = dyn_cast_or_null<LIT::FnOp>(
@@ -381,10 +397,10 @@ launchedKernel(SymbolConstantAttr call, ModuleOp module,
       found = {fn, symbol};
       return;
     }
-    for (TypedAttr inner : symbol.getParamValues())
+    for (TypedAttr inner : boundParamValues(symbol))
       search(inner, depth + 1);
   };
-  for (TypedAttr param : call.getParamValues())
+  for (TypedAttr param : boundParamValues(call))
     search(param, 0);
   return found;
 }
@@ -1474,11 +1490,11 @@ struct State {
 /// its call's callee (`f[4]`) instead, binding its own parameters; the other
 /// names in its body are the enclosing function's.
 struct InstanceLink {
-  SymbolConstantAttr symbol;
+  FuncSymbolGenerator symbol;
   LIT::FnOp fn;
   size_t implicit = 0;
 
-  ArrayRef<TypedAttr> values() const { return symbol.getParamValues(); }
+  ArrayRef<TypedAttr> values() const { return boundParamValues(symbol); }
 };
 
 struct Obligation {
@@ -1874,7 +1890,7 @@ public:
       while (auto sugar = dyn_cast<SugarAttr>(value))
         value = sugar.getCanonical();
       bool opaque = false;
-      value.walk([&](SymbolConstantAttr symbol) {
+      value.walk([&](FuncSymbolAttr symbol) {
         // The stdlib's functions, and the ones naming the build's
         // accelerator (`get_gpu_target()`), are what `paramTerm` models.
         std::string path = printed(symbol.getSymbol());
@@ -3163,7 +3179,7 @@ private:
       rest = rest.drop_front(field.size());
       if (!rest.starts_with("\">"))
         return false;
-      auto st = dyn_cast<LIT::StructType>(type);
+      auto st = structTypeOf(type);
       if (!st || field.empty())
         return false;
       auto decl = dyn_cast_or_null<LIT::StructDeclOp>(
@@ -4094,7 +4110,7 @@ private:
   bool needsDestroy(Type type, unsigned depth = 0) {
     if (!type)
       return true; // Not resolved: as unknown.
-    auto st = dyn_cast<LIT::StructType>(type);
+    auto st = structTypeOf(type);
     if (!st)
       return false; // A builtin (`!pop.simd`, a raw pointer).
     auto decl = dyn_cast_or_null<LIT::StructDeclOp>(
@@ -4116,7 +4132,7 @@ private:
       for (Block &block : region)
         for (auto field : block.getOps<LIT::StructFieldOp>()) {
           Type fieldType = field.getType();
-          if (isa<LIT::StructType>(fieldType)
+          if (structTypeOf(fieldType)
                   ? needsDestroy(fieldType, depth + 1)
                   : StringRef(printed(fieldType)).contains("param.decl.ref"))
             return true;
@@ -4127,7 +4143,7 @@ private:
   /// The type parameter `index` of a struct type (`T` of `Pointer`, at 2;
   /// of `Allocation`, at 0), if it resolves to a type.
   Type typeParamOf(Type type, unsigned index) {
-    auto st = dyn_cast<LIT::StructType>(type);
+    auto st = structTypeOf(type);
     if (!st || st.getParamValues().size() <= index)
       return {};
     auto param = dyn_cast<TypeParamAttr>(
@@ -5955,13 +5971,16 @@ private:
       std::optional<std::string> end;
       initial.walk([&](ParamOperatorAttr apply) {
         ArrayRef<TypedAttr> ops = apply.getOperands();
-        if (!end && apply.getOpcode() == POC::Apply && ops.size() == 2 &&
-            StringRef(printed(ops[0]))
-                .starts_with("#kgen.symbol.constant<@std::@builtin::@range::@"
-                             "\"range[::DType](::SIMD[$0, 1])\""))
-          if (std::string e = paramTerm(ops[1], Sort{false, 64, true});
-              !sortOfTerm(e).isBool && sortOfTerm(e).width == 64)
-            end = e;
+        if (end || apply.getOpcode() != POC::Apply || ops.size() != 2)
+          return;
+        FuncSymbolGenerator fn = FuncSymbolGenerator::dynCast(ops[0]);
+        if (!fn ||
+            printed(fn.getSymbol()) !=
+                "@std::@builtin::@range::@\"range[::DType](::SIMD[$0, 1])\"")
+          return;
+        if (std::string e = paramTerm(ops[1], Sort{false, 64, true});
+            !sortOfTerm(e).isBool && sortOfTerm(e).width == 64)
+          end = e;
       });
       // Its uses name it `#kgen.param.decl.ref<"iter`30">`.
       static llvm::Regex nameRe("param.decl \\*(\"[^\"]*\")");
@@ -6050,11 +6069,12 @@ private:
                             "__getitem_param__["))
         return;
       auto ref = dyn_cast<LIT::RefType>(call->getResult(0).getType());
-      auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+      auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
       // At the loop's own index (`xs[v]`, not `xs[base + v]`).
-      auto index = symbol && symbol.getParamValues().size() >= 3
-                       ? dyn_cast<ParamOperatorAttr>(symbol.getParamValues()[2])
-                       : ParamOperatorAttr();
+      auto index =
+          symbol && boundParamValues(symbol).size() >= 3
+              ? dyn_cast<ParamOperatorAttr>(boundParamValues(symbol)[2])
+              : ParamOperatorAttr();
       candidate = candidate ||
                   (ref && !ref.isMutableKnown(false) && index &&
                    index.getOpcode() == POC::ApplyResultSlot &&
@@ -7400,7 +7420,7 @@ private:
       Type type = operand.getType();
       if (auto ref = dyn_cast<LIT::RefType>(type))
         type = ref.getElementType();
-      auto st = dyn_cast<LIT::StructType>(type);
+      auto st = structTypeOf(type);
       if (!st || printed(st.getSymbol()) != "@layout::@tile_tensor::@TileTensor")
         continue;
       auto it = partialValid.find(tensorTerm(operand, state));
@@ -7781,7 +7801,7 @@ private:
     if (auto extract = dyn_cast<LIT::StructExtractAttr>(attr);
         extract && depth < 16 &&
         !isa<LIT::LITStructAttr>(extract.getStructValue()) &&
-        isa<LIT::StructType>(extract.getStructValue().getType()) &&
+        structTypeOf(extract.getStructValue().getType()) &&
         !isScalar(extract.getStructValue().getType())) {
       TypedAttr base = extract.getStructValue();
       return fieldOf(paramTerm(base, sortOf(base.getType()), depth + 1),
@@ -7908,21 +7928,21 @@ private:
           if (MaybeTerm t = dtypeMembership(ops))
             return *t;
         if (ops.size() == 1 && !sort.isBool && sort.width == 64)
-          if (auto symbol = dyn_cast<SymbolConstantAttr>(ops[0]))
+          if (auto symbol = FuncSymbolGenerator::dynCast(ops[0]))
             if (MaybeTerm w = simdWidth(symbol))
               return *w;
         if (ops.size() == 1 && !sort.isBool && sort.width == 64)
-          if (auto symbol = dyn_cast<SymbolConstantAttr>(ops[0]))
+          if (auto symbol = FuncSymbolGenerator::dynCast(ops[0]))
             if (MaybeTerm bytes = dtypeSize(symbol))
               return *bytes;
         if (ops.size() == 1 && !sort.isBool && sort.width == 64)
-          if (auto symbol = dyn_cast<SymbolConstantAttr>(ops[0]))
+          if (auto symbol = FuncSymbolGenerator::dynCast(ops[0]))
             if (MaybeTerm bytes = typeSize(symbol))
               return *bytes;
         // `Wrapper(n)` of an integer wrapper (`GEMVAlgorithm.GEMV_KERNEL`
         // is `GEMVAlgorithm(0)`): `n`.
         if (ops.size() == 2 && !sort.isBool)
-          if (auto symbol = dyn_cast<SymbolConstantAttr>(ops[0]))
+          if (auto symbol = FuncSymbolGenerator::dynCast(ops[0]))
             if (auto init = dyn_cast_or_null<LIT::FnOp>(
                     symbols.lookupSymbolIn(module, symbol.getSymbol()));
                 init && isFieldInit(init))
@@ -8012,9 +8032,9 @@ private:
   /// `comptime` are the same width. As cases, not `w & (w - 1) == 0`: each
   /// case makes the width a constant; with the bit trick six of gemv's
   /// `vectorize` preconditions ran to the solver's limit.
-  MaybeTerm simdWidth(SymbolConstantAttr symbol) {
+  MaybeTerm simdWidth(FuncSymbolGenerator symbol) {
     std::optional<CalleeName> name = calleeName(symbol);
-    ArrayRef<TypedAttr> ps = symbol.getParamValues();
+    ArrayRef<TypedAttr> ps = boundParamValues(symbol);
     if (!name || ps.size() < 2 ||
         !StringRef(name->path)
              .starts_with("std::sys::info::simd_width_of[!kgen.target,::DType,"))
@@ -8053,9 +8073,9 @@ private:
   /// A literal's is in its name (`f32`, `bf16`, `si8`; `bool` is one byte,
   /// `index` eight); any other dtype's is a power of two up to 32 (`uint256`
   /// is the widest), one term per dtype expression.
-  MaybeTerm dtypeSize(SymbolConstantAttr symbol) {
+  MaybeTerm dtypeSize(FuncSymbolGenerator symbol) {
     std::optional<CalleeName> name = calleeName(symbol);
-    ArrayRef<TypedAttr> ps = symbol.getParamValues();
+    ArrayRef<TypedAttr> ps = boundParamValues(symbol);
     if (!name || ps.size() < 2 ||
         !StringRef(name->path)
              .starts_with("std::sys::info::size_of[!kgen.target,::DType,"))
@@ -8066,9 +8086,9 @@ private:
   /// `size_of[T]()` of a type that is not a dtype (a struct): one unknown
   /// per type, not negative, as a parameter expression or a call. So a
   /// clause's `size_of[Smem]()` is the launcher's.
-  MaybeTerm typeSize(SymbolConstantAttr symbol) {
+  MaybeTerm typeSize(FuncSymbolGenerator symbol) {
     std::optional<CalleeName> name = calleeName(symbol);
-    ArrayRef<TypedAttr> ps = symbol.getParamValues();
+    ArrayRef<TypedAttr> ps = boundParamValues(symbol);
     if (!name || ps.size() < 2 ||
         !StringRef(name->path)
              .starts_with("std::sys::info::size_of[!kgen.target,::AnyType,"))
@@ -8092,9 +8112,8 @@ private:
       params = scope;
       std::string text;
       auto typed = dyn_cast<TypeParamAttr>(attr);
-      auto structType = typed && depth < 6
-                            ? dyn_cast<LIT::StructType>(typed.getTypeValue())
-                            : LIT::StructType();
+      auto structType = typed && depth < 6 ? structTypeOf(typed.getTypeValue())
+                                           : LIT::StructType();
       if (structType) {
         text = printed(structType.getSymbol()) + "<";
         for (TypedAttr param : structType.getParamValues())
@@ -8214,7 +8233,7 @@ private:
     value = unwrapValue(resolveParam(unwrapValue(value), &scope));
     if (std::optional<uint64_t> c = dtypeLiteral(value))
       return bvConst(*c, 8);
-    auto type = dyn_cast<LIT::StructType>(value.getType());
+    auto type = structTypeOf(value.getType());
     if (!type || printed(type.getSymbol()) != "@std::@builtin::@dtype::@DType")
       return "";
     MLIRContext *ctx = value.getContext();
@@ -8233,7 +8252,7 @@ private:
   /// runs, when it has a body: the capture constructor, the `__call__`
   /// wrapper, or the body itself. Null for any other callee.
   LIT::FnOp closureMember(LIT::CallOp call) {
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!symbol)
       return {};
     ArrayRef<FlatSymbolRefAttr> nested =
@@ -8456,7 +8475,7 @@ private:
         continue;
       for (auto member : conformance.getBody().getOps<WitnessOp>())
         if (member.getSymName() == "__call__")
-          if (auto value = dyn_cast<SymbolConstantAttr>(member.getValue()))
+          if (auto value = FuncSymbolGenerator::dynCast(member.getValue()))
             impl = dyn_cast_or_null<LIT::FnOp>(
                 symbols.lookupSymbolIn(module, value.getSymbol()));
     }
@@ -8515,7 +8534,8 @@ private:
   bool inlineHigherOrder(LIT::CallOp call, LIT::FnOp callee, ParamFrame &frame,
                          State &state) {
     if (inContract || !callee || callee.getFunctionBody().empty() ||
-        !isa<SymbolConstantAttr>(call.getCallee()) || closureStructOf(callee))
+        !FuncSymbolGenerator::dynCast(call.getCallee()) ||
+        closureStructOf(callee))
       return false;
     if (std::optional<CalleeName> name = calleeName(call.getCallee());
         name && modelledHigherOrder(*name))
@@ -8602,7 +8622,7 @@ private:
                        LIT::FnOp callee, ParamFrame &frame, State &state) {
     if (inContract || transparentDepth >= 3 || call->getNumResults() != 1 ||
         !isScalar(call->getResult(0).getType()) ||
-        !isa<SymbolConstantAttr>(call.getCallee()) ||
+        !FuncSymbolGenerator::dynCast(call.getCallee()) ||
         StringRef(name.path).starts_with("std::") ||
         StringRef(printed(call.getCallee().getType())).contains(" throws") ||
         !isExpression(callee))
@@ -8802,7 +8822,7 @@ private:
       return;
     if (name && evalExternalMemory(call, *name, state))
       return;
-    if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    if (auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
         symbol && call.getNumOperands() == 0 && call->getNumResults() == 1)
       if (sortOf(call->getResult(0).getType()).width == 64) {
         MaybeTerm w = simdWidth(symbol);
@@ -8926,10 +8946,10 @@ private:
                          "!kgen.string](::StringLiteral[") &&
         call.getNumOperands() == 2 &&
         isa<LIT::RefType>(call.getOperands()[1].getType()))
-      if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
-          symbol && symbol.getParamValues().size() == 1)
+      if (auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+          symbol && boundParamValues(symbol).size() == 1)
         if (std::optional<int64_t> n =
-                stringLength(resolveParam(symbol.getParamValues()[0]))) {
+                stringLength(resolveParam(boundParamValues(symbol)[0]))) {
           std::string string = valueThrough(call.getOperands()[1], state);
           state.pc = define({true, 1, false},
                             "(and " + state.pc + " (= " + lenOf(string) + " " +
@@ -9005,16 +9025,16 @@ private:
   void assumeAssertion(LIT::CallOp call, const std::optional<CalleeName> &name,
                        State &state) {
     const char *prefix = "std::testing::testing::assert_";
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!name || !StringRef(name->path).starts_with(prefix) || !symbol ||
-        symbol.getParamValues().empty() || call->getNumResults() < 1 ||
+        boundParamValues(symbol).empty() || call->getNumResults() < 1 ||
         !sortOf(call->getResult(0).getType()).isBool)
       return;
     StringRef kind =
         StringRef(name->path).drop_front(strlen(prefix)).take_until([](char c) {
           return c == '[' || c == '(';
         });
-    TypedAttr type = resolveParam(symbol.getParamValues()[0]);
+    TypedAttr type = resolveParam(boundParamValues(symbol)[0]);
     auto value = [&](Value v) {
       return isa<LIT::RefType>(v.getType()) ? valueThrough(v, state)
                                             : term(v, state);
@@ -9067,8 +9087,7 @@ private:
     if (ops.size() < 2 || call->getNumResults() < 1)
       return "";
     auto ref = dyn_cast<LIT::RefType>(ops[0].getType());
-    auto st = ref ? dyn_cast<LIT::StructType>(ref.getElementType())
-                  : LIT::StructType();
+    auto st = ref ? structTypeOf(ref.getElementType()) : LIT::StructType();
     auto other = dyn_cast<LIT::RefType>(ops[1].getType());
     if (!st || !other || other.getElementType() != ref.getElementType())
       return "";
@@ -9244,7 +9263,7 @@ private:
           frame.values[decl.getName()] = witness.getTypeValue();
       return frame;
     }
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!callee || !symbol)
       return frame;
     frame.fn = callee;
@@ -9276,7 +9295,7 @@ private:
 
   /// The parameters `symbol` binds of `callee`, whose last `implicit`
   /// parameters (implicit origins) it does not.
-  ParamFrame paramFrame(SymbolConstantAttr symbol, LIT::FnOp callee,
+  ParamFrame paramFrame(FuncSymbolGenerator symbol, LIT::FnOp callee,
                         size_t implicit, ParamFrame frame) {
     frame.scope = printed(symbol.getSymbol());
     SmallVector<ParamDeclAttr> decls;
@@ -9289,7 +9308,7 @@ private:
     ArrayRef<ParamDeclAttr> own = callee.getParams();
     if (implicit <= own.size())
       llvm::append_range(decls, own.drop_back(implicit));
-    ArrayRef<TypedAttr> values = symbol.getParamValues();
+    ArrayRef<TypedAttr> values = boundParamValues(symbol);
     if (decls.size() == values.size())
       for (auto [decl, value] : llvm::zip(decls, values))
         frame.values[decl.getName()] = value;
@@ -9512,11 +9531,11 @@ private:
     // `xs[v]` with a comptime `v` (`__getitem_param__[v]`): the index is the
     // method's first parameter, after the array's two.
     if (path.contains("::__getitem_param__[")) {
-      auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
-      if (!symbol || symbol.getParamValues().size() < 3 ||
+      auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+      if (!symbol || boundParamValues(symbol).size() < 3 ||
           call.getNumOperands() != 1)
         return false;
-      index = paramTerm(symbol.getParamValues()[2], Sort{false, 64, true});
+      index = paramTerm(boundParamValues(symbol)[2], Sort{false, 64, true});
       if (sortOfTerm(index).isBool || sortOfTerm(index).width != 64)
         return false;
       Value result = call->getResult(0);
@@ -9874,12 +9893,12 @@ private:
         !isa<LIT::RefType>(call->getResult(0).getType()))
       return false;
     std::optional<Loc> tuple = placeOf(call.getOperands()[0]);
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!tuple || !symbol)
       return false;
     // The index is the callee's own first parameter, after the tuple's.
     std::optional<int64_t> k;
-    for (TypedAttr param : symbol.getParamValues()) {
+    for (TypedAttr param : boundParamValues(symbol)) {
       static llvm::Regex indexRe("^#lit.struct<\\{_mlir_value: scalar<index> "
                                  "= ([0-9]+)\\}>");
       SmallVector<StringRef> m;
@@ -10040,8 +10059,8 @@ private:
   MaybeTerm comptimeShape(TypedAttr layoutParam, int64_t k) {
     ParamFrame *scope = nullptr;
     auto layout = dyn_cast<TypeParamAttr>(resolveParam(layoutParam, &scope));
-    auto type = layout ? dyn_cast<LIT::StructType>(layout.getTypeValue())
-                       : LIT::StructType();
+    auto type =
+        layout ? structTypeOf(layout.getTypeValue()) : LIT::StructType();
     if (!type || type.getParamValues().empty() ||
         printed(type.getSymbol()) != "@layout::@tile_layout::@Layout")
       return std::nullopt;
@@ -10059,8 +10078,8 @@ private:
   /// expression `v`, as a term in the current scope.
   MaybeTerm comptimeIntTerm(TypedAttr mode) {
     auto type = dyn_cast<TypeParamAttr>(mode);
-    auto comptimeInt = type ? dyn_cast<LIT::StructType>(type.getTypeValue())
-                            : LIT::StructType();
+    auto comptimeInt =
+        type ? structTypeOf(type.getTypeValue()) : LIT::StructType();
     if (!comptimeInt || comptimeInt.getParamValues().size() != 1 ||
         printed(comptimeInt.getSymbol()) !=
             "@std::@utils::@coord::@ComptimeInt")
@@ -10141,7 +10160,7 @@ private:
   /// and true for a tuple one.
   bool evalTileTensor(LIT::CallOp call, const CalleeName &name, State &state) {
     StringRef path = name.path;
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!symbol || call->getNumResults() != 1)
       return false;
     Value result = call->getResult(0);
@@ -10169,8 +10188,7 @@ private:
       std::string value = term(call.getOperands()[0], state);
       Sort actual = sortOfTerm(value);
       std::optional<Sort> source;
-      if (auto simd =
-              dyn_cast<LIT::StructType>(call.getOperands()[0].getType());
+      if (auto simd = structTypeOf(call.getOperands()[0].getType());
           simd && simd.getParamValues().size() == 2 &&
           printed(simd.getSymbol()) == "@std::@simd::@SIMD" &&
           isWidthOne(printed(simd.getParamValues()[1])))
@@ -10320,7 +10338,7 @@ private:
       Type type = tensor.getType();
       if (auto ref = dyn_cast<LIT::RefType>(type))
         type = ref.getElementType();
-      auto st = dyn_cast<LIT::StructType>(type);
+      auto st = structTypeOf(type);
       Value list = call.getOperands()[1];
       std::string index = isa<LIT::RefType>(list.getType())
                               ? valueThrough(list, state)
@@ -10395,7 +10413,7 @@ private:
     // layout's shape).
     if (path.starts_with("layout::tile_tensor::TileTensor::num_elements(") &&
         call.getNumOperands() == 1) {
-      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      ArrayRef<TypedAttr> params = boundParamValues(symbol);
       if (params.size() < 4)
         return false;
       auto product = [&](size_t rank) -> MaybeTerm {
@@ -10431,8 +10449,8 @@ private:
       return true;
     }
     if (path.starts_with("layout::tile_tensor::_coord_in_bounds[") &&
-        call.getNumOperands() == 2 && !symbol.getParamValues().empty()) {
-      std::string type = printed(resolveParam(symbol.getParamValues()[0]));
+        call.getNumOperands() == 2 && !boundParamValues(symbol).empty()) {
+      std::string type = printed(resolveParam(boundParamValues(symbol)[0]));
       SmallVector<StringRef> m;
       std::string bound = term(call.getOperands()[1], state), v;
       if (StringRef(type).contains("@std::@utils::@coord::@Coord<")) {
@@ -10445,7 +10463,7 @@ private:
         if (m[2].getAsInteger(10, n))
           return false;
         v = bvConst(n, 64);
-      } else if (isIntType(resolveParam(symbol.getParamValues()[0]))) {
+      } else if (isIntType(resolveParam(boundParamValues(symbol)[0]))) {
         v = term(call.getOperands()[0], state);
       } else {
         return false;
@@ -10460,7 +10478,7 @@ private:
     if (path.starts_with(
             "layout::tile_tensor::TileTensor::dim[::SIMD[DType.int, 1]](") &&
         call.getNumOperands() == 1) {
-      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      ArrayRef<TypedAttr> params = boundParamValues(symbol);
       SmallVector<StringRef> m;
       int64_t k;
       std::string last =
@@ -10477,7 +10495,7 @@ private:
     // `t._valid_dim[k]()`: the valid extent (`validExtent`).
     if (path.starts_with("layout::tile_tensor::TileTensor::_valid_dim[") &&
         call.getNumOperands() == 1) {
-      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      ArrayRef<TypedAttr> params = boundParamValues(symbol);
       SmallVector<StringRef> m;
       int64_t k;
       std::string last =
@@ -10510,8 +10528,8 @@ private:
         if (!place || !isIntPlace(placeType(*place)))
           return false;
         std::string v = load(*place, state, sort);
-        MaybeTerm d = validExtent(symbol.getParamValues(), call.getOperands()[0],
-                                  k, state);
+        MaybeTerm d = validExtent(boundParamValues(symbol),
+                                  call.getOperands()[0], k, state);
         if (!d)
           return false;
         all = "(and " + all + " (bvsle " + bvConst(0, 64) + " " + v +
@@ -10526,7 +10544,7 @@ private:
     // its valid extents say how much of it is backed (`recordTile`).
     if (path.starts_with("layout::tile_tensor::TileTensor::_tile_in_bounds[") &&
         call.getNumOperands() == 2) {
-      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      ArrayRef<TypedAttr> params = boundParamValues(symbol);
       if (params.size() < 9)
         return false;
       std::optional<SmallVector<std::string>> sizes = intList(params[8]);
@@ -10555,7 +10573,7 @@ private:
         (path.starts_with(
              "layout::tile_tensor::TileTensor::_tile_shape_in_bounds") &&
          call.getNumOperands() == 3)) {
-      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      ArrayRef<TypedAttr> params = boundParamValues(symbol);
       std::optional<SmallVector<std::string>> sizes;
       if (fromSizes && (params.size() < 9 || !(sizes = intList(params[8]))))
         return false;
@@ -10624,7 +10642,7 @@ private:
     if (path.starts_with(
             "layout::tile_tensor::TileTensor::_access_in_bounds[") &&
         call.getNumOperands() == 2) {
-      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      ArrayRef<TypedAttr> params = boundParamValues(symbol);
       if (params.size() < 10)
         return false;
       // The width: a literal, or a parameter's value (`load[simd_width]`).
@@ -10815,7 +10833,7 @@ private:
     if (path.starts_with(
             "layout::tile_tensor::TileTensor::_vectorize_in_bounds[") &&
         call.getNumOperands() == 1) {
-      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      ArrayRef<TypedAttr> params = boundParamValues(symbol);
       std::optional<SmallVector<std::string>> sizes;
       if (params.size() < 9 || !(sizes = intList(params[8])))
         return false;
@@ -10843,7 +10861,7 @@ private:
     if ((withOffset ||
          path.starts_with("layout::tile_tensor::TileTensor::distribute[")) &&
         call.getNumOperands() == 2) {
-      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      ArrayRef<TypedAttr> params = boundParamValues(symbol);
       if (params.size() < 9)
         return false;
       ParamFrame *scope = nullptr;
@@ -10897,7 +10915,7 @@ private:
     // dimension (its layout type gives them unevaluated).
     if (path.starts_with("layout::tile_tensor::TileTensor::vectorize[") &&
         call.getNumOperands() == 1) {
-      ArrayRef<TypedAttr> params = symbol.getParamValues();
+      ArrayRef<TypedAttr> params = boundParamValues(symbol);
       std::optional<SmallVector<std::string>> sizes;
       if (params.size() < 9 || !(sizes = intList(params[8])))
         return false;
@@ -10993,12 +11011,12 @@ private:
   /// is backed.
   void recordTile(LIT::CallOp call, const CalleeName &name, State &state) {
     StringRef path = name.path;
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!symbol || call->getNumResults() != 1 || call.getNumOperands() != 2 ||
         !path.starts_with("layout::tile_tensor::TileTensor::tile[") ||
         !path.contains("*::SIMD[DType.int, 1]"))
       return;
-    ArrayRef<TypedAttr> params = symbol.getParamValues();
+    ArrayRef<TypedAttr> params = boundParamValues(symbol);
     if (params.size() < 9)
       return;
     std::optional<SmallVector<std::string>> sizes = intList(params[8]);
@@ -11169,7 +11187,7 @@ private:
     Type tensorType = tensor.getType();
     if (auto ref = dyn_cast<LIT::RefType>(tensorType))
       tensorType = ref.getElementType();
-    auto st = dyn_cast<LIT::StructType>(tensorType);
+    auto st = structTypeOf(tensorType);
     if (!st || st.getParamValues().size() < 4)
       return;
     // The coordinate's elements, by the element types of its `Coord`.
@@ -11241,13 +11259,13 @@ private:
   /// elements (`Coord(n, k)` built with integers).
   void recordRowMajor(LIT::CallOp call, const CalleeName &name,
                       State &state) {
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!symbol || call->getNumResults() != 1 || call.getNumOperands() != 1 ||
         !StringRef(name.path).starts_with("layout::tile_layout::row_major[") ||
-        symbol.getParamValues().empty())
+        boundParamValues(symbol).empty())
       return;
     // Kept alive while its elements are used.
-    std::string typeList = printed(resolveParam(symbol.getParamValues()[0]));
+    std::string typeList = printed(resolveParam(boundParamValues(symbol)[0]));
     std::optional<SmallVector<StringRef>> types = coordTypes(typeList);
     if (!types)
       return;
@@ -11298,7 +11316,7 @@ private:
   /// `t`'s first element on; assumed: `t` has no zero stride). Any other
   /// layout leaves the view's dimensions unknown, as before.
   void checkReshape(LIT::CallOp call, const CalleeName &name, State &state) {
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!symbol || call->getNumResults() != 1 || call.getNumOperands() != 2 ||
         !StringRef(name.path).starts_with(
             "layout::tile_tensor::TileTensor::reshape["))
@@ -11341,7 +11359,7 @@ private:
                   "TileTensor.reshape"};
     ob.claim = "that the new layout covers no more elements than the tensor";
     if (MaybeTerm count =
-            validCount(symbol.getParamValues(), call.getOperands()[0], state))
+            validCount(boundParamValues(symbol), call.getOperands()[0], state))
       ob.cond = define({true, 1, false}, "(bvsle " + size + " " + *count + ")");
     else
       ob.analyzed = false;
@@ -11392,7 +11410,7 @@ private:
   /// wrapper such as `GEMVAlgorithm`, a file descriptor): its values are
   /// represented by that integer. Null if `type` is not one.
   LIT::StructDeclOp intWrapper(Type type) {
-    auto st = dyn_cast<LIT::StructType>(type);
+    auto st = structTypeOf(type);
     if (!st || !st.getParamValues().empty())
       return {};
     auto decl = dyn_cast_or_null<LIT::StructDeclOp>(
@@ -11616,7 +11634,7 @@ private:
   /// ordinary call, among them) are the same pointer.
   bool evalPointer(LIT::CallOp call, const CalleeName &name, State &state) {
     StringRef path = name.path;
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!symbol || call->getNumResults() != 1)
       return false;
     Value result = call->getResult(0);
@@ -11687,9 +11705,10 @@ private:
       // is in the type of the reference it is called on.
       if (!n)
         if (auto ref = dyn_cast<LIT::RefType>(call.getOperands()[0].getType()))
-          if (auto type = dyn_cast<LIT::StructType>(ref.getElementType());
+          if (auto type = structTypeOf(ref.getElementType());
               type && type.getParamValues().size() == 2 &&
-              printed(type.getSymbol()) == "@std::@collections::@array::@Array") {
+              printed(type.getSymbol()) ==
+                  "@std::@collections::@array::@Array") {
             TypedAttr size = type.getParamValues()[1];
             Sort sort = sortOf(size.getType());
             if (!sort.isBool && sort.width == 64)
@@ -11717,13 +11736,13 @@ private:
         call.getNumOperands() == 1 &&
         !isa<LIT::RefType>(call.getOperands()[0].getType())) {
       auto elementBytes = [&](Type type) -> MaybeTerm {
-        auto pointer = dyn_cast<LIT::StructType>(type);
+        auto pointer = structTypeOf(type);
         if (!pointer || pointer.getParamValues().size() < 3)
           return std::nullopt;
         auto element = dyn_cast<TypeParamAttr>(
             unwrapValue(resolveParam(pointer.getParamValues()[2])));
-        auto simd = element ? dyn_cast<LIT::StructType>(element.getTypeValue())
-                            : LIT::StructType();
+        auto simd =
+            element ? structTypeOf(element.getTypeValue()) : LIT::StructType();
         if (!element)
           return std::nullopt;
         // Any other element type: its `size_of`.
@@ -11770,10 +11789,10 @@ private:
       return true;
     }
     if (path.starts_with("_offset_in_bounds[") && call.getNumOperands() == 2 &&
-        !symbol.getParamValues().empty()) {
+        !boundParamValues(symbol).empty()) {
       MaybeTerm e = pointerExtent(call.getOperands()[0], state);
       std::string width =
-          paramTerm(symbol.getParamValues().back(), Sort{false, 64, true});
+          paramTerm(boundParamValues(symbol).back(), Sort{false, 64, true});
       std::string offset = term(call.getOperands()[1], state);
       if (!e || sortOfTerm(width).width != 64 || sortOfTerm(width).isBool ||
           sortOfTerm(offset).width != 64 || sortOfTerm(offset).isBool)
@@ -11791,15 +11810,15 @@ private:
   /// integer dtype): their `__ceildiv__`, which it calls. Generic over its
   /// type, it returns through an out slot, its last operand.
   bool evalCeildiv(LIT::CallOp call, const CalleeName &name, State &state) {
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!StringRef(name.path).starts_with("std::math::math::ceildiv[") ||
-        !symbol || symbol.getParamValues().size() != 1 ||
+        !symbol || boundParamValues(symbol).size() != 1 ||
         call.getNumOperands() != 3)
       return false;
     std::optional<Loc> out = placeOf(call.getOperands()[2]);
     if (!out)
       return false;
-    TypedAttr type = resolveParam(symbol.getParamValues()[0]);
+    TypedAttr type = resolveParam(boundParamValues(symbol)[0]);
     std::optional<Sort> sort;
     if (isIntType(type))
       sort = Sort{false, 64, true};
@@ -11890,9 +11909,9 @@ private:
                 "SIMD[DType.int, 1])";
     bool isSigned = false;
     if (!isUnsigned && path.starts_with("std::math::math::divmod[")) {
-      auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
-      isSigned = symbol && symbol.getParamValues().size() == 1 &&
-                 isIntType(resolveParam(symbol.getParamValues()[0]));
+      auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+      isSigned = symbol && boundParamValues(symbol).size() == 1 &&
+                 isIntType(resolveParam(boundParamValues(symbol)[0]));
     }
     if ((!isUnsigned && !isSigned) || call.getNumOperands() != 2 ||
         call->getNumResults() != 1)
@@ -11987,12 +12006,12 @@ private:
   /// tuple's elements are the fields its literal was built with.
   bool evalDim(LIT::CallOp call, const CalleeName &name, State &state) {
     StringRef path = name.path;
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!(path.starts_with("max::gpu::host::dim::Dim::__init__[") ||
           path.starts_with("max::gpu::host::_legacy::dim::Dim::__init__[")) ||
         !symbol || call->getNumResults() != 1)
       return false;
-    ArrayRef<TypedAttr> types = symbol.getParamValues();
+    ArrayRef<TypedAttr> types = boundParamValues(symbol);
     bool fromTuple = path.contains("](::Tuple[");
     if (call.getNumOperands() != (fromTuple ? 1 : types.size()) ||
         types.empty() || types.size() > 3)
@@ -12041,7 +12060,7 @@ private:
   /// and `block_dim` the launch's dimensions. They are not analyzed where
   /// the arguments or dimensions are not known.
   void checkLaunch(LIT::CallOp call, const CalleeName &name, State &state) {
-    auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+    auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     StringRef path = name.path;
     if (!symbol ||
         !(path.contains("DeviceContext::enqueue_function[") ||
@@ -12398,7 +12417,7 @@ private:
         call.getNumOperands() != 0 || call->getNumResults() != 1)
       return false;
     Value result = call->getResult(0);
-    auto pointer = dyn_cast<LIT::StructType>(result.getType());
+    auto pointer = structTypeOf(result.getType());
     if (!pointer || pointer.getParamValues().size() < 3 ||
         !StringRef(printed(result.getType())).contains("\"SHARED\""))
       return false;
@@ -12418,8 +12437,8 @@ private:
     }
     auto element = dyn_cast<TypeParamAttr>(
         unwrapValue(resolveParam(pointer.getParamValues()[2])));
-    auto simd = element ? dyn_cast<LIT::StructType>(element.getTypeValue())
-                        : LIT::StructType();
+    auto simd =
+        element ? structTypeOf(element.getTypeValue()) : LIT::StructType();
     if (!element)
       return false;
     std::string size =
@@ -12807,10 +12826,10 @@ private:
     }
     if (path.starts_with(
             "std::builtin::string_literal::StringLiteral::byte_length("))
-      if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
-          symbol && symbol.getParamValues().size() == 1)
+      if (auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+          symbol && boundParamValues(symbol).size() == 1)
         if (std::optional<int64_t> n =
-                stringLength(resolveParam(symbol.getParamValues()[0]))) {
+                stringLength(resolveParam(boundParamValues(symbol)[0]))) {
           values[result] = bvConst(*n, 64);
           return true;
         }
@@ -12819,9 +12838,9 @@ private:
     if (path.starts_with("std::builtin::int::index[") &&
         call.getNumOperands() == 1 &&
         isa<LIT::RefType>(call.getOperands()[0].getType()))
-      if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
-          symbol && symbol.getParamValues().size() == 1) {
-        TypedAttr type = resolveParam(symbol.getParamValues()[0]);
+      if (auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+          symbol && boundParamValues(symbol).size() == 1) {
+        TypedAttr type = resolveParam(boundParamValues(symbol)[0]);
         if (isIntType(type)) {
           values[result] = valueThrough(call.getOperands()[0], state);
           return true;
@@ -12963,9 +12982,9 @@ private:
     // The parameters resolved: in a callee's clause they may name its own
     // (`Int(offset)` for an `offset: Scalar` of any dtype).
     auto resolved = [&](size_t i) {
-      auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
-      return symbol && i < symbol.getParamValues().size()
-                 ? printed(resolveParam(symbol.getParamValues()[i]))
+      auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+      return symbol && i < boundParamValues(symbol).size()
+                 ? printed(resolveParam(boundParamValues(symbol)[i]))
                  : name.params[i];
     };
     if (path.starts_with("std::simd::SIMD::__init__[::DType](::SIMD[") &&
@@ -12994,9 +13013,9 @@ private:
     // A dtype that is the enclosing function's parameter (`Scalar[a.dtype]`
     // in a helper evaluated at its call): what the call binds it to.
     std::string boundDtype;
-    if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
-        !sort && symbol && !symbol.getParamValues().empty()) {
-      boundDtype = printed(resolveParam(symbol.getParamValues()[0]));
+    if (auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+        !sort && symbol && !boundParamValues(symbol).empty()) {
+      boundDtype = printed(resolveParam(boundParamValues(symbol)[0]));
       sort = dtypeSort(boundDtype);
       // The operands were given their sorts where the dtype was not known.
       for (Value v : call.getOperands()) {
@@ -13186,7 +13205,7 @@ private:
 
   /// The length of the `Array` at `loc`, from its type.
   MaybeTerm arrayLength(const Loc &loc) {
-    auto type = dyn_cast<LIT::StructType>(placeType(loc));
+    auto type = structTypeOf(placeType(loc));
     if (!type || type.getParamValues().size() != 2 ||
         printed(type.getSymbol()) != "@std::@collections::@array::@Array")
       return std::nullopt;
@@ -14020,7 +14039,7 @@ struct VerifyContractsPass
       auto closureOf = [&](Type type) -> Operation * {
         if (auto ref = dyn_cast<LIT::RefType>(type))
           type = ref.getElementType();
-        auto st = dyn_cast<LIT::StructType>(type);
+        auto st = structTypeOf(type);
         if (!st)
           return nullptr;
         StringRef leaf = st.getSymbol().getLeafReference().getValue();
@@ -14036,7 +14055,7 @@ struct VerifyContractsPass
           return;
         Operation *owner = op->getParentOfType<LIT::StructDeclOp>();
         if (auto call = dyn_cast<LIT::CallOp>(op))
-          if (auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee()))
+          if (auto symbol = FuncSymbolGenerator::dynCast(call.getCallee()))
             if (auto callee = dyn_cast_or_null<LIT::FnOp>(
                     symbols.lookupSymbolIn(module, symbol.getSymbol()))) {
               // A closure's own member, or a function with a body the
@@ -14087,7 +14106,7 @@ struct VerifyContractsPass
         for (auto witness : conformance.getBody().getOps<WitnessOp>()) {
           auto method = dyn_cast_or_null<LIT::FnOp>(
               symbols.lookupSymbolIn(trait, witness.getSymNameAttr()));
-          auto value = dyn_cast<SymbolConstantAttr>(witness.getValue());
+          auto value = FuncSymbolGenerator::dynCast(witness.getValue());
           if (!method || !value || method.getFunctionBody().empty())
             continue;
           auto impl = dyn_cast_or_null<LIT::FnOp>(
@@ -14133,7 +14152,7 @@ struct VerifyContractsPass
       };
       SmallVector<Launch> launches;
       module.walk([&](LIT::CallOp call) {
-        auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+        auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
         ArrayRef<FlatSymbolRefAttr> nested =
             symbol ? symbol.getSymbol().getNestedReferences()
                    : ArrayRef<FlatSymbolRefAttr>();
@@ -14158,8 +14177,8 @@ struct VerifyContractsPass
           value.walk([&](ParamDeclRefAttr) { found = true; });
         return found;
       };
-      auto open = [&](SymbolConstantAttr symbol) {
-        return openValues(symbol.getParamValues());
+      auto open = [&](FuncSymbolGenerator symbol) {
+        return openValues(boundParamValues(symbol));
       };
       // The same of a chain's last step.
       auto openChain = [&](ArrayRef<InstanceLink> chain) {
@@ -14197,7 +14216,7 @@ struct VerifyContractsPass
           continue;
         StringRef wrapperName = *wrapper.getSymName();
         module.walk([&](LIT::CallOp call) {
-          auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+          auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
           if (!symbol ||
               symbol.getSymbol().getLeafReference().getValue() != wrapperName ||
               symbols.lookupSymbolIn(module, symbol.getSymbol()) != wrapper)
@@ -14219,7 +14238,7 @@ struct VerifyContractsPass
             names.insert(*name);
         DenseSet<Operation *> next;
         module.walk([&](LIT::CallOp call) {
-          auto symbol = dyn_cast<SymbolConstantAttr>(call.getCallee());
+          auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
           if (!symbol ||
               !names.contains(symbol.getSymbol().getLeafReference().getValue()))
             return;

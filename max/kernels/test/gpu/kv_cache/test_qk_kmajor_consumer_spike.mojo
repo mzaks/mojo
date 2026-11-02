@@ -91,6 +91,7 @@ from nn.attention.gpu.nvidia.sm100.attention_utils import (
 
 from max.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
 from std.testing import assert_almost_equal
+from std.utils.coord import Coord
 from std.utils.index import Index, IndexList
 from std.utils.numerics import get_accum_type
 
@@ -133,7 +134,7 @@ def qk_consumer_kernel[
     q_desc_shape: Coord,
     k_tile_shape: Coord,
     k_desc_shape: Coord,
-    block_tile_shape: IndexList[3],
+    block_tile_shape: Coord[Int, Int, Int],
     swizzle_mode: TensorMapSwizzle,
     use_pagedense: Bool,
     num_threads: Int = 128,
@@ -295,23 +296,13 @@ def run_qk_consumer[
 ](ctx: DeviceContext) raises:
     comptime ab_type = DType.bfloat16
     comptime c_type = DType.float32
-    comptime block_tile_shape = Index(M, N, K)
+    comptime block_tile_shape = (M, N, K)
     comptime gran = swizzle_mode.bytes() // size_of[ab_type]()
     comptime block_dim = 128
 
     print(
-        "qk_kmajor_consumer pagedense="
-        + String(use_pagedense)
-        + " MNK="
-        + String(M)
-        + "x"
-        + String(N)
-        + "x"
-        + String(K)
-        + " gran="
-        + String(gran)
-        + " num_chunks(BK/gran)="
-        + String(K // gran)
+        t"qk_kmajor_consumer"
+        t" pagedense={use_pagedense} MNK={M}x{N}x{K} gran={gran} num_chunks(BK/gran)={K // gran}"
     )
 
     var q = HostDeviceTileTensor[ab_type](row_major[M, K](), ctx)
@@ -425,14 +416,8 @@ def run_qk_consumer[
             except e:
                 if mismatches < 8:
                     print(
-                        "  MISMATCH ["
-                        + String(m)
-                        + ","
-                        + String(n)
-                        + "] got="
-                        + String(o_host[m, n])
-                        + " ref="
-                        + String(o_host_ref[m, n])
+                        t"  MISMATCH [{m},{n}]"
+                        t" got={o_host[m, n]} ref={o_host_ref[m, n]}"
                     )
                 mismatches += 1
     if mismatches == 0:

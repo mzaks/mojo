@@ -50,7 +50,7 @@ from layout import (
     row_major,
 )
 from layout.tile_layout import Layout
-from std.math import align_up, ceildiv, gcd, exp
+from std.math import align_up, ceildiv, gcd, exp, isfinite
 from std.math.uutils import ufloordiv
 from std.memory import unsafe_stack_allocation
 from std.atomic import Atomic
@@ -281,8 +281,9 @@ def TopKMaskLogitsKernel[
     var logits_row = logits[bx : bx + 1, :]
     var masked_logits_row = masked_logits[bx : bx + 1, :]
 
+    var k = _top_k_val
+
     with PDL():
-        var k = _top_k_val
         if case .Some(top_k_arr) = top_k_arr:
             k = Int(top_k_arr[bx])
 
@@ -454,7 +455,7 @@ def topk_mask_logits[
             Span(
                 [
                     trace_arg("logits", shape, dtype),
-                    "top_k_val=" + String(top_k_val),
+                    String(t"top_k_val={top_k_val}"),
                 ]
             )
         )
@@ -462,7 +463,7 @@ def topk_mask_logits[
     with Trace[TraceLevel.OP, target=StaticString("gpu")](
         "topk_mask_logits",
         Trace[TraceLevel.OP]._get_detail_str(trace_information),
-        task_id=Int(ctx.id()),
+        task_id=Int(ctx.device().id),
     ):
         var out_shape = coord_to_index_list(masked_logits.layout.shape_coord())
         if shape[0] != out_shape[0] or shape[1] != out_shape[1]:
@@ -841,9 +842,10 @@ def TopKSamplingFromProbKernel[
     var bx = block_idx.x
     var tx = thread_idx.x
 
+    var generator = Random(seed=rng_seed, offset=UInt64(bx) + rng_offset)
+    var k = _top_k_val
+
     with PDL():
-        var generator = Random(seed=rng_seed, offset=UInt64(bx) + rng_offset)
-        var k = _top_k_val
         if case .Some(top_k_arr) = top_k_arr:
             k = Int(top_k_arr.unsafe_load(bx))
         var row_idx = bx
@@ -1211,7 +1213,7 @@ def topk_sampling_from_prob[
             Span(
                 [
                     trace_arg("probs", shape, dtype),
-                    "top_k_val=" + String(top_k_val),
+                    String(t"top_k_val={top_k_val}"),
                 ]
             )
         )
@@ -1219,7 +1221,7 @@ def topk_sampling_from_prob[
     with Trace[TraceLevel.OP, target=StaticString("gpu")](
         "topk_sampling_from_prob",
         Trace[TraceLevel.OP]._get_detail_str(trace_information),
-        task_id=Int(ctx.id()),
+        task_id=Int(ctx.device().id),
     ):
         var out_shape = coord_to_index_list(output.layout.shape_coord())
         if out_shape[0] != batch_size:
@@ -1989,8 +1991,9 @@ def TopKTopPSamplingFromProbKernel[
     if case .Some(indices) = indices:
         row_idx = Int(indices.unsafe_load(bx))
 
+    var seed_val = UInt64(0)
+
     with PDL():
-        var seed_val = UInt64(0)
         if case .Some(rng_seed) = rng_seed:
             seed_val = rng_seed[row_idx]
 
@@ -2013,6 +2016,16 @@ def TopKTopPSamplingFromProbKernel[
 
         var probs_ptr = probs.ptr.unsafe_offset(row_idx * _d)
         var probs_row = TileTensor(probs_ptr, row_major(Idx[1], _d))
+
+        # A greedy row is one argmax pass, which one block already does without
+        # any group traffic, so a split row drops back to a single block for it:
+        # the rest of the group returns and rank 0 scans the whole row below.
+        # `k` is read on the device and every block of a group reads the same
+        # row, so the whole group takes this exit together and a captured graph
+        # keeps deciding per row.
+        comptime if coop_size > 1 and not emit_dist:
+            if k == 1 and rank != 0:
+                return
 
         comptime if is_apple_gpu() and coop_size == 1:
             # A k=1 draw returns a row maximum whatever the temperature, top-p
@@ -2044,23 +2057,33 @@ def TopKTopPSamplingFromProbKernel[
                     )
                 return
 
-        comptime if not is_apple_gpu() and not emit_dist and coop_size == 1:
+        comptime if not is_apple_gpu() and not emit_dist:
             # A k=1 draw is the row's first argmax whatever the temperature,
             # top-p or min-p: the k == 1 block after the search overwrites
             # whatever the search drew. Take that argmax up front and skip the
             # softmax passes and the search, which would only be thrown away.
-            # `k` is uniform per block, so the collectives stay legal, and
-            # the branch is decided on the device, so a captured graph keeps
-            # serving each row by its own `k`. Rows with k > 1 run the code
-            # below unchanged. `emit_dist` still needs the distribution, and
-            # split rows (`coop_size > 1`) keep the combined path below.
+            # `k` is uniform per group (every block of a group reads the same
+            # row), so the collectives stay legal, and the branch is decided on
+            # the device, so a captured graph keeps serving each row by its own
+            # `k`. Rows with k > 1 run the code below unchanged. `emit_dist`
+            # still needs the distribution.
             if k == 1:
                 comptime vec_bytes = align_of[SIMD[dtype, vec_size]]()
+                # A split row only reaches this point when its row is greedy,
+                # and then every peer has already returned, so the surviving
+                # block scans the whole row rather than a slice and needs no
+                # combine: the group costs a greedy row nothing but its empty
+                # blocks.
+                var scan_begin = vec_begin
+                var scan_end = vec_end
+                comptime if coop_size > 1:
+                    scan_begin = 0
+                    scan_end = n_vec
                 var best = _block_reduce_topk[ascending=True](
                     _argmax_block_partial[dtype, vec_size, 4](
                         probs_ptr.as_unsafe_any_origin(),
-                        0,
-                        _d,
+                        scan_begin * vec_size,
+                        (scan_end - scan_begin) * vec_size,
                         _d % vec_size == 0 and Int(probs.ptr) % vec_bytes == 0,
                         Int(tx),
                         block_size,
@@ -2483,7 +2506,15 @@ def TopKTopPSamplingFromProbKernel[
                 var cutoff = Float32.MAX_FINITE
                 var kept_mass = Float32(1)
 
-                if accepted_e >= 0:
+                # A row whose total mass is not finite has no distribution to
+                # report either. The row max ignores a NaN logit (see
+                # `test_topk_nan_contract`), so a lone NaN leaves one weight
+                # NaN and the rest usable: the loop can still accept, and
+                # normalizing by `z` would emit NaN -- the one value callers
+                # cannot read as "no distribution".
+                var has_dist = isfinite(z)
+
+                if accepted_e >= 0 and has_dist:
                     if k == _d and p >= 1.0 and not min_p:
                         cutoff = 0
                         kept_mass = z
@@ -2552,6 +2583,13 @@ def TopKTopPSamplingFromProbKernel[
                     var masked = (e.gt(cutoff)).select(
                         e / kept_mass, SIMD[.float32, vec_size](0)
                     )
+                    # Neither the predicate nor the division is trustworthy
+                    # for a row with no distribution: `e / NaN` is NaN
+                    # wherever the predicate holds, and both `NaN > cutoff`
+                    # and an unreachable `+Inf` weight depend on the compare
+                    # the backend picks. Zero the row outright.
+                    if not has_dist:
+                        masked = SIMD[.float32, vec_size](0)
                     dist_row.store(
                         (Idx[0], i * vec_size), masked.cast[dist_dtype]()
                     )
@@ -2695,6 +2733,7 @@ def topk_topp_sampling_from_prob[
             dist_dtype, DistLayoutType, MutAnyOrigin, Engine=OutDistEngine
         ]
     ] = None,
+    num_coop_blocks: Int = 0,
 ) raises:
     """Joint top-k + top-p sampling from probability distribution.
 
@@ -2757,6 +2796,11 @@ def topk_topp_sampling_from_prob[
             when `from_logits` is True.
         out_dist: Output masked distribution [batch_size, d]. Required when
             `emit_dist` is set.
+        num_coop_blocks: Blocks per row to split the fused softmax and the
+            search across, for tests and profiles that want a group size other
+            than the one the device picks. Only used with `from_logits`;
+            values above what the device can keep resident fall back to the
+            largest group that fits. Zero derives the group from the device.
 
     Raises:
         Error: If tensor ranks or shapes are invalid.
@@ -2774,8 +2818,8 @@ def topk_topp_sampling_from_prob[
             Span(
                 [
                     trace_arg("probs", shape, dtype),
-                    "top_k_val=" + String(top_k_val),
-                    "top_p_val=" + String(top_p_val),
+                    String(t"top_k_val={top_k_val}"),
+                    String(t"top_p_val={top_p_val}"),
                 ]
             )
         )
@@ -2783,7 +2827,7 @@ def topk_topp_sampling_from_prob[
     with Trace[TraceLevel.OP, target=StaticString("gpu")](
         "topk_topp_sampling_from_prob",
         Trace[TraceLevel.OP]._get_detail_str(trace_information),
-        task_id=Int(ctx.id()),
+        task_id=Int(ctx.device().id),
     ):
         var out_shape = coord_to_index_list(output.layout.shape_coord())
         if out_shape[0] != batch_size:
@@ -2844,10 +2888,23 @@ def topk_topp_sampling_from_prob[
         if batch_size == 0:
             return
 
-        comptime coop_capable = from_logits and ctx.target.is_amd_gpu()
+        # Apple keeps its single-block path; every other target splits the row
+        # across a resident group sized from the device.
+        comptime coop_capable = from_logits and not ctx.target.is_apple_gpu()
+        # A launch whose k is the scalar one draws each row's argmax, which one
+        # block does in a single pass: a group would only add its barrier and
+        # its zeroed counters to that pass. A per-row k vector can still hold a
+        # row with k > 1, so the vector case keeps the split and the kernel's
+        # own greedy exit handles the rows that ask for it.
+        var greedy_launch = top_k_val == 1
+        if case .Some(_) = top_k_arr:
+            greedy_launch = False
         var coop = 1
         comptime if coop_capable:
-            coop = coop_group_size(ctx, batch_size, block_size, d // vec_size)
+            if not greedy_launch:
+                coop = coop_group_size(
+                    ctx, batch_size, block_size, d // vec_size, num_coop_blocks
+                )
         var coop_buf = ctx.enqueue_create_buffer[.int32](
             coop_row_words(batch_size, coop) if coop > 1 else 1
         )
@@ -3010,15 +3067,15 @@ def topk_softmax_sample_kernel[
     var s_idxs = s_vals.unsafe_offset(k_rounded).unsafe_bitcast[Int]()
     var s_count = unsafe_stack_allocation[1, Int, address_space=.SHARED]()
 
+    if tx == 0:
+        s_count[0] = 0
+
+    var pivot = Float32.MIN
+    var max_logit: Float32
+    var logits_vec = SIMD[.float32, vec_size]()
+
     with PDL():
-        if tx == 0:
-            s_count[0] = 0
-
         # PHASE 1: Find pivot (k-th largest) via ternary search.
-        var pivot = Float32.MIN
-        var max_logit: Float32
-        var logits_vec = SIMD[.float32, vec_size]()
-
         if k < _d:
             var min_max = get_min_max_value[vec_size, block_size](
                 logits, row_idx, _d
@@ -3254,7 +3311,7 @@ def topk_softmax_sample[
             Span(
                 [
                     trace_arg("logits", shape, dtype),
-                    "top_k_val=" + String(top_k_val),
+                    String(t"top_k_val={top_k_val}"),
                 ]
             )
         )
@@ -3262,7 +3319,7 @@ def topk_softmax_sample[
     with Trace[TraceLevel.OP, target=StaticString("gpu")](
         "topk_softmax_sample",
         Trace[TraceLevel.OP]._get_detail_str(trace_information),
-        task_id=Int(ctx.id()),
+        task_id=Int(ctx.device().id),
     ):
         var out_shape = coord_to_index_list(
             sampled_indices.layout.shape_coord()
@@ -3374,6 +3431,11 @@ def TopKTopPMaskedProbsKernel[
     coop_ws: Optional[MutPointer[Int32, MutAnyOrigin]],
 ):
     """Writes each row's top-k/top-p masked softmax.
+
+    A row whose total mass is not finite (a NaN logit the row max ignores, so
+    only that weight goes NaN) has no distribution to report and comes out
+    all-zero -- the same row shape the `emit_dist` sampler zeroes for the
+    draft side.
 
     With `coop_size` above one, `coop_size` blocks share a row: each owns a
     contiguous slice and combines whole-row statistics through `coop_ws`. The
@@ -3507,6 +3569,12 @@ def TopKTopPMaskedProbsKernel[
         positive_count = Int32(totals[1])
     var p_eff = _topp_budget(p, z)
 
+    # A row whose total mass is not finite has no distribution to report:
+    # `e / NaN` is NaN wherever the predicate holds, and the verifier reads
+    # these slots as the target's probabilities. Zero the row outright and
+    # skip the search, whose bracket walk has no meaning on a NaN mass.
+    var has_dist = isfinite(z)
+
     @inline(.always)
     def load_e(offset: Int) {imm} -> SIMD[.float32, vec_size]:
         comptime if is_amd_gpu():
@@ -3516,7 +3584,7 @@ def TopKTopPMaskedProbsKernel[
 
     var cut = Float32(0)
     var mass_s = z
-    if positive_count > Int32(k) or z > p_eff:
+    if has_dist and (positive_count > Int32(k) or z > p_eff):
         var refined: Tuple[Float32, Float32]
         if k == _d:
             refined = _topk_topp_cutoff_search[
@@ -3561,6 +3629,8 @@ def TopKTopPMaskedProbsKernel[
     for i in range(vec_begin + Int(tx), vec_end, block_size):
         var e = load_e(i * vec_size)
         var masked = (e.gt(cut)).select(e / mass_s, SIMD[.float32, vec_size](0))
+        if not has_dist:
+            masked = SIMD[.float32, vec_size](0)
         probs_row.store((Idx[0], i * vec_size), masked)
 
 
@@ -3655,7 +3725,7 @@ def topk_topp_masked_probs[
             Span(
                 [
                     trace_arg("logits", shape, dtype),
-                    "top_k=" + String(top_k_val),
+                    String(t"top_k={top_k_val}"),
                 ]
             )
         )
@@ -3663,7 +3733,7 @@ def topk_topp_masked_probs[
     with Trace[TraceLevel.OP, target=StaticString("gpu")](
         "topk_topp_masked_probs",
         Trace[TraceLevel.OP]._get_detail_str(trace_information),
-        task_id=Int(ctx.id()),
+        task_id=Int(ctx.device().id),
     ):
         var probs_shape = coord_to_index_list(probs.layout.shape_coord())
         if probs_shape[0] != batch_size or probs_shape[1] != d:
@@ -3690,7 +3760,9 @@ def topk_topp_masked_probs[
         if case .Some(temperature) = temperature:
             temperature_ptr = temperature.ptr
 
-        comptime coop_capable = ctx.target.is_amd_gpu()
+        # Apple keeps its single-block path; every other target picks a
+        # resident group for the row.
+        comptime coop_capable = not ctx.target.is_apple_gpu()
         var coop = 1
         comptime if coop_capable:
             coop = coop_group_size(ctx, batch_size, block_size, d // vec_size)

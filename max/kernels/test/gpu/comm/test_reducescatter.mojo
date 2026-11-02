@@ -81,34 +81,11 @@ def reducescatter_test[
     var epilogue_tag = "-custom_epilogue" if use_custom_epilogue else ""
     comptime if rank == 1:
         print(
-            String(
-                "====reducescatter-flat-",
-                dtype,
-                "-",
-                ngpus,
-                "gpus-",
-                num_elements,
-                multimem_tag,
-                epilogue_tag,
-            )
+            t"====reducescatter-flat-{dtype}-{ngpus}gpus-{num_elements}{multimem_tag}{epilogue_tag}"
         )
     else:
         print(
-            String(
-                "====reducescatter-axis",
-                axis,
-                "-",
-                dtype,
-                "-",
-                ngpus,
-                "gpus-(",
-                shape[0].value(),
-                "x",
-                shape[1].value(),
-                ")",
-                multimem_tag,
-                epilogue_tag,
-            )
+            t"====reducescatter-axis{axis}-{dtype}-{ngpus}gpus-({shape[0].value()}x{shape[1].value()}){multimem_tag}{epilogue_tag}"
         )
 
     # Compute partitioning config.
@@ -165,7 +142,7 @@ def reducescatter_test[
         ]: Signal.unsafe_ptr_from(signal_buffers[i])
     )
 
-    comptime for i in range(ngpus):
+    for i in range(ngpus):
         list_of_ctx[i].synchronize()
 
     # Create input buffers.
@@ -188,7 +165,7 @@ def reducescatter_test[
         var multicast_buf = DeviceMulticastBuffer[dtype](
             list_of_ctx.copy(), num_elements
         )
-        comptime for i in range(ngpus):
+        for i in range(ngpus):
             var unicast_buf = multicast_buf.unicast_buffer_for(list_of_ctx[i])
             list_of_ctx[i].enqueue_copy(unicast_buf, host_in[i])
         in_bufs[0] = InputTileType(
@@ -198,7 +175,7 @@ def reducescatter_test[
             row_major(shape),
         )
     else:
-        comptime for i in range(ngpus):
+        for i in range(ngpus):
             in_bufs[i] = InputTileType(
                 in_bufs_list[i].unsafe_ptr().as_unsafe_any_origin(),
                 row_major(shape),
@@ -285,7 +262,7 @@ def reducescatter_test[
                 my_rank=Optional[Int](i),
             )
 
-    comptime for i in range(ngpus):
+    for i in range(ngpus):
         list_of_ctx[i].synchronize()
 
     # Create TileTensors, run reduce-scatter, and verify results.
@@ -308,7 +285,7 @@ def reducescatter_test[
                 comptime accum_t = get_accum_type[dtype]()
                 var accum = Scalar[accum_t](0)
                 var global_idx = config.rank_start(gpu_idx) + j
-                comptime for k in range(ngpus):
+                for k in range(ngpus):
                     accum += Scalar[accum_t](
                         test_value_for_gpu_element[dtype](k, global_idx)
                     )
@@ -351,7 +328,7 @@ def reducescatter_test[
                         var global_flat = (row_start + r) * Int(shape[1]) + c
                         comptime accum_t = get_accum_type[dtype]()
                         var accum = Scalar[accum_t](0)
-                        comptime for k in range(ngpus):
+                        for k in range(ngpus):
                             accum += Scalar[accum_t](
                                 test_value_for_gpu_element[dtype](
                                     k, global_flat
@@ -382,7 +359,7 @@ def reducescatter_test[
                         var global_flat = r * Int(shape[1]) + (col_start + c)
                         comptime accum_t = get_accum_type[dtype]()
                         var accum = Scalar[accum_t](0)
-                        comptime for k in range(ngpus):
+                        for k in range(ngpus):
                             accum += Scalar[accum_t](
                                 test_value_for_gpu_element[dtype](
                                     k, global_flat
@@ -443,17 +420,7 @@ def grouped_reducescatter_test[
     comptime rank = 2
 
     print(
-        "====grouped-reducescatter-axis",
-        axis,
-        "-float32-",
-        ngpus,
-        "gpus-group",
-        group_size,
-        "-rows",
-        rows_first,
-        "/",
-        rows_second,
-        sep="",
+        t"====grouped-reducescatter-axis{axis}-float32-{ngpus}gpus-group{group_size}-rows{rows_first}/{rows_second}"
     )
 
     var in_bufs_list = List[DeviceBuffer[dtype]](capacity=ngpus)
@@ -512,7 +479,7 @@ def grouped_reducescatter_test[
         ]: Signal.unsafe_ptr_from(signal_buffers[i])
     )
 
-    comptime for i in range(ngpus):
+    for i in range(ngpus):
         list_of_ctx[i].synchronize()
 
     comptime shape_type = DynamicCoord[.int, rank]
@@ -599,7 +566,7 @@ def grouped_reducescatter_test[
                 my_rank=Optional[Int](gpu_idx),
             )
 
-    comptime for i in range(ngpus):
+    for i in range(ngpus):
         list_of_ctx[i].synchronize()
 
     for gpu_idx in range(ngpus):
@@ -621,7 +588,7 @@ def grouped_reducescatter_test[
                 var global_flat = (row_start + r) * D + c
                 comptime accum_t = get_accum_type[dtype]()
                 var accum = Scalar[accum_t](0)
-                comptime for local_input_idx in range(group_size):
+                for local_input_idx in range(group_size):
                     accum += Scalar[accum_t](
                         test_value_for_gpu_element[dtype](
                             group_start + local_input_idx, global_flat

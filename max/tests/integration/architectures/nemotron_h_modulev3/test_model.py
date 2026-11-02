@@ -32,21 +32,13 @@ from _tiny_config import (
     lightning_scheme,
     model_config,
 )
+from max import functional as F
 from max.driver import CPU
 from max.dtype import DType
-from max.experimental import functional as F
-from max.experimental.functional import collective_ops
-from max.experimental.realization_context import ensure_context
-from max.experimental.sharding import (
-    DeviceMesh,
-    Replicated,
-    Sharded,
-    auto_reshard,
-)
-from max.experimental.tensor import Tensor, default_device, default_dtype
+from max.functional import collective_ops
 from max.graph import DeviceRef, TensorValue
-from max.nn import kernels
-from max.nn.transformer import ReturnHiddenStates
+from max.nn.legacy import kernels
+from max.nn.legacy.transformer import ReturnHiddenStates
 from max.pipelines.architectures.nemotron_h_modulev3.layers.attention import (
     NemotronHAttention,
 )
@@ -83,6 +75,14 @@ from max.pipelines.kv_cache.paged_kv_cache.jenga_block_pool import (
 )
 from max.pipelines.lib.interfaces.batch_processor import (
     modulev3_ragged_kv_symbolic_inputs,
+)
+from max.tensor import Tensor, default_device, default_dtype
+from max.tensor.realization_context import ensure_context
+from max.tensor.sharding import (
+    DeviceMesh,
+    Replicated,
+    Sharded,
+    auto_reshard,
 )
 
 MIB = 1024**2
@@ -266,6 +266,9 @@ def _trace_on_devices(
     return broadcast, len(allreduces), peer_copies
 
 
+# The router's fused gate GEMV and top-k, the third of its three variants, is
+# not traced here: the op refuses a CPU mesh. `test_local_routing_ir` covers it
+# on virtual GPU devices, where it builds.
 @pytest.mark.parametrize("n", [2, 4, 8])
 def test_inputs_reach_the_other_devices_by_collective(
     monkeypatch: pytest.MonkeyPatch, n: int
@@ -274,12 +277,12 @@ def test_inputs_reach_the_other_devices_by_collective(
 
     A peer copy of the inputs makes one device's stream wait on another's,
     which invalidates the capture, so the tokens and row offsets reach the
-    other devices through the broadcast collective. Past two devices, so do
-    the MoE layer's expert ids and weights, which device 0 picks.
+    other devices through the broadcast collective, and nothing else does:
+    every device routes its own bit-identical replica of the router input, so
+    the MoE layer's expert ids and weights cost no broadcast at any width.
     """
     broadcast, _, _ = _trace_on_devices(monkeypatch, n, WIDE)
-    routing = [DType.int32, DType.float32] if n > 2 else []
-    assert broadcast == [DType.int64, DType.uint32, *routing]
+    assert broadcast == [DType.int64, DType.uint32]
 
 
 @pytest.mark.parametrize("n", [2, 4, 8])

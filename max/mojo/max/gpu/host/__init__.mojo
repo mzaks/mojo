@@ -20,6 +20,7 @@ from ._legacy.device_attribute import DeviceAttribute
 from ._overlay import (
     CompletionFlag,
     DefaultDeviceTypeEncoder,
+    Device,
     DeviceBuffer,
     DeviceContext,
     DeviceContextArray,
@@ -37,9 +38,19 @@ from ._overlay import (
     _DeviceContextPtr,
     _DeviceFunctionPtr,
     _DumpPath,
+    _check_dim,
     _checked,
 )
 from ._legacy.dim import Dim
+from .launch_config import (
+    BlockExecutionConfig,
+    ClusterExecutionConfig,
+    ClusterLaunchConfig,
+    ExecutionConfig,
+    GridBlockExecutionConfig,
+    GridBlockLaunchConfig,
+    NearComputeGeneralPurposeScratchpadExecutionConfig,
+)
 from ._legacy.func_attribute import Attribute, FuncAttribute
 from ._legacy.launch_attribute import (
     LaunchAttribute,
@@ -64,7 +75,7 @@ from ._overlay import (
     CUstream,
     _CUstream_st,
 )
-from ._legacy._amdgpu_hip import HIP, HIP_MODULE, hipDevice_t, hipStream_t
+from ._overlay import HIP, HIP_MODULE, hipDevice_t, hipStream_t
 from ._legacy._kernel_load_gate import (
     CollectiveEnqueueScope,
     CollectiveGate,

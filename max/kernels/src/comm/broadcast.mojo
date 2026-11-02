@@ -248,7 +248,9 @@ def broadcast_pull_1stage_kernel[
             var data = rebind[Scalar[dtype]](in_tensor.load((tail_idx,)))
             out_tensor.store((tail_idx,), data)
 
-        _multi_gpu_barrier[ngpus, is_start=False](rank_sigs, my_sig, _my_rank)
+        _multi_gpu_barrier[ngpus, is_start=False, sync_after_wait=True](
+            rank_sigs, my_sig, _my_rank
+        )
 
 
 @__llvm_metadata(
@@ -484,7 +486,8 @@ def broadcast[
     out_engine: TensorEngine,
     //,
     ngpus: Int,
-    pdl_level: PDLLevel = PDLLevel(),
+    # PDL is verified on 2 GPUs only; wider worlds stay OFF until measured.
+    pdl_level: PDLLevel = PDLLevel.ON if ngpus <= 2 else PDLLevel.OFF,
     use_multimem: Bool = False,
 ](
     input_tensor: TileTensor[dtype, in_layout, in_origin, Engine=in_engine],

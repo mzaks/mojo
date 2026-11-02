@@ -129,9 +129,12 @@ def LIT_FnOp : LITOp<"fn", [
     /// parameter bindings.
     TypedAttr getBoundReference(ParameterEvaluationContext &evalContext,
                                 ParameterExprArrayAttr bindings = {});
-    SymbolConstantAttr
+    FuncSymbolGenerator
     getBoundSymbolRef(ParameterEvaluationContext &evalContext,
                       ParameterExprArrayAttr bindings = {});
+    FuncSymbolGenerator
+    getBoundSymbolRef(ParameterEvaluationContext &evalContext,
+                      ArrayRef<TypedAttr> bindings);
 
     /// Return a GeneratorAttr that generates a FuncLiteralAttr for this
     /// function. `dischargedBodyConstraints` is an optional bitmask over the
@@ -476,8 +479,8 @@ def LIT_StructDeclOp : LITOp<"struct.decl", [
     TypeAttrOf<LIT_TraitType>:$canonicalTrait,
     UnitAttr:$synthetic,
     OptionalAttr<TypeAttr>:$nonmaterializableTarget,
-    OptionalAttr<KGEN_SymbolConstantAttr>:$moveInit,
-    OptionalAttr<KGEN_SymbolConstantAttr>:$copyInit,
+    OptionalAttr<KGEN_GeneratorAttr>:$moveInit,
+    OptionalAttr<KGEN_GeneratorAttr>:$copyInit,
     // This is the error message to produce if a non-destructible type needs an
     // implicit destructor call.
     OptionalAttr<StrAttr>:$linearTypeErrorMsg,
@@ -1675,7 +1678,8 @@ def LIT_OwnershipMarkDestroyedOp : LITOp<"ownership.mark_destroyed"> {
 
 class RefImmutType<string lhs, string rhs> : TypesMatchWith<
     "reference with mutability removed", lhs, rhs,
-    "llvm::cast<RefType>($_self).getWithMutability(false)">;
+    "llvm::isa<RefType>($_self) ? "
+    "llvm::cast<RefType>($_self).getWithMutability(false) : Type()">;
 
 def LIT_RefImmutOp : LITOp<"ref.immut", [RefImmutType<"ref", "result">]> {
   let summary = "Drop mutability from a reference";
@@ -1743,7 +1747,8 @@ def LIT_RefUpcastOp : LITOp<"ref.upcast", [Pure]> {
 // Given a `!lit.ref<X, life>`, return `!kgen.pointer<X>`.
 class RefPointerType<string lhs, string rhs> : TypesMatchWith<
     "reference as pointer type", lhs, rhs,
-    "llvm::cast<RefType>($_self).getAsPointerType()">;
+    "llvm::isa<RefType>($_self) ? "
+    "llvm::cast<RefType>($_self).getAsPointerType() : Type()">;
 
 def LIT_RefToPointerOp : LITOp<"ref.to_pointer",
                               [RefPointerType<"ref", "ptr">]> {

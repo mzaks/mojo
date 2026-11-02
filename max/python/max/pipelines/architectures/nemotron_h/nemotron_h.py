@@ -31,33 +31,27 @@ against the verified HF reference and is ready to logit-verify once invocable.
 from __future__ import annotations
 
 import functools
+import logging
 import math
-from collections.abc import Iterable, Sequence
-from pathlib import Path
-from typing import Any
+from collections.abc import Iterable, Mapping, Sequence
 
 from max import tree
-from max.driver import accelerator_api
+from max.driver import Device, DLPackArray, accelerator_api
 from max.dtype import DType
 from max.graph import (
-    BufferType,
     BufferValue,
     DeviceRef,
-    Graph,
     ShardingStrategy,
-    TensorType,
     TensorValue,
     TensorValueLike,
-    Type,
-    Value,
     Weight,
     ops,
 )
-from max.graph import Module as GraphModule
 from max.graph.quantization import QuantizationEncoding
-from max.nn.attention import MHAMaskVariant
-from max.nn.embedding import Embedding
-from max.nn.kernels import (
+from max.graph.weights import WeightData
+from max.nn.legacy.attention import MHAMaskVariant
+from max.nn.legacy.embedding import Embedding
+from max.nn.legacy.kernels import (
     flash_attention_ragged,
     grouped_matmul_ragged,
     moe_create_indices,
@@ -65,25 +59,29 @@ from max.nn.kernels import (
     store_k_cache_ragged,
     store_v_cache_ragged,
 )
-from max.nn.kv_cache import (
+from max.nn.legacy.kv_cache import (
     KVCacheInputsPerDevice,
-    KVCacheParamInterface,
     KVCacheParams,
     PagedCacheValues,
 )
-from max.nn.layer import LayerList, Module
-from max.nn.linear import MLP, Linear
-from max.nn.moe import GatedActivation, MoE, MoEGate
-from max.nn.norm import RMSNorm
-from max.nn.quant_config import QuantConfig
-from max.nn.state_space import (
+from max.nn.legacy.layer import LayerList, Module
+from max.nn.legacy.linear import MLP, Linear
+from max.nn.legacy.moe import GatedActivation, MoE, MoEGate
+from max.nn.legacy.norm import RMSNorm
+from max.nn.legacy.quant_config import QuantConfig
+from max.nn.legacy.state_space import (
     causal_conv1d_varlen_fwd,
     gated_group_rmsnorm,
     mamba2_ssd_chunk_scan_varlen_fwd_inplace,
 )
-from max.nn.transformer import DecoderOutputs, ReturnLogits, logits_postprocess
+from max.nn.legacy.transformer import logits_postprocess
+from max.pipelines.lib.registration_graph_api import decoder_outputs
+from max.pipelines.lib.role_contracts import DecoderInputs, DecoderOutputs
 
 from .model_config import NemotronHConfig
+from .state_cache import NemotronHStateCache
+
+logger = logging.getLogger("max.pipelines")
 
 
 def _relu2(x: TensorValue) -> TensorValue:
@@ -95,10 +93,12 @@ def _relu2(x: TensorValue) -> TensorValue:
 def _weight_dtype(
     model_dtype: DType, quant_config: QuantConfig | None
 ) -> DType:
-    """Linear weight storage dtype. FP8 (per-tensor static) stores the weight
-    as ``float8_e4m3fn``; the ``quantized_matmul`` kernel quantizes the bf16
-    activation with ``input_scale`` and dequantizes. Otherwise the weight is the
-    model dtype."""
+    """Linear weight storage dtype.
+
+    FP8 (per-tensor static) stores the weight as ``float8_e4m3fn``; the
+    ``quantized_matmul`` kernel quantizes the bf16 activation with
+    ``input_scale`` and dequantizes. Otherwise the weight is the model dtype.
+    """
     if quant_config is not None:
         return DType.float8_e4m3fn
     return model_dtype
@@ -152,6 +152,7 @@ class NemotronHMLP(Module):
         )
 
     def __call__(self, x: TensorValue) -> TensorValue:
+        """Runs the MLP over ``x``."""
         return self.down_proj(_relu2(self.up_proj(x)))
 
 
@@ -160,7 +161,7 @@ class NemotronHExpertMLP(MLP):
 
     Serves two roles in :class:`NemotronHMoE`:
 
-    * routed experts (``mlp_cls``): the base :class:`~max.nn.moe.MoE` reads only
+    * routed experts (``mlp_cls``): the base :class:`~max.nn.legacy.moe.MoE` reads only
       ``.up_proj.weight`` / ``.down_proj.weight`` to build the grouped-matmul
       weight stacks and never calls ``__call__``, so the up/down Linears are all
       that is required;
@@ -216,6 +217,7 @@ class NemotronHExpertMLP(MLP):
         )
 
     def __call__(self, x: TensorValueLike) -> TensorValue:
+        """Runs one expert's MLP over ``x``."""
         x = TensorValue(x)
         return self.down_proj(_relu2(self.up_proj(x)))
 
@@ -335,6 +337,7 @@ class NemotronHMoEGate(MoEGate):
     def __call__(
         self, hidden_states: TensorValue
     ) -> tuple[TensorValue, TensorValue]:
+        """Scores each token's experts and returns the routing weights."""
         # Routing math in fp32 (matches the HF reference); the weights are cast
         # back to the activation dtype for the downstream combine matmul in
         # ``MoE.__call__``.
@@ -366,7 +369,7 @@ class NemotronHMoE(MoE):
     ``gate_proj``), so the routed-expert weight stack is the up-projection only,
     ``[num_experts, moe_intermediate_size, hidden]``.
 
-    bf16 (no ``quant_config``) reuses the base :class:`~max.nn.moe.MoE`
+    bf16 (no ``quant_config``) reuses the base :class:`~max.nn.legacy.moe.MoE`
     grouped-matmul routing verbatim.
 
     FP8 (per-tensor static ``quant_config``, the 30B-A3B) keeps the routed
@@ -382,6 +385,7 @@ class NemotronHMoE(MoE):
 
     @property
     def gate_up_proj(self) -> TensorValue:
+        """The gate and up projections, stacked for the grouped matmul."""
         # Non-gated experts: the base property interleaves gate+up and would
         # AttributeError on our gate-less experts. Stack the up projections
         # only -> [num_experts, moe_intermediate_size, hidden]. FP8 experts
@@ -407,6 +411,7 @@ class NemotronHMoE(MoE):
         return ops.stack(scales, axis=0)
 
     def __call__(self, x: TensorValue) -> TensorValue:
+        """Runs the routed and shared experts over ``x``."""
         # bf16 MoE (no quant_config): the base grouped-matmul path is exact.
         if self.quant_config is None:
             return super().__call__(x)
@@ -581,6 +586,7 @@ class NemotronHAttention(Module):
         kv_collection: PagedCacheValues,
         input_row_offsets: TensorValue,
     ) -> TensorValue:
+        """Runs the attention over ``x``, reading and updating the KV cache."""
         total_seq_len = x.shape[0]
         if self.qkv_proj is None:
             q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -730,6 +736,7 @@ class NemotronHMamba2Mixer(Module):
 
     @property
     def mamba_in_proj_out(self) -> int:
+        """The width the mixer's input projection produces."""
         return self.intermediate + self.conv_dim + self.nheads
 
     def _gated_group_rmsnorm(
@@ -931,6 +938,7 @@ class NemotronHBlock(Module):
             self.mixer = NemotronHMLP(config, quant_config=quant_config)
 
     def __call__(self, *args, **kwargs):
+        """Raises, because :class:`NemotronH` dispatches by layer kind instead."""
         raise RuntimeError(
             "NemotronHBlock dispatches per-kind in NemotronH.__call__; do not "
             "call the block directly."
@@ -938,19 +946,27 @@ class NemotronHBlock(Module):
 
 
 class NemotronH(Module):
-    """Full Nemotron-H decoder: embed -> hybrid blocks -> norm -> lm_head."""
+    """Full Nemotron-H decoder: embed -> hybrid blocks -> norm -> lm_head.
 
-    def __init__(
-        self,
-        config: NemotronHConfig,
-        *,
-        quant_config: QuantConfig | None = None,
-        return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
-    ) -> None:
+    Registered for the ``DECODER`` role. Its Mamba layers keep each request's
+    conv and SSM state in slot pools the graph updates in place
+    (:meth:`state_store`).
+    """
+
+    graph_name = "nemotron_h"
+    """The name the graph compiled under before registration, which keys
+    precompiled MEFs."""
+
+    override_quantization_encoding = True
+    # Missing and unused checkpoint weights are logged by load_state_dict.
+    strict_state_dict_loading = False
+
+    def __init__(self, config: NemotronHConfig) -> None:
         super().__init__()
         self.config = config
         self.kv_params = config.kv_params
-        self.return_logits = return_logits
+        self.return_logits = config.return_logits
+        quant_config = config.quant_config
         dev = config.devices[0]
 
         self.embed_tokens = Embedding(
@@ -1010,26 +1026,85 @@ class NemotronH(Module):
         self.mamba_head_dim = config.mamba_head_dim
         self.dstate = config.ssm_state_size
 
-    def __call__(
+    @classmethod
+    def state_store(
+        cls,
+        config: NemotronHConfig,
+        *,
+        max_batch_size: int,
+        devices: Sequence[Device],
+    ) -> NemotronHStateCache:
+        """Returns the conv and SSM state pools, one slot per request."""
+        return NemotronHStateCache(
+            num_mamba_layers=sum(
+                1 for kind in config.layer_kinds if kind == "mamba"
+            ),
+            conv_dim=config.conv_dim,
+            conv_kernel=config.conv_kernel,
+            nheads=config.mamba_num_heads,
+            head_dim=config.mamba_head_dim,
+            dstate=config.ssm_state_size,
+            max_slots=max_batch_size,
+            device=devices[0],
+            conv_dtype=config.dtype,
+            # bf16 on Apple GPUs (halves the dominant decode-step pool
+            # traffic; the scan still accumulates in fp32), fp32 elsewhere.
+            ssm_dtype=_ssm_state_dtype(),
+        )
+
+    def load_state_dict(
         self,
-        tokens: TensorValue,
-        input_row_offsets: TensorValue,
-        return_n_logits: TensorValue,
-        kv_collections: list[PagedCacheValues],
-        slot_idx: TensorValue,
-        conv_pools: list[BufferValue],
-        ssm_pools: list[BufferValue],
-        has_initial_state: TensorValue,
-    ) -> DecoderOutputs:
+        state_dict: Mapping[str, DLPackArray | WeightData],
+        *,
+        override_quantization_encoding: bool = False,
+        weight_alignment: int | None = None,
+        strict: bool = True,
+    ) -> None:
+        """Loads the checkpoint, logging the weights it lacks or doesn't use."""
+        expected = set(self.raw_state_dict())
+        provided = set(state_dict)
+        if missing := expected - provided:
+            logger.warning(
+                f"Nemotron-H load_state_dict: {len(missing)} MISSING weights"
+                f" (not in checkpoint): {sorted(missing)[:30]}"
+                + ("..." if len(missing) > 30 else "")
+            )
+        if unused := provided - expected:
+            logger.info(
+                f"Nemotron-H load_state_dict: {len(unused)} unused checkpoint"
+                f" keys: {sorted(unused)[:20]}"
+                + ("..." if len(unused) > 20 else "")
+            )
+        super().load_state_dict(
+            state_dict,
+            override_quantization_encoding=override_quantization_encoding,
+            weight_alignment=weight_alignment,
+            strict=strict,
+        )
+
+    def __call__(
+        self, inputs: DecoderInputs[TensorValue]
+    ) -> DecoderOutputs[TensorValue]:
         """Run the hybrid stack.
 
-        Returns the logits tuple from :func:`logits_postprocess`. The conv and
-        SSM pools are mutable graph inputs mutated in place at slot
-        ``slot_idx[batch_item]`` (the SSD kernel reads/writes the ssm_pool
-        directly via ``mamba2_ssd_chunk_scan_varlen_fwd_inplace``), so the
-        only graph outputs are the logits.
+        The state is ``slot_idx``, the conv pools, the SSM pools and
+        ``has_initial_state``. The conv and SSM pools are mutable graph inputs
+        mutated in place at slot ``slot_idx[batch_item]`` (the SSD kernel
+        reads/writes the ssm_pool directly via
+        ``mamba2_ssd_chunk_scan_varlen_fwd_inplace``), so the only graph
+        outputs are the logits.
         """
-        h = self.embed_tokens(tokens)
+        assert inputs.state is not None
+        num_mamba = self.num_mamba_layers
+        slot_idx, *pools, has_initial_state = inputs.state
+        conv_pools: list[BufferValue] = pools[:num_mamba]
+        ssm_pools: list[BufferValue] = pools[num_mamba:]
+        kv_collections = tree.leaves(
+            self.kv_params.unflatten_kv_inputs(iter(tree.leaves(inputs.kv))),
+            leaf=KVCacheInputsPerDevice,
+        )
+        input_row_offsets = inputs.input_row_offsets
+        h = self.embed_tokens(inputs.tokens)
 
         kv_i = 0
         mamba_i = 0
@@ -1066,149 +1141,13 @@ class NemotronH(Module):
                 out = block.mixer(normed)
             h = residual + out
 
-        return logits_postprocess(
-            h,
-            input_row_offsets,
-            return_n_logits,
-            self.norm_f,
-            self.lm_head,
-            self.return_logits,
-        )
-
-    def input_types(
-        self, kv_params: KVCacheParamInterface
-    ) -> tuple[TensorType | BufferType, ...]:
-        """Graph input types for the Nemotron-H language graph.
-
-        Order: ``tokens, input_row_offsets, return_n_logits, *kv_inputs,
-        slot_idx, *conv_pools, *ssm_pools, has_initial_state``. The conv pools
-        are model-dtype mutable buffers; the SSM pools are mutable buffers of
-        ``_ssm_state_dtype()`` (fp32; bf16 on Apple GPUs, storage only — the
-        scan accumulates in fp32) mutated in place by
-        ``mamba2_ssd_chunk_scan_varlen_fwd_inplace`` at
-        slot ``slot_idx[batch_item]``. ``has_initial_state`` is ``[batch]``
-        bool (empty for a fresh prefill, all-True for decode).
-        """
-        dev = self.config.devices[0]
-        tokens_type = TensorType(
-            DType.int64, shape=["total_seq_len"], device=dev
-        )
-        input_row_offsets_type = TensorType(
-            DType.uint32, shape=["input_row_offsets_len"], device=dev
-        )
-        return_n_logits_type = TensorType(
-            DType.int64, shape=["return_n_logits"], device=DeviceRef.CPU()
-        )
-        kv_types = list(kv_params.flattened_kv_inputs())
-
-        slot_idx_type = TensorType(
-            DType.uint32, shape=["batch_size"], device=dev
-        )
-        conv_pool_types: list[TensorType | BufferType] = [
-            BufferType(
-                self.config.dtype,
-                shape=["max_slots", self.conv_dim, self.conv_kernel - 1],
-                device=dev,
+        return decoder_outputs(
+            logits_postprocess(
+                h,
+                input_row_offsets,
+                inputs.return_n_logits,
+                self.norm_f,
+                self.lm_head,
+                self.return_logits,
             )
-            for _ in range(self.num_mamba_layers)
-        ]
-        ssm_pool_types: list[TensorType | BufferType] = [
-            BufferType(
-                _ssm_state_dtype(),
-                shape=[
-                    "max_slots",
-                    self.mamba_nheads,
-                    self.mamba_head_dim,
-                    self.dstate,
-                ],
-                device=dev,
-            )
-            for _ in range(self.num_mamba_layers)
-        ]
-        has_initial_state_type = TensorType(
-            DType.bool, shape=["has_initial_state_len"], device=dev
-        )
-
-        base: list[TensorType | BufferType] = [
-            tokens_type,
-            input_row_offsets_type,
-            return_n_logits_type,
-        ]
-        return tuple(
-            base
-            + kv_types
-            + [slot_idx_type]
-            + conv_pool_types
-            + ssm_pool_types
-            + [has_initial_state_type]
-        )
-
-    def trace(
-        self,
-        *input_types: Type[Any],
-        name: str | None = None,
-        module: GraphModule | None = None,
-        custom_extensions: Iterable[Path] = (),
-        is_device_graph: bool = False,
-    ) -> Graph:
-        """Traces the graph, whose inputs are :meth:`input_types`.
-
-        Adapts the flat graph inputs to :meth:`__call__`: splits them into
-        the batch, the KV cache, the slot indices, the conv and SSM state
-        pools and ``has_initial_state``.
-
-        Args:
-            *input_types: The graph's input types, as :meth:`input_types`
-                returns them.
-            name: The name of the graph. Defaults to the class's qualified
-                name.
-            module: The MLIR module to add the graph to. Defaults to a new
-                module.
-            custom_extensions: Paths to custom kernel libraries the graph
-                uses.
-            is_device_graph: Whether to build a device graph.
-
-        Returns:
-            The traced :class:`~max.graph.Graph`.
-        """
-        num_mamba = self.num_mamba_layers
-
-        def forward(
-            tokens: Value[Any],
-            input_row_offsets: Value[Any],
-            return_n_logits: Value[Any],
-            *variadic: Value[Any],
-        ) -> DecoderOutputs:
-            # The KV inputs come first, then slot_idx, the conv pools, the
-            # SSM pools and has_initial_state.
-            kv_count = len(variadic) - 1 - num_mamba * 2 - 1
-            kv_collections = tree.leaves(
-                self.kv_params.unflatten_kv_inputs(iter(variadic[:kv_count])),
-                leaf=KVCacheInputsPerDevice,
-            )
-            idx = kv_count
-            slot_idx = variadic[idx].tensor
-            idx += 1
-            conv_pools = [variadic[idx + i].buffer for i in range(num_mamba)]
-            idx += num_mamba
-            ssm_pools = [variadic[idx + i].buffer for i in range(num_mamba)]
-            idx += num_mamba
-            return self(
-                tokens.tensor,
-                input_row_offsets.tensor,
-                return_n_logits.tensor,
-                kv_collections,
-                slot_idx,
-                conv_pools,
-                ssm_pools,
-                variadic[idx].tensor,
-            )
-
-        return Graph(
-            type(self).__qualname__ if name is None else name,
-            forward,
-            input_types=input_types,
-            custom_extensions=list(custom_extensions),
-            module=module,
-            is_device_graph=is_device_graph,
         )

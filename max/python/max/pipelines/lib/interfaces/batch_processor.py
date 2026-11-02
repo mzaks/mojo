@@ -33,18 +33,18 @@ from max import tree
 from max.driver import Buffer, Device, is_virtual_device_mode
 from max.dtype import DType
 from max.graph import BufferType, DeviceRef, TensorType
-from max.nn.comm import Signals
-from max.nn.graph_groups import (
+from max.nn.legacy.comm import Signals
+from max.nn.legacy.graph_groups import (
     RaggedBatch,
     TPSignals,
     VisionMerge,
 )
-from max.nn.kv_cache import KVCacheInputs
-from max.nn.kv_cache.cache_params import (
+from max.nn.legacy.kv_cache import KVCacheInputs
+from max.nn.legacy.kv_cache.cache_params import (
     KVCacheParamInterface,
     max_pages_per_request,
 )
-from max.nn.transformer import ReturnHiddenStates, ReturnLogits
+from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
 from max.pipelines.context import BaseContext, TextContext
 from max.pipelines.context.tokens import TokenBuffer
 from max.pipelines.graph_input_stager import (
@@ -278,6 +278,19 @@ class BatchProcessor(ABC, Generic[ContextT, InputsT, ArchConfigT_co]):
                 graph's input types in declaration order.
         """
         self.input_tree = input_tree
+
+    def max_dims(
+        self, dims: Iterable[str], kv_params: KVCacheParamInterface
+    ) -> dict[str, int]:
+        """Returns the largest size each per-step input dim can take.
+
+        Defaults to :meth:`BatchProcessorRuntime.max_dims`; a processor that
+        feeds inputs of its own bounds their dims too.
+
+        Raises:
+            ValueError: If no maximum is known for a dim.
+        """
+        return self.runtime.max_dims(dims, kv_params)
 
     @abstractmethod
     def prepare_initial_token_inputs(
