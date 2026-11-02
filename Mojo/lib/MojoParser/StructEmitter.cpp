@@ -819,6 +819,43 @@ FnOp StructEmitter::synthesizeEmptyMoveOrCopyInit(
   return resultFn;
 }
 
+FnOp StructEmitter::synthesizeInvariantPredicate() {
+  ASTType selfType = structDecl.getSelfType();
+  MLIRContext *ctx = shared.getContext();
+  Builder b(ctx);
+  SMLoc loc = structDecl.getLoc();
+  ASTType boolType = shared.lookupBuiltinType("Bool", structDecl, loc);
+  if (!boolType)
+    return {};
+
+  // `self` as a method reads it: in a register when the struct is trivial,
+  // otherwise in memory.
+  Type selfArgType = selfType;
+  ArgConvention selfConv = ArgConvention::ImmReg;
+  if (selfType.getRegisterPassability(loc, shared) !=
+      TypeConvention::RegisterPassableTrivial) {
+    selfArgType = selfType.getRefForArgument("self", /*isMut=*/false);
+    selfConv = ArgConvention::ImmMem;
+  }
+  auto argListAttrs =
+      PogListAttr::get(ctx, {b.getStringAttr("self")}, {PassingKind::PosOrKw});
+  auto [fn, fnDecl] = synthesizeMethodInStruct(
+      kInvariantPredicateName, /*params=*/{},
+      /*paramListAttrs=*/
+      PogListAttr::get(ctx, /*numPogs=*/0, ArrayRef<ConstraintAttr>()),
+      /*argTypes=*/{selfArgType}, /*argConvs=*/{selfConv}, argListAttrs,
+      boolType);
+  if (!fn)
+    return {};
+  fnDecl->resolvedness = DeclResolvedness::signature;
+
+  // An unresolved end: the body is populated when the function is resolved.
+  auto endBuilder = OpBuilder::atBlockEnd(fn.getBody());
+  EndFnOp::create(endBuilder, fn.getLoc(), /*unresolved=*/true);
+  fn.setInlineLevelAttr(getInlineLevelAttr(ctx, InlineLevel::Always));
+  return fn;
+}
+
 /// Rebind a field reference to access it through a trait downcast.
 static Value rebindRefForTrait(Value fieldRef, Type fieldMLIRType,
                                TraitDeclOp traitOp, ImplicitLocOpBuilder &b) {

@@ -224,12 +224,23 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   unproven one is reported at the `return` statement (at the `def` where
   the function ends without one), with a note at the clause.
 - Struct invariants: a struct's `invariant` clauses hold for each argument
-  of the struct's type of its methods. They are assumed where a method
-  starts (unless it initializes the argument, `out`), proven where a method
-  that initializes or changes it (`out`, `mut`) returns, and so assumed
-  after a call to such a method. Callers do not prove them, and a function
-  that is not a method of the struct does not assume them for its
-  arguments (`invariants.mojo`).
+  of the struct's type, of its methods and of any other function. They
+  are assumed where a function starts (unless it initializes the
+  argument, `out`), proven where a function that initializes or changes
+  it (`out`, `mut`) returns, and so assumed after a call to such a
+  function. Callers do not prove them. A function outside the struct
+  states them through the struct's `__invariant__(self) -> Bool`, the
+  method the parser synthesizes from the clauses (which the package of
+  the struct carries, so `List`'s invariant reaches `ok_rows`, and which
+  a struct may define by hand); the pass evaluates its body in the
+  clause. A loop that writes elements of a list argument assumes the
+  invariant of the list again where the loop starts (`ok_rows`). Limits:
+  a memory clause of the invariant (`_initialized` of the list's
+  storage) is only checked where the struct's own methods return, since
+  the pass reads such clauses from clause bodies, not from the
+  predicate's; and a function outside the struct that returns one of its
+  values does not prove the invariant of its result (the struct's own
+  methods do), so a caller does not assume it (`invariants.mojo`).
 - Quantifiers (`all([... for i in range(lo, hi)])`) are proven for an
   arbitrary index and assumed as real quantifiers.
 - List elements: `xs[i]` reads `elem(xs, i)`; writing it keeps the length
@@ -275,12 +286,13 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   span (`ok_length_through_imm`). `Span` states its invariant: its
   `_len` is not negative and at most the extent of its `_data`. It is
   proven where the constructors from a list, an array, nothing and
-  another span return, and assumed of every span a function is given by
-  value, so that two spans' lengths add without wrapping
-  (`ok_total_length`; `bad_length_plus_unbounded` adds an unbounded
-  integer). The builtin constructor from a pointer and a length is
-  trusted, and a span a call returns is not assumed to satisfy it (the
-  callee's postcondition says what it does). A span's `_len` field and
+  another span return, and assumed of every span a function is given
+  (through `Span.__invariant__`, like any struct's), so that two spans'
+  lengths add without wrapping (`ok_total_length`;
+  `bad_length_plus_unbounded` adds an unbounded integer). The builtin
+  constructor from a pointer and a length is trusted, and a span a call
+  returns is not assumed to satisfy it (the callee's postcondition says
+  what it does). A span's `_len` field and
   its `len` are the same value. A write
   through a span of a list (`s[0] = 9`) writes an element of the list,
   whose length is kept (`ok_write_through_span`): a store through a

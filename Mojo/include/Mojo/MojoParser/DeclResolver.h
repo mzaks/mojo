@@ -68,6 +68,14 @@ struct ContractClause {
   unsigned selfArg = 0;
 };
 
+/// The method a struct with `invariant` clauses gets, `__invariant__(self)
+/// -> Bool`: their conjunction. A function outside the struct that takes one
+/// of its values assumes and ensures the invariant by calling the method,
+/// which a package carries where the clauses themselves are not (see
+/// `appendInvariantClauses`). A struct may define the method by hand
+/// instead.
+inline constexpr llvm::StringLiteral kInvariantPredicateName = "__invariant__";
+
 /// A postcondition to emit before each return of a function.
 struct PostconditionClause {
   const ParsedConstraint *clause;

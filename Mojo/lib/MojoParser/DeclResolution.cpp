@@ -2363,6 +2363,10 @@ LogicalResult DefASTDecl::resolveSignature(Lexer &lexer) {
                           captureSignature, signature);
 }
 
+static LogicalResult
+populateInvariantPredicate(DeclResolver &resolver, DefASTDecl &fnDecl,
+                           ArrayRef<ParsedConstraint> clauses);
+
 LogicalResult DefASTDecl::resolveSyntheticBody() {
   FnOp fn = getOp();
   if (!fn.isSynthetic())
@@ -2375,6 +2379,15 @@ LogicalResult DefASTDecl::resolveSyntheticBody() {
 
   if (fn.getInheritedFrom())
     return gen.populateDefaultedTraitFunction(*this);
+
+  // The struct's `__invariant__` predicate (see `kInvariantPredicateName`).
+  if (fn.getDeclName().getValue() == kInvariantPredicateName) {
+    auto &invariants = shared.getDeclResolver().structInvariants;
+    if (auto it = invariants.find(gen.structDeclOp); it != invariants.end()) {
+      return populateInvariantPredicate(shared.getDeclResolver(), *this,
+                                        it->second);
+    }
+  }
 
   if (fn.getSpecialFunctionKind() == SpecialFunctionKind::kNormal &&
       gen.structDeclOp.isEnum())
@@ -2465,6 +2478,51 @@ static void bindFunctionArguments(DeclResolver &resolver, FnOp funcOp,
     bindArgument(resolver, convention, block.getArgument(argIdx), argName,
                  scope, loc);
   }
+}
+
+/// Populate a struct's `__invariant__` predicate (see
+/// `kInvariantPredicateName`) with `return c1 and c2 and ...`, its
+/// `invariant` clauses as written: each names `self`, the argument.
+static LogicalResult
+populateInvariantPredicate(DeclResolver &resolver, DefASTDecl &fnDecl,
+                           ArrayRef<ParsedConstraint> clauses) {
+  SharedState &shared = resolver.shared;
+  fnDecl.resolvedness = DeclResolvedness::body;
+  FnOp fn = fnDecl.getOp();
+  DebugInfo::DIBuilder::ScopeGuard diScopeGuard;
+  if (shared.diBuilder)
+    diScopeGuard = shared.diBuilder->pushScopeGuard(fn.getLocScope());
+  auto endFn = cast<EndFnOp>(fn.getBody()->getTerminator());
+  endFn.setUnresolved(false);
+  ImplicitLocOpBuilder b(fn.getLoc(), endFn);
+  SMLoc loc = fnDecl.getLoc();
+  ASTDecl &scope =
+      resolver.addFullyResolvedDecl(nullptr, StringAttr(), loc, &fnDecl);
+  bindFunctionArguments(resolver, fn, scope, *fn.getBody(), loc,
+                        /*withResultSlot=*/false);
+  IREmitter emitter(scope, b);
+
+  ExprNode *cond = nullptr;
+  for (const ParsedConstraint &clause : clauses) {
+    if (!clause.propExpr)
+      continue;
+    cond = cond ? shared.persistentAllocator.create<BinOpNode>(
+                      ExprNode::kAnd, cond, clause.loc, clause.propExpr)
+                : clause.propExpr;
+  }
+  if (!cond)
+    return failure();
+  ExprDest dest(fn.getUserResultType(), EC_ReturnValue);
+  AnyValue value = emitter.emitExpr(cond, dest);
+  Value result = value ? emitter.emitSRValue({value, cond}, EC_ReturnValue,
+                                             fn.getMLIRResultType())
+                       : Value();
+  if (!result) {
+    dest.resetForError(emitter);
+    return failure();
+  }
+  emitter.emitNormalReturn(fn.getLoc(), result, /*emitEndFunc=*/false);
+  return success();
 }
 
 /// Emit the condition of a contract clause into the region of the contract op
@@ -2774,53 +2832,70 @@ static Type argValueType(Value arg) {
   return arg.getType();
 }
 
-/// The invariant of the struct whose method `funcOp` is, as clauses about
-/// each of its arguments of that struct (`self`, and others like `copy` or
-/// `other`): assumed on entry, unless the function initializes the argument
-/// (`out`), and ensured on return where it initializes or changes it (`out`,
-/// `mut`). Callers do not establish it (see `kgen.requires`).
+/// A clause `self.__invariant__()` about argument `argName` of struct
+/// `structName`, for a function that is not the struct's own method (see
+/// `kInvariantPredicateName`): `self` names the argument where the clause
+/// is emitted (`emitContractCondition`).
+static const ParsedConstraint *predicateClause(DeclResolver &resolver,
+                                               ASTDecl &decl,
+                                               StringAttr structName,
+                                               StringAttr argName) {
+  BumpAllocator &allocator = resolver.shared.persistentAllocator;
+  SMLoc loc = decl.getLoc();
+  auto *self = allocator.create<DeclRefNode>("self");
+  auto *method =
+      allocator.create<AttributeRefNode>(self, loc, kInvariantPredicateName);
+  auto *call =
+      allocator.create<CallNode>(method, loc, ArrayRef<Operand>(), loc);
+  auto *clause = allocator.create<ParsedConstraint>();
+  clause->loc = loc;
+  clause->propExpr = call;
+  clause->message = StringAttr::get(
+      resolver.getContext(),
+      "invariant of '" + structName.getValue() + "' does not hold for '" +
+          (argName ? argName.getValue() : StringRef("an argument")) + "'");
+  return clause;
+}
+
+/// The invariants of the structs whose values `funcOp` takes, as clauses
+/// about each such argument: assumed on entry, unless the function
+/// initializes the argument (`out`), and ensured on return where it
+/// initializes or changes it (`out`, `mut`). Callers do not establish them
+/// (see `kgen.requires`). In the struct's own methods the clauses are its
+/// `invariant` clauses, about `self` and the other arguments of the struct
+/// (`copy`, `other`); elsewhere a struct's invariant is its `__invariant__`
+/// predicate, which the package carries (see `kInvariantPredicateName`).
 static void appendInvariantClauses(DeclResolver &resolver, FnOp funcOp,
                                    ASTDecl &decl,
                                    SmallVectorImpl<ContractClause> &contracts) {
-  ASTDecl *parent = decl.getParentDecl();
-  auto structOp = parent
-                      ? dyn_cast_or_null<StructDeclOp>(parent->getIfOperation())
-                      : StructDeclOp();
-  if (!structOp)
-    return;
-  auto it = resolver.structInvariants.find(structOp);
-  if (it == resolver.structInvariants.end())
-    return;
   // An `@always_inline("builtin")` function folds to its result: it cannot
   // carry contract ops.
   if (inlineLevelOrAutomatic(funcOp.getInlineLevel()) ==
       InlineLevel::AlwaysBuiltin)
     return;
+  // The predicate states the invariant; it does not assume it.
+  if (funcOp.getDeclName().getValue() == kInvariantPredicateName)
+    return;
+  SharedState &shared = resolver.shared;
 
-  // The struct's type, as `self` has it. A method without `self` has no
-  // invariant.
+  // The struct whose method this is, and its own clauses.
+  ASTDecl *parent = decl.getParentDecl();
+  auto ownStruct =
+      parent ? dyn_cast_or_null<StructDeclOp>(parent->getIfOperation())
+             : StructDeclOp();
+  ArrayRef<ParsedConstraint> ownClauses;
+  if (ownStruct)
+    if (auto it = resolver.structInvariants.find(ownStruct);
+        it != resolver.structInvariants.end())
+      ownClauses = it->second;
+
   FnTypeGeneratorType funcSignature = funcOp.getFuncTypeGenerator();
   ArrayRef<ArgConvention> conventions = funcSignature.getArgConventions();
   Block *body = funcOp.getBody();
-  Type selfType;
-  for (unsigned i = 0, e = conventions.size(); i != e; ++i)
-    if (StringAttr name = funcSignature.getArgName(i);
-        name && name.getValue() == "self")
-      selfType = argValueType(body->getArgument(i));
-  bool selfIsResult = false;
-  if (!selfType && funcOp.getNamedResultAttr() &&
-      funcOp.getNamedResultAttr().getValue() == "self" &&
-      !funcSignature.hasMemoryOnlyResult()) {
-    selfType = funcOp.getUserResultType();
-    selfIsResult = true;
-  }
-  if (!selfType)
-    return;
-
-  StringAttr structName = structOp.getDeclName();
   SmallVector<ContractClause, 2> ensures;
-  auto add = [&](unsigned selfArg, bool entry, bool exit) {
-    for (const ParsedConstraint &clause : it->second) {
+  auto add = [&](StringAttr structName, ArrayRef<ParsedConstraint> clauses,
+                 unsigned selfArg, bool entry, bool exit) {
+    for (const ParsedConstraint &clause : clauses) {
       if (entry)
         contracts.push_back(
             {&clause, ContractClause::Requires, structName, selfArg});
@@ -2829,17 +2904,45 @@ static void appendInvariantClauses(DeclResolver &resolver, FnOp funcOp,
             {&clause, ContractClause::Ensures, structName, selfArg});
     }
   };
+  bool hasSelfArg = false;
   for (auto [i, convention] : llvm::enumerate(conventions)) {
-    if (convention == ArgConvention::ByRefError ||
-        argValueType(body->getArgument(i)) != selfType)
+    StringAttr argName = funcSignature.getArgName(i);
+    hasSelfArg |= argName && argName.getValue() == "self";
+    if (convention == ArgConvention::ByRefError)
+      continue;
+    auto *structDecl = dyn_cast_or_null<StructASTDecl>(
+        ASTType(argValueType(body->getArgument(i))).getDecl(shared));
+    if (!structDecl)
+      continue;
+    StructDeclOp structOp = structDecl->getOp();
+    bool resultSlot = convention == ArgConvention::ByRefResult &&
+                      (!argName || argName.getValue() == "__result__");
+    ArrayRef<ParsedConstraint> clauses;
+    if (structOp == ownStruct && !ownClauses.empty())
+      clauses = ownClauses;
+    // Not the slot of a result a function outside the struct returns in
+    // memory (`-> List[Int]`): the struct's constructors and methods build
+    // the result and ensure its invariant, which a caller of such a
+    // function then does not assume.
+    else if (!resultSlot &&
+             shared.typeHasMember(*structDecl, kInvariantPredicateName,
+                                  decl.getLoc()))
+      clauses = ArrayRef(
+          predicateClause(resolver, decl, structOp.getDeclName(), argName), 1);
+    if (clauses.empty())
       continue;
     bool initialized = convention == ArgConvention::ByRefResult;
-    add(i, /*entry=*/!initialized,
+    add(structOp.getDeclName(), clauses, i, /*entry=*/!initialized,
         /*exit=*/initialized || convention == ArgConvention::Mut ||
             convention == ArgConvention::MutRef);
   }
-  if (selfIsResult)
-    add(kSelfIsResult, /*entry=*/false, /*exit=*/true);
+  // A constructor of a register-passable struct returns `self`: its
+  // invariant holds of the result.
+  if (!hasSelfArg && !ownClauses.empty() && funcOp.getNamedResultAttr() &&
+      funcOp.getNamedResultAttr().getValue() == "self" &&
+      !funcSignature.hasMemoryOnlyResult())
+    add(ownStruct.getDeclName(), ownClauses, kSelfIsResult, /*entry=*/false,
+        /*exit=*/true);
   llvm::append_range(contracts, ensures);
 }
 
@@ -5178,6 +5281,12 @@ LogicalResult StructASTDecl::resolveBody(Lexer &lexer) {
           copyFn.getBoundSymbolRef(shared.getEvaluationContext()));
     }
   }
+  // A struct with `invariant` clauses gets `__invariant__(self) -> Bool`,
+  // their conjunction, for the functions outside it that take its values
+  // (see `appendInvariantClauses`), unless it defines the method itself.
+  if (resolver.structInvariants.count(structOp) &&
+      !shared.typeHasMember(*this, kInvariantPredicateName, getLoc()))
+    StructEmitter(*this).synthesizeInvariantPredicate();
 
   // Iterate over all the parsed decls.  in general these won't be signature
   // resolved, and we don't want to resolve functions.  We do need to resolve

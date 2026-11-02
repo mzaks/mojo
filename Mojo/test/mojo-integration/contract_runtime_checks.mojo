@@ -14,7 +14,7 @@
 # `requires` and `ensures` clauses are checked at run time when assertions
 # are enabled (see Mojo/proposals/function-contracts.md), and not evaluated
 # at all otherwise. A clause that uses `old` is not checked at run time. A
-# struct's `invariant` clauses are checked where a method that initializes or
+# struct's `invariant` clauses are checked where a function that initializes or
 # changes a value of it returns.
 
 # Without assertions every case runs to its end.
@@ -28,6 +28,7 @@
 # RUN: %mojo -D CASE=5 %s 2>&1 | FileCheck %s --check-prefix=PASS
 # RUN: not %mojo -D CASE=6 %s 2>&1 | FileCheck %s --check-prefix=INVARIANT
 # RUN: not %mojo -D CASE=7 %s 2>&1 | FileCheck %s --check-prefix=OTHER
+# RUN: not %mojo -D CASE=8 %s 2>&1 | FileCheck %s --check-prefix=FREE
 
 from std.sys.defines import get_defined_int
 
@@ -78,6 +79,11 @@ struct Gauge(Movable)
         return self.level
 
 
+@inline(.never)
+def lower(mut g: Gauge, by: Int):
+    g.level -= by  # no check that `by` is at most the level
+
+
 def main():
     comptime test_case = get_defined_int["CASE", 0]()
     var xs: List[Int] = [1, 2, 3]
@@ -110,6 +116,11 @@ def main():
         # OTHER: invariant of 'Gauge' does not hold: self.level >= 0
         g.drain(h)
         print(h.read())
+    elif test_case == 8:
+        var g = Gauge(1)
+        # FREE: invariant of 'Gauge' does not hold for 'g'
+        lower(g, 2)
+        print(g.read())
     # OFF: done
     # PASS: done
     print("done")

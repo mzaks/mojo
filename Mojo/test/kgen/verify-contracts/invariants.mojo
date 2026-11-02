@@ -10,9 +10,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# Struct invariants for `verify-contracts`: assumed where a method starts,
-# proven where a method that initializes or changes the value returns, and
-# assumed after a call to such a method; see README.md.
+# Struct invariants for `verify-contracts`: assumed where a function that
+# takes a value of the struct starts, proven where a function that
+# initializes or changes the value returns, and assumed after a call to
+# such a function; see README.md.
 
 from std.memory.alloc import unsafe_alloc
 
@@ -97,16 +98,45 @@ def ok_new_ring() -> Int:
     return r.data[unsafe_offset=r.at]  # from the constructor
 
 
-# --- must be WARNED ---
-def bad_argument(xs: List[Int], c: Counter) -> Int:
-    # A function that is not a method of the struct does not assume the
-    # invariant of its arguments.
+def ok_argument(xs: List[Int], c: Counter) -> Int:
+    # A function that is not a method of the struct assumes the invariant
+    # of its arguments too (through the struct's `__invariant__`).
     if c.limit < len(xs):
         return xs[c.count]
     return 0
 
 
+def ok_free_bump(mut c: Counter):
+    # ... and keeps it where it changes one.
+    if c.count < c.limit:
+        c.count += 1
+
+
+def ok_make(out c: Counter, limit: Int) requires limit >= 0:
+    c = Counter(limit)
+
+
+def ok_rows(mut xs: List[List[Int]]):
+    for i in range(len(xs)):
+        xs[i].append(0)  # writes the rows, not the fields of `xs`
+
+
+# --- must be WARNED (where they return) ---
+def bad_free_bump(mut c: Counter):
+    c.count += 1  # may pass `limit`
+
+
+def bad_make(out c: Counter):
+    c = Counter(0)
+    c.count = -1
+
+
 def main():
     var xs: List[Int] = [1, 2, 3]
-    print(ok_after_mut_call(xs, Counter(1)), bad_argument(xs, Counter(1)))
+    var c = Counter(1)
+    print(ok_after_mut_call(xs, Counter(1)), ok_argument(xs, c))
     print(ok_new_ring())
+    ok_free_bump(c)
+    bad_free_bump(c)
+    var rows: List[List[Int]] = [[1], [2]]
+    ok_rows(rows)

@@ -109,6 +109,10 @@ public:
   /// provided fnDecl is marked erroneous. Otherwise returns success().
   LogicalResult populateDefaultedTraitFunction(DefASTDecl &fnDecl);
 
+  /// Add `__invariant__(self) -> Bool` to a struct with `invariant` clauses
+  /// (see `kInvariantPredicateName`), to be filled in later.
+  FnOp synthesizeInvariantPredicate();
+
   /// Add a attribute initializer method for this struct with a body.
   FnOp synthesizeFieldwiseInit();
 
