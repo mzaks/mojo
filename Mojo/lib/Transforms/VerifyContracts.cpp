@@ -1626,19 +1626,6 @@ public:
       } else
         values[arg] = declare(sortOf(arg.getType()), "a");
     }
-    // A span given by value: its `_len` is its length, at most the extent
-    // of its memory (`Span`'s invariant, which its constructors prove; the
-    // one from a pointer and a length is builtin and trusted).
-    for (BlockArgument arg : entry.getArguments())
-      if (!isa<LIT::RefType>(arg.getType()) && isSpanType(arg.getType())) {
-        Sort i64{false, 64, true};
-        std::string span = values[arg];
-        std::string n = define(i64, lenOf(span));
-        fieldValues[{span, "/_len"}] = n;
-        facts.push_back("(bvsle " + n + " " +
-                        extentOf(fieldOf(span, "/_data", {false, 64, false})) +
-                        ")");
-      }
     registerLocals(fn);
     // The function's own constraints on its parameters (`where N <= 8`): the
     // compiler rejects any instantiation that breaks them, so they hold in
