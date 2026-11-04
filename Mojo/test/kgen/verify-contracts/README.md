@@ -63,7 +63,8 @@ deterministic resource limit of each query (default 100000000),
 value of their parameters, `generic-rlimit=` the limit of each such query
 (default 10000000; see below), `houdini-rlimit=` the limit of each
 loop-invariant candidate's query (default 1000000, at most a twentieth
-of the query limit; a candidate not decided within it is dropped),
+of the query limit; a query over several candidates has the limit of each
+of them; a candidate not decided within it is dropped),
 `wall-seconds=` caps each z3
 process (default 600: a safety net only, see below), `int-rlimit=` and
 `range-rlimit=` are the limits of the integer retry's queries (defaults
@@ -216,7 +217,15 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   equals the cursor or adds up with it to what the two were on entry
   (`ok_iterate_with_counter`, `ok_counter_down`,
   `ok_linked_list_counter`). Only variables the loop's conditions depend on are
-  considered. The invariants hold only where the loop is reached.
+  considered. The invariants hold only where the loop is reached. The
+  candidates are decided by models: one query asks whether all the candidates
+  standing hold (on entry; then, at each end of the body, under the candidates
+  assumed at the loop head), and a model of its failure drops every candidate
+  false in it, until a round drops none. A handful of queries so decide
+  hundreds of candidates, where asking each alone cost a search for a model
+  of the whole function per candidate that fails (a test with many `List`
+  calls: 46 s to 13 s of solver time). A query the solver cannot decide falls
+  back to asking the candidates one by one.
 
 - Postconditions: a function's own clauses on `out` and `mut` arguments are
   proven where it returns, with `old(...)` evaluated at its entry, and a

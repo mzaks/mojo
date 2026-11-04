@@ -593,46 +593,66 @@ void pruneCache(StringRef dir) {
   }
 }
 
-std::optional<SmallVector<Answer>>
-runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
-  // The answers to a script are a function of the script and the solver:
-  // the limits are deterministic, and runs stopped at the wall-clock cap are
-  // not cached.
-  size_t expected = script.count("(check-sat)");
-  SmallString<128> cachePath;
-  if (!config.cacheDir.empty()) {
-    uint64_t hash = llvm::xxh3_64bits(script);
-    // The solver: its path, and its binary's size and modification time,
-    // so an upgraded z3 does not reuse answers.
-    std::string solver = config.z3;
-    llvm::sys::fs::file_status status;
-    if (!llvm::sys::fs::status(config.z3, status))
-      solver += "|" + std::to_string(status.getSize()) + "|" +
-                std::to_string(llvm::sys::toTimeT(status.getLastModificationTime()));
-    uint64_t solverHash = llvm::xxh3_64bits(solver);
-    cachePath = config.cacheDir;
-    llvm::sys::path::append(cachePath, llvm::utohexstr(hash) + "-" +
-                                           llvm::utohexstr(solverHash) +
-                                           ".answers");
-    if (auto cached = llvm::MemoryBuffer::getFile(cachePath)) {
-      SmallVector<Answer> answers;
-      for (char c : (*cached)->getBuffer())
-        if (c == 'p' || c == 'u' || c == 'k')
-          answers.push_back(c == 'p'   ? Answer::Proven
-                            : c == 'u' ? Answer::Unproven
-                                       : Answer::Unknown);
-      if (answers.size() == expected) {
-        // Used: kept by the pruning (see `pruneCache`).
-        int fd;
-        if (!llvm::sys::fs::openFileForRead(cachePath, fd)) {
-          (void)llvm::sys::fs::setLastAccessAndModificationTime(
-              fd, std::chrono::system_clock::now());
-          llvm::sys::Process::SafelyCloseFileDescriptor(fd);
-        }
-        return answers;
-      }
-    }
+/// Where the answers to `script` are cached, or "" without a cache: by a
+/// hash of the script and one of the solver (its path, and its binary's
+/// size and modification time, so an upgraded z3 does not reuse answers).
+std::string cachePathOf(const SolverConfig &config, StringRef script) {
+  if (config.cacheDir.empty())
+    return "";
+  uint64_t hash = llvm::xxh3_64bits(script);
+  std::string solver = config.z3;
+  llvm::sys::fs::file_status status;
+  if (!llvm::sys::fs::status(config.z3, status))
+    solver +=
+        "|" + std::to_string(status.getSize()) + "|" +
+        std::to_string(llvm::sys::toTimeT(status.getLastModificationTime()));
+  uint64_t solverHash = llvm::xxh3_64bits(solver);
+  SmallString<128> path(config.cacheDir);
+  llvm::sys::path::append(path, llvm::utohexstr(hash) + "-" +
+                                    llvm::utohexstr(solverHash) + ".answers");
+  return std::string(path);
+}
+
+/// The text cached at `path`, if any; a file read is kept by the pruning
+/// (see `pruneCache`).
+std::optional<std::string> readCache(StringRef path) {
+  if (path.empty())
+    return std::nullopt;
+  auto cached = llvm::MemoryBuffer::getFile(path);
+  if (!cached)
+    return std::nullopt;
+  int fd;
+  if (!llvm::sys::fs::openFileForRead(path, fd)) {
+    (void)llvm::sys::fs::setLastAccessAndModificationTime(
+        fd, std::chrono::system_clock::now());
+    llvm::sys::Process::SafelyCloseFileDescriptor(fd);
   }
+  return (*cached)->getBuffer().str();
+}
+
+/// Caches `text` at `path`: written to a temporary and renamed, so a
+/// parallel reader never sees a partial file.
+void writeCache(StringRef path, StringRef text) {
+  if (path.empty())
+    return;
+  SmallString<128> temp;
+  int fd;
+  if (llvm::sys::fs::createUniqueFile(path + ".%%%%%%", fd, temp))
+    return;
+  {
+    llvm::raw_fd_ostream os(fd, /*shouldClose=*/true);
+    os << text;
+  }
+  if (llvm::sys::fs::rename(temp, path))
+    llvm::sys::fs::remove(temp);
+}
+
+/// Runs z3 on `script` with the wall-clock cap and returns what it printed;
+/// `rc` its exit code (1 after an error it printed), or -1 when it was
+/// stopped at the cap or could not run.
+std::optional<std::string> runSolver(const SolverConfig &config,
+                                     StringRef script, StringRef dumpName,
+                                     int &rc) {
   SmallString<128> scriptPath, outPath;
   if (!config.dumpDir.empty()) {
     scriptPath = config.dumpDir;
@@ -652,22 +672,43 @@ runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
   std::optional<StringRef> redirects[] = {StringRef(""), StringRef(outPath),
                                           StringRef("")};
   StringRef z3 = config.z3;
-  int rc = runWithCap(z3, {z3, "-smt2", scriptPath}, redirects,
-                      config.wallSeconds);
-  if (rc != 0)
-    cachePath.clear(); // Stopped (e.g. at the cap): do not cache.
-  bool stopped = rc != 0;
+  rc = runWithCap(z3, {z3, "-smt2", scriptPath}, redirects, config.wallSeconds);
   auto buffer = llvm::MemoryBuffer::getFile(outPath);
   llvm::sys::fs::remove(outPath);
   if (config.dumpDir.empty())
     llvm::sys::fs::remove(scriptPath);
   if (!buffer)
     return std::nullopt;
+  return (*buffer)->getBuffer().str();
+}
+
+std::optional<SmallVector<Answer>>
+runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
+  // The answers to a script are a function of the script and the solver:
+  // the limits are deterministic, and runs stopped at the wall-clock cap are
+  // not cached.
+  size_t expected = script.count("(check-sat)");
+  std::string cachePath = cachePathOf(config, script);
+  if (std::optional<std::string> cached = readCache(cachePath)) {
+    SmallVector<Answer> answers;
+    for (char c : *cached)
+      if (c == 'p' || c == 'u' || c == 'k')
+        answers.push_back(c == 'p'   ? Answer::Proven
+                          : c == 'u' ? Answer::Unproven
+                                     : Answer::Unknown);
+    if (answers.size() == expected)
+      return answers;
+  }
+  int rc = 0;
+  std::optional<std::string> output = runSolver(config, script, dumpName, rc);
+  if (!output)
+    return std::nullopt;
+  bool stopped = rc != 0;
   // A process stopped at the cap answers nothing for the remaining queries,
   // which count as unknown.
   SmallVector<Answer> answers;
   SmallVector<StringRef> segments;
-  (*buffer)->getBuffer().split(segments, "@@");
+  StringRef(*output).split(segments, "@@");
   for (StringRef segment : ArrayRef(segments).drop_front()) {
     StringRef answer = segment.trim().split('\n').first.trim();
     answers.push_back(answer == "unsat" ? Answer::Proven
@@ -678,24 +719,13 @@ runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
     ++stoppedScripts;
     stoppedQueries += expected - std::min(expected, answers.size());
   }
-  if (!cachePath.empty() && answers.size() == expected) {
+  if (!stopped && answers.size() == expected) {
     std::string text;
     for (Answer answer : answers)
       text += answer == Answer::Proven     ? 'p'
               : answer == Answer::Unproven ? 'u'
                                            : 'k';
-    // Written to a temporary and renamed, so a parallel reader never sees a
-    // partial file.
-    SmallString<128> temp;
-    int fd;
-    if (!llvm::sys::fs::createUniqueFile(cachePath + ".%%%%%%", fd, temp)) {
-      {
-        llvm::raw_fd_ostream os(fd, /*shouldClose=*/true);
-        os << text;
-      }
-      if (llvm::sys::fs::rename(temp, cachePath))
-        llvm::sys::fs::remove(temp);
-    }
+    writeCache(cachePath, text);
   }
   return answers;
 }
@@ -777,6 +807,68 @@ std::optional<std::vector<SExpr>> parseSExprs(StringRef text) {
   if (stack.size() != 1)
     return std::nullopt;
   return std::move(stack.front());
+}
+
+/// The answer to a script whose one query is followed by a `(get-value
+/// (...))` of boolean terms: with `sat`, each term's value in the model.
+struct ModelAnswer {
+  Answer answer = Answer::Unknown;
+  SmallVector<bool> values;
+};
+
+/// Runs z3 on `script`, one `(check-sat)` followed by a `(get-value
+/// (...))` of `values` boolean terms; returns the answer and, with `sat`,
+/// the terms' values in the model found. Cached like `runScript`: the
+/// answer's letter, then a `t` or `f` per value.
+std::optional<ModelAnswer> runModelScript(const SolverConfig &config,
+                                          StringRef script, StringRef dumpName,
+                                          size_t values) {
+  auto parse = [&](StringRef text) -> std::optional<ModelAnswer> {
+    if (text.empty())
+      return std::nullopt;
+    ModelAnswer result;
+    result.answer = text[0] == 'p'   ? Answer::Proven
+                    : text[0] == 'u' ? Answer::Unproven
+                                     : Answer::Unknown;
+    for (char c : text.drop_front())
+      if (c == 't' || c == 'f')
+        result.values.push_back(c == 't');
+    if (result.answer == Answer::Unproven && result.values.size() != values)
+      return std::nullopt;
+    return result;
+  };
+  std::string cachePath = cachePathOf(config, script);
+  if (std::optional<std::string> cached = readCache(cachePath))
+    if (std::optional<ModelAnswer> result = parse(*cached))
+      return result;
+  // The `(get-value)` after an `unsat` or `unknown` is an error, which z3
+  // reports in its exit code: only a run stopped at the cap is stopped.
+  int rc = 0;
+  std::optional<std::string> output = runSolver(config, script, dumpName, rc);
+  if (!output || rc == -1) {
+    ++stoppedScripts;
+    ++stoppedQueries;
+    return std::nullopt;
+  }
+  // The answer on its line, then the values: `((term true) (term false))`.
+  StringRef rest = StringRef(*output).split("@@").second.trim();
+  StringRef answer;
+  std::tie(answer, rest) = rest.split('\n');
+  answer = answer.trim();
+  std::string text = answer == "unsat" ? "p" : answer == "sat" ? "u" : "k";
+  if (answer == "sat") {
+    std::optional<std::vector<SExpr>> parsed = parseSExprs(rest);
+    if (!parsed || parsed->size() != 1 || (*parsed)[0].list.size() != values)
+      return std::nullopt;
+    for (const SExpr &pair : (*parsed)[0].list) {
+      if (pair.list.size() != 2 || !pair.list[1].isAtom() ||
+          (pair.list[1].atom != "true" && pair.list[1].atom != "false"))
+        return std::nullopt;
+      text += pair.list[1].atom == "true" ? 't' : 'f';
+    }
+  }
+  writeCache(cachePath, text);
+  return parse(text);
 }
 
 std::string printSExpr(const SExpr &e) {
@@ -6766,13 +6858,39 @@ private:
       ends.push_back(const_cast<State *>(&s));
     auto houdini = [&](ArrayRef<Candidate> set) {
       std::vector<bool> kept(set.size(), true);
-      for (unsigned round = 0; round < 8; ++round) {
+      // Whether a candidate holds on entry does not depend on the others:
+      // decided once, by models, before the rounds, which then ask only
+      // whether an iteration keeps the candidates. Asked one by one, the
+      // candidates that fail on entry each cost a search for a model of
+      // the whole prelude (a test with many `List` calls: 6.7 s for 402
+      // candidates, 0.1 s by models). When the solver cannot decide them
+      // by models, the rounds ask entry as well, candidate by candidate.
+      bool entry = true;
+      {
+        SmallVector<std::string> goals;
+        for (const Candidate &c : set)
+          goals.push_back(render(c, before));
+        ModelSearch search = refuteByModels(
+            {before.pc}, goals, houdiniLimit(),
+            dumpPrefix + ".entry" + std::to_string(houdiniRuns++) + "-");
+        for (size_t i = 0; i < set.size(); ++i)
+          if (search.refuted[i])
+            kept[i] = false;
+        entry = !search.decided;
+      }
+      const size_t per = (entry ? 1 : 0) + ends.size();
+      // A round over the kept candidates in `only` (all of them without
+      // it), candidate by candidate; returns whether any was dropped.
+      auto perCandidate = [&](const std::vector<bool> *only) {
         // The queries, in the order `rebuild` emits them.
         SmallVector<size_t> asked;
         for (size_t i = 0; i < set.size(); ++i)
-          if (kept[i])
-            asked.append(1 + ends.size(), i);
-        std::string text = rebuild(set, kept, before, head, ends, render);
+          if (kept[i] && (!only || (*only)[i]))
+            asked.append(per, i);
+        if (asked.empty())
+          return false;
+        std::string text =
+            rebuild(set, kept, before, head, ends, render, entry, only);
         std::string run = dumpPrefix + ".houdini" + std::to_string(houdiniRuns++);
         std::optional<SmallVector<Answer>> answers = runZ3(solver, text, run);
         if (answers)
@@ -6809,9 +6927,10 @@ private:
           SmallVector<size_t> again;
           for (size_t i = 0; i < set.size(); ++i)
             if (kept[i] && open[i])
-              again.append(1 + ends.size(), i);
-          std::string retry = rebuild(set, kept, before, head, ends, render,
-                                      &open, solver.invariantRetry ? 4 : 2);
+              again.append(per, i);
+          std::string retry =
+              rebuild(set, kept, before, head, ends, render, entry, &open,
+                      solver.invariantRetry ? 4 : 2);
           std::string name =
               dumpPrefix + ".houdini" + std::to_string(houdiniRuns++);
           std::optional<SmallVector<Answer>> more = runZ3(solver, retry, name);
@@ -6833,9 +6952,68 @@ private:
             changed = true;
           }
         }
-        if (!changed)
+        return changed;
+      };
+      // A round by models (`refuteByModels`), of the candidates not
+      // relating a length to a loop variable (`combine`: assumed only in
+      // their own queries, see `rebuild`): at each end of the body, whether
+      // the kept candidates, assumed at the head, all hold there. Returns
+      // whether any was dropped, or nothing when the solver could not
+      // decide, which a round candidate by candidate then does.
+      auto byModels = [&]() -> std::optional<bool> {
+        bool changed = false;
+        SmallVector<std::string> premises;
+        for (size_t i = 0; i < set.size(); ++i)
+          if (kept[i] && set[i].combine.empty())
+            premises.push_back(render(set[i], head));
+        for (State *end : ends) {
+          SmallVector<std::string> goals;
+          SmallVector<size_t> which;
+          for (size_t i = 0; i < set.size(); ++i)
+            if (kept[i] && set[i].combine.empty()) {
+              goals.push_back(render(set[i], *end));
+              which.push_back(i);
+            }
+          if (goals.empty())
+            break;
+          SmallVector<std::string> assumptions{end->pc};
+          assumptions.append(premises.begin(), premises.end());
+          ModelSearch search = refuteByModels(
+              assumptions, goals, houdiniLimit(),
+              dumpPrefix + ".keep" + std::to_string(houdiniRuns++) + "-");
+          for (auto [k, i] : llvm::enumerate(which))
+            if (search.refuted[k]) {
+              kept[i] = false;
+              changed = true;
+            }
+          if (!search.decided)
+            return std::nullopt;
+        }
+        return changed;
+      };
+      // The rounds, until none drops a candidate: what is kept then holds
+      // on entry and is kept by an iteration under itself. The candidates
+      // kept by a round that still dropped some were shown kept only under
+      // the dropped ones: not invariants.
+      bool converged = per == 0;
+      for (unsigned round = 0; round < 16 && per; ++round) {
+        bool changed;
+        if (std::optional<bool> dropped = entry ? std::nullopt : byModels()) {
+          std::vector<bool> combine(set.size(), false);
+          for (size_t i = 0; i < set.size(); ++i)
+            combine[i] = kept[i] && !set[i].combine.empty();
+          bool more = perCandidate(&combine);
+          changed = *dropped || more;
+        } else {
+          changed = perCandidate(nullptr);
+        }
+        if (!changed) {
+          converged = true;
           break;
+        }
       }
+      if (!converged)
+        kept.assign(set.size(), false);
       for (size_t i = 0; i < set.size(); ++i)
         if (kept[i]) {
           facts.push_back(
@@ -6859,15 +7037,102 @@ private:
     houdini(candidates);
   }
 
+  /// The work limit of a loop-invariant candidate's query, `scale` times
+  /// the usual one: a twentieth of the function's budget (its own, where
+  /// it has one: a launched kernel's generic proof), capped by
+  /// `houdini-rlimit`, and never above the budget. A candidate the solver
+  /// cannot decide within it is dropped, which is sound: it is only not
+  /// assumed.
+  unsigned houdiniLimit(unsigned scale = 1) const {
+    unsigned budget = queryRlimit ? queryRlimit : solver.rlimit;
+    unsigned limit = std::max(1u, budget / 20);
+    if (solver.houdiniRlimit)
+      limit = std::min(limit, solver.houdiniRlimit);
+    if (scale > 1)
+      limit = std::min<uint64_t>(uint64_t(limit) * scale, budget);
+    return limit;
+  }
+
+  /// What `refuteByModels` found: the goals a model refuted, and whether
+  /// the others were seen to hold (`decided`); when not, nothing is known
+  /// of them.
+  struct ModelSearch {
+    std::vector<bool> refuted;
+    bool decided = false;
+  };
+
+  /// Which of `goals` hold under `assumptions`, found by models: one query
+  /// asks whether all the goals still standing hold, and a model of its
+  /// failure refutes every goal false in it, so a few queries decide what
+  /// asking each goal alone takes hundreds. A query has the work limit of
+  /// the queries it stands for (`limit` for each goal standing), within
+  /// the function's budget. Stops, undecided, at the solver's `unknown` or
+  /// at a model refuting nothing. The scripts are dumped as `dumpName`
+  /// followed by the query's number.
+  ModelSearch refuteByModels(ArrayRef<std::string> assumptions,
+                             ArrayRef<std::string> goals, unsigned limit,
+                             const Twine &dumpName) {
+    ModelSearch search{std::vector<bool>(goals.size(), false), false};
+    for (unsigned n = 0; n < 64; ++n) {
+      SmallVector<size_t> standing;
+      for (size_t i = 0; i < goals.size(); ++i)
+        if (!search.refuted[i])
+          standing.push_back(i);
+      if (standing.empty()) {
+        search.decided = true;
+        return search;
+      }
+      std::string text = header() + "(echo \"@@\")\n(push 1)\n";
+      for (const std::string &a : assumptions)
+        text += "(assert " + a + ")\n";
+      std::string all;
+      if (standing.size() == 1) {
+        all = goals[standing[0]];
+      } else {
+        all = "(and";
+        for (size_t i : standing)
+          all += " " + goals[i];
+        all += ")";
+      }
+      uint64_t budget = queryRlimit ? queryRlimit : solver.rlimit;
+      uint64_t batch = std::min(uint64_t(limit) * standing.size(), budget);
+      text += "(assert (not " + all + "))\n(set-option :rlimit " +
+              std::to_string(batch) +
+              ")\n(check-sat)\n(set-option :rlimit 0)\n(get-value (";
+      for (size_t i : standing)
+        text += " " + goals[i];
+      text += "))\n(pop 1)\n";
+      std::optional<ModelAnswer> answer = runModelScript(
+          solver, text, (dumpName + Twine(n)).str(), standing.size());
+      if (!answer || answer->answer == Answer::Unknown)
+        return search;
+      if (answer->answer == Answer::Proven) {
+        search.decided = true;
+        return search;
+      }
+      bool any = false;
+      for (auto [k, i] : llvm::enumerate(standing))
+        if (!answer->values[k]) {
+          search.refuted[i] = true;
+          any = true;
+        }
+      if (!any)
+        return search;
+    }
+    return search;
+  }
+
   /// The Houdini script for the kept candidates: rendering first (which may
-  /// add definitions to the prelude), then the header, then the queries; of
-  /// the candidates in `only` alone (all kept ones are assumed), with
-  /// `scale` times the limit, when asking again what was left undecided.
+  /// add definitions to the prelude), then the header, then the queries
+  /// (whether a candidate holds on entry only with `entry`); of the
+  /// candidates in `only` alone (all kept ones are assumed), with `scale`
+  /// times the limit, when asking again what was left undecided.
   template <typename Render>
-  std::string
-  rebuild(ArrayRef<Candidate> candidates, const std::vector<bool> &kept,
-          State &before, State &head, ArrayRef<State *> ends, Render &render,
-          const std::vector<bool> *only = nullptr, unsigned scale = 1) {
+  std::string rebuild(ArrayRef<Candidate> candidates,
+                      const std::vector<bool> &kept, State &before, State &head,
+                      ArrayRef<State *> ends, Render &render, bool entry,
+                      const std::vector<bool> *only = nullptr,
+                      unsigned scale = 1) {
     // The templates relating a length to a loop variable (`combine`, last)
     // are assumed only in their own queries: assumed in every query, they
     // made z3 much slower on the whole script, although each query alone
@@ -6887,17 +7152,9 @@ private:
       ArrayRef<std::string> premises(assumed);
       if (candidates[i].combine.empty())
         premises = premises.take_front(plain);
-      // A candidate the solver cannot decide quickly is dropped, which is
-      // sound: it is only not assumed. Within the function's own budget,
-      // where it has one (a launched kernel's generic proof).
-      unsigned limit =
-          std::max(1u, (queryRlimit ? queryRlimit : solver.rlimit) / 20);
-      if (solver.houdiniRlimit)
-        limit = std::min(limit, solver.houdiniRlimit);
-      if (scale > 1)
-        limit = std::min<uint64_t>(uint64_t(limit) * scale,
-                                   queryRlimit ? queryRlimit : solver.rlimit);
-      queries += query({before.pc}, render(candidates[i], before), limit);
+      unsigned limit = houdiniLimit(scale);
+      if (entry)
+        queries += query({before.pc}, render(candidates[i], before), limit);
       for (State *end : ends) {
         SmallVector<std::string> assumptions{end->pc};
         assumptions.append(premises.begin(), premises.end());
