@@ -66,7 +66,9 @@ loop-invariant candidate's query (default 1000000, at most a twentieth
 of the query limit; a query over several candidates has the limit of each
 of them; a candidate not decided within it is dropped),
 `wall-seconds=` caps each z3
-process (default 600: a safety net only, see below), `int-rlimit=` and
+script (default 600: a safety net only, see below), `live-solver=false`
+runs every script in a z3 process of its own instead of one process per
+function kept alive between its scripts (below), `int-rlimit=` and
 `range-rlimit=` are the limits of the integer retry's queries (defaults
 1000000 and 300000), `check-division=true` reports integer divisions
 by a value that may be 0, `int-retry=false` turns off the integer retry
@@ -868,6 +870,21 @@ that hangs; a run it stops is reported in the summary (`N solver runs
 were stopped ...`), and its result is then not to be trusted. The cap
 counts the time the process could run, not the time that passed: a
 machine that sleeps stops the solver too.
+
+The scripts of a function run in one z3 process, kept alive from the
+first to the last. A script is the function's facts (its declarations,
+definitions and assertions, which only grow as the pass walks the
+function) followed by its queries, each in a `(push) ... (pop)`; the
+process reads the facts it has not seen yet and then the queries. What
+the solver learns of the facts stays with it: finding a model of them
+and the path condition is most of what a query answered by a model
+costs, and a fresh process finds it again at every query. A function
+with many loops asks fifty such queries in a row (the loop-invariant
+rounds), and the chain ran in a third of the time this way. A script
+that drops a fact already sent, or resets the solver (case splits, the
+integer retry), gets a fresh process. Each script keeps its own
+`wall-seconds` cap; a process stopped at it is started again for the
+next script.
 
 ## Expected results
 

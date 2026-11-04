@@ -61,15 +61,28 @@
 
 #include <atomic>
 #include <chrono>
+#include <fcntl.h>
 #include <functional>
 #include <future>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <poll.h>
 #include <set>
 #include <signal.h>
+#include <spawn.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <thread>
+#include <unistd.h>
+
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define SOLVER_ENVIRON (*_NSGetEnviron())
+#else
+extern char **environ;
+#define SOLVER_ENVIRON environ
+#endif
 
 using namespace M;
 using namespace KGEN;
@@ -447,6 +460,9 @@ struct SolverConfig {
   /// Whether an undecided invariant candidate is asked again with four
   /// times its limit.
   bool invariantRetry = false;
+  /// Whether a function's scripts run in one solver process kept alive
+  /// (`SolverSession`), a fresh process per script otherwise.
+  bool liveSolver = true;
   /// Whether a query still undecided is asked over the integers with the
   /// products that provably do not overflow taken exactly
   /// (`exactIntegers`); with the integer retry.
@@ -502,6 +518,184 @@ int runWithCap(StringRef program, ArrayRef<StringRef> args,
   }
 }
 
+/// One z3 process kept running through the scripts of a function. A script
+/// is a header (the declarations, definitions and facts before its first
+/// query) and `(push 1) ... (pop 1)` blocks. The header lines the process
+/// has read are not sent again, so the solver keeps what it learned of
+/// them: finding a model of the prelude and the path condition is most of
+/// the cost of a query that a model answers, and a fresh process finds it
+/// again at every query. The next script's header extends the last one's
+/// (new declarations and facts); one that drops a line read restarts the
+/// process. A script with `(reset)` is not served.
+class SolverSession {
+public:
+  SolverSession(StringRef z3, unsigned wallSeconds)
+      : z3(z3.str()), wallSeconds(wallSeconds) {}
+  ~SolverSession() { stop(); }
+  SolverSession(const SolverSession &) = delete;
+  SolverSession &operator=(const SolverSession &) = delete;
+
+  /// Whether a session can run `script`: its queries follow the header,
+  /// each in a `(push 1) ... (pop 1)`, and nothing resets the solver.
+  static bool serves(StringRef script) {
+    return script.contains(kQuery) && !script.contains("(reset)");
+  }
+
+  /// Runs `script` and returns what the solver printed; `rc` as
+  /// `runWithCap`'s: 0, 1 when it printed an error, -1 when it was
+  /// stopped at the wall-clock cap or the process failed (what it printed
+  /// until then is returned).
+  std::optional<std::string> run(StringRef script, int &rc) {
+    rc = -1;
+    size_t at = script.find(kQuery);
+    if (at == StringRef::npos)
+      return std::nullopt;
+    StringRef header = script.take_front(at), body = script.drop_front(at);
+    SmallVector<StringRef> lines;
+    header.split(lines, '\n', -1, /*KeepEmpty=*/false);
+    // The lines the process has not read, in order. Every line read must
+    // be in the header, in the order read: declarations and facts only
+    // come after what they use, so new ones can follow the old.
+    std::string fresh;
+    size_t matched = 0;
+    for (StringRef line : lines) {
+      if (matched < sent.size() && line == sent[matched])
+        ++matched;
+      else
+        fresh += line.str() + "\n";
+    }
+    if (matched != sent.size()) {
+      stop();
+      fresh = header.str();
+    }
+    if (pid < 0 && !start())
+      return std::nullopt;
+    std::string output;
+    if (!exchange(fresh + body.str() + "(echo \"" + kEnd.str() + "\")\n",
+                  output)) {
+      stop();
+      return output;
+    }
+    sent.clear();
+    for (StringRef line : lines)
+      sent.push_back(line.str());
+    rc = output.find("(error") != std::string::npos ? 1 : 0;
+    output.resize(output.size() - kEnd.size() - 1);
+    return output;
+  }
+
+private:
+  static constexpr StringLiteral kQuery = "(echo \"@@\")\n";
+  static constexpr StringLiteral kEnd = "@@END";
+
+  bool start() {
+    int sv[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+      return false;
+    ::fcntl(sv[0], F_SETFD, FD_CLOEXEC);
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    ::setsockopt(sv[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, sv[1], 0);
+    posix_spawn_file_actions_adddup2(&actions, sv[1], 1);
+    posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&actions, sv[1]);
+    const char *argv[] = {z3.c_str(), "-in", "-smt2", nullptr};
+    int err = ::posix_spawn(&pid, z3.c_str(), &actions, nullptr,
+                            const_cast<char **>(argv), SOLVER_ENVIRON);
+    posix_spawn_file_actions_destroy(&actions);
+    ::close(sv[1]);
+    if (err != 0) {
+      ::close(sv[0]);
+      pid = -1;
+      return false;
+    }
+    fd = sv[0];
+    return true;
+  }
+
+  void stop() {
+    if (pid >= 0) {
+      ::kill(pid, SIGKILL);
+      int status = 0;
+      while (::waitpid(pid, &status, 0) == -1 && errno == EINTR) {
+      }
+      pid = -1;
+    }
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
+    }
+    sent.clear();
+  }
+
+  /// Writes `text` to the process and reads what it prints until the end
+  /// marker closes a line; false when the process stopped or the cap (the
+  /// time the process had, as `runWithCap` counts it) passed.
+  bool exchange(StringRef text, std::string &output) {
+    auto budget = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::seconds(wallSeconds));
+    auto spent = std::chrono::milliseconds(0);
+    auto last = std::chrono::steady_clock::now();
+    size_t written = 0;
+    char buffer[65536];
+    while (true) {
+      if (StringRef line = StringRef(output).rtrim('\n');
+          output.ends_with("\n") && line.ends_with(kEnd) &&
+          (line.size() == kEnd.size() ||
+           line[line.size() - kEnd.size() - 1] == '\n'))
+        return true;
+      pollfd poll{fd, short(written < text.size() ? POLLIN | POLLOUT : POLLIN),
+                  0};
+      int ready = ::poll(&poll, 1, 100);
+      if (ready < 0 && errno != EINTR)
+        return false;
+      if (ready > 0) {
+        if (poll.revents & POLLIN) {
+          ssize_t n = ::read(fd, buffer, sizeof buffer);
+          if (n <= 0)
+            return false;
+          output.append(buffer, n);
+        } else if (poll.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+          return false;
+        }
+        if ((poll.revents & POLLOUT) && written < text.size()) {
+          int flags = 0;
+#ifdef MSG_NOSIGNAL
+          flags = MSG_NOSIGNAL;
+#endif
+          ssize_t n =
+              ::send(fd, text.data() + written, text.size() - written, flags);
+          if (n < 0) {
+            if (errno != EAGAIN && errno != EINTR)
+              return false;
+          } else {
+            written += n;
+          }
+        }
+      }
+      auto now = std::chrono::steady_clock::now();
+      spent += std::min(
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - last),
+          std::chrono::milliseconds(1000));
+      last = now;
+      if (spent >= budget)
+        return false;
+    }
+  }
+
+  std::string z3;
+  unsigned wallSeconds;
+  pid_t pid = -1;
+  /// This end of the socket that is the process's stdin and stdout.
+  int fd = -1;
+  /// The header lines the process has read, in order.
+  std::vector<std::string> sent;
+};
+
 /// The answers to the scripts of one run of the pass, by script: the same
 /// script is run once (the instantiations of a kernel that differ in a
 /// parameter its proof does not read have the same scripts), and whoever
@@ -512,8 +706,10 @@ struct ScriptMemo {
   std::map<std::string, std::shared_future<Answers>> answers;
 };
 
-std::optional<SmallVector<Answer>>
-runScript(const SolverConfig &config, StringRef script, StringRef dumpName);
+std::optional<SmallVector<Answer>> runScript(const SolverConfig &config,
+                                             StringRef script,
+                                             StringRef dumpName,
+                                             SolverSession *session = nullptr);
 
 /// Solver runs stopped at the wall-clock cap, and the queries they left
 /// unanswered: what makes a run's result depend on the machine's load.
@@ -521,11 +717,12 @@ std::atomic<unsigned> stoppedScripts{0}, stoppedQueries{0};
 
 /// Runs z3 on `script` with a wall-clock cap; returns one answer per query
 /// (queries are separated by `(echo "@@")`). A script already run is not
-/// run, or dumped, again.
+/// run, or dumped, again. With `session`, in that process.
 std::optional<SmallVector<Answer>> runZ3(const SolverConfig &config,
-                                         StringRef script, StringRef dumpName) {
+                                         StringRef script, StringRef dumpName,
+                                         SolverSession *session = nullptr) {
   if (!config.memo)
-    return runScript(config, script, dumpName);
+    return runScript(config, script, dumpName, session);
   std::promise<ScriptMemo::Answers> promise;
   std::shared_future<ScriptMemo::Answers> running;
   {
@@ -538,7 +735,7 @@ std::optional<SmallVector<Answer>> runZ3(const SolverConfig &config,
   }
   if (running.valid())
     return running.get();
-  ScriptMemo::Answers answers = runScript(config, script, dumpName);
+  ScriptMemo::Answers answers = runScript(config, script, dumpName, session);
   promise.set_value(answers);
   return answers;
 }
@@ -649,26 +846,32 @@ void writeCache(StringRef path, StringRef text) {
 
 /// Runs z3 on `script` with the wall-clock cap and returns what it printed;
 /// `rc` its exit code (1 after an error it printed), or -1 when it was
-/// stopped at the cap or could not run.
+/// stopped at the cap or could not run. In `session`'s process when it
+/// serves the script (the script is still dumped whole).
 std::optional<std::string> runSolver(const SolverConfig &config,
                                      StringRef script, StringRef dumpName,
-                                     int &rc) {
+                                     int &rc,
+                                     SolverSession *session = nullptr) {
+  bool live = session && SolverSession::serves(script);
   SmallString<128> scriptPath, outPath;
   if (!config.dumpDir.empty()) {
     scriptPath = config.dumpDir;
     llvm::sys::path::append(scriptPath, dumpName + ".smt2");
-  } else if (llvm::sys::fs::createTemporaryFile("verify", "smt2", scriptPath)) {
+  } else if (!live &&
+             llvm::sys::fs::createTemporaryFile("verify", "smt2", scriptPath)) {
     return std::nullopt;
   }
-  if (llvm::sys::fs::createTemporaryFile("verify", "out", outPath))
-    return std::nullopt;
-  {
+  if (!scriptPath.empty()) {
     std::error_code ec;
     llvm::raw_fd_ostream os(scriptPath, ec);
     if (ec)
       return std::nullopt;
     os << script;
   }
+  if (live)
+    return session->run(script, rc);
+  if (llvm::sys::fs::createTemporaryFile("verify", "out", outPath))
+    return std::nullopt;
   std::optional<StringRef> redirects[] = {StringRef(""), StringRef(outPath),
                                           StringRef("")};
   StringRef z3 = config.z3;
@@ -682,8 +885,10 @@ std::optional<std::string> runSolver(const SolverConfig &config,
   return (*buffer)->getBuffer().str();
 }
 
-std::optional<SmallVector<Answer>>
-runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
+std::optional<SmallVector<Answer>> runScript(const SolverConfig &config,
+                                             StringRef script,
+                                             StringRef dumpName,
+                                             SolverSession *session) {
   // The answers to a script are a function of the script and the solver:
   // the limits are deterministic, and runs stopped at the wall-clock cap are
   // not cached.
@@ -700,7 +905,8 @@ runScript(const SolverConfig &config, StringRef script, StringRef dumpName) {
       return answers;
   }
   int rc = 0;
-  std::optional<std::string> output = runSolver(config, script, dumpName, rc);
+  std::optional<std::string> output =
+      runSolver(config, script, dumpName, rc, session);
   if (!output)
     return std::nullopt;
   bool stopped = rc != 0;
@@ -822,7 +1028,8 @@ struct ModelAnswer {
 /// answer's letter, then a `t` or `f` per value.
 std::optional<ModelAnswer> runModelScript(const SolverConfig &config,
                                           StringRef script, StringRef dumpName,
-                                          size_t values) {
+                                          size_t values,
+                                          SolverSession *session = nullptr) {
   auto parse = [&](StringRef text) -> std::optional<ModelAnswer> {
     if (text.empty())
       return std::nullopt;
@@ -844,7 +1051,8 @@ std::optional<ModelAnswer> runModelScript(const SolverConfig &config,
   // The `(get-value)` after an `unsat` or `unknown` is an error, which z3
   // reports in its exit code: only a run stopped at the cap is stopped.
   int rc = 0;
-  std::optional<std::string> output = runSolver(config, script, dumpName, rc);
+  std::optional<std::string> output =
+      runSolver(config, script, dumpName, rc, session);
   if (!output || rc == -1) {
     ++stoppedScripts;
     ++stoppedQueries;
@@ -2011,6 +2219,16 @@ public:
   SmallVector<Obligation> obligations;
   unsigned invariantsFound = 0, loopsAnalyzed = 0;
 
+  /// The solver process this function's scripts share; null with
+  /// `live-solver=false`.
+  SolverSession *liveSolver() {
+    if (!solver.liveSolver)
+      return nullptr;
+    if (!session)
+      session = std::make_unique<SolverSession>(solver.z3, solver.wallSeconds);
+    return session.get();
+  }
+
 private:
   ModuleOp module;
   SymbolTableCollection &symbols;
@@ -2023,6 +2241,7 @@ private:
   /// which the trait's `Self` is.
   std::string selfStruct;
   unsigned houdiniRuns = 0;
+  std::unique_ptr<SolverSession> session;
 
   DenseMap<Value, std::string> values;
   /// Fields of struct values the encoder builds (`range`s), by path.
@@ -6892,7 +7111,8 @@ private:
         std::string text =
             rebuild(set, kept, before, head, ends, render, entry, only);
         std::string run = dumpPrefix + ".houdini" + std::to_string(houdiniRuns++);
-        std::optional<SmallVector<Answer>> answers = runZ3(solver, text, run);
+        std::optional<SmallVector<Answer>> answers =
+            runZ3(solver, text, run, liveSolver());
         if (answers)
           runCases(text, *answers, run);
         // With `invariant-retry`: a candidate left undecided, and not
@@ -6933,7 +7153,8 @@ private:
                       solver.invariantRetry ? 4 : 2);
           std::string name =
               dumpPrefix + ".houdini" + std::to_string(houdiniRuns++);
-          std::optional<SmallVector<Answer>> more = runZ3(solver, retry, name);
+          std::optional<SmallVector<Answer>> more =
+              runZ3(solver, retry, name, liveSolver());
           std::vector<bool> failed(set.size(), false);
           for (auto [k, i] : llvm::enumerate(again))
             if (!more || k >= more->size() || (*more)[k] != Answer::Proven)
@@ -7102,8 +7323,9 @@ private:
       for (size_t i : standing)
         text += " " + goals[i];
       text += "))\n(pop 1)\n";
-      std::optional<ModelAnswer> answer = runModelScript(
-          solver, text, (dumpName + Twine(n)).str(), standing.size());
+      std::optional<ModelAnswer> answer =
+          runModelScript(solver, text, (dumpName + Twine(n)).str(),
+                         standing.size(), liveSolver());
       if (!answer || answer->answer == Answer::Unknown)
         return search;
       if (answer->answer == Answer::Proven) {
@@ -14248,6 +14470,7 @@ struct VerifyContractsPass
     solver.exactRetry = intRetry;
     solver.caseSplit = caseSplit;
     solver.invariantRetry = invariantRetry;
+    solver.liveSolver = liveSolver;
     solver.memo = std::make_shared<ScriptMemo>();
     // A cache that cannot be created (a read-only home, a sandbox) is not
     // used.
@@ -14556,7 +14779,7 @@ struct VerifyContractsPass
       if (enc.obligations.empty())
         return;
       std::optional<SmallVector<Answer>> answers =
-          runZ3(solver, enc.script(), name);
+          runZ3(solver, enc.script(), name, enc.liveSolver());
       // Still open: case splitting over the finite-domain unknowns, before
       // the full limit (a case makes them constants, so it is quick where
       // the full limit runs to its end).
@@ -14620,7 +14843,8 @@ struct VerifyContractsPass
           if (!lowered && !ints)
             return;
           if (std::optional<SmallVector<Answer>> retried =
-                  runZ3(solver, lowered ? text : *ints, name + suffix.str()))
+                  runZ3(solver, lowered ? text : *ints, name + suffix.str(),
+                        enc.liveSolver()))
             for (auto [i, k] : llvm::enumerate(open))
               if (i < retried->size() &&
                   (lowered || (*retried)[i] == Answer::Proven))
