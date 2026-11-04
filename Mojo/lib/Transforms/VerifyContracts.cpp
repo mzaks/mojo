@@ -2234,6 +2234,8 @@ private:
   SymbolTableCollection &symbols;
   const SolverConfig &solver;
   DenseMap<Value, unsigned> order;
+  /// The blocks whose values `numberValues` has numbered.
+  DenseSet<Block *> numbered;
   std::string dumpPrefix;
   const TraitImpls &impls;
   LIT::FnOp refines;
@@ -5288,7 +5290,31 @@ private:
   // Walking
   //===--------------------------------------------------------------------===//
 
+  /// Numbers the values of `block` and its operations (in order, with
+  /// their regions) not numbered yet: the body of a callee or a closure the
+  /// pass walks joins the function's order where its walk starts. Before,
+  /// such values took their positions when first compared, in the order of
+  /// a hash set (the roots a loop writes), so the unknowns of their places
+  /// were named differently from one run to the next, which the answer
+  /// cache then missed.
+  void numberValues(Block &block) {
+    if (!numbered.insert(&block).second)
+      return;
+    for (BlockArgument arg : block.getArguments())
+      order.try_emplace(arg, order.size());
+    for (Operation &op : block)
+      op.walk<mlir::WalkOrder::PreOrder>([&](Operation *nested) {
+        for (Region &region : nested->getRegions())
+          for (Block &inner : region)
+            for (BlockArgument arg : inner.getArguments())
+              order.try_emplace(arg, order.size());
+        for (Value result : nested->getResults())
+          order.try_emplace(result, order.size());
+      });
+  }
+
   void walkBlock(Block &block, State &state) {
+    numberValues(block);
     for (Operation &op : block) {
       if (!state.alive)
         return;
