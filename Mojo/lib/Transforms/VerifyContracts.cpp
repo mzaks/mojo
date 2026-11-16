@@ -3114,6 +3114,12 @@ private:
     // The same place, seen as immutable, rebound, or with a wider origin.
     if (isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp>(def))
       return placeOf(def->getOperand(0));
+    // A reference taken apart into its pointer and put together again (how
+    // a tuple pattern takes the elements out of the tuple): the same place.
+    if (isa<LIT::RefFromPointerOp>(def))
+      if (auto toPointer = dyn_cast_or_null<LIT::RefToPointerOp>(
+              def->getOperand(0).getDefiningOp()))
+        return placeOf(toPointer->getOperand(0));
     if (auto gep = dyn_cast<LIT::RefStructGEROp>(def)) {
       std::optional<Loc> base = placeOf(gep->getOperand(0));
       if (!base)
@@ -7748,6 +7754,14 @@ private:
         auto element = it->second;
         elements[op->getResult(0)] = element;
       }
+    if (isa<LIT::RefFromPointerOp>(op))
+      if (auto toPointer = dyn_cast_or_null<LIT::RefToPointerOp>(
+              op->getOperand(0).getDefiningOp()))
+        if (auto it = elements.find(toPointer->getOperand(0));
+            it != elements.end()) {
+          auto element = it->second;
+          elements[op->getResult(0)] = element;
+        }
     // Declarations, lifetimes, debug info, and ops producing values not
     // modelled: results are unknown, memory unchanged.
     setResultsUnknown(op);
