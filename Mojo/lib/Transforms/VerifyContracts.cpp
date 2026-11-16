@@ -715,6 +715,12 @@ std::optional<SmallVector<Answer>> runScript(const SolverConfig &config,
 /// unanswered: what makes a run's result depend on the machine's load.
 std::atomic<unsigned> stoppedScripts{0}, stoppedQueries{0};
 
+/// Solver runs that answered every query but printed an error: a script
+/// the pass wrote wrongly (the solver skips the command it rejects, so a
+/// fact or a definition is missing from the queries after it). Their
+/// answers are not cached.
+std::atomic<unsigned> erroredScripts{0};
+
 /// Runs z3 on `script` with a wall-clock cap; returns one answer per query
 /// (queries are separated by `(echo "@@")`). A script already run is not
 /// run, or dumped, again. With `session`, in that process.
@@ -921,7 +927,9 @@ std::optional<SmallVector<Answer>> runScript(const SolverConfig &config,
                       : answer == "sat" ? Answer::Unproven
                                         : Answer::Unknown);
   }
-  if (stopped || answers.size() < expected) {
+  if (rc == 1 && answers.size() == expected) {
+    ++erroredScripts;
+  } else if (stopped || answers.size() < expected) {
     ++stoppedScripts;
     stoppedQueries += expected - std::min(expected, answers.size());
   }
@@ -5605,7 +5613,10 @@ private:
       for (auto [taken, path] : llvm::zip(arms, paths))
         if (taken.alive)
           pc += " " + path;
-      joined.pc = define({true, 1, false}, pc + ")", "r");
+      // No arm reaches the end (each raises or returns): nothing after the
+      // `if` is reached. (`(or)` is not a term.)
+      joined.pc = define({true, 1, false}, pc == "(or" ? "false" : pc + ")",
+                         "r");
     }
     joined.yields = state.yields;
     state = std::move(joined);
@@ -15177,6 +15188,12 @@ struct VerifyContractsPass
                    << " s cap, leaving " << stoppedQueries
                    << " queries unanswered: this result depends on the "
                       "machine's load\n";
+    if (erroredScripts)
+      llvm::errs() << "verify-contracts: the solver reported an error in "
+                   << erroredScripts
+                   << " scripts (a bug in verify-contracts: please report "
+                      "it); their answers may miss facts and are not "
+                      "cached\n";
   }
 };
 
