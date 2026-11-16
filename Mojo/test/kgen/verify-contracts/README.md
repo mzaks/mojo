@@ -448,9 +448,9 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   supported GPU has (assumptions): `0 <= thread_idx < block_dim <= 1024`
   and `0 <= block_idx < grid_dim < 2^31`; `global_idx` is
   `block_idx * block_dim + thread_idx`; `lane_id()` is in `[0, 64)`
-  (warps have 32 or 64 lanes). `ufloordiv`, `udiv_unchecked` and
-  `uceildiv` are bounded unsigned divisions (`udiv_unchecked` and
-  `udivmod_unchecked` require `b > 0`: by 0 they are undefined);
+  (warps have 32 or 64 lanes). `ufloordiv` and `uceildiv` are bounded
+  unsigned divisions (`udivmod_unchecked` requires `b > 0`: by 0 it is
+  undefined);
   `warp.broadcast(x)` and the
   unmasked `shuffle_idx/up/down/xor` are `x` as some thread of the same
   block computes it: `x`'s term with thread ids, `lane_id`, arguments and
@@ -601,7 +601,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `p.unsafe_offset(k)`, or cast, points into the same allocation. A pointer
   from `xs.unsafe_ptr()` is retired by a call that may reallocate the list
   (`append`, `insert`, `extend`, `reserve`, `resize`, `shrink`, or its
-  destruction; `bad_list_appended`), not by a write to an element
+  destruction; the compiler's lifetime check now rejects the plain case
+  itself), not by a write to an element
   (`ok_list_pointer`). These are the pass's own obligations ("that the element
   read is initialized", "that the memory the pointer points into has not been
   freed"), not clauses: `p[]` cannot carry one (see above), and `__getitem__`

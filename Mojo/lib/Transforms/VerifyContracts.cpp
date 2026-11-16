@@ -195,7 +195,7 @@ SmallVector<StringRef> listElements(StringRef &text) {
 /// List `which` (0 the shape, 1 the strides) of a printed `TileTensor`
 /// layout type, as one printed type per mode; empty if it is not one.
 SmallVector<StringRef> layoutList(StringRef layout, unsigned which) {
-  size_t at = layout.find("@layout::@tile_layout::@Layout<");
+  size_t at = layout.find("@layout::@layout::@Layout<");
   if (at == StringRef::npos)
     return {};
   StringRef rest = layout.drop_front(at);
@@ -10557,7 +10557,7 @@ private:
     std::string elements;
     for (StringRef element : listElements(rest))
       elements += (elements.empty() ? "" : ", ") + element.str();
-    return "@layout::@tile_layout::@Layout<:param_list<> [" + elements +
+    return "@layout::@layout::@Layout<:param_list<> [" + elements +
            "], :param_list<> []> " + text;
   }
 
@@ -10567,7 +10567,7 @@ private:
     auto type =
         layout ? structTypeOf(layout.getTypeValue()) : LIT::StructType();
     if (!type || type.getParamValues().empty() ||
-        printed(type.getSymbol()) != "@layout::@tile_layout::@Layout")
+        printed(type.getSymbol()) != "@layout::@layout::@Layout")
       return std::nullopt;
     auto shape = dyn_cast<ParamListAttr>(type.getParamValues()[0]);
     if (!shape || k >= (int64_t)shape.getValues().size())
@@ -11766,7 +11766,7 @@ private:
                       State &state) {
     auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
     if (!symbol || call->getNumResults() != 1 || call.getNumOperands() != 1 ||
-        !StringRef(name.path).starts_with("layout::tile_layout::row_major[") ||
+        !StringRef(name.path).starts_with("layout::layout::row_major[") ||
         boundParamValues(symbol).empty())
       return;
     // Kept alive while its elements are used.
@@ -12635,8 +12635,9 @@ private:
       Type type = ref.getType();
       if (auto r = dyn_cast<LIT::RefType>(type))
         type = r.getElementType();
-      if (!StringRef(printed(type))
-               .contains("::@device_context::@DeviceBuffer<"))
+      StringRef typeName(printed(type));
+      if (!typeName.contains("::@device_context::@DeviceBuffer<") &&
+          !typeName.contains("::@device_context::@LegacyDeviceBuffer<"))
         continue;
       std::string value = valueOf(ref);
       if (!sortOfTerm(value).isBool && sortOfTerm(value).width == 64)

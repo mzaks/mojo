@@ -88,6 +88,7 @@ class _python_symbols(Symbols):
     dotted_name: int
     encoding_decl: int
     ensures_clause: int
+    enum_case_payload: int
     enum_case_stmt: int
     eval_input: int
     except_clause: int
@@ -104,6 +105,7 @@ class _python_symbols(Symbols):
     generatortype: int
     global_stmt: int
     guard: int
+    guard_stmt: int
     if_stmt: int
     import_as_name: int
     import_as_names: int
@@ -260,6 +262,7 @@ def initialize(cache_dir: Union[str, "os.PathLike[str]", None] = None) -> None:
         "struct",
         "trait",
         "__enum",
+        "__union",
     ]
     mojo_grammar.version = (0, 1)
 

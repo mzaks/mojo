@@ -20,9 +20,9 @@ from typing import Any, ClassVar
 
 from max.dtype import DType
 from max.graph import DeviceRef
-from max.nn.legacy.comm.ep import EPConfig, calculate_ep_max_tokens_per_rank
-from max.nn.legacy.kv_cache import KVCacheParams, spec_decode_cache_slack
-from max.nn.legacy.quant_config import QuantConfig
+from max.nn.ep_config import EPConfig, calculate_ep_max_tokens_per_rank
+from max.nn.kv_cache import KVCacheParams, spec_decode_cache_slack
+from max.nn.quant_config import QuantConfig
 from max.pipelines.kv_cache import cache_dtype_for_encoding
 from max.pipelines.lib import KVCacheConfig, MAXModelConfig, PipelineConfig
 from max.pipelines.lib.config.model_config import _select_quantization_encoding
@@ -92,7 +92,7 @@ class DeepseekV3Config(ArchConfigWithKVCache, ExpertParallelDeploymentConfig):
     n_routed_experts: int = 256
     routed_scaling_factor: float = 2.5
     kv_lora_rank: int = 512
-    q_lora_rank: int = 1536
+    q_lora_rank: int | None = 1536
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     qk_nope_head_dim: int = 128

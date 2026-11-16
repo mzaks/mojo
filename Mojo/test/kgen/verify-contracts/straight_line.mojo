@@ -14,7 +14,6 @@
 # before elaboration; see README.md.
 
 from std.math import ceildiv, max, min
-from std.math.uutils import udiv_unchecked
 
 
 def ok_get(xs: List[Int], i: Int) -> Int requires 0 <= i and i < len(xs):
@@ -141,12 +140,6 @@ def ok_ceildiv(xs: List[Int], n: Int) -> Int:
     return 0
 
 
-def ok_udiv_unchecked(a: Int, b: Int) -> Int:
-    if b > 0:
-        return udiv_unchecked(a, b)  # by 0 it is undefined
-    return 0
-
-
 def ok_mode_chosen(xs: List[Int]) -> Int:
     var mode = Mode.SAFE
     if len(xs) > 0:
@@ -239,12 +232,6 @@ def bad_signed_index(xs: List[Int], n: Int8) -> Int:
 def bad_ceildiv(xs: List[Int], n: Int) -> Int:
     if n > 0 and len(xs) >= n:
         return xs[ceildiv(n, 4) * 4 - 1]  # past `n` when 4 does not divide it
-    return 0
-
-
-def bad_udiv_unchecked(a: Int, b: Int) -> Int:
-    if b >= 0:
-        return udiv_unchecked(a, b)  # `b` may be 0
     return 0
 
 

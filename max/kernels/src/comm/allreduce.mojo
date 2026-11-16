@@ -109,7 +109,14 @@ from std.atomic import Atomic, Ordering, fence
 from std.collections import Array
 from std.math.uutils import ualign_down
 from std.math import ceildiv, clamp
-from std.sys import align_of, is_amd_gpu, is_nvidia_gpu, simd_width_of, size_of
+from std.sys import (
+    align_of,
+    get_defined_int,
+    is_amd_gpu,
+    is_nvidia_gpu,
+    simd_width_of,
+    size_of,
+)
 from std.sys._assembly import inlined_assembly
 
 from layout import (
@@ -119,7 +126,7 @@ from layout import (
     TileTensor,
     row_major,
 )
-from layout.tile_layout import TensorLayout
+from layout.layout import TensorLayout
 from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_dim,
@@ -138,7 +145,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
 from std.utils import StaticTuple
 from std.utils.numerics import get_accum_type
 
-from std.collections.optional import Optional
+from std.collections.optional import Optional, OptionalReg
 
 from .reducescatter import (
     CollectiveEpilogueFn,
@@ -170,6 +177,44 @@ from .device_query import (
 )
 from internal_utils import Table
 
+# Launch geometry for the Lamport path at `ngpus=8` on `sm_100a`. The kernel
+# runs one 128-bit pack per thread, so the block size alone sets the CTA count,
+# `ceil(num_packs / BLOCK_SIZE)`, and therefore how much of the machine a
+# decode-sized collective occupies. Two geometries cover the decode sizes, a
+# narrow one over the middle message band and the wide one either side of it.
+# `us` per call, median of three passes of
+# `max/kernels/benchmarks/gpu/comm/bench_allreduce_lamport_geometry.yaml` on
+# 8x B200, bf16, with `ALLREDUCE_PDL=True`. The graph op passes no PDL
+# attribute, so at the `ngpus == 8` these bands cover, the default is off:
+#
+#   bytes    128 threads   256 threads
+#   12288         10.10          8.92
+#   49152          9.76         10.28
+#   98304         10.06         10.49
+#   196608        14.91         11.72
+#
+# Both choices hold with PDL off too (narrow vs wide: 9.78 vs 9.44 at 12 KiB,
+# 10.11 vs 12.32 at 48 KiB, 10.46 vs 10.85 at 96 KiB, 11.90 vs 12.01 at
+# 192 KiB), so the geometry does not depend on the launch attribute. The
+# 192 KiB row is what fixes the upper edge, and it is the only row where the
+# attribute flips the sign: without it the two geometries tie there.
+#
+# Below the band a 12 KiB message is 768 packs, three CTAs at the wide geometry
+# and six at the narrow one, so splitting the threads further only adds
+# per-CTA cost. Above the band a 128-thread launch is 96 CTAs, a second
+# resident collective's worth of blocks competing with the grid it waits on.
+comptime LAMPORT_NARROW_BLOCK_SIZE = 128
+"""Block size for the Lamport path's middle message band on 8x sm_100a."""
+
+comptime LAMPORT_WIDE_BLOCK_SIZE = 256
+"""Block size for the Lamport path's small and large bands on 8x sm_100a."""
+
+comptime LAMPORT_NARROW_BAND_MIN_BYTES = 16 * KB
+"""Per-rank message size (exclusive) above which the narrow launch wins."""
+
+comptime LAMPORT_NARROW_BAND_MAX_BYTES = 128 * KB
+"""Per-rank message size (exclusive) below which the narrow launch wins."""
+
 # Tuning table to get num_blocks for allreduce.
 
 
@@ -198,7 +243,7 @@ struct AllReduceAlgorithm(EnumLike, TrivialRegisterPassable, Writable):
     ].values
 
     comptime _enum_case_types = TypeList.splat[
-        ParameterList[Self._enum_case_names].length, NoneType
+        ParameterList[Self._enum_case_names].length, Tuple[]
     ].values
 
     @inline(.always)
@@ -236,7 +281,6 @@ struct AllReduceAlgorithm(EnumLike, TrivialRegisterPassable, Writable):
                 writer.write("lamport")
 
 
-@fieldwise_init
 struct AllReduceTuningConfig(CommTuningConfig, TrivialRegisterPassable):
     """
     Parameters:
@@ -244,6 +288,9 @@ struct AllReduceTuningConfig(CommTuningConfig, TrivialRegisterPassable):
         num_bytes: Total number of input bytes supported by the config.
         sm_version: SM version (as string).
         num_blocks: Number of thread blocks for running allreduce.
+        allreduce_num_blocks: Thread blocks for the plain allreduce only, or
+            None to use `num_blocks`. The fused collectives that read this
+            table keep `num_blocks`.
     """
 
     var ngpus: Int
@@ -251,6 +298,24 @@ struct AllReduceTuningConfig(CommTuningConfig, TrivialRegisterPassable):
     var sm_version: StaticString
     var num_blocks: Int
     var algorithm: AllReduceAlgorithm
+    var allreduce_num_blocks: OptionalReg[Int]
+
+    def __init__(
+        out self,
+        *,
+        ngpus: Int,
+        num_bytes: Int,
+        sm_version: StaticString,
+        num_blocks: Int,
+        algorithm: AllReduceAlgorithm,
+        allreduce_num_blocks: OptionalReg[Int] = None,
+    ):
+        self.ngpus = ngpus
+        self.num_bytes = num_bytes
+        self.sm_version = sm_version
+        self.num_blocks = num_blocks
+        self.algorithm = algorithm
+        self.allreduce_num_blocks = allreduce_num_blocks
 
     def get_num_blocks(self) -> Int:
         return self.num_blocks
@@ -263,9 +328,6 @@ struct AllReduceTuningConfig(CommTuningConfig, TrivialRegisterPassable):
 
     def get_ngpus(self) -> Int:
         return self.ngpus
-
-    def get_algorithm(self) -> AllReduceAlgorithm:
-        return self.algorithm
 
     def write_to(self, mut writer: Some[Writer]):
         """Writes the tuning config as a string.
@@ -412,12 +474,17 @@ comptime allreduce_tuning_table = Table(
             num_blocks=512,
             algorithm=AllReduceAlgorithm.ONE_STAGE,
         ),
+        # 8xB200 bf16 2-stage: the plain allreduce at 384 blocks beats 512 by
+        # 10-20% from 16MB to 1GB (426 vs 511 us at 128MB) and ties it at
+        # 4-8MB. The fused allreduce + RMSNorm keeps 512: at 384 its bf16
+        # output runs 2-11% slower from 64MB to 256MB.
         AllReduceTuningConfig(
             ngpus=8,
             num_bytes=(2 * GB),
             sm_version="sm_100a",
             num_blocks=512,
             algorithm=AllReduceAlgorithm.TWO_STAGE,
+            allreduce_num_blocks=384,
         ),
         # default for sm103 (B300, encoded with ngpus=-1, num_bytes=-1)
         AllReduceTuningConfig(
@@ -812,7 +879,7 @@ def _allreduce_2stage_kernel[
         in_layout: Layout of the input TileTensors.
         in_engine: Storage engine of the input TileTensors.
         out_layout: Layout of the output TileTensor.
-        BLOCK_SIZE: Number of threads per block.
+        BLOCK_SIZE: Maximum number of threads per block.
         OutputLambdaType: The type of `output_lambda`.
         use_multimem: If True, use multi-memory space buffers for input.
         domain_id: Barrier counter bank to use (0 for full-world; a distinct
@@ -836,12 +903,17 @@ def _allreduce_2stage_kernel[
     # --- Thread Indexing ---
     var global_tid = global_idx.x
     # Stride equals total threads in grid dimension for grid-strided loops.
-    var stride = grid_dim.x * BLOCK_SIZE
+    # The dispatch may launch fewer than `BLOCK_SIZE` threads per block.
+    var stride = grid_dim.x * block_dim.x
 
     var rs_config = ReduceScatterConfig[dtype, ngpus](_num_elements, stride)
 
     comptime num_tensors = 1 if use_multimem else ngpus
 
+    # Safety invariant: this wait is all that orders the device read below it
+    # behind the peer's store, so nothing may be hoisted above it whenever the
+    # launch grants `PDLLevel.ON`, which the graph op leaves to `allreduce`'s
+    # own default: on at up to two GPUs, off wider.
     with PDL():
         # --- Define tmp buffers by offsetting for Signal struct ---
         # Round-robin access pattern to balance NVLink traffic across GPUs.
@@ -928,15 +1000,21 @@ def _allreduce_2stage_kernel[
             rs_config.rank_part(ngpus - 1),
             rs_config.stride,
         ):
+            # Issue every peer load before the first store: the output may
+            # alias the peers' buffers as far as the compiler knows, so an
+            # interleaved store would wait out each remote load in turn.
+            var vals = Array[SIMD[dtype, simd_width], ngpus](uninitialized=True)
             comptime for gpu_idx in range(ngpus):
-                var peer_rank = circular_add[ngpus](_my_rank, gpu_idx)
-
-                var dst_idx = rs_config.rank_start(peer_rank) + idx
-                output_lambda[width=simd_width, alignment=alignment](
-                    output_layout.idx2crd(dst_idx),
+                vals[gpu_idx] = (
                     tmps[gpu_idx]
                     .unsafe_address_space_cast[_target_address_space]()
-                    .unsafe_load[width=simd_width, alignment=alignment](idx),
+                    .unsafe_load[width=simd_width, alignment=alignment](idx)
+                )
+            comptime for gpu_idx in range(ngpus):
+                var peer_rank = circular_add[ngpus](_my_rank, gpu_idx)
+                var dst_idx = rs_config.rank_start(peer_rank) + idx
+                output_lambda[width=simd_width, alignment=alignment](
+                    output_layout.idx2crd(dst_idx), vals[gpu_idx]
                 )
 
         # Ragged tail - max 1 simd vector per gpu, spread work between threads
@@ -1151,6 +1229,10 @@ def _allreduce_1stage_kernel[
             )
         ).copy()
 
+    # Safety invariant: this wait is all that orders the device read below it
+    # behind the peer's store, so nothing may be hoisted above it whenever the
+    # launch grants `PDLLevel.ON`, which the graph op leaves to `allreduce`'s
+    # own default: on at up to two GPUs, off wider.
     with PDL():
         _multi_gpu_barrier[ngpus, is_start=True, domain_id=domain_id](
             rank_sigs, my_sig, _my_rank
@@ -1375,6 +1457,10 @@ def _allreduce_lamport_kernel[
 
     var sentinel = set_neg_zero[dtype, atomic_width]()
 
+    # Safety invariant: this wait is all that orders the device read below it
+    # behind the peer's store, so nothing may be hoisted above it whenever the
+    # launch grants `PDLLevel.ON`, which the graph op leaves to `allreduce`'s
+    # own default: on at up to two GPUs, off wider.
     with PDL():
         var state = rank_sigs[_my_rank][].lamport_state_ptr()
         var flag = Int(
@@ -1604,16 +1690,175 @@ def _allreduce_lamport_p2p[
     )
 
     comptime sm_version = ctx.default_device_info.version
-    comptime BLOCK_SIZE = 512 if sm_version == "CDNA4" else 256
-    var num_packs = num_elements // atomic_width
-    var grid_size = clamp(
-        ceildiv(num_packs, BLOCK_SIZE), 1, dispatch_config.num_blocks
+    # The kernel runs one 128-bit pack per thread, so the block size is the
+    # only knob that sets how many CTAs the collective spreads over: the grid
+    # is `ceil(num_packs / BLOCK_SIZE)`, clamped to the tuning config's
+    # `num_blocks`, which is 512 on the 8x sm_100a Lamport bucket. Every
+    # Lamport-eligible message is at most `Lamport.MAX_SMALL_MESSAGE_BYTES`
+    # (1 MiB), i.e. 65536 packs, so no shipped geometry reaches that clamp:
+    # `512 * 128` packs is exactly the ceiling. A `-D` override below 128 can
+    # reach it, which only makes each thread walk more than one pack; the
+    # grid-strided loop covers the same packs however the clamp lands.
+    #
+    # `ALLREDUCE_LAMPORT_BLOCK_SIZE` is a benchmark knob: the geometry sweep
+    # drives one block size across every message size with it. It folds into
+    # both band values rather than bypassing them, so a build that sets it keeps
+    # the band decision -- and the two geometries it instantiates -- unchanged.
+    # It is capped at 512, the largest geometry this kernel is built at
+    # anywhere.
+    comptime override_block_size = get_defined_int[
+        "ALLREDUCE_LAMPORT_BLOCK_SIZE", 0
+    ]()
+    comptime assert override_block_size == 0 or (
+        override_block_size >= 32
+        and override_block_size <= 512
+        and override_block_size % 32 == 0
+    ), "Lamport block size must be a multiple of 32 in [32, 512]"
+
+    # Bands only exist for the configuration they were measured on; every
+    # other target keeps its single historical block size, so both band
+    # values collapse onto the same kernel there.
+    comptime banded = ngpus == 8 and sm_version == "sm_100a"
+    comptime default_block_size = 512 if sm_version == "CDNA4" else 256
+    comptime narrow_block_size = (
+        override_block_size if override_block_size
+        != 0 else LAMPORT_NARROW_BLOCK_SIZE if banded else default_block_size
     )
+    comptime wide_block_size = (
+        override_block_size if override_block_size
+        != 0 else LAMPORT_WIDE_BLOCK_SIZE if banded else default_block_size
+    )
+    var in_narrow_band = (
+        num_bytes > LAMPORT_NARROW_BAND_MIN_BYTES
+        and num_bytes < LAMPORT_NARROW_BAND_MAX_BYTES
+    )
+
+    comptime if narrow_block_size == wide_block_size:
+        # One geometry covers every message size, so there is no band to pick.
+        _enqueue_lamport[
+            dtype,
+            ngpus,
+            FlatLayout,
+            in_engine,
+            out_layout,
+            OutputLambdaType,
+            use_fence=use_fence,
+            pdl_level=pdl_level,
+            BLOCK_SIZE=narrow_block_size,
+        ](
+            output_layout,
+            flat_inputs,
+            rank_sigs,
+            num_elements,
+            my_rank,
+            dispatch_config.num_blocks,
+            ctx,
+            output_lambda,
+        )
+    else:
+        if in_narrow_band:
+            _enqueue_lamport[
+                dtype,
+                ngpus,
+                FlatLayout,
+                in_engine,
+                out_layout,
+                OutputLambdaType,
+                use_fence=use_fence,
+                pdl_level=pdl_level,
+                BLOCK_SIZE=narrow_block_size,
+            ](
+                output_layout,
+                flat_inputs,
+                rank_sigs,
+                num_elements,
+                my_rank,
+                dispatch_config.num_blocks,
+                ctx,
+                output_lambda,
+            )
+        else:
+            _enqueue_lamport[
+                dtype,
+                ngpus,
+                FlatLayout,
+                in_engine,
+                out_layout,
+                OutputLambdaType,
+                use_fence=use_fence,
+                pdl_level=pdl_level,
+                BLOCK_SIZE=wide_block_size,
+            ](
+                output_layout,
+                flat_inputs,
+                rank_sigs,
+                num_elements,
+                my_rank,
+                dispatch_config.num_blocks,
+                ctx,
+                output_lambda,
+            )
+
+
+@inline(.always)
+def _enqueue_lamport[
+    dtype: DType,
+    ngpus: Int,
+    flat_layout: TensorLayout,
+    in_engine: TensorEngine,
+    out_layout: TensorLayout,
+    OutputLambdaType: CollectiveEpilogueFn,
+    *,
+    use_fence: Bool,
+    pdl_level: PDLLevel,
+    BLOCK_SIZE: Int,
+](
+    output_layout: out_layout,
+    flat_inputs: Array[
+        TileTensor[dtype, flat_layout, ImmutAnyOrigin, Engine=in_engine], ngpus
+    ],
+    rank_sigs: Array[MutPointer[Signal, MutAnyOrigin], ngpus],
+    num_elements: Int,
+    my_rank: Int,
+    num_blocks: Int,
+    ctx: DeviceContext,
+    output_lambda: OutputLambdaType,
+) raises:
+    """Launches the Lamport kernel over one fixed launch geometry.
+
+    Split out of `_allreduce_lamport_p2p` so the block size can be a comptime
+    parameter chosen per message-size band without repeating the launch.
+
+    Parameters:
+        dtype: Data dtype of tensor elements.
+        ngpus: Number of GPUs participating.
+        flat_layout: Layout of the flattened input TileTensors.
+        in_engine: Storage engine of the input TileTensors.
+        out_layout: Layout of the output TileTensor.
+        OutputLambdaType: The type of `output_lambda`.
+        use_fence: Whether the kernel fences around each push and poll.
+        pdl_level: Controls PDL behavior for this launch.
+        BLOCK_SIZE: Threads per block, and so the CTA count (`ceil(packs /
+            BLOCK_SIZE)`).
+
+    Args:
+        output_layout: Layout of the output.
+        flat_inputs: The flattened inputs from all `ngpus` devices.
+        rank_sigs: Signal pointers, indexed by global device rank.
+        num_elements: Number of elements to reduce.
+        my_rank: This device's global rank.
+        num_blocks: Upper bound on the grid size from the tuning config.
+        ctx: Device context for this device.
+        output_lambda: Elementwise output epilogue.
+    """
+    comptime atomic_width = Lamport.ATOMIC_BYTES // size_of[dtype]()
+    var num_packs = num_elements // atomic_width
+    var grid_size = clamp(ceildiv(num_packs, BLOCK_SIZE), 1, num_blocks)
 
     comptime lamport_kernel = _allreduce_lamport_kernel[
         dtype,
         ngpus,
-        FlatLayout,
+        flat_layout,
         in_engine,
         out_layout,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -1849,13 +2094,20 @@ def _allreduce_p2p[
             attributes=pdl_launch_attributes(pdl_level),
         )
     else:
-        # Define grid size for 2-stage, which processes 1/group_size of the
-        # number of elements.
-        var grid_size = clamp(
-            ceildiv(num_elements // (simd_width * group_size), BLOCK_SIZE),
-            1,
-            max_num_blocks,
-        )
+        # Each 2-stage thread handles SIMD vectors of this rank's 1/group_size
+        # share. On CDNA4, narrow the blocks while the grid still covers every
+        # vector in one pass: a small share then spreads over more CUs, which
+        # keeps more peer reads in flight.
+        var rank_vecs = num_elements // (simd_width * group_size)
+        var block_size = BLOCK_SIZE
+        comptime if sm_version == "CDNA4":
+            comptime min_block_size = 64
+            while (
+                block_size > min_block_size
+                and ceildiv(rank_vecs, block_size // 2) <= max_num_blocks
+            ):
+                block_size //= 2
+        var grid_size = clamp(ceildiv(rank_vecs, block_size), 1, max_num_blocks)
 
         # Otherwise, use 2-stage allreduce for the bandwidth bound regime.
         comptime kernel = _allreduce_2stage_kernel[
@@ -1877,7 +2129,7 @@ def _allreduce_p2p[
             Int32(loc_rank),
             host_args=(output_lambda,),
             grid_dim=grid_size,
-            block_dim=BLOCK_SIZE,
+            block_dim=block_size,
             attributes=pdl_launch_attributes(pdl_level),
         )
 
@@ -2106,6 +2358,8 @@ def allreduce[
     var dispatch_config = dispatch_select_comm_config[
         group_size, sm_version, allreduce_tuning_table
     ](num_bytes)
+    if case .Some(allreduce_num_blocks) = dispatch_config.allreduce_num_blocks:
+        dispatch_config.num_blocks = allreduce_num_blocks
 
     if case .Some(max_num_blocks) = _max_num_blocks:
         dispatch_config.num_blocks = max_num_blocks

@@ -33,12 +33,13 @@ import numpy as np
 import pytest
 from dspark_test_support import TESTDATA
 from max import functional as F
+from max import tree
 from max.driver import CPU, Buffer
 from max.dtype import DType
 from max.graph import DeviceRef
-from max.nn.legacy.kv_cache import KVCacheInputsPerDevice
-from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
-from max.pipelines.architectures import register_all_models
+from max.nn.kv_cache import KVCacheInputsPerDevice, MHAKVCacheParams
+from max.nn.outputs import ReturnHiddenStates, ReturnLogits
+from max.pipelines.architectures import hf_config_shims, register_all_models
 from max.pipelines.architectures.deepseekV41_modulev3 import (
     model as model_module,
 )
@@ -64,6 +65,7 @@ from max.pipelines.architectures.deepseekV41_modulev3.model import (
 from max.pipelines.architectures.deepseekV41_modulev3.model_config import (
     DeepseekV41Config,
     dspark_draft_width,
+    vision_config,
 )
 from max.pipelines.architectures.dspark_deepseekV41_modulev3 import (
     DSparkDeepseekV41Draft,
@@ -73,6 +75,7 @@ from max.pipelines.architectures.dspark_deepseekV41_modulev3.model import (
     configure_dspark_draft,
 )
 from max.pipelines.context import TextContext, TokenBuffer
+from max.pipelines.context.context_validators import validate_no_images
 from max.pipelines.lib import (
     BatchProcessorRuntime,
     GraphRole,
@@ -83,6 +86,7 @@ from max.pipelines.lib import (
     PipelineRuntimeConfig,
 )
 from max.pipelines.lib.arch_lookup import ARCH_LOOKUP
+from max.pipelines.lib.memory_plan import _vision_row, vision_cache_plan
 from max.pipelines.lib.module_registration import construct_module, device_mesh
 from max.pipelines.lib.pipeline_variants.spec_decode_pipeline_model import (
     SpecDecodePipelineModel,
@@ -96,7 +100,8 @@ from max.pipelines.speculative import spec_adapters as registry
 from max.pipelines.speculative.config import SpeculativeConfig
 from max.pipelines.speculative.spec_input_types import (
     SpecDecodeInputTypeSpec,
-    spec_decode_tail_input_types,
+    declared_spec_decode_inputs,
+    spec_decode_input_tree,
 )
 
 BLOCK = 5
@@ -293,6 +298,35 @@ def test_dspark_pairs_the_modulev3_trunk_with_its_modulev3_draft() -> None:
     }
 
 
+def test_the_pairing_reserves_vision_cache_only_with_its_encoder() -> None:
+    """The pairing of a vision checkpoint loads the trunk's encoder and takes
+    images, so it fills the vision cache it reserves."""
+    register_all_models()
+    paired = spec_decode_architecture(
+        "DeepseekV41ForCausalLM", "dspark", None, prefer_module_v3=True
+    )
+    assert paired is not None
+    assert validate_no_images not in paired.context_validators
+    model = SimpleNamespace(
+        huggingface_config=hf_config_shims.DeepseekV41HFConfig(**_hf_dict()),
+        vision_config_overrides={},
+    )
+    pipeline = SimpleNamespace(
+        model=model,
+        runtime=SimpleNamespace(vision_cache_utilization=0.05),
+        speculative=SimpleNamespace(speculative_method="dspark"),
+    )
+    reserved, plan = vision_cache_plan(
+        cast(Any, pipeline),
+        _vision_row(cast(Any, pipeline), paired),
+        1 << 34,
+        1,
+    )
+    assert vision_config(cast(Any, pipeline)) is not None
+    assert reserved > 0
+    assert plan is not None
+
+
 def test_the_modulev3_stages_are_a_registered_block_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -352,15 +386,27 @@ def test_the_modulev3_trunk_serves_stochastic_acceptance_and_grammar() -> None:
             registry.check(TARGET, speculative, structured_output)
 
     device = DeviceRef.CPU()
-    plain = spec_decode_tail_input_types(
-        SpecDecodeInputTypeSpec(devices=[device], distributed=False), device
+    kv_params = MHAKVCacheParams(
+        dtype=DType.bfloat16,
+        head_dim=64,
+        num_layers=1,
+        devices=[device],
+        n_kv_heads=1,
     )
-    grammar = spec_decode_tail_input_types(
-        SpecDecodeInputTypeSpec(
-            devices=[device], distributed=False, enable_structured_output=True
-        ),
-        device,
-    )
+
+    def tail(structured_output: bool) -> list[Any]:
+        spec = SpecDecodeInputTypeSpec(
+            devices=[device],
+            distributed=False,
+            enable_structured_output=structured_output,
+        )
+        named = spec_decode_input_tree(
+            spec, declared_spec_decode_inputs(spec, kv_params=kv_params)
+        )
+        return tree.leaves([named["spec"], named.get("bitmask", ())])
+
+    plain = tail(structured_output=False)
+    grammar = tail(structured_output=True)
     # draft_tokens, seed, temperature, top_k, max_k, top_p, min_top_p.
     assert len(plain) == 7
     assert grammar[:7] == plain

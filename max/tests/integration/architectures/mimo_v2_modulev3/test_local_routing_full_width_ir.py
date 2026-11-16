@@ -22,6 +22,7 @@ postsubmit; the fixture-width forward and verify graphs stay in presubmit.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -44,13 +45,14 @@ set_virtual_device_count(4)
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph
-from max.nn.legacy import kernels
-from max.pipelines.architectures.mimo_v2_modulev3.mimo_v2 import MiMoV2
+from max.nn import _graph_ops as kernels
+from max.pipelines.architectures.mimo_v2_modulev3.mimo_v2 import MiMoV2Decoder
 from max.pipelines.architectures.mimo_v2_modulev3.model_config import (
     MiMoV2Config,
 )
-from max.pipelines.lib.interfaces.batch_processor import (
-    modulev3_ragged_kv_symbolic_inputs,
+from max.pipelines.lib.module_registration import (
+    _DecoderGraph,
+    decoder_input_types,
 )
 from max.tensor import Tensor, default_device, default_dtype
 from max.tensor.executor import CompilingExecutor, set_default_executor
@@ -80,7 +82,7 @@ def _device_mesh() -> DeviceMesh:
 
 def _full_width_model(
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[MiMoV2, MiMoV2Config]:
+) -> tuple[MiMoV2Decoder, MiMoV2Config]:
     monkeypatch.setattr(kernels, "_is_sm10x_gpu", lambda: True)
     hf = first_four_layer_config()
     # Production shards the vocabulary, which a one-row table cannot split.
@@ -93,7 +95,7 @@ def _full_width_model(
         max_seq_len=256,
     )
     with F.lazy(), default_device(_device_mesh()), default_dtype(config.dtype):
-        model = MiMoV2(config)
+        model = MiMoV2Decoder(config)
     assert model.route_on_every_device
     assert config.hidden_size == 4096
     return model, config
@@ -110,18 +112,33 @@ def _load_post_fusion_ir(
     )
 
 
-def _moe_attention_allreduces(config: MiMoV2Config) -> list[int]:
-    return [ALLREDUCES_PER_LAYER * layer for layer in sorted(config.moe_layers)]
+def _attention_allreduces(config: MiMoV2Config) -> list[int]:
+    """Returns the op indices of every layer's attention reduction.
+
+    A layer's `2 * layer`-th allreduce is its attention output's; the
+    `2 * layer + 1`-th is its MLP or MoE output's.
+    """
+    return [
+        ALLREDUCES_PER_LAYER * layer for layer in range(len(config.layer_types))
+    ]
 
 
-def test_full_width_production_fuses_only_moe_attention_allreduces(
+def test_full_width_production_fuses_every_attention_allreduce(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Pins which of production's full-width allreduces fuse, per op index.
 
-    The dense layer's norm feeds the MLP's 1x128 FP8 quantize, which the
-    composite cannot take, so only the MoE layers' attention reductions
-    fuse. The replica trace test compares against the same indices.
+    A layer's attention boundary is allreduce + residual add + the norm in
+    front of its MLP or MoE, which is exactly the composite, and that norm's
+    FP8 quantize folds into the same composite whether it scales in 1x128
+    groups (the dense layer) or in block groups (the MoE layers). The MLP
+    output reductions do not fuse, because the next layer's norm is inside the
+    norm-plus-quantize op its projection already runs. The replica trace test
+    compares against the same indices.
+
+    The same compile also pins where the router gate's weight cast runs (see
+    `_assert_gate_cast_runs_at_init`), since only a full-width gate takes the
+    fused GEMV.
     """
     model, config = _full_width_model(monkeypatch)
     # The values are never read, so every weight of one shape and dtype
@@ -137,14 +154,52 @@ def test_full_width_production_fuses_only_moe_attention_allreduces(
                 parameter.dtype, list(shape)
             )
         weights[name] = zeros[key]
-    staged, registry = model.stage(
-        *modulev3_ragged_kv_symbolic_inputs(
-            kv_params=config.kv_params, device_refs=list(config.devices)
+    staged, registry = _DecoderGraph(model).stage(
+        decoder_input_types(
+            config.kv_params,
+            config.devices[0],
+            input_layout=MiMoV2Decoder.input_layout,
         ),
         weights=weights,
+        name=MiMoV2Decoder.graph_name,
     )
     ir = _load_post_fusion_ir(staged.graph, registry, tmp_path)
-    assert fused_allreduces(ir) == _moe_attention_allreduces(config)
+    assert fused_allreduces(ir) == _attention_allreduces(config)
+    _assert_gate_cast_runs_at_init(tmp_path)
+
+
+def _assert_gate_cast_runs_at_init(ir_dir: Path) -> None:
+    """Checks that the router gate's fp32 weight is cast once, at init.
+
+    The fused router GEMV prefetches its first weight tile before it waits on
+    the grid in front of it, so its weight must not be written by a kernel in
+    the same execution. MiMo-V2 feeds it ``weight.cast(float32)``, which is
+    safe only because the compiler's exec-invariant code motion hoists that
+    cast into the model's init callable. That pass is heuristic; if it stops
+    hoisting the cast, the GEMV races the cast kernel and picks experts from
+    a stale weight. So this pins the hoist on the post-EICM dump: each MoE
+    layer's gate cast is a standalone ``mo.cast`` kernel per device in
+    ``$init``, and ``$exec`` runs no such kernel and fuses no cast into the
+    GEMV.
+    """
+    (path,) = ir_dir.glob("*.mgp.mlir")
+    chunks: dict[str, list[str]] = {"$init": [], "$exec": []}
+    for chunk in re.split(r"(?m)^(?=\s*mef\.callable @)", path.read_text()):
+        header = re.match(r"\s*mef\.callable @[^(]*?(\$init|\$exec)\(", chunk)
+        if header:
+            chunks[header.group(1)].append(chunk)
+    assert chunks["$init"] and chunks["$exec"], "no init or exec callable"
+    init, exec_ = "".join(chunks["$init"]), "".join(chunks["$exec"])
+    cast_kernel = 'dSummary = "mo.cast"'
+    moe_layers = sum(first_four_layer_config().moe_layer_freq)
+    assert init.count(cast_kernel) == moe_layers * NUM_DEVICES, (
+        "the router gates' weight casts are no longer hoisted into init"
+    )
+    assert cast_kernel not in exec_, "a weight cast runs in every execution"
+    gemv_steps = re.findall(r'dSummary = "([^"]*mixed\.gemv[^"]*)"', exec_)
+    assert gemv_steps, "the router gate no longer takes the fused GEMV"
+    for steps in gemv_steps:
+        assert "mo.cast, custom__moe.router.gate.mixed.gemv" not in steps, steps
 
 
 def test_full_width_replica_trace_fuses_as_production(
@@ -163,7 +218,7 @@ def test_full_width_replica_trace_fuses_as_production(
     ir = _load_post_fusion_ir(staged.graph, registry, tmp_path)
     ops = allreduce_ops(ir)
     assert len(ops) == ALLREDUCES_PER_LAYER * len(config.layer_types), ops
-    assert fused_allreduces(ir) == _moe_attention_allreduces(config)
+    assert fused_allreduces(ir) == _attention_allreduces(config)
 
 
 @pytest.fixture(scope="module")
@@ -176,7 +231,7 @@ def checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 def _tiny_fixture_model(
     hf: PretrainedConfig, monkeypatch: pytest.MonkeyPatch
-) -> tuple[MiMoV2, MiMoV2Config]:
+) -> tuple[MiMoV2Decoder, MiMoV2Config]:
     """``hf``'s four layers on this module's mesh, without compiling."""
     monkeypatch.setattr(kernels, "_is_sm10x_gpu", lambda: True)
     refs = [DeviceRef.GPU(i) for i in range(NUM_DEVICES)]
@@ -187,7 +242,7 @@ def _tiny_fixture_model(
         max_seq_len=256,
     )
     with F.lazy(), default_device(_device_mesh()), default_dtype(config.dtype):
-        model = MiMoV2(config)
+        model = MiMoV2Decoder(config)
     assert model.route_on_every_device
     return model, config
 
@@ -219,7 +274,7 @@ def test_replica_trace_loads_and_preserves_production_fusion(
     ops = allreduce_ops(ir)
     assert len(ops) == ALLREDUCES_PER_LAYER * len(config.layer_types), ops
     assert_allreduce_form(ir)
-    assert fused_allreduces(ir) == _moe_attention_allreduces(config)
+    assert fused_allreduces(ir) == _attention_allreduces(config)
 
 
 def test_replica_weights_stage_the_real_first_four_layers(

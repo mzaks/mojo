@@ -661,6 +661,7 @@ struct List[T: AnyType, /](
             index += 1
         return True
 
+    @stable(since="1.3")
     def __hash__[
         H: Hasher
     ](self, mut hasher: H) where conforms_to(Self.T, Hashable):
@@ -778,6 +779,10 @@ struct List[T: AnyType, /](
         """
         return {self^, 0}
 
+    # Without this, a call through a mutable `ref self` counts as a write to
+    # the list and invalidates its existing pointers and views. This is safe
+    # because creating an iterator does not change the list or its elements.
+    @__unsafe_nested_origins_read_only
     def __iter__(ref self) -> Self.IteratorType[origin_of(self)]:
         """Iterate over elements of the list, returning immutable references.
 
@@ -788,8 +793,13 @@ struct List[T: AnyType, /](
         comptime assert conforms_to(
             Self.T, Copyable
         ), "List iteration requires the element to be `Copyable`."
-        return _ListIter(0, self.unsafe_ptr(), self._len)
+        return _ListIter(0, self._storage_ptr(), self._len)
 
+    # Without this, a call through a mutable `ref self` counts as a write to
+    # the list and invalidates its existing pointers and views. This is safe
+    # because creating a reverse iterator does not change the list or its
+    # elements.
+    @__unsafe_nested_origins_read_only
     def __reversed__(
         ref self,
     ) -> _ListIter[Self.T, origin_of(self), False] where conforms_to(
@@ -800,7 +810,9 @@ struct List[T: AnyType, /](
         Returns:
             A reversed iterator of immutable references to the list elements.
         """
-        return _ListIter[forward=False](len(self), self.unsafe_ptr(), self._len)
+        return _ListIter[forward=False](
+            len(self), self._storage_ptr(), self._len
+        )
 
     # ===-------------------------------------------------------------------===#
     # Trait implementations
@@ -977,6 +989,7 @@ struct List[T: AnyType, /](
         self._storage.storage()._unchecked_get(self._len).unsafe_write(value^)
         self._len += 1
 
+    @__unsafe_nested_origins_read_only
     @inline(.always)
     @stable(since="1.2")
     def insert(mut self, i: Int, var value: Self.T, /)
@@ -1378,6 +1391,10 @@ struct List[T: AnyType, /](
             earlier_idx += 1
             later_idx -= 1
 
+    # Without this, a call through a mutable `ref self` counts as a write to
+    # the list and invalidates its existing pointers and views. This is safe
+    # because the search only reads the list and compares its elements.
+    @__unsafe_nested_origins_read_only
     def try_index(
         ref self,
         value: Self.T,
@@ -1426,6 +1443,10 @@ struct List[T: AnyType, /](
                 return i
         return None
 
+    # Without this, a call through a mutable `ref self` counts as a write to
+    # the list and invalidates its existing pointers and views. This is safe
+    # because the search only reads the list and compares its elements.
+    @__unsafe_nested_origins_read_only
     def index(
         ref self,
         value: Self.T,
@@ -1455,10 +1476,11 @@ struct List[T: AnyType, /](
         print(my_list.index(2)) # prints `1`
         ```
         """
-        var result = self.try_index(value, start=start, stop=stop)
-        if result is None:
+        __guard case .Some(index) = self.try_index(
+            value, start=start, stop=stop
+        ) else:
             raise "ValueError: Given element is not in list"
-        return result.value()
+        return index
 
     @stable(since="1.2")
     def clear(mut self)
@@ -1520,16 +1542,34 @@ struct List[T: AnyType, /](
         self._len = 0
         return storage^
 
-    def __getitem__(self, slice: StridedSlice) -> Self
-        where conforms_to(Self.T, Copyable)
+    def __getitem__(
+        self, slice: StridedSlice
+    ) -> Self where conforms_to(Self.T, Copyable)
         ensures len(result) == slice._length(len(self)):
-        """Gets the sequence of elements at the specified positions.
+        """Gets a new list with the elements at the specified positions.
+
+        Subscripting calls this method: `lst[1:5:2]` is `lst.__getitem__()`.
+
+        The slice's bounds are resolved with `indices()`: negative bounds
+        count back from the end of the list, and `None` bounds resolve to
+        the start or the end in the step's direction.
 
         Args:
-            slice: A slice that specifies positions of the new list.
+            slice: The slice specifying the positions of the elements.
 
         Returns:
-            A new list containing the list at the specified slice.
+            A new list with the elements at the specified positions.
+
+        Examples:
+
+        ```mojo
+        var letters: List[String] = ["a", "b", "c", "d", "e", "f", "g"]
+        # The stride picks every second element.
+        print(letters[0:7:2])  # [a, c, e, g]
+        # The negative end counts back from the end, excluding the last
+        # element.
+        print(letters[0:-1:2])  # [a, c, e]
+        ```
         """
         var start, end, step = slice.indices(len(self))
         var r = range(start, end, step)
@@ -1560,21 +1600,35 @@ struct List[T: AnyType, /](
         ensures len(result) == slice.end.or_else(
             len(self)
         ) - slice.start.or_else(0) and len(self) == old(len(self)):
-        """Gets the sequence of elements at the specified positions.
+        """Gets a span over the elements at the specified slice positions.
+
+        Subscripting calls this method: `lst[1:5]` is `lst.__getitem__()`.
 
         Aborts if `slice`'s start or end index is out of bounds (valid range
         is `0` to `len(self)`, inclusive), or if start is greater than end.
-        Negative indices are not supported and always abort.
+        Negative indices are not supported: they abort when bounds checking
+        is enabled (the default on CPU) and cause undefined behavior
+        otherwise. Compute bounds from the length instead, like
+        `lst[1 : len(lst) - 1]`.
 
         Args:
-            slice: A slice the specifies the positions of the new list.
+            slice: The slice specifying the range of elements.
 
         Returns:
             A span over the specified slice.
+
+        Examples:
+
+        ```mojo
+        var numbers: List[Int] = [10, 20, 30, 40, 50]
+        # Bounds must be non-negative, so compute them from the length.
+        var middle = numbers[1 : len(numbers) - 1]
+        print(middle)  # [20, 30, 40]
+        ```
         """
         var start, end = check_slice_bounds(slice, len(self))
         return {
-            unsafe_ptr = self._unsafe_interior_ptr().unsafe_offset(start),
+            unsafe_ptr = self.unsafe_ptr().unsafe_offset(start),
             length = end - start,
         }
 
@@ -1585,6 +1639,8 @@ struct List[T: AnyType, /](
     ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T
         requires Int(idx) < len(self):
         """Gets the list element at the given index.
+
+        Subscripting calls this method: `lst[3]` invokes `lst.__getitem__(3)`.
 
         Args:
             idx: The index of the element.
@@ -1607,9 +1663,12 @@ struct List[T: AnyType, /](
         requires _index_in_bounds(idx, len(self)):
         """Gets the list element at the given index.
 
-        Unlike when subscripting using slices negative indices are
-        considered out of bounds. They will be checked in the same situations
-        as "off the end" indexing.
+        Subscripting calls this method: `lst[3]` invokes `lst.__getitem__(3)`.
+
+        The index is bounds-checked: a negative index or one past the end
+        aborts at run time when the check is enabled (the default on CPU).
+        To index from the end, compute the position from the length, like
+        `lst[len(lst) - 1]`.
 
         Args:
             idx: The index of the element.
@@ -1627,9 +1686,12 @@ struct List[T: AnyType, /](
     ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T:
         """Gets the list element at the given index.
 
-        Unlike when subscripting using slices negative indices are
-        considered out of bounds. They will be checked in the same situations
-        as "off the end" indexing.
+        Subscripting calls this method: `lst[3]` invokes `lst.__getitem__(3)`.
+
+        The index is bounds-checked: a negative index or one past the end
+        aborts at run time when the check is enabled (the default on CPU).
+        To index from the end, compute the position from the length, like
+        `lst[len(lst) - 1]`.
 
         Args:
             idx: The index of the element.
@@ -1665,7 +1727,7 @@ struct List[T: AnyType, /](
             list. Instead, do `my_list.unsafe_get(len(my_list) - 1)`.
         """
         check_bounds[cpu_default=False](idx, length=len(self))
-        return self._unsafe_interior_ptr().unsafe_offset(idx)[]
+        return self.unsafe_ptr().unsafe_offset(idx)[]
 
     @inline(.always)
     def unsafe_set(mut self, idx: Int, var value: Self.T)
@@ -1740,26 +1802,32 @@ struct List[T: AnyType, /](
         )
         Span(self).unsafe_swap_elements(elt_idx_1, elt_idx_2)
 
+    # TODO: Give list iterators and `Span(List)` the interior origin, then
+    # remove this.
     @inline(.always)
-    def _unsafe_interior_ptr[
-        origin: Origin,
-        //,
-    ](ref[origin] self) -> Pointer[Self.T, Self._InteriorOrigin[origin]]:
-        return Pointer(
-            to=self.unsafe_ptr()._get_ref_with_unsafe_interior_origin[
-                "element", origin
-            ]()
-        )
-
-    def unsafe_ptr[
+    def _storage_ptr[
         origin: Origin,
         //,
     ](ref[origin] self) -> Pointer[Self.T, origin]:
+        return self._storage.unsafe_ptr().unsafe_origin_cast[origin]()
+
+    # Without this, a call through a mutable `ref self` counts as a write to
+    # the list and invalidates its existing pointers and views. This is safe
+    # because forming a pointer does not change the list or its elements.
+    @__unsafe_nested_origins_read_only
+    def unsafe_ptr[
+        origin: Origin,
+        //,
+    ](ref[origin] self) -> Pointer[Self.T, Self._InteriorOrigin[origin]]:
         """Retrieves a pointer to the underlying memory, or a dangling pointer
         if the `List` has not yet allocated.
 
         You should use the `len` of this `List` to determine if the pointer
         is valid for reads and writes.
+
+        The pointer carries the list's interior origin. Reassigning the list
+        or calling a `mut self` method on it, such as `append()`, can move its
+        storage, so the compiler rejects any use of the pointer after that.
 
         Parameters:
             origin: The origin of the `List`.
@@ -1767,12 +1835,16 @@ struct List[T: AnyType, /](
         Returns:
             The pointer to the underlying memory.
         """
-        return self._storage.unsafe_ptr().unsafe_origin_cast[origin]()
+        return Pointer(
+            to=self._storage.unsafe_ptr()._get_ref_with_unsafe_interior_origin[
+                "element", origin
+            ]()
+        )
 
     @inline(.always)
     def _unsafe_next_uninit_ptr(
         ref self,
-    ) -> Pointer[Self.T, origin_of(self)]:
+    ) -> Pointer[Self.T, Self._InteriorOrigin[origin_of(self)]]:
         """Retrieves a pointer to the next uninitialized element position.
 
         Safety:

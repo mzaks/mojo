@@ -20,7 +20,7 @@ from typing import Any, ClassVar
 
 from max.dtype import DType
 from max.graph import DeviceRef
-from max.nn.legacy.comm.ep import EPConfig, calculate_ep_max_tokens_per_rank
+from max.nn.ep_config import EPConfig, calculate_ep_max_tokens_per_rank
 from max.pipelines.kv_cache import cache_dtype_for_encoding
 from max.pipelines.lib import MAXModelConfig, PipelineConfig
 from max.pipelines.lib.config.model_config import _select_quantization_encoding
@@ -40,7 +40,11 @@ from typing_extensions import Self, override
 
 from ..deepseekV3_2_modulev3.model_config import (
     DeepseekV3_2Config,
+    check_replica_layout,
+    hisparse_params_for,
+    resolve_dcp_q_replicate,
     resolve_indexer_types,
+    resolve_prefill_context_parallel,
 )
 from ..glm5_1.model_config import glm_rope_scaling, glm_unpadded_vocab_size
 
@@ -115,6 +119,14 @@ class Glm5_1Config(DeepseekV3_2Config, ExpertParallelDeploymentConfig):
         else:
             graph_mode = "auto"
 
+        # Set only by the exporter's ``--hisparse``; ``None`` otherwise, so
+        # every existing export builds the same config it always did.
+        hisparse = hisparse_params_for(
+            pipeline_config=pipeline_config,
+            model_config=model_config,
+            huggingface_config=config,
+        )
+
         return cls(
             dtype=dtype,
             kv_params=kv_params,
@@ -154,6 +166,18 @@ class Glm5_1Config(DeepseekV3_2Config, ExpertParallelDeploymentConfig):
             attention_dropout=config.attention_dropout,
             graph_mode=graph_mode,
             data_parallel_degree=model_config.data_parallel_degree,
+            decode_context_parallel_degree=(
+                model_config.decode_context_parallel_degree
+            ),
+            decode_context_parallel_interleave=(
+                model_config.decode_context_parallel_interleave
+            ),
+            dcp_q_replicate=resolve_dcp_q_replicate(
+                model_config.dcp_q_replicate
+            ),
+            prefill_context_parallel=resolve_prefill_context_parallel(
+                model_config.prefill_context_parallel
+            ),
             index_head_dim=config.index_head_dim,
             index_n_heads=config.index_n_heads,
             index_topk=config.index_topk,
@@ -165,6 +189,7 @@ class Glm5_1Config(DeepseekV3_2Config, ExpertParallelDeploymentConfig):
             ),
             quantization_encoding=quantization_encoding,
             unpadded_vocab_size=glm_unpadded_vocab_size(pipeline_config),
+            hisparse=hisparse,
         )
 
     def finalize(
@@ -249,16 +274,11 @@ class Glm5_1Config(DeepseekV3_2Config, ExpertParallelDeploymentConfig):
         """Returns the config placed on the deployment's mesh.
 
         Raises:
-            NotImplementedError: If data parallelism runs over fewer
-                replicas than devices.
+            NotImplementedError: If the replicas or the decode context
+                parallel group don't fit the mesh (see
+                :func:`check_replica_layout`).
         """
-        n_devices = len(runtime.mesh.devices)
-        if 1 < runtime.data_parallel_degree != n_devices:
-            raise NotImplementedError(
-                f"data_parallel_degree={runtime.data_parallel_degree} must "
-                f"equal the device count ({n_devices}); dp x tp meshes are "
-                "not supported yet."
-            )
+        check_replica_layout(self, runtime)
         return replace(
             self,
             mesh=runtime.mesh,

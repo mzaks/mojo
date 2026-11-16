@@ -322,14 +322,6 @@ def bad_partial_loop(n: Int) -> Int:
     return t
 
 
-def bad_list_appended(mut xs: List[Int]) -> Int:
-    if len(xs) > 0:
-        var p = xs.unsafe_ptr()
-        xs.append(1)  # may reallocate
-        return p[]
-    return 0
-
-
 def bad_freed_in_branch(c: Bool) -> Int:
     var p = unsafe_alloc[Int](1)
     p[] = 1

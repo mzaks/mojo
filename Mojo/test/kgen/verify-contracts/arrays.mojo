@@ -35,12 +35,12 @@ def ok_generic[n: Int](a: Array[Int, n], i: Int) -> Int:
 
 def ok_span_of_array() -> Int:
     var a: Array[Int, 7] = [1, 2, 3, 4, 5, 6, 7]
-    var s = Span(array=a)
+    var s = Span(a)
     return s[6]  # the span is as long as the array
 
 
 def ok_span_of_array_loop(a: Array[Int, 4]) -> Int:
-    var s = Span(array=a)
+    var s = Span(a)
     var t = 0
     for i in range(len(s)):
         t += s[i]
@@ -49,7 +49,7 @@ def ok_span_of_array_loop(a: Array[Int, 4]) -> Int:
 
 def ok_slice_of_array_span() -> Int:
     var a: Array[Int, 7] = [1, 2, 3, 4, 5, 6, 7]
-    var s = Span(array=a)[2:]
+    var s = Span(a)[2:]
     return s[4]
 
 
@@ -68,10 +68,10 @@ def bad_generic_past[n: Int](a: Array[Int, n], i: Int) -> Int:
 
 def bad_span_of_array_past() -> Int:
     var a: Array[Int, 3] = [1, 2, 3]
-    var s = Span(array=a)
+    var s = Span(a)
     return s[3]
 
 
 def bad_slice_of_array_span() -> Int:
     var a: Array[Int, 3] = [1, 2, 3]
-    return len(Span(array=a)[4:])  # the array is shorter than 4
+    return len(Span(a)[4:])  # the array is shorter than 4

@@ -72,15 +72,12 @@ from max.graph import (
 )
 from max.graph import Module as GraphModule
 from max.graph.weights import Weights, WeightsAdapter
+from max.nn.kv_cache import KVCacheInputs, KVCacheParamInterface
 from max.nn.legacy.graph_groups import BatchContext
 from max.nn.legacy.graph_groups import DecoderOutputs as GroupedDecoderOutputs
-from max.nn.legacy.kv_cache import KVCacheInputs, KVCacheParamInterface
 from max.nn.legacy.layer import Module as GraphApiModule
-from max.nn.legacy.transformer import (
-    ReturnHiddenStates,
-    ReturnLogits,
-    logits_outputs,
-)
+from max.nn.legacy.transformer import logits_outputs
+from max.nn.outputs import ReturnHiddenStates, ReturnLogits
 from max.pipelines.context import TextContext
 from max.pipelines.kv_cache.config import KVCacheConfig
 from max.pipelines.modeling.types import PipelineTask
@@ -127,12 +124,11 @@ from .request_state import (
     split_state_outputs,
 )
 from .role_contracts import DecoderInputs, DecoderOutputs, VisionInputs
+from .weight_transform import CheckpointRole, WeightEntry, WeightTransform
 
 if TYPE_CHECKING:
     from .config import PipelineConfig
-
-    # TODO(MXF-517): Remove the interfaces/memory_estimation import cycle.
-    from .memory_estimation import MemoryPlan
+    from .memory_plan import MemoryPlan
 
 __all__ = [
     "GraphApiDecoderBatchProcessor",
@@ -293,7 +289,7 @@ def graph_api_decoder_input_types(
     types["kv"] = kv_params.get_symbolic_inputs()
     if batch_context_lengths is not None:
         types["batch_context_lengths"] = BatchContext(
-            context_lengths=tuple(batch_context_lengths)
+            length=tuple(batch_context_lengths)
         )
     if ep is not None:
         types["ep"] = ep
@@ -696,6 +692,19 @@ class GraphApiDecoderPipelineModel(
     def _hf_config_for_weights(self) -> AutoConfig | None:
         return self.huggingface_config
 
+    def _load_state_dict(self) -> dict[str, Any]:
+        """Loads the checkpoint through the architecture's adapter.
+
+        A checkpoint that loads through rules names the decoder's weights.
+        """
+        if isinstance(self.adapter, WeightTransform):
+            self.weight_naming = {
+                GraphRole.DECODER: (
+                    WeightEntry(CheckpointRole.TARGET, self.adapter),
+                )
+            }
+        return super()._load_state_dict()
+
     def load_graphs(self, session: InferenceSession) -> dict[str, Model]:
         """Loads the graphs with the session used to initialize EP first."""
         self._session = session
@@ -731,9 +740,10 @@ class GraphApiDecoderPipelineModel(
                     f"{type(config).__qualname__} doesn't support expert "
                     "parallelism"
                 )
-            runtime, self.ep_comm_initializer = initialize_ep_comm_buffers(
-                config, runtime, self._session
+            runtime, self.ep_comm_initializer, ep_init = (
+                initialize_ep_comm_buffers(config, runtime, self._session)
             )
+            self.compiled_modules = {**self.compiled_modules, **ep_init}
         self._runtime = runtime
         if isinstance(config, DeploymentConfig):
             return config.apply_runtime(runtime)

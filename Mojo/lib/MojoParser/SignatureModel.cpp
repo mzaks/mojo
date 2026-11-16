@@ -546,6 +546,10 @@ static StringRef getConventionString(ArgConvention convention) {
   switch (convention) {
   case ArgConvention::ByRefError:
     llvm_unreachable("error arguments are not rendered");
+  case ArgConvention::PackImmMem:
+  case ArgConvention::PackMut:
+  case ArgConvention::PackOwnedMem:
+    llvm_unreachable("pack conventions do not occur before LowerLIT");
   case ArgConvention::ByRefResult:
     return "out";
   case ArgConvention::ImmReg:
@@ -1057,8 +1061,8 @@ void printFunctionSignature(DefASTDecl &decl, llvm::raw_string_ostream &os,
   FnTypeGeneratorType signature = fnOp.getFuncTypeGenerator();
 
   std::optional<ASTType> selfType;
-  if (auto parentStruct = dyn_cast<StructDeclOp>(parentOp))
-    selfType = ASTType(StructASTDecl::computeSelfType(parentStruct));
+  if (auto *parentStruct = dyn_cast<StructASTDecl>(decl.getParentDecl()))
+    selfType = ASTType(parentStruct->computeSelfType());
   else if (auto parentTrait = dyn_cast<TraitDeclOp>(parentOp))
     selfType = ASTType(TraitASTDecl::computeSelfType(parentTrait));
 

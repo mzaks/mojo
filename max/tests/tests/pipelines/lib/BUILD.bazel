@@ -6,12 +6,14 @@ package(default_visibility = [
     "//oss/modular/max/tests:__subpackages__",
 ])
 
+# Guards shared PipelineArgs/PipelineConfig loading and CLI precedence.
 modular_py_test(
     name = "tests",
     srcs = glob(
         ["test_*.py"],
         exclude = [
             "test_artifact.py",
+            "test_overlap_helpers.py",
             "test_export.py",
             "test_bounded_cache.py",
             "test_chat_encoder.py",
@@ -37,6 +39,7 @@ modular_py_test(
         "//conditions:default": [],
     }),  # FIXME: MOCO-2411
     deps = [
+        "//max/python/max:_validation_hooks",
         "//max/python/max:tensor",
         "//max/python/max:tree",
         "//max/python/max/_entrypoints",
@@ -45,8 +48,11 @@ modular_py_test(
         "//max/python/max/driver",
         "//max/python/max/dtype",
         "//max/python/max/engine",
+        "//max/python/max/experimental/cascade/deployment:context_config",
         "//max/python/max/graph",
         "//max/python/max/nn",
+        "//max/python/max/nn:core",
+        "//max/python/max/nn/kv_cache",
         "//max/python/max/nn/legacy",
         "//max/python/max/pipelines:graph_input_stager",
         "//max/python/max/pipelines:logging_utils",
@@ -103,11 +109,26 @@ modular_py_test(
         "//max/python/max:_core",
         "//max/python/max/_artifact",
         "//max/python/max/_artifact:model_artifact",
+        "//max/python/max/_artifact:overlap_helpers",
         "//max/python/max/driver",
         "//max/python/max/dtype",
         "//max/python/max/pipelines/lib",
         requirement("huggingface-hub"),
         requirement("typing-extensions"),
+    ],
+)
+
+modular_py_test(
+    name = "test_overlap_helpers",
+    srcs = ["test_overlap_helpers.py"],
+    deps = [
+        "//max/python/max/_artifact",
+        "//max/python/max/_artifact:model_artifact",
+        "//max/python/max/_artifact:overlap_helpers",
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/graph",
+        "//max/python/max/nn/kv_cache",
     ],
 )
 
@@ -134,11 +155,14 @@ modular_py_test(
     deps = [
         "//max/python/max:tensor",
         "//max/python/max:tree",
+        "//max/python/max/_artifact",
         "//max/python/max/driver",
         "//max/python/max/dtype",
         "//max/python/max/engine",
         "//max/python/max/graph",
         "//max/python/max/nn",
+        "//max/python/max/nn:core",
+        "//max/python/max/nn/kv_cache",
         "//max/python/max/nn/legacy",
         "//max/python/max/pipelines/context",
         "//max/python/max/pipelines/lib",
@@ -160,6 +184,7 @@ modular_py_test(
         "//max/python/max/engine",
         "//max/python/max/graph",
         "//max/python/max/nn",
+        "//max/python/max/nn:core",
         "//max/python/max/nn/legacy",
         "//max/python/max/pipelines/context",
         "//max/python/max/pipelines/lib",
@@ -181,6 +206,8 @@ modular_py_test(
         "//max/python/max/engine",
         "//max/python/max/graph",
         "//max/python/max/nn",
+        "//max/python/max/nn:core",
+        "//max/python/max/nn/kv_cache",
         "//max/python/max/nn/legacy",
         "//max/python/max/pipelines/context",
         "//max/python/max/pipelines/lib",
@@ -200,6 +227,8 @@ modular_py_test(
         "//max/python/max/dtype",
         "//max/python/max/engine",
         "//max/python/max/graph",
+        "//max/python/max/nn:core",
+        "//max/python/max/nn/kv_cache",
         "//max/python/max/nn/legacy",
         "//max/python/max/pipelines/context",
         "//max/python/max/pipelines/lib",
@@ -215,18 +244,21 @@ modular_py_test(
     srcs = ["test_export.py"],
     # The architectures ship the FormatSpec documents the test finds.
     ignore_extra_deps = [
+        "//max/python/max/pipelines/architectures/beam_modulev3",
         "//max/python/max/pipelines/architectures/deepseekV41",
         "//max/python/max/pipelines/architectures/gemma4",
         "//max/python/max/pipelines/architectures/glm5_1",
+        "//max/python/max/pipelines/architectures/inkling",
         "//max/python/max/pipelines/architectures/laguna",
         "//max/python/max/pipelines/architectures/lfm3",
-        "//max/python/max/pipelines/architectures/mimo_v2",
+        "//max/python/max/pipelines/architectures/mimo_v2_modulev3",
         "//max/python/max/pipelines/architectures/muse_glimmer",
         "//max/python/max/pipelines/architectures/nemotron_h_modulev3",
         "//max/python/max/pipelines/architectures/qwen3_5",
     ],
     deps = [
         "//max/python/max:tensor",
+        "//max/python/max:tree",
         "//max/python/max/_artifact",
         "//max/python/max/_artifact:export",
         "//max/python/max/_artifact:model_artifact",
@@ -234,19 +266,26 @@ modular_py_test(
         "//max/python/max/dtype",
         "//max/python/max/engine",
         "//max/python/max/graph",
+        "//max/python/max/nn:core",
+        "//max/python/max/nn/kv_cache",
         "//max/python/max/nn/legacy",
+        "//max/python/max/pipelines/architectures/beam_modulev3",
         "//max/python/max/pipelines/architectures/deepseekV41",
         "//max/python/max/pipelines/architectures/gemma4",
         "//max/python/max/pipelines/architectures/glm5_1",
+        "//max/python/max/pipelines/architectures/inkling",
         "//max/python/max/pipelines/architectures/laguna",
         "//max/python/max/pipelines/architectures/lfm3",
-        "//max/python/max/pipelines/architectures/mimo_v2",
+        "//max/python/max/pipelines/architectures/llama3",
+        "//max/python/max/pipelines/architectures/mimo_v2_modulev3",
         "//max/python/max/pipelines/architectures/muse_glimmer",
         "//max/python/max/pipelines/architectures/nemotron_h_modulev3",
         "//max/python/max/pipelines/architectures/qwen3_5",
+        "//max/python/max/pipelines/context",
         "//max/python/max/pipelines/lib",
         "//max/python/max/pipelines/sampling",
         "//max/python/max/pipelines/speculative",
+        requirement("huggingface-hub"),
     ],
 )
 

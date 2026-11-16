@@ -61,7 +61,7 @@ from max.graph import Module as GraphModule
 from max.graph.weights import Weights, WeightsAdapter
 from max.nn import Module
 from max.nn.legacy.layer import Module as GraphApiModule
-from max.nn.legacy.transformer import ReturnLogits
+from max.nn.outputs import ReturnLogits
 from max.pipelines.context import TextContext
 from max.pipelines.kv_cache.config import KVCacheConfig
 from max.tensor import Tensor, default_dtype
@@ -87,9 +87,7 @@ from .utils import parse_state_dict_from_weights
 
 if TYPE_CHECKING:
     from .config import PipelineConfig
-
-    # TODO(MXF-517): Remove the interfaces/memory_estimation import cycle.
-    from .memory_estimation import MemoryPlan
+    from .memory_plan import MemoryPlan
 
 __all__ = [
     "EncoderInputs",

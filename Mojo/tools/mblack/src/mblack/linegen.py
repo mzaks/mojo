@@ -363,7 +363,7 @@ class LineGenerator(Visitor[Line]):
             yield from self.line()
 
     def visit_comptime_stmt(self, node: Node) -> Iterator[Line]:
-        """Visit `comptime if/for/match`, `comptime assert`, `comptime x = ...`."""
+        """Visit comptime compound statements and variable declarations."""
         yield from self.line()
 
         children = iter(node.children)
@@ -380,7 +380,11 @@ class LineGenerator(Visitor[Line]):
             # break that visit_match_stmt adds. Cases are indented under the
             # header, including input that was written flat.
             yield from self._visit_match_children(internal_stmt)
-        elif internal_stmt.type in (syms.if_stmt, syms.for_stmt):
+        elif internal_stmt.type in (
+            syms.if_stmt,
+            syms.for_stmt,
+            syms.guard_stmt,
+        ):
             # Visit child statement's children directly to avoid the
             # initial line break that visit_if_stmt/for_stmt add.
             for child in internal_stmt.children:
@@ -413,6 +417,15 @@ class LineGenerator(Visitor[Line]):
         """Visit decorators."""
         for child in node.children:
             yield from self.line()
+            yield from self.visit(child)
+
+    def visit_decorated(self, node: Node) -> Iterator[Line]:
+        """Visit a decorated statement."""
+        for child in node.children:
+            # A decorated `var` ends in its own NEWLINE, whose prefix holds the
+            # trailing comment of the `var` line.
+            if child.type != token.NEWLINE:
+                yield from self.line()
             yield from self.visit(child)
 
     def visit_power(self, node: Node) -> Iterator[Line]:
@@ -635,12 +648,17 @@ class LineGenerator(Visitor[Line]):
         parens: set[str],
         nodeTypes: set[int] | None = None,
     ):
-        # Only sort for struct/enum/trait, not regular class
+        # Only sort for struct/enum/union/trait, not regular class
         from mblib2to3.pgen2 import token as mtoken
 
         if nodeTypes is None:
             nodeTypes = set()
-        if node.children[0].type in (mtoken.STRUCT, mtoken.ENUM, mtoken.TRAIT):
+        if node.children[0].type in (
+            mtoken.STRUCT,
+            mtoken.ENUM,
+            mtoken.UNION,
+            mtoken.TRAIT,
+        ):
             self._sort_struct_trait_conformances(node)
         # Fallback to original logic
         yield from self.visit_stmt(node, keywords, parens, nodeTypes)
@@ -666,6 +684,9 @@ class LineGenerator(Visitor[Line]):
         )
         self.visit_while_stmt = partial(
             v, keywords={"while", "else"}, parens={"while"}
+        )
+        self.visit_guard_stmt = partial(
+            v, keywords={"__guard"}, parens={"__guard"}
         )
         self.visit_for_stmt = partial(
             v, keywords={"for", "else"}, parens={"for", "in"}
@@ -693,6 +714,7 @@ class LineGenerator(Visitor[Line]):
             nodeTypes={
                 mtoken.STRUCT,
                 mtoken.ENUM,
+                mtoken.UNION,
                 mtoken.TRAIT,
                 mtoken.EXTENSION,
             },
@@ -704,7 +726,6 @@ class LineGenerator(Visitor[Line]):
         self.visit_import_from = partial(v, keywords=Ø, parens={"import"})
         self.visit_del_stmt = partial(v, keywords=Ø, parens={"del"})
         self.visit_async_funcdef = self.visit_async_stmt
-        self.visit_decorated = self.visit_decorators
 
         # Mojo-specific declarations
         from mblib2to3.pgen2 import token as mtoken

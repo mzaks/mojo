@@ -46,12 +46,12 @@ from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph
 from max.graph.weights import SafetensorWeights, WeightData
 from max.nn import Module
-from max.nn.legacy import kernels
-from max.nn.legacy.comm.ep import EPBatchManager, EPConfig
-from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
+from max.nn import _graph_ops as kernels
+from max.nn.ep_config import EPConfig
+from max.nn.legacy.comm.ep import EPBatchManager
+from max.nn.outputs import ReturnHiddenStates, ReturnLogits
 from max.pipelines.architectures.mimo_v2_modulev3.mimo_v2 import (
-    MiMoV2,
-    MiMoV2SpecTarget,
+    MiMoV2Decoder,
 )
 from max.pipelines.architectures.mimo_v2_modulev3.model_config import (
     MiMoV2Config,
@@ -64,6 +64,10 @@ from max.pipelines.architectures.mimo_v2_modulev3.weight_adapters import (
 )
 from max.pipelines.lib.interfaces.batch_processor import (
     modulev3_ragged_kv_symbolic_inputs,
+)
+from max.pipelines.lib.module_registration import (
+    _DecoderGraph,
+    decoder_input_types,
 )
 from max.tensor import Tensor, default_device, default_dtype
 from max.tensor.compilation import StagedGraph
@@ -130,31 +134,34 @@ def _post_fusion_ir(
         config.target_layer_ids = [1, 3]
     ep_batch_manager = _ep_manager(config) if layout == "tp_ep" else None
     weights = SafetensorWeights(sorted(checkpoint.glob("*.safetensors")))
-    adapted = convert_safetensor_state_dict(
-        dict(weights.items()), huggingface_config=hf
-    )
+    adapted = convert_safetensor_state_dict(dict(weights.items()))
     mesh = _device_mesh()
-    extra_inputs = (
-        ep_batch_manager.input_types() if ep_batch_manager is not None else []
-    )
-    model: MiMoV2 | MiMoV2SpecTarget
+    model: MiMoV2Decoder
     graph: Graph
     registry: dict[str, Tensor]
     with F.lazy(), default_device(mesh), default_dtype(config.dtype):
         if verify:
             assert layout == "tp_tp"
-            model = MiMoV2SpecTarget(config)
+            model = MiMoV2Decoder(config)
             verify_graph, registry = _stage_verify(model, adapted)
             graph = verify_graph.graph
         else:
-            model = MiMoV2(config, ep_batch_manager)
-            inputs = [
-                *modulev3_ragged_kv_symbolic_inputs(
-                    kv_params=config.kv_params, device_refs=refs
+            model = MiMoV2Decoder(config)
+            inputs = decoder_input_types(
+                config.kv_params,
+                refs[0],
+                ep=(
+                    ep_batch_manager.input_tree()
+                    if ep_batch_manager is not None
+                    else None
                 ),
-                *extra_inputs,
-            ]
-            forward_graph, registry = model.stage(*inputs, weights=adapted)
+                input_layout=MiMoV2Decoder.input_layout,
+            )
+            forward_graph, registry = _DecoderGraph(model).stage(
+                inputs,
+                weights=adapted,
+                name=MiMoV2Decoder.graph_name,
+            )
             graph = forward_graph.graph
     assert model.route_on_every_device
 
@@ -168,7 +175,7 @@ def _post_fusion_ir(
 
 
 class _VerifyGraph(Module[..., tuple[Tensor, list[Tensor]]]):
-    def __init__(self, target: MiMoV2SpecTarget) -> None:
+    def __init__(self, target: MiMoV2Decoder) -> None:
         self.target = target
 
     def forward(
@@ -190,7 +197,7 @@ class _VerifyGraph(Module[..., tuple[Tensor, list[Tensor]]]):
 
 
 def _stage_verify(
-    target: MiMoV2SpecTarget,
+    target: MiMoV2Decoder,
     adapted: Mapping[str, WeightData],
 ) -> tuple[StagedGraph[..., tuple[Tensor, list[Tensor]]], dict[str, Tensor]]:
     # Verify's keyword/tree ABI differs from ModuleV3.forward; this wrapper
@@ -238,7 +245,13 @@ def test_four_device_forward_ir_reduces_on_every_device(
         post_fusion, len(config.layer_types)
     )
     if layout == "tp_tp":
-        assert len(fused_allreduces(post_fusion)) == len(config.moe_layers)
+        # Every layer's attention boundary fuses: the norm in front of the MLP
+        # or MoE is the composite's epilogue. Only the dense layer's boundary
+        # takes the FP8 quantize that norm feeds along with it; a MoE layer's
+        # quantize runs inside the shared MoE subgraph, behind its own
+        # reductions, so those composites are the reduction, the residual add
+        # and the norm alone.
+        assert len(fused_allreduces(post_fusion)) == len(config.layer_types)
     # Two non-router broadcasts carry the graph inputs. The shared MoE
     # subgraph must not contain its two router-result broadcasts.
     assert len(treatment_broadcasts) == 2, treatment_broadcasts
@@ -253,7 +266,7 @@ def test_four_device_verify_ir_reduces_on_every_device(
     treatment_broadcasts = _assert_local_routing_ir(
         post_fusion, len(config.layer_types)
     )
-    assert len(fused_allreduces(post_fusion)) == len(config.moe_layers)
+    assert len(fused_allreduces(post_fusion)) == len(config.layer_types)
     # The verify graph carries the same two non-router input broadcasts.
     assert len(treatment_broadcasts) == 2, treatment_broadcasts
 
@@ -278,5 +291,5 @@ def test_route_on_every_device_gate_covers_the_device_count(
     )
     mesh = _device_mesh(num_devices)
     with F.lazy(), default_device(mesh), default_dtype(config.dtype):
-        model = MiMoV2(config)
+        model = MiMoV2Decoder(config)
     assert model.route_on_every_device

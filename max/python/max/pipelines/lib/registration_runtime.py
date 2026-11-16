@@ -31,20 +31,27 @@ import dataclasses
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import ClassVar, Protocol, TypeVar
+from typing import Any, ClassVar, Protocol, TypeVar
 
 from max import tree
 from max.driver import Buffer, is_virtual_device_mode
 from max.dtype import DType
-from max.engine import InferenceSession
+from max.engine import CompilationStopped, InferenceSession
 from max.graph import BufferType, DeviceRef, TensorType
 from max.graph.weights import WeightData
-from max.nn.legacy.comm.ep import EPBatchManager, EPCommInitializer, EPConfig
+from max.nn.ep_config import EPConfig
+from max.nn.legacy.comm.ep import EPBatchManager, EPCommInitializer
 from max.pipelines.context import TextContext
+from max.tensor.compilation import CompiledCallable
 from max.tensor.sharding import DeviceMesh
 from typing_extensions import Self
 
-from .interfaces.pipeline_model import ModelLoadContext
+from .interfaces.pipeline_model import (
+    ModelLoadContext,
+    compile_ep_init,
+    init_ep_comm,
+)
+from .weight_transform import WeightEntry
 
 __all__ = [
     "BatchContextLengths",
@@ -77,6 +84,10 @@ class ConstantInputs:
     buffers: tree.Tree[Buffer]
 
     def __post_init__(self) -> None:
+        if is_virtual_device_mode() and not self.buffers:
+            # Compile-only: a virtual device cannot allocate, and only
+            # execution reads the buffers. The declarations still stand.
+            return
         _, structure = tree.flatten(self.input_types)
         structure.flatten_up_to(self.buffers)
 
@@ -152,9 +163,6 @@ class DeploymentConfig:
     takes every default.
     """
 
-    export_ep_init: ClassVar[bool] = False
-    """Whether artifacts include the exchange initialization graph."""
-
     preserve_checkpoint_keys: ClassVar[bool] = False
     """Whether finalization reads raw keys before :meth:`prepare_weights`
     performs the architecture's declared weight transforms.
@@ -192,6 +200,19 @@ class DeploymentConfig:
         """
         return dict(state_dict)
 
+    @classmethod
+    def weight_entries(cls) -> Mapping[str, Sequence[WeightEntry]]:
+        """Returns the entries that name each role's checkpoint weights.
+
+        A config that names the weights itself, by keeping the checkpoint's
+        keys or overriding :meth:`prepare_weights`, declares here the names
+        its roles' weights end up with, so an exported artifact names them
+        as serving does. Keyed by
+        :class:`~max.pipelines.lib.graph_specs.GraphRole`; the default names
+        none.
+        """
+        return {}
+
     def apply_runtime(self, runtime: ModuleRuntime) -> Self:
         """Returns the config completed with ``runtime``.
 
@@ -199,6 +220,15 @@ class DeploymentConfig:
         """
         del runtime
         return self
+
+    def export_records(self, runtime: ModuleRuntime) -> Mapping[str, object]:
+        """Returns what an exporter records of the deployment, by name.
+
+        The serving pipeline model keeps them as its ``export_records``,
+        where an exporter reads them. The default records nothing.
+        """
+        del runtime
+        return {}
 
 
 class ExpertParallelDeploymentConfig(DeploymentConfig, abc.ABC):
@@ -268,7 +298,11 @@ def initialize_ep_comm_buffers(
     config: ExpertParallelDeploymentConfig,
     runtime: ModuleRuntime,
     session: InferenceSession,
-) -> tuple[ModuleRuntime, ExpertParallelExchange | None]:
+) -> tuple[
+    ModuleRuntime,
+    ExpertParallelExchange | None,
+    dict[str, CompiledCallable[..., Any]],
+]:
     """Sizes and initializes the expert-parallel communication buffers.
 
     It sizes the buffers from the config, then compiles and runs the
@@ -282,11 +316,13 @@ def initialize_ep_comm_buffers(
         session: The session that compiles the init graph.
 
     Returns:
-        ``runtime`` with :attr:`ModuleRuntime.ep` set, and the buffers the
+        ``runtime`` with :attr:`ModuleRuntime.ep` set, the buffers the
         decoder's graph takes, as the config's
         :attr:`~ExpertParallelDeploymentConfig.expert_parallel_inputs`
-        selects them. They are ``None`` on virtual devices, which can't run
-        the init graph.
+        selects them, and the init graph by role, for the pipeline's
+        ``compiled_modules``. On virtual devices, which can't run the init
+        graph, the graph is only compiled and the buffers are ``None``. A
+        ``pre-jit`` stop leaves no init graph.
 
     Raises:
         ValueError: If the expert-parallel size isn't a multiple of the
@@ -299,13 +335,18 @@ def initialize_ep_comm_buffers(
             f"devices on this node ({n_devices})"
         )
     ep = config.expert_parallel_config(runtime)
-    exchange = None
-    if not is_virtual_device_mode():
-        initializer = EPCommInitializer(ep)
-        initializer.ep_init(session)
-        ep.node_id = initializer.config.node_id
-        exchange = config.expert_parallel_inputs.exchange(initializer)
-    return dataclasses.replace(runtime, ep=ep), exchange
+    if is_virtual_device_mode():
+        try:
+            _, modules = compile_ep_init(session, ep)
+        except CompilationStopped:
+            # `pre-jit` stops every compile, and this graph compiles before
+            # the decoder's. Propagating would leave the decoder unemitted.
+            modules = {}
+        return dataclasses.replace(runtime, ep=ep), None, modules
+    initializer, modules = init_ep_comm(session, ep)
+    ep.node_id = initializer.config.node_id
+    exchange = config.expert_parallel_inputs.exchange(initializer)
+    return dataclasses.replace(runtime, ep=ep), exchange, modules
 
 
 def ep_input_tree(
@@ -317,26 +358,43 @@ def ep_input_tree(
 
 def batch_context_length_types(
     data_parallel_degree: int,
+    *,
+    devices_per_replica: int = 1,
+    dtype: DType = DType.int32,
 ) -> tuple[TensorType, ...]:
-    """Returns the ``batch_context_lengths`` input types, one per replica."""
+    """Returns the ``batch_context_lengths`` input types.
+
+    There is one per replica, or with ``devices_per_replica``, one for each
+    device of each replica, a replica's devices in a row.
+    """
     return tuple(
-        TensorType(DType.int32, shape=[1], device=DeviceRef.CPU())
-        for _ in range(max(1, data_parallel_degree))
+        TensorType(dtype, shape=[1], device=DeviceRef.CPU())
+        for _ in range(max(1, data_parallel_degree) * devices_per_replica)
     )
 
 
 class BatchContextLengths:
     """Each replica's page-aligned KV context length, refreshed per batch.
 
-    The buffers persist across batches, and each batch rewrites them in
-    place, so a captured device graph keeps reading the live values.
+    With ``devices_per_replica``, each replica's length fills that many
+    buffers in a row, one for each of its devices. The buffers persist
+    across batches, and each batch rewrites them in place, so a captured
+    device graph keeps reading the live values.
     """
 
-    def __init__(self, data_parallel_degree: int, page_size: int) -> None:
+    def __init__(
+        self,
+        data_parallel_degree: int,
+        page_size: int,
+        *,
+        devices_per_replica: int = 1,
+        dtype: DType = DType.int32,
+    ) -> None:
         self._page_size = page_size
+        self._devices_per_replica = devices_per_replica
         self._buffers = [
-            Buffer.zeros(shape=[1], dtype=DType.int32)
-            for _ in range(max(1, data_parallel_degree))
+            Buffer.zeros(shape=[1], dtype=dtype)
+            for _ in range(max(1, data_parallel_degree) * devices_per_replica)
         ]
 
     def update(
@@ -344,9 +402,12 @@ class BatchContextLengths:
     ) -> list[Buffer]:
         """Writes each replica's context length and returns the buffers."""
         page = self._page_size
-        for buffer, batch in zip(self._buffers, replica_batches, strict=False):
-            buffer.to_numpy()[0] = sum(
+        count = self._devices_per_replica
+        for replica, batch in enumerate(replica_batches):
+            length = sum(
                 (ctx.tokens.current_position + page - 1) // page * page
                 for ctx in batch
             )
+            for buffer in self._buffers[replica * count :][:count]:
+                buffer.to_numpy()[0] = length
         return self._buffers

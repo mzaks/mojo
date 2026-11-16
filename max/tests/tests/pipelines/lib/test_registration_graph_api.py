@@ -27,7 +27,7 @@ import pytest
 from max import tree
 from max.driver import CPU, Buffer
 from max.dtype import DType
-from max.engine import InferenceSession
+from max.engine import CompilationStopped, InferenceSession
 from max.graph import (
     BufferType,
     BufferValue,
@@ -37,16 +37,16 @@ from max.graph import (
     Weight,
 )
 from max.graph.weights import WeightsFormat
-from max.nn.legacy.comm.ep import EPConfig
+from max.nn.ep_config import EPConfig
+from max.nn.kv_cache import KVCacheInputsPerDevice
 from max.nn.legacy.graph_groups import (
     BatchContext,
     EPPayload,
     RaggedBatch,
     TPSignals,
 )
-from max.nn.legacy.kv_cache import KVCacheInputsPerDevice
 from max.nn.legacy.layer import Module
-from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
+from max.nn.outputs import ReturnHiddenStates, ReturnLogits
 from max.pipelines.context import TextContext
 from max.pipelines.lib import GraphRole, SupportedArchitecture, TextTokenizer
 from max.pipelines.lib.interfaces.arch_config import ModelOutputConfig
@@ -576,13 +576,13 @@ def test_deployment_is_completed_before_constructing_the_decoder(
 
     def initialize(
         config: _DeploymentConfig, runtime: ModuleRuntime, session: object
-    ) -> tuple[ModuleRuntime, object]:
+    ) -> tuple[ModuleRuntime, object, dict[str, object]]:
         assert config.finalized
         assert session is model._session
         ep = config.expert_parallel_config(runtime)
         config.events.append("initialize_exchange")
         ep.node_id = 7
-        return replace(runtime, ep=ep), exchange
+        return replace(runtime, ep=ep), exchange, {}
 
     monkeypatch.setattr(
         "max.pipelines.lib.registration_graph_api.initialize_ep_comm_buffers",
@@ -640,7 +640,7 @@ def test_deployment_without_ep_does_not_initialize_an_exchange(
     assert config.events == ["apply_runtime"]
 
 
-def test_virtual_ep_deployment_sizes_without_allocating_buffers(
+def test_virtual_ep_deployment_compiles_the_init_graph_without_running_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = replace(_DeploymentConfig(), finalized=True)
@@ -656,14 +656,46 @@ def test_virtual_ep_deployment_sizes_without_allocating_buffers(
         raise AssertionError("virtual deployment allocated an EP initializer")
 
     monkeypatch.setattr(
-        "max.pipelines.lib.registration_runtime.EPCommInitializer", unexpected
+        "max.pipelines.lib.registration_runtime.init_ep_comm", unexpected
     )
-    initialized, exchange = initialize_ep_comm_buffers(
+    graph = object()
+    monkeypatch.setattr(
+        "max.pipelines.lib.registration_runtime.compile_ep_init",
+        lambda session, ep: (object(), {"ep_init": graph}),
+    )
+    initialized, exchange, ep_init = initialize_ep_comm_buffers(
         config, runtime, model._session
     )
     assert initialized.ep is not None
     assert exchange is None
+    assert ep_init == {"ep_init": graph}
     assert config.events == ["apply_runtime", "size_exchange"]
+
+
+def test_virtual_ep_deployment_continues_when_pre_jit_stops_the_init_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(_DeploymentConfig(), finalized=True)
+    model = _deployment_model(config, ep_size=1)
+    finalized = model._create_model_config({})
+    runtime = replace(finalized.runtime, ep_size=2)
+    monkeypatch.setattr(
+        "max.pipelines.lib.registration_runtime.is_virtual_device_mode",
+        lambda: True,
+    )
+
+    def stopped(*args: object) -> None:
+        raise CompilationStopped("stopped by pre-jit")
+
+    monkeypatch.setattr(
+        "max.pipelines.lib.registration_runtime.compile_ep_init", stopped
+    )
+    initialized, exchange, ep_init = initialize_ep_comm_buffers(
+        config, runtime, model._session
+    )
+    assert initialized.ep is not None
+    assert exchange is None
+    assert ep_init == {}
 
 
 def test_batch_processor_passes_the_ep_exchange_and_context_lengths() -> None:

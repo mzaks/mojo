@@ -1288,5 +1288,5 @@ def _str_iota_impl[
     for i in range(count):
         s += prefix + String(i)
         if i < count - 1:
-            s += StringSlice(sep)
+            s += StringSpan(sep)
     return s

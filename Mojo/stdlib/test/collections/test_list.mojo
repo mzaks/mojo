@@ -268,7 +268,7 @@ def test_list_reverse_property_test() raises:
         for a, b in zip(forward, reversed(rev)):
             assert_equal(a, b)
 
-    PropTest().test[properties](List[Int].strategy(Int.strategy()))
+    PropTest().test(List[Int].strategy(Int.strategy()), properties)
 
 
 def test_list_reverse() raises:
@@ -1480,5 +1480,14 @@ def test_list_niche() raises:
 # ===-------------------------------------------------------------------===#
 # main
 # ===-------------------------------------------------------------------===#
+def test_insert_pointer_with_mutable_origin() raises:
+    var o = 1
+    var l = List[Pointer[Int, origin_of(o)]]()
+    l.append(Pointer(to=o))
+    l.insert(0, Pointer(to=o))
+    assert_equal(len(l), 2)
+    assert_equal(l[0][], 1)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

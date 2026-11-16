@@ -24,7 +24,7 @@ from max.gpu import (
     grid_dim,
     thread_idx,
 )
-from max.gpu.host import DeviceContext, FuncAttribute
+from max.gpu.host import DeviceContext
 from max.gpu.host.compile import _compile_code
 from max.gpu.intrinsics import lop
 from max.gpu.primitives.grid_controls import (
@@ -220,7 +220,7 @@ struct _block_Q4_0:
 
 def test_repack_Q4_0_for_sm8x[
     NType: CoordLike, KType: CoordLike, //
-](ctx: DeviceContext, n: NType, k: KType) raises:
+](ctx: DeviceContext[], n: NType, k: KType) raises:
     print("test repack_Q4_0_for_sm8x")
 
     def fill_random[dtype: DType](mut array: Array[Scalar[dtype], ...]):
@@ -302,9 +302,6 @@ def test_repack_Q4_0_for_sm8x[
         grid_dim=(ceildiv(N, BN), ceildiv(K, BK), 1),
         block_dim=(128, 1, 1),
         shared_mem_bytes=smem_usage,
-        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
-            UInt32(smem_usage)
-        ),
     )
 
     comptime dequan = create_ref_b[
@@ -324,9 +321,6 @@ def test_repack_Q4_0_for_sm8x[
         grid_dim=(ceildiv(N, 128), ceildiv(K, 32), 1),
         block_dim=(128, 1, 1),
         shared_mem_bytes=smem_usage,
-        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
-            UInt32(smem_usage)
-        ),
     )
 
     ctx.enqueue_copy(repacked_b_host_ptr, repacked_b_device)
@@ -437,7 +431,7 @@ def test_quantized[
     use_ragged_epilogue: Bool = False,
     join_pdl_chain: Bool = False,
     pdl_level: PDLLevel = PDLLevel(),
-](ctx: DeviceContext, m: MType, n: NType, k: KType) raises:
+](ctx: DeviceContext[], m: MType, n: NType, k: KType) raises:
     # quantization configs
     comptime group_size = 128
     comptime has_zero_point = False
@@ -562,7 +556,7 @@ def test_quantized[
         comptime nwarmup = 2
 
         @inline(.always)
-        def run_func(ctx: DeviceContext) raises {imm}:
+        def run_func(ctx: DeviceContext[]) raises {imm}:
             multistage_gemm_q[
                 group_size=group_size, pack_factor=pack_factor, config=config
             ](
@@ -609,7 +603,7 @@ def test_quantized[
             c_dev_tt.store[alignment=alignment](idx, value.cast[a_type]())
 
         # The helper supplies a null output view; only the epilogue may write.
-        _qmatmul_common[group_size=group_size, target="gpu"](
+        _qmatmul_common[group_size=group_size](
             a_dev_tt.as_imm(),
             b_dev_tt.bitcast[.uint8]().as_imm(),
             ctx,
@@ -617,7 +611,7 @@ def test_quantized[
         )
     elif use_dispatch:
         comptime assert dtype == .uint8
-        matmul_gpu_qint4[group_size, "gpu"](
+        matmul_gpu_qint4[group_size](
             c_dev_tt, a_dev_tt, b_dev_tt.bitcast[.uint8](), ctx
         )
     else:
@@ -706,6 +700,20 @@ def test_quantized[
     _ = c_device_ref^
 
     _ = b_tensor
+
+
+def _find_required(text: StringSpan, needle: StaticString) raises -> Int:
+    """Returns where `needle` first occurs in `text`."""
+    __guard case .Some(index) = text.find(needle) else:
+        raise Error(t"expected to find {needle}")
+    return index
+
+
+def _rfind_required(text: StringSpan, needle: StaticString) raises -> Int:
+    """Returns where `needle` last occurs in `text`."""
+    __guard case .Some(index) = text.rfind(needle) else:
+        raise Error(t"expected to find {needle}")
+    return index
 
 
 def test_pdl_release_sites() raises:
@@ -808,15 +816,17 @@ def test_pdl_release_sites() raises:
         assert_true(release in end_asm)
         # After the MMA loop: nothing in the loop reads an input from below the
         # release, so the release cannot be hoisted above every `mma.sync`.
-        assert_true(end_asm.rfind(mma) < end_asm.find(release))
+        assert_true(
+            _rfind_required(end_asm, mma) < _find_required(end_asm, release)
+        )
 
         assert_true(wait in beginning_asm)
         assert_true(release in beginning_asm)
-        var wait_at = beginning_asm.find(wait)
-        var release_at = beginning_asm.find(release)
+        var wait_at = _find_required(beginning_asm, wait)
+        var release_at = _find_required(beginning_asm, release)
         assert_true(wait_at < release_at)
         # On entry, before the MMA loop starts.
-        assert_true(release_at < beginning_asm.find(mma))
+        assert_true(release_at < _find_required(beginning_asm, mma))
     else:
         # Below SM90 the levels change nothing in the emitted code, so neither
         # instruction may appear at any level. `mma.sync` above still has to be

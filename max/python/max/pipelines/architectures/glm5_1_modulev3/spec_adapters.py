@@ -25,13 +25,17 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from max import functional as F
-from max.graph import BufferType, DimLike, TensorType
+from max.driver import CPU
+from max.dtype import DType
+from max.graph import BufferType, DeviceRef, DimLike, TensorType, TensorValue
+from max.nn._graph_ops.data_parallel import split_batch_replicated
 from max.nn.common_layers.kv_cache import PagedCacheValues
+from max.nn.common_layers.mesh_axis import DP
 from max.nn.common_layers.multi_latent_attention import (
     MLAPrefillMetadata,
 )
 from max.nn.legacy.comm.ep import EPCommBuffers
-from max.nn.legacy.transformer import ReturnHiddenStates, ReturnLogits
+from max.nn.outputs import ReturnHiddenStates, ReturnLogits
 from max.pipelines.speculative._tensor_compat import (
     as_graph_values,
     as_tensors,
@@ -49,13 +53,28 @@ from max.pipelines.speculative.driver import (
     TensorAdapter,
     gather_variable_rows,
 )
+from max.pipelines.speculative.spec_adapters import HISPARSE_INPUTS
 from max.pipelines.speculative.spec_adapters.target_adapter import TargetAdapter
 from max.pipelines.speculative.spec_target import Verified
 from max.tensor import Tensor
-from max.tensor.sharding import DeviceMapping, DeviceMesh
+from max.tensor.sharding import (
+    DeviceMapping,
+    DeviceMesh,
+    Replicated,
+    Sharded,
+    Unknown,
+)
 
 from ..deepseekV3_2.layers.sparse_mla import sparse_selection_width
-from ..deepseekV3_2_modulev3.deepseekV3_2 import project_to_logits
+from ..deepseekV3_2_modulev3.deepseekV3_2 import (
+    hisparse_inputs_from_values,
+    project_to_logits,
+)
+from ..deepseekV3_2_modulev3.layers.prefill_context_parallel import (
+    PrefillContextParallelStep,
+    prefill_predicate,
+)
+from ..deepseekV3_2_modulev3.layers.sparse_mla import Selection
 from ..deepseekV3_2_modulev3.nextn import DeepseekV3_2NextN
 from ..deepseekV3_modulev3.deepseekV3 import gather_last_tokens
 from .glm5_1 import Glm5_1Decoder
@@ -83,6 +102,76 @@ def _replicate(tokens: Tensor, mesh: DeviceMesh) -> Tensor:
     # The broadcast collective needs signal buffers, which only a
     # multi-device graph has. Onto one device, replicating is a placement.
     return tokens.to(mesh)
+
+
+def _kv_mapping(mesh: DeviceMesh, data_parallel_degree: int) -> DeviceMapping:
+    """The placement of the paged caches.
+
+    Tensor-parallel devices all store the same latent cache; data-parallel
+    replicas serve different requests, so theirs vary.
+    """
+    if data_parallel_degree == 1:
+        return DeviceMapping.replicated(mesh)
+    return DeviceMapping(
+        mesh,
+        tuple(
+            Unknown() if name == DP else Replicated()
+            for name in mesh.axis_names
+        ),
+    )
+
+
+def _split_replicas(
+    h: Tensor,
+    input_row_offsets: Tensor,
+    input_row_offsets_i64: Tensor,
+    data_parallel_splits: Tensor,
+    mapping: DeviceMapping,
+    prefix: str,
+) -> tuple[Tensor, Tensor]:
+    """Splits a replicated batch into each replica's rows.
+
+    ``split_replicated_batch`` with the split dims named by ``prefix``.
+    """
+    h_shards, offset_shards = split_batch_replicated(
+        [DeviceRef.from_device(d) for d in mapping.mesh.devices],
+        [TensorValue(shard) for shard in h.local_shards],
+        [TensorValue(shard) for shard in input_row_offsets.local_shards],
+        TensorValue(input_row_offsets_i64),
+        TensorValue(data_parallel_splits),
+        prefix=prefix,
+    )
+    return (
+        Tensor.from_shard_values(h_shards, mapping),
+        Tensor.from_shard_values(offset_shards, mapping),
+    )
+
+
+def _replica_rows(mesh: DeviceMesh) -> DeviceMapping:
+    """The placement of a tensor holding each replica's own rows."""
+    return DeviceMapping(
+        mesh,
+        tuple(
+            Sharded(0) if name == DP else Replicated()
+            for name in mesh.axis_names
+        ),
+    )
+
+
+def _context_lengths(batch: _Batch) -> Tensor:
+    """The host cache-length bound the MLA prefill plan reads.
+
+    One per replica under data parallelism, where each replica's batch has
+    its own longest context.
+    """
+    if batch.data_parallel_degree == 1:
+        return batch.batch_context_lengths[0]
+    degree = batch.data_parallel_degree
+    cpu_mesh = DeviceMesh(tuple(CPU() for _ in range(degree)), (degree,), (DP,))
+    return Tensor.from_shard_values(
+        [TensorValue(length) for length in batch.batch_context_lengths],
+        DeviceMapping(cpu_mesh, (Replicated(),)),
+    )
 
 
 class Glm5_1Target:
@@ -114,8 +203,7 @@ class Glm5_1Target:
         language_model = self.target.language_model
         mesh = language_model.mesh
         assert mesh is not None
-        # Tensor-parallel devices all store the same latent cache.
-        replicated = DeviceMapping.replicated(mesh)
+        kv_mapping = _kv_mapping(mesh, batch.data_parallel_degree)
 
         comm_buffers = None
         ep_batch_manager = self.target.ep_batch_manager
@@ -123,20 +211,44 @@ class Glm5_1Target:
             assert batch.ep_inputs is not None
             comm_buffers = ep_batch_manager.comm_buffers(batch.ep_inputs)
 
+        data_parallel_splits: Tensor | None = None
+        merged_offsets_i64: Tensor | None = None
+        if batch.data_parallel_degree > 1:
+            assert batch.distributed is not None
+            data_parallel_splits = batch.distributed.data_parallel_splits
+            merged_offsets_i64 = F.cast(
+                batch.distributed.host_merged_offsets, DType.int64
+            )
+
+        # Only the target reads the HiSparse tables. The fused graph runs
+        # every target forward -- a context step's rows ride the verify's
+        # merged batch -- while the NextN draft's latent and indexer stay
+        # fully resident, so its proposer never sees them.
+        hisparse = (
+            hisparse_inputs_from_values(
+                self.target.config, batch.extra[HISPARSE_INPUTS]
+            )
+            if HISPARSE_INPUTS in batch.extra
+            else None
+        )
         logits, _, hidden = language_model(
             batch.merged_tokens,
-            PagedCacheValues.from_upstream(batch.kv_collections, replicated),
+            PagedCacheValues.from_upstream(batch.kv_collections, kv_mapping),
             PagedCacheValues.from_upstream(
-                batch.passthrough_kv[_INDEXER_KV], replicated
+                batch.passthrough_kv[_INDEXER_KV], kv_mapping
             ),
             batch.return_n_logits,
-            # The target broadcasts the merged tokens and offsets itself.
+            # The target broadcasts the merged tokens and offsets itself, and
+            # under data parallelism splits them over its replicas.
             batch.merged_offsets,
-            batch.batch_context_lengths[0],
-            None,
-            None,
+            _context_lengths(batch),
+            data_parallel_splits,
+            merged_offsets_i64,
             comm_buffers,
+            hisparse,
         )
+        # Under data parallelism each device's shard is its replica's rows,
+        # the layout the proposer's step 0 reads.
         return Verified(logits=logits, hidden=list(hidden.local_shards))
 
 
@@ -168,28 +280,56 @@ class Glm5_1MTPProposer(TensorAdapter):
         assert mesh is not None
         self.mesh = mesh
         self.hidden_dim: DimLike = draft.config.hidden_size
-        self.reuse: ReuseSpec | None = ReuseSpec(
-            dim=sparse_selection_width(
-                draft.config.mla_kv_params, draft.config.index_topk
-            ),
-            split_prefix="mtp_topk",
+        config = draft.config
+        # Under decode context parallelism every draft step runs its own
+        # indexer instead of reusing step 0's selection: the lagged reuse
+        # measurably lowers acceptance there (2.7 accepted tokens per step
+        # against 3.5 at TP8, K = 5), while each step's own selection, which
+        # also sees the drafts before it, recovers most of it (3.3).
+        self.reuse: ReuseSpec | None = (
+            None
+            if config.decode_context_parallel_degree > 1
+            else ReuseSpec(
+                dim=sparse_selection_width(
+                    config.mla_kv_params, config.index_topk
+                ),
+                split_prefix="mtp_topk",
+            )
         )
 
     def prefill(
         self, batch: _Batch, tokens: Tensor, target_hidden: list[Tensor]
     ) -> Proposed[Tensor]:
         """Runs the draft over the prompt's target hidden states."""
-        h, topk, offsets = self._decode(batch, tokens, target_hidden, None)
+        h, topk, offsets = self._decode(
+            batch,
+            tokens,
+            target_hidden,
+            None,
+            split_prefix="mtp_prefill",
+            prefill_context_parallel=True,
+        )
         # Every row's hidden state and the logits of each request's last
         # ``return_n_logits`` rows, which the driver gathers at the accepted
-        # position.
+        # position. Under data parallelism the hidden states and top-k stay
+        # with their replica, and only the logit rows join the whole batch.
         rows, _ = gather_variable_rows(
-            h, offsets, batch.return_n_logits, self.mesh
+            h,
+            offsets,
+            batch.return_n_logits,
+            self.mesh,
+            data_parallel_degree=batch.data_parallel_degree,
         )
+        reuse: list[Tensor] = []
+        if self.reuse is not None:
+            # Only a draft without DCP reuses its selection, and only a
+            # predicated (PCP, so DCP) prefill splits it.
+            assert isinstance(topk, Tensor), type(topk)
+            reuse = list(topk.local_shards)
         return Proposed(
             logits=self._project(rows),
             hidden=list(h.local_shards),
-            reuse=list(topk.local_shards),
+            reuse=reuse,
         )
 
     def step(
@@ -200,24 +340,36 @@ class Glm5_1MTPProposer(TensorAdapter):
         # hands over at step 0. ``shared_head_norm`` is row-wise, so
         # normalizing the one carried row here is equivalent and far cheaper.
         hidden = self.draft.shared_head_norm(
-            Tensor.from_shard_values(draft_input.hidden, self._replicated)
+            Tensor.from_shard_values(draft_input.hidden, self._rows(batch))
         )
         # Every step reuses step 0's selection, made for the token one
-        # position before step 1's.
+        # position before step 1's, unless the proposer declares no reuse.
+        reuse = draft_input.reuse if self.reuse is not None else None
         h, _, offsets = self._decode(
             batch,
             draft_input.tokens,
             hidden,
-            draft_input.reuse,
-            selection_lag=index,
+            reuse,
+            selection_lag=index if reuse is not None else 0,
+            split_prefix=f"mtp_step_{index}",
         )
         last = gather_last_tokens(h, offsets)
+        if batch.data_parallel_degree > 1:
+            # LAST_PER_DEVICE hands the driver the whole batch on every
+            # device, which it slices back to each replica's rows.
+            last = F.allgather(last, tensor_axis=0)
         return Proposed(
             logits=self._project(last), hidden=list(last.local_shards)
         )
 
-    @property
-    def _replicated(self) -> DeviceMapping:
+    def _rows(self, batch: _Batch) -> DeviceMapping:
+        """The placement of a per-row tensor the driver hands in shards.
+
+        Every device holds the whole batch under tensor parallelism, and
+        only its replica's rows under data parallelism.
+        """
+        if batch.data_parallel_degree > 1:
+            return _replica_rows(self.mesh)
         return DeviceMapping.replicated(self.mesh)
 
     def _project(self, h: Tensor) -> Tensor:
@@ -238,22 +390,49 @@ class Glm5_1MTPProposer(TensorAdapter):
         hidden: list[Tensor] | Tensor,
         reuse: list[Tensor] | None,
         selection_lag: int = 0,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Runs the draft layer, returning its output, top-k and offsets."""
-        replicated = self._replicated
+        split_prefix: str = "mtp",
+        prefill_context_parallel: bool = False,
+    ) -> tuple[Tensor, Selection, Tensor]:
+        """Runs the draft layer, returning its output, top-k and offsets.
+
+        ``split_prefix`` names this call's per-replica row dims. Every call
+        that splits the batch needs its own: the target and the prefill split
+        prompt tokens, each step one row per request, and dims that share a
+        name share one runtime extent.
+
+        With ``prefill_context_parallel`` (the prefill call) a model built
+        for prefill context parallelism predicates the draft's rows per step
+        as the target does, and the selection comes back split into its DCP
+        and PCP rows' halves. No draft step reuses it: none does under
+        decode context parallelism.
+        """
+        rows = self._rows(batch)
         embedded = self.language_model.embed_tokens(
             _replicate(tokens, self.mesh)
         )
         if isinstance(hidden, list):
-            hidden = Tensor.from_shard_values(hidden, replicated)
+            hidden = Tensor.from_shard_values(hidden, rows)
         offsets = Tensor.from_shard_values(
-            batch.query_offsets_per_dev, replicated
+            batch.query_offsets_per_dev, DeviceMapping.replicated(self.mesh)
         )
+        if batch.data_parallel_degree > 1:
+            # The driver hands the whole query on every device; each replica
+            # drafts its own requests, as the target verified them.
+            assert batch.distributed is not None
+            embedded, offsets = _split_replicas(
+                embedded,
+                offsets,
+                F.cast(batch.distributed.host_query_offsets, DType.int64),
+                batch.distributed.data_parallel_splits,
+                rows,
+                split_prefix,
+            )
+        kv_mapping = _kv_mapping(self.mesh, batch.data_parallel_degree)
         kv_collection = PagedCacheValues.from_upstream(
-            batch.draft_kv_collections, replicated
+            batch.draft_kv_collections, kv_mapping
         )
         indexer_kv_collection = PagedCacheValues.from_upstream(
-            batch.passthrough_kv[_DRAFT_INDEXER_KV], replicated
+            batch.passthrough_kv[_DRAFT_INDEXER_KV], kv_mapping
         )
         freqs_cis = F.cast(
             self.language_model.rope.freqs_cis, embedded.dtype
@@ -266,7 +445,7 @@ class Glm5_1MTPProposer(TensorAdapter):
                 offsets, kv_collection
             )
             # Host-substitute the D2H buffer_length copy, as the target does.
-            mla_prefill_metadata.buffer_lengths = batch.batch_context_lengths[0]
+            mla_prefill_metadata.buffer_lengths = _context_lengths(batch)
 
         comm_buffers: EPCommBuffers | None = None
         if self.draft.ep_batch_manager is not None:
@@ -275,21 +454,53 @@ class Glm5_1MTPProposer(TensorAdapter):
                 batch.ep_inputs
             )
 
-        h, topk = self.draft(
-            embedded,
-            hidden,
+        def draft(
+            pcp: PrefillContextParallelStep | None = None,
+        ) -> tuple[Tensor, Selection]:
+            return self.draft(
+                embedded,
+                hidden,
+                kv_collection,
+                indexer_kv_collection,
+                offsets,
+                freqs_cis,
+                mla_prefill_metadata,
+                comm_buffers,
+                Tensor.from_shard_values(reuse, rows)
+                if reuse is not None
+                else None,
+                reuse is not None,
+                selection_lag=selection_lag,
+                pcp=pcp,
+            )
+
+        config = self.draft.config
+        if not (prefill_context_parallel and config.prefill_context_parallel):
+            h, topk = draft()
+            return h, topk, offsets
+
+        # The draft's prefill runs over the target's rows, so it makes the
+        # target's per-step choice (:func:`prefill_predicate`) and predicates
+        # its rows as the target does, with its own plan over its own caches:
+        # the NextN layer's attention runs both paths, each on its rows.
+        attention = self.draft.decoder_layer.self_attn
+        context_lengths = _context_lengths(batch)
+        active = prefill_predicate(embedded, offsets, context_lengths)
+        pcp = PrefillContextParallelStep(
+            dcp=attention.dcp_size,
+            interleave=attention.dcp_interleave,
+            page_size=config.mla_kv_params.page_size,
+            namespace="pcp_mtp",
+            active=active,
+            batch_context_length=context_lengths,
+        ).predicated(embedded)
+        pcp = pcp.with_plan(
+            offsets,
+            pcp.rows_split(embedded)[0],
             kv_collection,
             indexer_kv_collection,
-            offsets,
-            freqs_cis,
-            mla_prefill_metadata,
-            comm_buffers,
-            Tensor.from_shard_values(reuse, replicated)
-            if reuse is not None
-            else None,
-            reuse is not None,
-            selection_lag=selection_lag,
         )
+        h, topk = draft(pcp)
         return h, topk, offsets
 
 
@@ -305,7 +516,6 @@ def verify(
         ValueError: If the target wasn't built to return the normalized
             hidden states the NextN layer reads, or spans several devices
             without expert parallelism.
-        NotImplementedError: Under data parallelism.
     """
     del target_config, draft_config
     if hidden_states != ReturnHiddenStates.ALL_NORMALIZED:
@@ -315,11 +525,6 @@ def verify(
         )
     assert isinstance(target, Glm5_1Decoder)
     config = target.config
-    if config.data_parallel_degree > 1:
-        raise NotImplementedError(
-            "MTP with a ModuleV3 GLM-5.x target requires"
-            " data_parallel_degree=1."
-        )
     if len(config.devices) > 1 and target.ep_batch_manager is None:
         raise ValueError(
             "MTP with a ModuleV3 GLM-5.x target on several devices requires"
@@ -328,12 +533,21 @@ def verify(
     return Glm5_1Target(target)
 
 
-def ep_input_types(target: Any) -> Sequence[TensorType | BufferType]:
-    """Returns the target's expert-parallel inputs, empty when EP is off."""
+def ep_input_tree(target: Any) -> object | None:
+    """Returns the group that names the target's EP inputs, if EP is on."""
     assert isinstance(target, Glm5_1Decoder)
     if target.ep_batch_manager is None:
+        return None
+    return target.ep_batch_manager.input_tree()
+
+
+def hisparse_input_types(
+    target_config: Any,
+) -> Sequence[TensorType | BufferType]:
+    """Returns the target's HiSparse inputs, empty with every page resident."""
+    if getattr(target_config, "hisparse", None) is None:
         return ()
-    return target.ep_batch_manager.input_types()
+    return target_config.hisparse_input_types()
 
 
 def sequential_proposer(
@@ -359,10 +573,22 @@ def check(speculative: SpeculativeConfig, structured_output: bool) -> None:
         )
 
 
+def _takes_prefill_rows(target_config: Any) -> bool:
+    """Returns whether the MTP verify commits a prefill row.
+
+    Attention that splits positions across ranks takes no prompt row.
+    """
+    return target_config.decode_context_parallel_degree <= 1
+
+
 ADAPTER = TargetAdapter(
     primary_kv=PRIMARY_KV,
     verify=verify,
-    ep_input_types=ep_input_types,
+    ep_input_tree=ep_input_tree,
+    hisparse_input_types=hisparse_input_types,
     check=check,
     sequential_proposer=sequential_proposer,
+    verify_takes_prefill_rows=_takes_prefill_rows,
+    # The NextN head reads each position's successor token.
+    successor_replay=True,
 )

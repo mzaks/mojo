@@ -39,9 +39,9 @@ from max.driver import Buffer, DLPackArray
 from max.dtype import DType
 from max.graph import DeviceRef, TensorType
 from max.nn import Module
-from max.nn.legacy.kv_cache import PagedCacheValues
+from max.nn.kv_cache import PagedCacheValues
 from max.pipelines.architectures.mimo_v2_modulev3.mimo_v2 import (
-    MiMoV2,
+    MiMoV2Decoder,
     MiMoV2DecoderLayer,
     MiMoV2MoE,
 )
@@ -296,7 +296,7 @@ class MiMoReplicaTrace(Module[..., list[Tensor]]):
     every device's residual after the MLP or MoE output's reduction.
     """
 
-    def __init__(self, model: MiMoV2) -> None:
+    def __init__(self, model: MiMoV2Decoder) -> None:
         self.layers = model.layers
         self.ropes = model.ropes
         self.kv_params = model.kv_params
@@ -371,10 +371,11 @@ class MiMoReplicaTrace(Module[..., list[Tensor]]):
         first_allreduce: int,
     ) -> tuple[Tensor, list[Tensor]]:
         attn_out = layer.self_attn(
-            layer.input_layernorm(h),
+            h,
             kv_collection,
             freqs_cis,
             input_row_offsets,
+            norm=layer.input_layernorm,
         )
         h = h + cls._planted(attn_out, plant, first_allreduce).to(h.mapping)
         router_input = layer.post_attention_layernorm(h)

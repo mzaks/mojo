@@ -15,7 +15,7 @@
 
 # --- must be PROVEN ---
 def ok_span_of_list(l: List[Int]) -> Int:
-    var s = Span(list=l)
+    var s = Span(l)
     var t = 0
     for i in range(len(l)):
         t += s[i] + l[i]  # the span is as long as the list, which it keeps
@@ -38,7 +38,7 @@ def ok_slice_prefix(vs: List[Int], n: Int) -> Int:
 
 def ok_slice_of_span() -> Int:
     var l: List[Int] = [1, 2, 3, 4, 5, 6, 7]
-    var s = Span(list=l)
+    var s = Span(l)
     var s2 = s[2:]
     return s2[0] + s2[4]
 
@@ -136,7 +136,7 @@ def bad_slice_swapped(vs: List[Int], a: Int, b: Int) -> Int:
 
 def bad_span_past_end() -> Int:
     var l: List[Int] = [1, 2, 3]
-    var s = Span(list=l)
+    var s = Span(l)
     return s[3]
 
 

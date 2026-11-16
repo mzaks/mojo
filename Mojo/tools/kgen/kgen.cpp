@@ -122,8 +122,6 @@ struct CLOptions : public CommonOptions {
   /// The requested `-emit` kind, or empty when no emit command was given.
   std::string emissionKind;
   SmallVector<CommandLineFunc> funcs;
-  /// The input files after the first, which `inputFilename` holds.
-  std::vector<std::string> inputFiles;
   CompilationOptions compilationOptions;
   FrontendOptions frontendOptions;
   AsyncRT::CPUDeviceOptions cpuDeviceOptions;
@@ -140,6 +138,9 @@ struct CLOptions : public CommonOptions {
   /// `--bounds-check-report` runs in-process on the elaborated module, which
   /// avoids printing and re-parsing the IR; none when not given.
   std::optional<std::string> boundsCheckReport;
+  /// The `--namespace` that `--precompile` builds the package under, outermost
+  /// component first.
+  SmallVector<std::string> outputNamespace;
   /// The driver state, which formats the errors and diagnostics.
   const State *state = nullptr;
 
@@ -155,10 +156,7 @@ struct CLOptions : public CommonOptions {
     return *found;
   }
 
-  /// Add all the input files provided on the command line to the SourceMgr.
-  /// This is how MLIR parses multiple files.
-  ErrorOrSuccess addInputFilesToSourceMgr(llvm::SourceMgr &mgr);
-  void addInputFilesToSourceMgrOrExit(llvm::SourceMgr &mgr);
+  void addInputFileToSourceMgrOrExit(llvm::SourceMgr &mgr);
 };
 
 /// Parses the command that `arg` gives into `clOptions`.
@@ -178,8 +176,7 @@ ErrorOrSuccess parseCommand(const llvm::opt::Arg &arg, CLOptions &clOptions) {
   case options::OPT_emit_eq:
     // Any kind is recorded; it is validated against kgen's emission kinds and
     // the target's traits once the targets are initialized.
-    clOptions.emissionKind =
-        value.empty() ? stringifyEmitAs(EmitAs::OBJECT).str() : value.str();
+    clOptions.emissionKind = value.str();
     clOptions.cmd = "emit=" + clOptions.emissionKind;
     return M::success();
   case options::OPT_execute:
@@ -238,37 +235,12 @@ bool parseForwardedCLOptions(const char *programName,
 }
 } // namespace
 
-ErrorOrSuccess CLOptions::addInputFilesToSourceMgr(llvm::SourceMgr &mgr) {
-  if (inputFiles.empty()) {
-    ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
-        openInputFile(inputFilename);
-    if (buffer.isError())
-      return buffer.takeError();
-    mgr.AddNewSourceBuffer(buffer.takeValue(), llvm::SMLoc());
-  }
-
-  for (StringRef in : inputFiles) {
-    std::error_code ec;
-    std::filesystem::path fullPath = std::filesystem::absolute(in.str(), ec);
-    if (ec) {
-      return Error(
-          llvm::formatv("failed to resolve the absolute path for '{0}': {1}",
-                        in.str(), ec.message()));
-    }
-    std::string errorMsg;
-    auto result = mlir::openInputFile(fullPath.string(), &errorMsg);
-    if (!result)
-      return Error(errorMsg);
-
-    mgr.AddNewSourceBuffer(std::move(result), llvm::SMLoc());
-  }
-
-  return M::success();
-}
-
-void CLOptions::addInputFilesToSourceMgrOrExit(llvm::SourceMgr &mgr) {
-  if (auto err = addInputFilesToSourceMgr(mgr))
-    exit(reportError(err.getError()));
+void CLOptions::addInputFileToSourceMgrOrExit(llvm::SourceMgr &mgr) {
+  ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+      openInputFile(inputFilename);
+  if (buffer.isError())
+    exit(reportError(buffer.getError()));
+  mgr.AddNewSourceBuffer(buffer.takeValue(), llvm::SMLoc());
 }
 
 /// Emit the IR for `theModule` to a file.
@@ -338,6 +310,18 @@ static LogicalResult createDependencyFile(const CLOptions &clOptions,
 /// Runs the tool pipeline on the file fragment passed in. The pipeline does not
 /// output to the specific ostream provided to it, rather it opens and writes to
 /// files that are designated by the funcs it operates on.
+
+/// Returns whether --mlir-disable-threading was passed. The flag promises
+/// MLIR that nothing touches IR concurrently, so the AsyncRT pipeline must
+/// run single-threaded as well.
+static bool isMLIRThreadingDisabled() {
+  auto &opts = llvm::cl::getRegisteredOptions();
+  auto it = opts.find("mlir-disable-threading");
+  if (it == opts.end())
+    return false;
+  return static_cast<llvm::cl::opt<bool> *>(it->second)->getValue();
+}
+
 static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
                                      CLOptions &clOptions) {
   DialectRegistry registry;
@@ -364,6 +348,8 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
   registerKGENToLLVMTranslation(registry);
 
   // Create our context, with a cpuDevice; this should not fail.
+  if (isMLIRThreadingDisabled())
+    clOptions.cpuDeviceOptions.withSingleThreaded();
   ErrorOr<ContextRef> ctxOr = Init::createContext(
       "kgen", Init::Options().withCPUDeviceOptions(
                   clOptions.cpuDeviceOptions.withCPUAffinity(false)));
@@ -816,11 +802,8 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
 
 /// Precompiles the package directory given as the input, as `mojo precompile`
 /// does. The package parses under its directory's name, and takes the name of
-/// the `.mojoc` file it is written to.
+/// the `.mojoc` file it is written to, under any `-namespace`.
 static LogicalResult runPrecompile(CLOptions &clOptions) {
-  if (!clOptions.inputFiles.empty())
-    return failure(clOptions.reportError(
-        "precompile expects a single package directory as input"));
   StringRef input = clOptions.inputFilename;
   if (!Filesystem::isMojoSourcePackagePath(input.str()))
     return failure(clOptions.reportError(
@@ -836,7 +819,12 @@ static LogicalResult runPrecompile(CLOptions &clOptions) {
   std::string outputName = outputPath.extension() == ".mojoc"
                                ? outputPath.stem().string()
                                : sourceName;
+  LIT::ImportPath importPath;
+  llvm::append_range(importPath.components, clOptions.outputNamespace);
+  importPath.components.push_back(outputName);
 
+  if (isMLIRThreadingDisabled())
+    clOptions.cpuDeviceOptions.withSingleThreaded();
   ErrorOr<ContextRef> ctxOr = Init::createContext(
       "kgen", Init::Options().withCPUDeviceOptions(
                   clOptions.cpuDeviceOptions.withCPUAffinity(false)));
@@ -846,6 +834,7 @@ static LogicalResult runPrecompile(CLOptions &clOptions) {
   registerAllKGENDialects(registry);
   registerContext(registry, *ctxOr);
   MLIRContext context(registry, MLIRContext::Threading::DISABLED);
+  configureKGENContext(&context);
 
   llvm::SourceMgr sourceMgr;
   configureSourceMgr(*clOptions.state, clOptions.driverOptions, sourceMgr);
@@ -867,13 +856,14 @@ static LogicalResult runPrecompile(CLOptions &clOptions) {
 
   TimingScope ts;
   auto [module, packageOp] = LIT::importMojoPackage(
-      *ctxOr, packagePath.string(), sourceName, sourceMgr, &context, options,
-      clOptions.frontendOptions, ts);
+      *ctxOr, packagePath.string(), sourceName, importPath, sourceMgr, &context,
+      options, clOptions.frontendOptions, ts);
   if (!module)
     return failure(clOptions.reportError("could not parse the package"));
 
-  ErrorOr<OwningOpRef<ModuleOp>> built = buildPrecompiledPackage(
-      *module, packageOp, sourceName, outputName, options.bitcodeLibs);
+  ErrorOr<OwningOpRef<ModuleOp>> built =
+      buildPrecompiledPackage(*module, packageOp, sourceName,
+                              importPath.components, options.bitcodeLibs);
   if (failed(built))
     return failure(clOptions.reportError(built.getError()));
 
@@ -943,6 +933,7 @@ int main(int argc, char **argv) {
     CompilationOptions &compilationOptions = clOptions.compilationOptions;
     TargetArgs &targetArgs = clOptions.targetArgs;
     AsyncRT::CPUDeviceOptions &cpuDeviceOptions = clOptions.cpuDeviceOptions;
+    SmallVector<std::string> &outputNamespace = clOptions.outputNamespace;
 #define MOJO_OPTION_WITH_MARSHALLING(...)                                      \
   PARSE_OPTION_WITH_MARSHALLING(args, errors, __VA_ARGS__)
 #include "Mojo/tools/kgen/KGENOptions.inc"
@@ -972,10 +963,12 @@ int main(int argc, char **argv) {
   }
 
   std::vector<std::string> inputs = args.getAllArgValues(options::OPT_INPUT);
-  if (!inputs.empty()) {
+  if (inputs.size() > 1)
+    return state.reportError("expected one input file, but got " +
+                             Twine(inputs.size()) + ": " +
+                             llvm::join(inputs, ", "));
+  if (!inputs.empty())
     clOptions.inputFilename = inputs.front();
-    clOptions.inputFiles.assign(inputs.begin() + 1, inputs.end());
-  }
   for (StringRef func : args.getAllArgValues(options::OPT_func))
     clOptions.funcs.push_back(CommandLineFunc::parse(func));
   if (llvm::opt::Arg *arg = args.getLastArg(options::OPT_verify_contracts,
@@ -1033,13 +1026,14 @@ int main(int argc, char **argv) {
   if (clOptions.cmd == "precompile")
     return failed(runPrecompile(clOptions));
 
-  // Set up the input file(s).
+  // Set up the input file.
   llvm::SourceMgr sourceManager;
   configureSourceMgr(state, clOptions.driverOptions, sourceManager);
-  clOptions.addInputFilesToSourceMgrOrExit(sourceManager);
+  clOptions.addInputFileToSourceMgrOrExit(sourceManager);
 
   return failed(clOptions.configureMLIRContextAndExecute(
       sourceManager, [&](MLIRContext *ctx) -> LogicalResult {
+        configureKGENContext(ctx);
         ctx->printOpOnDiagnostic(true);
         ScopedMLIRWarningHandler warningHandler(
             ctx, clOptions.frontendOptions.disableWarnings,

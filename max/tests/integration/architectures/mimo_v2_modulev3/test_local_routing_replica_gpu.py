@@ -14,13 +14,11 @@
 
 The model is the first ``LAYERS`` layers of MiMo-V2.6 at full width with
 nonzero weights (:func:`replica_probe.replica_weights`): a dense layer, then
-three MoE layers. Each layer has two allreduces. On the MoE layers the
-attention output's reduction, residual add and ``post_attention_layernorm``
-fuse into the allreduce composite that produces the router input; layer 0's
-attention reduction and every MLP or MoE output's reduction stay plain. Ops
-``0`` through ``ALLREDUCES - 1`` number them in execution order, where
-``2 * layer`` is the attention's, ``2 * layer + 1`` the MLP's or MoE's, and
-ops 2, 4 and 6 are the composites.
+three MoE layers. Each layer has two allreduces, and ops ``0`` through
+``ALLREDUCES - 1`` number them in execution order, where ``2 * layer`` is the
+attention's and ``2 * layer + 1`` the MLP's or MoE's. Which of them the graph
+compiler folds into its allreduce composite is its own business, pinned by the
+post-fusion IR tests.
 
 Every row count runs as its own step, one sequence of ``rows`` independent
 random rows. The kernel each op takes on four B200s at 8 KiB per row:
@@ -77,7 +75,7 @@ from max.driver import CPU, Accelerator, Buffer, accelerator_count
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef
-from max.pipelines.architectures.mimo_v2_modulev3.mimo_v2 import MiMoV2
+from max.pipelines.architectures.mimo_v2_modulev3.mimo_v2 import MiMoV2Decoder
 from max.pipelines.architectures.mimo_v2_modulev3.model_config import (
     MiMoV2Config,
 )
@@ -195,7 +193,7 @@ def _assert_replicas_equal(
 
 
 def _compile_trace(
-    model: MiMoV2,
+    model: MiMoV2Decoder,
     refs: list[DeviceRef],
     session: InferenceSession,
 ) -> compilation.CompiledCallable[..., list[Tensor]]:
@@ -262,7 +260,7 @@ def run_replica_check() -> None:
     )
     session = InferenceSession(devices=[CPU(), *devices])
     with F.lazy(), default_device(mesh), default_dtype(config.dtype):
-        model = MiMoV2(config)
+        model = MiMoV2Decoder(config)
     # Both arms route on every device: the gate follows the mode, not the
     # device count.
     assert model.route_on_every_device

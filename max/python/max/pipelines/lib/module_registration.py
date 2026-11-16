@@ -22,7 +22,15 @@ the graph signature, batching and execution.
 A registered module class can also set:
 
 - ``graph_name``, the name its graph compiles under (:func:`graph_name`);
-- ``input_layout``, the role field names in a graph's existing input order;
+- ``input_layout``, the role field names in a graph's existing input order.
+  Naming ``signals`` places the allreduce signal buffers there, on one device
+  too, as the graph-API graph that keeps the layout takes them;
+- ``takes_total_context_length``, when its graph takes
+  :attr:`~max.pipelines.lib.role_contracts.DecoderInputs.batch_context_lengths`
+  as the ``total_length`` of a
+  :class:`~max.nn.legacy.graph_groups.BatchContext` group: one ``uint32``
+  per device, each replica's on every device of the replica, rather than one
+  page-aligned ``int32`` ``length`` per replica;
 - ``lora_targets``, the projections it serves LoRA adapters on
   (:func:`lora_targets`);
 - ``supports_data_parallel``, when it runs one replica per device
@@ -54,10 +62,27 @@ pixel layouts differ by architecture: it implements
 :class:`VisionBatchProcessor`. A registered ``VISION`` class constructs from
 the config like any role, and also has ``input_types()``, the vision graph's
 inputs, and ``embedding_dtype`` and ``embedding_dim``, the type of each
-embedding row it produces. Registration checks the combination up front: a
-``VISION`` module needs a decoder that consumes the embeddings and a batch
-processor that prepares them, and a decoder that consumes them needs a
-``VISION`` module.
+embedding row it produces. ``input_types()`` returns one type per argument of
+its ``forward``, or, so that an exported graph names its inputs and outputs
+for a serving engine, a named tree of vision groups (such as
+:class:`~max.nn.legacy.graph_groups.VisionRows`) whose fields are those
+arguments' names. It can also have the classmethods
+``vision_metadata(pipeline_config, config)``,
+``vision_preprocess_spec(pipeline_config, config)`` and
+``vision_preprocess_video_spec(pipeline_config, config)``, which take the
+config the module is constructed with. The pipeline model's
+``vision_metadata_for``, ``vision_preprocess_spec_for`` and
+``vision_preprocess_video_spec_for`` return them, so that ``max export``
+records the media layout and the image and video preprocessing graphs a
+serving engine needs, both for the registration alone and for a fused
+speculative-decoding graph whose target it is. Registration checks the
+combination up front: a ``VISION`` module needs a decoder that consumes the
+embeddings and a batch processor that prepares them, and a decoder that
+consumes them needs a ``VISION`` module.
+
+A registration can also add a ``BLOCK_DIFFUSION`` module, one denoise step
+over a canvas, beside the ``DECODER``, which then commits tokens into the KV
+cache. It serves through :class:`BlockDiffusionPipelineModel`.
 
 :mod:`~max.pipelines.lib.registration_runtime` lists what a registered
 config can declare about its deployment.
@@ -68,25 +93,52 @@ from __future__ import annotations
 import copy
 import copyreg
 import dataclasses
+import inspect
 import itertools
+import re
 from abc import ABCMeta
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Protocol, cast, runtime_checkable
+from types import MappingProxyType
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Protocol,
+    TypeAlias,
+    cast,
+    runtime_checkable,
+)
 
 import numpy as np
+import numpy.typing as npt
 from max import functional as F
 from max import tree
+from max._artifact.vision import VisionMetadata
 from max.driver import Buffer, Device
 from max.dtype import DType
 from max.engine import InferenceSession, Model
 from max.graph import BufferType, DeviceRef, TensorType, Type
+from max.graph.weights import WeightsAdapter
 from max.nn import Module
 from max.nn.common_layers.mesh_axis import DP, TP
-from max.nn.legacy.comm.ep import EPInit
-from max.nn.legacy.comm.ep.ep_manager import _ep_counter_words
-from max.nn.legacy.kv_cache import KVCacheInputs, KVCacheParamInterface
+from max.nn.kv_cache import KVCacheInputs, KVCacheParamInterface
+from max.nn.legacy.graph_groups import (
+    BatchContext,
+    BlockDiffusionGraphInputs,
+    DecoderGraphInputs,
+    DecoderGraphScratch,
+    HiddenStates,
+    Logits,
+    MRoPEPositions,
+    VisionEmbeddings,
+    VisionMerge,
+    group_fields,
+    vision_outputs,
+)
+from max.nn.legacy.graph_groups import DecoderOutputs as GroupedDecoderOutputs
+from max.nn.outputs import ReturnHiddenStates
 from max.pipelines.context import TextContext
 from max.pipelines.lora import LoRAManagerV3, LoRATargetModule
 from max.pipelines.modeling.types import RequestID
@@ -101,7 +153,7 @@ from max.tensor.sharding import (
 from transformers import AutoConfig
 
 from .decoder_scratch import DecoderScratch, build_decoder_scratch
-from .graph_specs import GraphRole, GraphSpec
+from .graph_specs import GraphRole, GraphSpec, _EagerCallable
 from .input_binding import _flatten_role_inputs
 from .interfaces.arch_config import ArchConfig, ModelOutputConfig
 from .interfaces.batch_processor import (
@@ -117,6 +169,7 @@ from .interfaces.pipeline_model import (
     ModelLoadContext,
     ModelOutputs,
     ModuleV3PipelineModelWithKVCache,
+    PipelineModel,
     _cast_to_parameter_dtypes,
 )
 from .log_probabilities import LogProbabilitiesMixin
@@ -140,11 +193,18 @@ from .registration_runtime import (
     uses_expert_parallel_exchange,
 )
 from .request_state import (
+    RequestStateGroup,
     RequestStateMixin,
     RequestStateStore,
     build_state_store,
 )
-from .role_contracts import DecoderInputs, DecoderOutputs, VisionInputs
+from .role_contracts import (
+    BlockDiffusionInputs,
+    BlockDiffusionOutputs,
+    DecoderInputs,
+    DecoderOutputs,
+    VisionInputs,
+)
 from .utils import (
     compute_data_parallel_splits,
     parse_state_dict_from_weights,
@@ -155,6 +215,15 @@ from .vision_encoder_cache import (
     VideoEncoderMetrics,
     VisionEncoderMetrics,
 )
+from .weight_transform import (
+    CheckpointRole,
+    WeightEntry,
+    WeightRenaming,
+    WeightTransform,
+)
+
+if TYPE_CHECKING:
+    from .config import PipelineConfig
 
 __all__ = [
     "DecoderBatchProcessor",
@@ -171,6 +240,7 @@ __all__ = [
     "graph_name",
     "module_pipeline_model",
     "supports_pipeline_stages",
+    "token_position_type",
 ]
 
 # Roles that the framework builds, never an architecture.
@@ -183,8 +253,11 @@ _FRAMEWORK_ROLES = frozenset(
     }
 )
 
+
 # The roles a registration can fill.
-_SERVED_ROLES = frozenset({GraphRole.DECODER, GraphRole.VISION})
+_SERVED_ROLES = frozenset(
+    {GraphRole.DECODER, GraphRole.VISION, GraphRole.BLOCK_DIFFUSION}
+)
 
 # The ragged batch inputs each DecoderInputs field takes its type from.
 _BATCH_FIELDS = {
@@ -265,6 +338,26 @@ def supports_multi_device_replicas(module_cls: type[Module[..., Any]]) -> bool:
     return bool(getattr(module_cls, "supports_multi_device_replicas", False))
 
 
+def token_position_type(
+    module_cls: type[Module[..., Any]], config: object, device_ref: DeviceRef
+) -> TensorType | None:
+    """Returns a registered decoder's ``token_positions`` input type.
+
+    A decoder that sets ``token_position_dtype`` takes each ragged token's
+    absolute position, ``[total_seq_len]``. One with a
+    ``token_position_type(config, device_ref)`` classmethod declares its
+    own, such as M-RoPE's ``[3, total_seq_len]`` positions, or ``None`` for
+    a config that takes none. Its batch processor fills them.
+    """
+    declared = getattr(module_cls, "token_position_type", None)
+    if declared is not None:
+        return declared(config, device_ref)
+    dtype = getattr(module_cls, "token_position_dtype", None)
+    if dtype is None:
+        return None
+    return TensorType(dtype, ["total_seq_len"], device=device_ref)
+
+
 def consumes_vision(module_cls: type[Module[..., Any]]) -> bool:
     """Returns whether a registered decoder reads image embeddings.
 
@@ -273,6 +366,60 @@ def consumes_vision(module_cls: type[Module[..., Any]]) -> bool:
     registers beside a ``VISION`` module.
     """
     return bool(getattr(module_cls, "consumes_vision", False))
+
+
+def _max_canvas_batch(module_cls: type[Module[..., Any]]) -> int | None:
+    """Returns how many canvases a registered denoiser takes in one step.
+
+    A ``BLOCK_DIFFUSION`` module that sets ``max_canvas_batch`` bounds the
+    canvases the block-diffusion pipeline denoises in one step. ``None``
+    leaves the pipeline's own bound.
+    """
+    cap = getattr(module_cls, "max_canvas_batch", None)
+    return None if cap is None else int(cap)
+
+
+def _block_diffusion_input_types(
+    kv_params: KVCacheParamInterface, device_ref: DeviceRef, vocab_size: int
+) -> BlockDiffusionGraphInputs:
+    """Returns a ``BLOCK_DIFFUSION`` graph's input types, keyed by field.
+
+    The graph takes the tree as its one argument, so an exported graph names
+    its inputs.
+
+    Args:
+        kv_params: The KV cache parameters that supply the ``kv`` subtree.
+        device_ref: The device that holds the canvas tensors.
+        vocab_size: The width of the self-conditioning logits.
+    """
+    batch = ragged_batch_inputs(device_ref, ("tokens", "row_offsets"))
+    tokens, row_offsets = batch["tokens"], batch["row_offsets"]
+    assert isinstance(tokens, TensorType)
+    assert isinstance(row_offsets, TensorType)
+    return _block_diffusion_graph_inputs(
+        BlockDiffusionInputs(
+            tokens=tokens,
+            input_row_offsets=row_offsets,
+            sc_logits=TensorType(
+                DType.bfloat16,
+                ["total_seq_len", vocab_size],
+                device=device_ref,
+            ),
+            sc_enabled=TensorType(DType.float32, [1], device=device_ref),
+            temperature=TensorType(DType.float32, [1], device=device_ref),
+            kv=kv_params.get_symbolic_inputs(),
+        )
+    )
+
+
+def _block_diffusion_graph_inputs(
+    inputs: BlockDiffusionInputs[Any],
+) -> BlockDiffusionGraphInputs:
+    """Returns a denoiser's inputs as its graph takes them: keyed, in order."""
+    return BlockDiffusionGraphInputs(
+        (entry.name, getattr(inputs, entry.name))
+        for entry in dataclasses.fields(inputs)
+    )
 
 
 def supports_pipeline_stages(module_cls: type[Module[..., Any]]) -> bool:
@@ -294,19 +441,27 @@ def decoder_input_types(
     data_parallel_degree: int = 1,
     vision: VisionInputs[TensorLayout] | VisionInputs[TensorType] | None = None,
     token_positions: TensorType | None = None,
-    batch_context_lengths: Sequence[TensorType] | None = None,
+    batch_context_lengths: BatchContext[tuple[TensorType, ...]] | None = None,
     ep: object | None = None,
+    hisparse: Sequence[TensorType] = (),
     lora: Sequence[TensorType] = (),
     constants: object | None = None,
     state: Sequence[Any] = (),
     scratch: Sequence[BufferType] = (),
     input_layout: Sequence[str] | None = None,
-) -> OrderedDict[str, object]:
+) -> DecoderGraphInputs:
     """Returns a ``DECODER`` graph's input types, keyed by field.
 
     The keys are the :class:`~max.pipelines.lib.role_contracts.DecoderInputs`
     fields the deployment sets, in its order, and the leaves are the graph's
-    inputs.
+    inputs. The graph takes the tree as its one argument, so an exported
+    graph names its inputs. It takes ``vision`` as a
+    :class:`~max.nn.legacy.graph_groups.VisionMerge` group, the kind a
+    serving engine feeds image embeddings by, ``scratch`` as a
+    :class:`~max.nn.legacy.graph_groups.DecoderGraphScratch` group, and
+    ``token_positions`` of more than one axis, M-RoPE's
+    ``[3, total_seq_len]``, as a
+    :class:`~max.nn.legacy.graph_groups.MRoPEPositions` group.
 
     Args:
         kv_params: The KV cache parameters that supply the ``kv`` subtree.
@@ -318,11 +473,13 @@ def decoder_input_types(
             with a ``VISION`` module. A graph built with them takes them on
             every batch, empty when the batch has no images.
         token_positions: The absolute position of each ragged token.
-        batch_context_lengths: Each replica's context-length input type,
-            when the decoder reads them.
+        batch_context_lengths: The context-length input types, when the
+            decoder reads them, under the field of the length it reads.
         ep: The expert-parallel input types, when serving with expert
             parallelism, in the layout of the config's
             :attr:`~max.pipelines.lib.registration_runtime.ExpertParallelDeploymentConfig.expert_parallel_inputs`.
+        hisparse: The per-device host and hot tables, followed by the CPU
+            mirror, when the decoder enables HiSparse.
         lora: The LoRA input types, when serving LoRA adapters.
         constants: The checkpoint-backed deployment input types.
         state: The input types of the decoder's per-request state.
@@ -347,13 +504,22 @@ def decoder_input_types(
     )
     types["kv"] = kv_params.get_symbolic_inputs()
     if token_positions is not None:
-        types["token_positions"] = token_positions
+        types["token_positions"] = (
+            MRoPEPositions(position_ids=token_positions)
+            if token_positions.rank > 1
+            else token_positions
+        )
     if vision is not None:
-        types["vision"] = vision
+        types["vision"] = VisionMerge(
+            image_embeddings=vision.embeddings,
+            image_token_indices=vision.scatter_indices,
+        )
     if batch_context_lengths is not None:
-        types["batch_context_lengths"] = tuple(batch_context_lengths)
+        types["batch_context_lengths"] = batch_context_lengths
     if ep is not None:
         types["ep"] = ep
+    if hisparse:
+        types["hisparse"] = tuple(hisparse)
     if lora:
         types["lora"] = tuple(lora)
     if constants is not None:
@@ -361,7 +527,7 @@ def decoder_input_types(
     if state:
         types["state"] = tuple(state)
     if scratch:
-        types["scratch"] = tuple(scratch)
+        types["scratch"] = DecoderGraphScratch(buffers=tuple(scratch))
     order = _FIELD_ORDER if input_layout is None else tuple(input_layout)
     if input_layout is not None:
         duplicates = sorted({name for name in order if order.count(name) > 1})
@@ -372,7 +538,58 @@ def decoder_input_types(
                 f"invalid decoder input_layout: duplicate fields {duplicates}, "
                 f"unknown fields {unknown}, missing fields {missing}"
             )
-    return OrderedDict((name, types[name]) for name in order if name in types)
+    return DecoderGraphInputs(
+        (name, types[name]) for name in order if name in types
+    )
+
+
+def _decoder_fields(inputs: Mapping[str, Any]) -> OrderedDict[str, Any]:
+    """Returns a decoder graph's named inputs as its role's fields.
+
+    The graph takes ``vision`` as a ``vision_merge`` group, which the decoder
+    reads as :class:`~max.pipelines.lib.role_contracts.VisionInputs`.
+    It takes ``batch_context_lengths``, ``scratch`` and multi-axis
+    ``token_positions`` as ``batch_context``, ``decoder_scratch`` and
+    ``mrope_positions`` groups, which it reads as their tensors alone.
+    """
+    fields = OrderedDict(inputs)
+    if isinstance(positions := fields.get("token_positions"), MRoPEPositions):
+        fields["token_positions"] = positions["position_ids"]
+    if (vision := fields.get("vision")) is not None:
+        fields["vision"] = VisionInputs(
+            embeddings=vision["image_embeddings"],
+            scatter_indices=vision["image_token_indices"],
+        )
+    if (lengths := fields.get("batch_context_lengths")) is not None:
+        fields["batch_context_lengths"] = tuple(tree.leaves(lengths))
+    if (scratch := fields.get("scratch")) is not None:
+        fields["scratch"] = tuple(scratch["buffers"])
+    return fields
+
+
+def _signal_buffer_index(
+    input_types: Mapping[str, object], input_layout: Sequence[str] | None
+) -> int | None:
+    """Returns where a ModuleV3 decoder's graph takes its signal buffers.
+
+    A decoder whose ``input_layout`` names ``signals`` takes them there:
+    after the graph inputs of every field before it, a distributed field
+    taking one input per device. Otherwise its compiled graph adds them after
+    the last input, and only on several devices.
+
+    Args:
+        input_types: The graph's input types, keyed by field.
+        input_layout: The decoder's ``input_layout``, if it declares one.
+    """
+    if input_layout is None or "signals" not in input_layout:
+        return None
+    before = input_layout[: list(input_layout).index("signals")]
+    return sum(
+        leaf.mesh.num_devices if isinstance(leaf, TensorLayout) else 1
+        for name in before
+        if name in input_types
+        for leaf in tree.leaves(input_types[name])
+    )
 
 
 def decoder_vision_input_types(
@@ -436,6 +653,9 @@ class DecoderModelInputs(ModelInputs):
     ep_inputs: tuple[Buffer, ...] = ()
     """The expert-parallel communication buffers, under expert parallelism."""
 
+    hisparse_inputs: tuple[Buffer, ...] = ()
+    """The HiSparse tables and host mirror, when declared."""
+
     signal_buffers: tuple[Buffer, ...] = ()
     """The graph-API decoder's allreduce signal buffers, when required."""
 
@@ -478,6 +698,7 @@ class DecoderModelInputs(ModelInputs):
                 else None
             ),
             ep=self.ep_inputs,
+            hisparse=self.hisparse_inputs,
             lora=tuple(self.lora_buffers),
             constants=self.constants,
             state=self.state,
@@ -514,15 +735,19 @@ class DecoderBatchProcessor(BatchProcessor[TextContext, DecoderModelInputs]):
     def bind_input_tree(self, input_tree: OrderedDict[str, object]) -> None:
         """Binds the graph's inputs, and sizes the ones this fills."""
         super().bind_input_tree(input_tree)
-        _, self._input_tree_def = tree.flatten(input_tree)
-        self._batch_context_lengths = (
-            BatchContextLengths(
-                self.runtime.data_parallel_degree,
+        _, self._input_tree_def = tree.flatten(_decoder_fields(input_tree))
+        # One per replica, or one per device of each replica, as declared.
+        lengths = tree.leaves(input_tree.get("batch_context_lengths", ()))
+        self._batch_context_lengths = None
+        if lengths:
+            assert isinstance(lengths[0], TensorType)
+            replicas = self.runtime.data_parallel_degree
+            self._batch_context_lengths = BatchContextLengths(
+                replicas,
                 self.runtime.pipeline_config.model.kv_cache.kv_cache_page_size,
+                devices_per_replica=len(lengths) // max(1, replicas),
+                dtype=lengths[0].dtype,
             )
-            if "batch_context_lengths" in input_tree
-            else None
-        )
 
     def bind_ep_comm_initializer(
         self, initializer: ExpertParallelExchange | None
@@ -637,26 +862,11 @@ class DecoderBatchProcessor(BatchProcessor[TextContext, DecoderModelInputs]):
             input_tree_def=self._input_tree_def,
         )
         if self.input_tree is not None and "token_positions" in self.input_tree:
-            position_type = self.input_tree["token_positions"]
+            position_type = _decoder_fields(self.input_tree)["token_positions"]
             assert isinstance(position_type, TensorType)
-            positions = (
-                np.concatenate(
-                    [
-                        np.arange(
-                            ctx.tokens.current_position
-                            - ctx.tokens.active_length,
-                            ctx.tokens.current_position,
-                            dtype=position_type.dtype.to_numpy(),
-                        )
-                        for ctx in context_batch
-                    ]
-                )
-                if context_batch
-                else np.empty(0, dtype=position_type.dtype.to_numpy())
-            )
-            inputs.token_positions = Buffer.from_numpy(positions).to(
-                position_type.device.to_device()
-            )
+            inputs.token_positions = Buffer.from_numpy(
+                self.token_positions(context_batch, position_type)
+            ).to(position_type.device.to_device())
         if data_parallel_degree > 1:
             inputs.host_input_row_offsets = Buffer.from_numpy(input_row_offsets)
             inputs.data_parallel_splits = Buffer.from_numpy(
@@ -681,6 +891,28 @@ class DecoderBatchProcessor(BatchProcessor[TextContext, DecoderModelInputs]):
             inputs.scratch = self.scratch.buffers
         return inputs
 
+    def token_positions(
+        self, context_batch: Sequence[TextContext], position_type: TensorType
+    ) -> npt.NDArray[np.integer[Any]]:
+        """Returns each ragged token's absolute position in its sequence.
+
+        A decoder that declares positions of another shape overrides this
+        in its batch processor.
+        """
+        dtype = position_type.dtype.to_numpy()
+        if not context_batch:
+            return np.empty(0, dtype=dtype)
+        return np.concatenate(
+            [
+                np.arange(
+                    ctx.tokens.current_position - ctx.tokens.active_length,
+                    ctx.tokens.current_position,
+                    dtype=dtype,
+                )
+                for ctx in context_batch
+            ]
+        )
+
     def process_outputs(
         self, outputs: Sequence[Buffer | object]
     ) -> ModelOutputs:
@@ -692,37 +924,125 @@ class DecoderBatchProcessor(BatchProcessor[TextContext, DecoderModelInputs]):
         )
 
 
-class _DecoderGraph(Module[..., DecoderOutputs]):
+_GroupedOutputs: TypeAlias = (
+    GroupedDecoderOutputs[Tensor]
+    | tuple[GroupedDecoderOutputs[Tensor], RequestStateGroup]
+)
+"""A decoder graph's outputs, named by group as :func:`_grouped_outputs`
+names them."""
+
+
+class _DecoderGraph(
+    Module[[DecoderGraphInputs], _GroupedOutputs | DecoderOutputs]
+):
     """Calls a decoder with :class:`DecoderInputs` built from its graph inputs.
 
-    The graph takes the leaves of :func:`decoder_input_types` in order, and
-    binds the LoRA inputs into the decoder's LoRA layers before calling it.
-    It is name-transparent to the decoder, so the weight names are the
-    decoder's own.
+    The graph takes the :func:`decoder_input_types` tree as its one argument
+    and returns the decoder's outputs named by group, so an exported graph
+    names both. A pipeline stage before the last returns what it hands the
+    next stage, in the tree the decoder returns it. The graph binds the LoRA
+    inputs into the decoder's LoRA layers before calling it. It is
+    name-transparent to the decoder, so the weight names are the decoder's
+    own.
     """
 
     def __init__(
         self,
         decoder: Module[[DecoderInputs], DecoderOutputs],
-        input_types: Mapping[str, object],
+        *,
         lora_manager: LoRAManagerV3 | None = None,
+        return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE,
+        last_stage: bool = True,
     ) -> None:
         super().__init__()
         # The LoRA weight adapter nests every checkpoint key under `model.`.
         decoder.name_transparent = lora_manager is None
         self.model = decoder
-        # A plain dict flattens in sorted key order; the graph takes its
-        # inputs in field order.
-        _, self.input_tree = tree.flatten(OrderedDict(input_types))
         self.lora_manager = lora_manager
+        self.return_hidden_states = return_hidden_states
+        self.last_stage = last_stage
 
-    def forward(self, *inputs: Tensor) -> DecoderOutputs:
+    def forward(
+        self, inputs: DecoderGraphInputs
+    ) -> _GroupedOutputs | DecoderOutputs:
         """Groups the graph's inputs into fields and runs the decoder."""
-        fields = DecoderInputs(**tree.unflatten(self.input_tree, inputs))
+        fields = DecoderInputs(**_decoder_fields(inputs))
         if fields.lora is not None:
             assert self.lora_manager is not None
             self.lora_manager.bind_inputs(self.model, fields.lora)
-        return self.model(fields)
+        outputs = self.model(fields)
+        if not self.last_stage:
+            return outputs
+        return _grouped_outputs(outputs, self.return_hidden_states)
+
+
+def _grouped_outputs(
+    outputs: DecoderOutputs, return_hidden_states: ReturnHiddenStates
+) -> _GroupedOutputs:
+    """Names a decoder's outputs by group, as a graph-API decoder's are.
+
+    The role's fields go in a ``logits`` group, then a ``hidden_states`` group
+    keyed by ``return_hidden_states`` when there are any, and its per-request
+    ``state`` follows in a
+    :class:`~max.pipelines.lib.request_state.RequestStateGroup`. The leaves
+    keep the role's order, so the graph's outputs do too.
+    """
+    grouped: GroupedDecoderOutputs[Tensor] = GroupedDecoderOutputs(
+        logits=Logits(
+            next_token_logits=outputs.next_token_logits,
+            logits=outputs.logits,
+            logit_offsets=outputs.logit_offsets,
+        )
+    )
+    if outputs.hidden_states is not None:
+        grouped["hidden_states"] = HiddenStates(
+            {return_hidden_states.value: (outputs.hidden_states,)}
+        )
+    if not outputs.state:
+        return grouped
+    return grouped, RequestStateGroup(state=tuple(outputs.state))
+
+
+def _role_outputs(outputs: _GroupedOutputs) -> DecoderOutputs:
+    """Returns what :func:`_grouped_outputs` named as the role's outputs."""
+    state: tuple[Tensor, ...] | None = None
+    if isinstance(outputs, tuple):
+        outputs, state_group = outputs
+        state = state_group["state"]
+    logits = outputs.logits
+    hidden_states: Tensor | None = None
+    if "hidden_states" in outputs:
+        (hidden_states,) = outputs.hidden_states.tensors()
+    return DecoderOutputs(
+        next_token_logits=logits["next_token_logits"],
+        logits=logits.get("logits"),
+        logit_offsets=logits.get("logit_offsets"),
+        hidden_states=hidden_states,
+        state=state,
+    )
+
+
+class _DenoiserGraph(
+    Module[[BlockDiffusionGraphInputs], BlockDiffusionOutputs]
+):
+    """Calls a denoiser with its graph inputs as :class:`BlockDiffusionInputs`.
+
+    It is name-transparent to the denoiser, so the weight names are the
+    denoiser's own.
+    """
+
+    def __init__(
+        self, denoiser: Module[[BlockDiffusionInputs], BlockDiffusionOutputs]
+    ) -> None:
+        super().__init__()
+        denoiser.name_transparent = True
+        self.model = denoiser
+
+    def forward(
+        self, inputs: BlockDiffusionGraphInputs
+    ) -> BlockDiffusionOutputs:
+        """Groups the graph's inputs into fields and runs the denoiser."""
+        return self.model(BlockDiffusionInputs(**inputs))
 
 
 def _returned_types(spec: GraphSpec) -> tree.Tree[Type[Any]]:
@@ -868,9 +1188,14 @@ class ModuleV3DecoderPipelineModel(
     """The expert-parallel buffers the decoder takes, under expert
     parallelism."""
 
+    export_records: Mapping[str, object] = MappingProxyType({})
+    """What the completed config records for exporters, by name
+    (:meth:`~max.pipelines.lib.registration_runtime.DeploymentConfig.export_records`)."""
+
     _session: InferenceSession
     _runtime: ModuleRuntime
     _vision_module: Any = None
+    _vision_config: object | None = None
 
     batch_processor_cls: ClassVar[type[BatchProcessor[Any, Any]] | None] = (
         DecoderBatchProcessor
@@ -934,7 +1259,7 @@ class ModuleV3DecoderPipelineModel(
         self._session = session
         models = super().load_graphs(session)
         # A pipeline stage after the first compiles no VISION graph.
-        vision_model = self.compiled_modules.get(GraphRole.VISION)
+        vision_model = self.compiled_graphs.get(GraphRole.VISION)
         if (
             vision_model is not None
             and (vision := self.vision_encoding) is not None
@@ -945,7 +1270,12 @@ class ModuleV3DecoderPipelineModel(
         return models
 
     def _load_state_dict(self) -> dict[str, Any]:
-        """Loads raw keys when config finalization precedes weight transforms."""
+        """Loads raw keys when config finalization precedes weight transforms.
+
+        A checkpoint that loads through rules names each module's weights.
+        """
+        if naming := _registered_weight_naming(type(self), self.adapter):
+            self.weight_naming = naming
         if getattr(
             type(self).model_config_cls, "preserve_checkpoint_keys", False
         ):
@@ -959,7 +1289,9 @@ class ModuleV3DecoderPipelineModel(
         """Finalizes the config, then completes it with the deployment.
 
         The expert-parallel buffers initialize in between, since they depend
-        on the finalized config and the modules read their node ID.
+        on the finalized config and the modules read their node ID. What the
+        completed config records for exporters becomes
+        :attr:`export_records`.
 
         Raises:
             ValueError: If the deployment asks for expert parallelism and the
@@ -990,12 +1322,14 @@ class ModuleV3DecoderPipelineModel(
                     f"{type(config).__qualname__} doesn't support expert "
                     "parallelism"
                 )
-            runtime, self.ep_comm_initializer = initialize_ep_comm_buffers(
-                config, runtime, self._session
+            runtime, self.ep_comm_initializer, ep_init = (
+                initialize_ep_comm_buffers(config, runtime, self._session)
             )
+            self.compiled_modules = {**self.compiled_modules, **ep_init}
         self._runtime = runtime
         if isinstance(config, DeploymentConfig):
-            return config.apply_runtime(runtime)
+            config = config.apply_runtime(runtime)
+            self.export_records = config.export_records(runtime)
         return config
 
     def _decoder_ep_inputs(self, model_config: Any) -> object | None:
@@ -1004,6 +1338,41 @@ class ModuleV3DecoderPipelineModel(
             return None
         assert isinstance(model_config, ExpertParallelDeploymentConfig)
         return ep_input_tree(model_config, self._runtime.ep)
+
+    def _batch_context_length_types(
+        self, model_config: Any
+    ) -> BatchContext[tuple[TensorType, ...]] | None:
+        """Returns the decoder's ``batch_context_lengths`` input types.
+
+        One ``int32`` ``length`` per replica. Replicas that span several
+        devices of a ``(dp, tp)`` mesh take one per device, each device its
+        replica's. A decoder that sets ``takes_total_context_length`` takes
+        one ``uint32`` ``total_length`` per device instead. ``None`` when its
+        config doesn't take them.
+        """
+        if not (
+            isinstance(model_config, DeploymentConfig)
+            and model_config.takes_batch_context_lengths
+        ):
+            return None
+        replicas = self._data_parallel_degree
+        devices_per_replica = len(self.devices) // max(1, replicas)
+        if getattr(type(self).decoder_cls, "takes_total_context_length", False):
+            return BatchContext(
+                total_length=batch_context_length_types(
+                    replicas,
+                    devices_per_replica=devices_per_replica,
+                    dtype=DType.uint32,
+                )
+            )
+        mesh = self._device_mesh()
+        if not (DP in mesh.axis_names and TP in mesh.axis_names):
+            devices_per_replica = 1
+        return BatchContext(
+            length=batch_context_length_types(
+                replicas, devices_per_replica=devices_per_replica
+            )
+        )
 
     def _decoder_vision_inputs(
         self, model_config: Any
@@ -1048,29 +1417,123 @@ class ModuleV3DecoderPipelineModel(
         stage = self.pipeline_config.model.pipeline_stage
         if vision_cls is None or (stage is not None and not stage.is_first):
             return None
-        enabled = getattr(vision_cls, "is_enabled", None)
-        if enabled is not None and not enabled(model_config):
-            self._vision_module = None
+        if not _vision_enabled(vision_cls, model_config):
+            self._vision_module = self._vision_config = None
             return None
-        # A registered module takes its config, which type[Module] can't say.
-        constructor: Any = vision_cls
-        with F.lazy():
-            vision = constructor(model_config)
-            vision.to(self.devices[0])
+        vision = _build_vision(vision_cls, model_config, self.devices[0])
         self._vision_module = vision
-        return GraphSpec(
+        self._vision_config = model_config
+        return _vision_spec(
             vision,
-            graph_name(vision_cls),
-            tuple(vision.input_types()),
-            weights=_cast_to_parameter_dtypes(
-                vision,
-                role_weights(
-                    self._checkpoint if checkpoint is None else checkpoint,
-                    model_config,
-                    GraphRole.VISION,
-                ),
-            ),
+            model_config,
+            self._checkpoint if checkpoint is None else checkpoint,
         )
+
+    def vision_metadata(self) -> VisionMetadata | None:
+        """Returns the built ``VISION`` module's media layout.
+
+        It reads :meth:`vision_metadata_for` with the config the module is
+        built with. ``None`` before the module is built, or when it isn't.
+        """
+        if self._vision_config is None:
+            return None
+        return self.vision_metadata_for(
+            self.pipeline_config, self._vision_config
+        )
+
+    def vision_preprocess_spec(self) -> GraphSpec | None:
+        """Returns the built ``VISION`` module's image preprocessing graph.
+
+        It reads :meth:`vision_preprocess_spec_for` with the config the
+        module is built with. ``None`` before the module is built, or when
+        it isn't.
+        """
+        if self._vision_config is None:
+            return None
+        return self.vision_preprocess_spec_for(
+            self.pipeline_config, self._vision_config
+        )
+
+    def vision_preprocess_video_spec(self) -> GraphSpec | None:
+        """Returns the built ``VISION`` module's video preprocessing graph.
+
+        It reads :meth:`vision_preprocess_video_spec_for` with the config
+        the module is built with. ``None`` before the module is built, or
+        when it isn't.
+        """
+        if self._vision_config is None:
+            return None
+        return self.vision_preprocess_video_spec_for(
+            self.pipeline_config, self._vision_config
+        )
+
+    @classmethod
+    def vision_metadata_for(
+        cls, pipeline_config: PipelineConfig, config: object
+    ) -> VisionMetadata | None:
+        """Returns the ``VISION`` module's ``vision_metadata`` for ``config``.
+
+        A fused speculative-decoding pipeline, which never builds this
+        pipeline model, reads its target's metadata here.
+
+        Args:
+            pipeline_config: The pipeline's configuration.
+            config: The finalized config the ``VISION`` module is built with.
+
+        Returns:
+            The media layout, or ``None`` when no ``VISION`` module serves
+            ``config`` or it declares no ``vision_metadata``.
+        """
+        hook = cls._vision_hook("vision_metadata", config)
+        return None if hook is None else hook(pipeline_config, config)
+
+    @classmethod
+    def vision_preprocess_spec_for(
+        cls, pipeline_config: PipelineConfig, config: object
+    ) -> GraphSpec | None:
+        """Returns the ``VISION`` module's ``vision_preprocess_spec``.
+
+        Args:
+            pipeline_config: The pipeline's configuration.
+            config: The finalized config the ``VISION`` module is built with.
+
+        Returns:
+            The image preprocessing graph, or ``None`` when no ``VISION``
+            module serves ``config`` or it declares no
+            ``vision_preprocess_spec``.
+        """
+        hook = cls._vision_hook("vision_preprocess_spec", config)
+        return None if hook is None else hook(pipeline_config, config)
+
+    @classmethod
+    def vision_preprocess_video_spec_for(
+        cls, pipeline_config: PipelineConfig, config: object
+    ) -> GraphSpec | None:
+        """Returns the ``VISION`` module's ``vision_preprocess_video_spec``.
+
+        Args:
+            pipeline_config: The pipeline's configuration.
+            config: The finalized config the ``VISION`` module is built with.
+
+        Returns:
+            The graph that preprocesses one segment of a video clip, or
+            ``None`` when no ``VISION`` module serves ``config`` or it
+            declares no ``vision_preprocess_video_spec``.
+        """
+        hook = cls._vision_hook("vision_preprocess_video_spec", config)
+        return None if hook is None else hook(pipeline_config, config)
+
+    @classmethod
+    def _vision_hook(cls, name: str, config: object) -> Any:
+        """Returns the ``VISION`` class's hook ``name`` that serves ``config``.
+
+        ``None`` without a ``VISION`` class, when its ``is_enabled`` turns it
+        off for ``config``, or when it declares no such hook.
+        """
+        vision_cls = cls.vision_cls
+        if vision_cls is None or not _vision_enabled(vision_cls, config):
+            return None
+        return getattr(vision_cls, name, None)
 
     def graph_specs(self, model_config: Any) -> dict[str, GraphSpec]:
         """Returns the decoder graph, and the vision graph when registered.
@@ -1142,6 +1605,7 @@ class ModuleV3DecoderPipelineModel(
             state_dict, model_config
         )
         lora_types: list[TensorType] = []
+        input_layout = getattr(decoder_cls, "input_layout", None)
         with F.lazy(), default_dtype(module_default_dtype):
             decoder = self._instantiate_module(model_config)
             if lora_manager is not None:
@@ -1155,22 +1619,18 @@ class ModuleV3DecoderPipelineModel(
             self.device_refs[0],
             data_parallel_degree=self._data_parallel_degree,
             vision=self._decoder_vision_inputs(model_config),
-            token_positions=(
-                TensorType(
-                    decoder_cls.token_position_dtype,
-                    ["total_seq_len"],
-                    device=self.device_refs[0],
-                )
-                if hasattr(decoder_cls, "token_position_dtype")
-                else None
+            token_positions=token_position_type(
+                decoder_cls, model_config, self.device_refs[0]
             ),
-            batch_context_lengths=(
-                batch_context_length_types(self._data_parallel_degree)
-                if isinstance(model_config, DeploymentConfig)
-                and model_config.takes_batch_context_lengths
-                else None
+            batch_context_lengths=self._batch_context_length_types(
+                model_config
             ),
             ep=self._decoder_ep_inputs(model_config),
+            hisparse=(
+                model_config.hisparse_input_types()
+                if getattr(model_config, "hisparse", None) is not None
+                else ()
+            ),
             lora=lora_types,
             constants=constants.input_types if constants is not None else None,
             state=(
@@ -1179,13 +1639,18 @@ class ModuleV3DecoderPipelineModel(
                 else ()
             ),
             scratch=scratch.input_types if scratch is not None else (),
-            input_layout=getattr(decoder_cls, "input_layout", None),
+            input_layout=input_layout,
         )
         # A stage after the first takes the previous stage's return last.
         if boundary := stage_input_types(stage, ()):
             (decoder_inputs["stage_boundary"],) = boundary
-        input_types = self._bind_graph_inputs(decoder_inputs)
-        graph = _DecoderGraph(decoder, input_types, lora_manager)
+        self._bind_graph_inputs(decoder_inputs)
+        graph = _DecoderGraph(
+            decoder,
+            lora_manager=lora_manager,
+            return_hidden_states=self.return_hidden_states,
+            last_stage=stage is None or stage.is_last,
+        )
         if stage is not None:
             # A stage holds only its own layers.
             declared = dict(graph.parameters)
@@ -1197,34 +1662,17 @@ class ModuleV3DecoderPipelineModel(
         spec = GraphSpec(
             graph,
             graph_name(decoder_cls),
-            tuple(tree.leaves(input_types)),
+            (decoder_inputs,),
             weights=_cast_to_parameter_dtypes(graph, state_dict),
+            signal_buffer_index=_signal_buffer_index(
+                decoder_inputs, input_layout
+            ),
         )
         if stage is not None and not stage.is_last and stage.trace_only:
             raise_stage_traced(_returned_types(spec))
         specs: dict[str, GraphSpec] = {GraphRole.DECODER: spec}
         if vision_spec is not None:
             specs[GraphRole.VISION] = vision_spec
-        if (
-            isinstance(model_config, DeploymentConfig)
-            and model_config.export_ep_init
-            and self._runtime.ep is not None
-        ):
-            ep = self._runtime.ep
-            init = EPInit(
-                ep,
-                [
-                    _ep_counter_words(
-                        ep.n_experts,
-                        ep.n_gpus_per_node,
-                        ep.use_allreduce,
-                        ep.moe_dim,
-                    )
-                ],
-            )
-            specs[GraphRole.EP_INIT] = GraphSpec(
-                init, "ep_init", init.input_types(), weights={}
-            )
         return specs
 
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
@@ -1236,19 +1684,23 @@ class ModuleV3DecoderPipelineModel(
         """
         assert isinstance(model_inputs, DecoderModelInputs)
         compiled = self.model
-        assert isinstance(compiled, CompiledCallable)
+        assert isinstance(compiled, (CompiledCallable, _EagerCallable))
         raw_outputs = iter(compiled.execute_raw(*model_inputs.buffers))
-        outputs = tree.unflatten(
-            compiled.out_tree,
-            [
-                Tensor._from_shards(
-                    tuple(
-                        itertools.islice(raw_outputs, layout.mesh.num_devices)
-                    ),
-                    layout.mapping,
-                )
-                for layout in compiled.out_layouts
-            ],
+        outputs = _role_outputs(
+            tree.unflatten(
+                compiled.out_tree,
+                [
+                    Tensor._from_shards(
+                        tuple(
+                            itertools.islice(
+                                raw_outputs, layout.mesh.num_devices
+                            )
+                        ),
+                        layout.mapping,
+                    )
+                    for layout in compiled.out_layouts
+                ],
+            )
         )
         if self._state_store is not None:
             self._state_store.update(
@@ -1258,13 +1710,312 @@ class ModuleV3DecoderPipelineModel(
         return self._to_model_outputs(outputs)
 
 
+class BlockDiffusionPipelineModel(ModuleV3DecoderPipelineModel):
+    """Serves a registered block-diffusion text-generation architecture.
+
+    :func:`module_pipeline_model` subclasses it for a registration with a
+    ``BLOCK_DIFFUSION`` module. The registered ``DECODER`` is the causal
+    encoder the block-diffusion pipeline runs through :meth:`execute` to
+    commit tokens into the KV cache; the registered ``BLOCK_DIFFUSION``
+    module is one denoise step, compiled as a second text graph and driven
+    through :meth:`execute_denoise_step`. The ``BLOCK_DIFFUSION`` role also
+    selects the
+    :class:`~max.pipelines.lib.pipeline_variants.block_diffusion_text_generation.BlockDiffusionTextGenerationPipeline`
+    that drives it.
+    """
+
+    denoiser_cls: ClassVar[type[Module[..., Any]]]
+    """The registered ``BLOCK_DIFFUSION`` module class."""
+
+    max_canvas_batch: ClassVar[int | None] = None
+    """How many canvases one denoise step takes, when the registered
+    ``BLOCK_DIFFUSION`` module bounds it (see :func:`_max_canvas_batch`).
+    ``None`` leaves the block-diffusion pipeline's own bound."""
+
+    # The denoise loop computes no per-token logits. The capability check
+    # compares against the base stub, so rebinding it reports none.
+    compute_log_probabilities = PipelineModel.compute_log_probabilities
+
+    @property
+    def config(self) -> Any:
+        """The finalized config, with the canvas geometry the pipeline reads.
+
+        It is the config the graphs were built with, which
+        :meth:`graph_specs` binds to the batch processor.
+        """
+        processor = self.batch_processor
+        assert processor is not None and processor.config is not None, (
+            f"{type(self).__qualname__} reads its config before the model is"
+            " built"
+        )
+        return processor.config
+
+    def graph_specs(self, model_config: Any) -> dict[str, GraphSpec]:
+        """Adds the denoiser's graph to the registered decoder's.
+
+        Raises:
+            TypeError: If the denoiser doesn't have ``vocab_size``.
+        """
+        specs = super().graph_specs(model_config)
+        denoiser_cls = type(self).denoiser_cls
+        checkpoint = prepare_weights(self._checkpoint, model_config)
+        state_dict = role_weights(
+            self._prepare_state_dict(checkpoint, model_config),
+            model_config,
+            GraphRole.BLOCK_DIFFUSION,
+        )
+        module_default_dtype = self._module_default_dtype(
+            state_dict, model_config
+        )
+        with F.lazy(), default_dtype(module_default_dtype):
+            denoiser = construct_module(
+                denoiser_cls, model_config, self._device_mesh()
+            )
+        vocab_size = getattr(denoiser, "vocab_size", None)
+        if not isinstance(vocab_size, int):
+            raise TypeError(
+                f"the BLOCK_DIFFUSION module {denoiser_cls.__qualname__} "
+                "needs vocab_size, the width of its self-conditioning logits"
+            )
+        graph = _DenoiserGraph(denoiser)
+        specs[GraphRole.BLOCK_DIFFUSION] = GraphSpec(
+            graph,
+            graph_name(denoiser_cls),
+            (
+                _block_diffusion_input_types(
+                    self.kv_params, self.device_refs[0], vocab_size
+                ),
+            ),
+            weights=_cast_to_parameter_dtypes(graph, state_dict),
+        )
+        return specs
+
+    def block_diffusion_metadata(self) -> Any:
+        """Returns the canvas geometry and denoise schedule of the export.
+
+        The geometry comes from the finalized config the graphs were built
+        with; the schedule from the pipeline's own generation config —
+        loaded once at construction, the same object MAX Serve's sampling
+        resolution reads — with the HF defaults the block-diffusion
+        pipeline applies. ``max export`` records them beside the
+        ``block_diffusion`` graph, so a serving engine runs the same
+        denoise loop the Python pipeline does.
+        """
+        # TODO(MXSERV-917): sync this section's fields with that ticket's
+        # denoise-schedule contract once it merges.
+        from max.pipelines.lib.pipeline_variants.block_diffusion_text_generation import (
+            _DEFAULT_GENERATION_PARAMS,
+        )
+
+        config = self.config
+        params: dict[str, Any] = dict(_DEFAULT_GENERATION_PARAMS)
+        # The pipeline's generation config keeps the checkpoint's unknown
+        # keys as attributes, so the diffusion schedule rides it without a
+        # second load.
+        gc = self.pipeline_config.model.generation_config
+        for key in params:
+            value = getattr(gc, key, None)
+            if value is not None:
+                params[key] = value
+        sampler_cfg = getattr(gc, "sampler_config", None)
+        if isinstance(sampler_cfg, dict):
+            params["entropy_bound"] = sampler_cfg.get(
+                "entropy_bound", params["entropy_bound"]
+            )
+        return {
+            "canvas_length": config.canvas_length,
+            "top_k": config.top_k,
+            # The Python pipeline caps a denoise step at
+            # `_MAX_CANVAS_BATCH` (16) canvases whatever the module
+            # declares; the contract records the same cap so the engine
+            # plans the same sub-batches.
+            "max_canvas_batch": min(
+                _max_canvas_batch(type(self).denoiser_cls) or 16, 16
+            ),
+            **params,
+        }
+
+    def execute_denoise_step(
+        self,
+        canvas_tokens: Buffer,
+        input_row_offsets: Buffer,
+        sc_logits: Buffer,
+        sc_enabled: Buffer,
+        temperature: Buffer,
+        kv_cache_inputs: KVCacheInputs[Buffer, Buffer],
+    ) -> tuple[Buffer, Buffer, Buffer, Buffer, Buffer]:
+        """Runs one denoise step over the canvas.
+
+        Args:
+            canvas_tokens: The canvas token ids, ``[total_seq_len]`` int64.
+            input_row_offsets: Each canvas's start in ``canvas_tokens``.
+            sc_logits: The previous step's processed logits, bf16
+                ``[total_seq_len, vocab]``.
+            sc_enabled: ``[1]`` float32; zero on the first step.
+            temperature: ``[1]`` float32; the step's schedule temperature.
+            kv_cache_inputs: The batch's paged KV cache inputs, as the KV
+                manager's ``runtime_inputs`` returns them.
+
+        Returns:
+            The fields of
+            :class:`~max.pipelines.lib.role_contracts.BlockDiffusionOutputs`,
+            in its order.
+        """
+        compiled = self.compiled_modules[GraphRole.BLOCK_DIFFUSION]
+        assert isinstance(compiled, CompiledCallable)
+        inputs = _block_diffusion_graph_inputs(
+            BlockDiffusionInputs[Buffer](
+                tokens=canvas_tokens,
+                input_row_offsets=input_row_offsets,
+                sc_logits=sc_logits,
+                sc_enabled=sc_enabled,
+                temperature=temperature,
+                kv=kv_cache_inputs,
+            )
+        )
+        outputs = tree.unflatten(
+            compiled.out_tree, compiled.execute_raw(*tree.leaves(inputs))
+        )
+        assert isinstance(outputs, BlockDiffusionOutputs)
+        return (
+            outputs.logits,
+            outputs.argmax,
+            outputs.top_k_probs,
+            outputs.top_k_indices,
+            outputs.entropy,
+        )
+
+
+def _vision_enabled(
+    vision_cls: type[Module[..., Any]], model_config: object
+) -> bool:
+    """Returns whether a registered ``VISION`` module serves ``model_config``.
+
+    It does unless its ``is_enabled`` turns it off.
+    """
+    enabled = getattr(vision_cls, "is_enabled", None)
+    return enabled is None or bool(enabled(model_config))
+
+
+class _VisionGraph(
+    Module[
+        [Mapping[str, Mapping[str, Tensor]]],
+        OrderedDict[str, VisionEmbeddings[Tensor]],
+    ]
+):
+    """Calls a vision encoder with the fields of its named input tree.
+
+    The graph takes the tree as its one argument and returns the embeddings
+    in a ``vision_embeddings`` group, so an exported graph names both, as a
+    graph-API encoder's does. It is name-transparent to the encoder, so the
+    weight names are the encoder's own.
+    """
+
+    def __init__(self, encoder: Module[..., Tensor]) -> None:
+        super().__init__()
+        encoder.name_transparent = True
+        self.model = encoder
+
+    def forward(
+        self, inputs: Mapping[str, Mapping[str, Tensor]]
+    ) -> OrderedDict[str, VisionEmbeddings[Tensor]]:
+        """Passes each field as the encoder's argument of that name."""
+        return vision_outputs((self.model(**group_fields(inputs)),))
+
+
+def _build_vision(
+    vision_cls: type[Module[..., Any]], model_config: Any, device: Device
+) -> Any:
+    """Constructs a registered ``VISION`` module on ``device``."""
+    # A registered module takes its config, which type[Module] can't say.
+    constructor: Any = vision_cls
+    with F.lazy():
+        vision = constructor(model_config)
+        vision.to(device)
+    return vision
+
+
+def _vision_spec(
+    vision: Any,
+    model_config: Any,
+    checkpoint: Mapping[str, Any],
+) -> GraphSpec:
+    """Returns a registered ``VISION`` module's graph.
+
+    An encoder whose ``input_types()`` is a named tree takes it through a
+    :class:`_VisionGraph`, which names the graph's outputs too.
+    """
+    input_types = vision.input_types()
+    graph: Module[..., Any] = vision
+    if isinstance(input_types, Mapping):
+        graph = _VisionGraph(vision)
+        input_types = (input_types,)
+    return GraphSpec(
+        graph,
+        graph_name(type(vision)),
+        tuple(input_types),
+        weights=_cast_to_parameter_dtypes(
+            graph, role_weights(checkpoint, model_config, GraphRole.VISION)
+        ),
+    )
+
+
+def _registered_weight_naming(
+    pipeline_model: type[ModuleV3DecoderPipelineModel],
+    adapter: WeightsAdapter | None,
+) -> dict[str, tuple[WeightEntry, ...]]:
+    """Returns the entry that names each registered module's weights, by role.
+
+    A config that keeps the checkpoint's keys or prepares the weights names
+    them itself, in its :meth:`~DeploymentConfig.weight_entries`. Otherwise
+    the checkpoint loads through the rules into the modules' names, or is
+    named by none. A module that takes its weights from under a prefix gets
+    them with the prefix stripped.
+    """
+    config_cls = pipeline_model.model_config_cls
+    if (
+        isinstance(config_cls, type)
+        and issubclass(config_cls, DeploymentConfig)
+        and (
+            config_cls.preserve_checkpoint_keys
+            or config_cls.prepare_weights
+            is not DeploymentConfig.prepare_weights
+        )
+    ):
+        return {
+            role: tuple(entries)
+            for role, entries in config_cls.weight_entries().items()
+        }
+    if not isinstance(adapter, WeightTransform):
+        return {}
+    roles = [GraphRole.DECODER]
+    if pipeline_model.vision_cls is not None:
+        roles.append(GraphRole.VISION)
+    if issubclass(pipeline_model, BlockDiffusionPipelineModel):
+        # The denoiser reads the same text weights as the encoder: one
+        # checkpoint, two graphs over it.
+        roles.append(GraphRole.BLOCK_DIFFUSION)
+    prefixes = getattr(config_cls, "weight_prefixes", {})
+    naming: dict[str, tuple[WeightEntry, ...]] = {}
+    for role in roles:
+        rules = list(adapter.rules)
+        if prefix := prefixes.get(role):
+            rules.append(WeightRenaming(f"^{re.escape(prefix)}", ""))
+        naming[role] = (
+            WeightEntry(CheckpointRole.TARGET, WeightTransform(rules)),
+        )
+    return naming
+
+
 @dataclass
 class RegisteredDecoderBuilder:
     """Constructs a registered ``DECODER`` for a caller that composes modules.
 
     A speculative pairing builds its target this way and compiles it beside
     its draft as one module, so the decoder holds no weights: it compiles
-    with those :meth:`checkpoint_weights` returns.
+    with those :meth:`checkpoint_weights` returns. The caller passes the
+    decoder its image embeddings, which the registration's ``VISION``
+    module, built by :meth:`build_vision`, encodes.
     """
 
     pipeline_model: type[ModuleV3DecoderPipelineModel]
@@ -1282,9 +2033,8 @@ class RegisteredDecoderBuilder:
         modules.
 
         Raises:
-            NotImplementedError: If the decoder reads image embeddings or
-                keeps per-request state, which a composed module doesn't
-                pass it.
+            NotImplementedError: If the decoder keeps per-request state,
+                which a composed module doesn't pass it.
             ValueError: If the deployment asks for expert or data
                 parallelism the decoder doesn't support.
         """
@@ -1292,21 +2042,15 @@ class RegisteredDecoderBuilder:
         state_requires_host = hasattr(
             decoder_cls, "state_store"
         ) and not getattr(decoder_cls, "composes_request_state", False)
-        if consumes_vision(decoder_cls) or state_requires_host:
+        if state_requires_host:
             raise NotImplementedError(
-                f"{decoder_cls.__qualname__} reads image embeddings or keeps "
-                "per-request state, which a composed module doesn't pass it"
+                f"{decoder_cls.__qualname__} keeps per-request state, which "
+                "a composed module doesn't pass it"
             )
         assert context.kv_params is not None
         pipeline_config = context.pipeline_config
         config_cls: Any = self.pipeline_model.model_config_cls
-        state_dict = (
-            {name: weight.data() for name, weight in context.weights.items()}
-            if getattr(config_cls, "preserve_checkpoint_keys", False)
-            else parse_state_dict_from_weights(
-                pipeline_config, context.weights, context.adapter
-            )
-        )
+        state_dict = self._state_dict(context)
         config: Any = finalize_config(
             dataclasses.replace(
                 config_cls.initialize(
@@ -1319,6 +2063,7 @@ class RegisteredDecoderBuilder:
             ModelOutputConfig(
                 return_logits=context.return_logits,
                 return_hidden_states=context.return_hidden_states,
+                target_layer_ids=context.target_layer_ids or None,
             ),
         )
         if isinstance(config, DeploymentConfig):
@@ -1357,6 +2102,26 @@ class RegisteredDecoderBuilder:
         )
         return module, config
 
+    def build_vision(
+        self, context: ModelLoadContext, config: object, device: Device
+    ) -> GraphSpec | None:
+        """Constructs the registration's ``VISION`` module on ``device``.
+
+        It is built as serving builds it, from ``config``, the one
+        :meth:`build_module` returned, and the checkpoint ``context`` names.
+
+        Returns:
+            The ``VISION`` graph, or ``None`` when the registration has no
+            ``VISION`` module or its ``is_enabled`` turns it off.
+        """
+        vision_cls = self.pipeline_model.vision_cls
+        if vision_cls is None or not _vision_enabled(vision_cls, config):
+            return None
+        checkpoint = prepare_weights(self._state_dict(context), config)
+        return _vision_spec(
+            _build_vision(vision_cls, config, device), config, checkpoint
+        )
+
     def checkpoint_weights(
         self, context: ModelLoadContext, config: object
     ) -> dict[str, Any]:
@@ -1368,6 +2133,44 @@ class RegisteredDecoderBuilder:
         del context, config
         weights, self._weights = self._weights, {}
         return weights
+
+    def weight_entries(
+        self, context: ModelLoadContext, config: object
+    ) -> list[WeightEntry]:
+        """Returns the entry that names the built decoder's weights.
+
+        Empty when the checkpoint doesn't load through rules into the
+        decoder's names; the decoder then compiles with
+        :meth:`checkpoint_weights`.
+        """
+        del config
+        naming = _registered_weight_naming(self.pipeline_model, context.adapter)
+        return list(naming.get(GraphRole.DECODER, ()))
+
+    def vision_weight_entries(
+        self, context: ModelLoadContext
+    ) -> list[WeightEntry]:
+        """Returns the entry that names the ``VISION`` module's weights.
+
+        Empty when the registration has no ``VISION`` module, or the
+        checkpoint doesn't load through rules into its names.
+        """
+        naming = _registered_weight_naming(self.pipeline_model, context.adapter)
+        return list(naming.get(GraphRole.VISION, ()))
+
+    def _state_dict(self, context: ModelLoadContext) -> dict[str, Any]:
+        """Returns the checkpoint ``context`` names, as serving loads it."""
+        if getattr(
+            self.pipeline_model.model_config_cls,
+            "preserve_checkpoint_keys",
+            False,
+        ):
+            return {
+                name: weight.data() for name, weight in context.weights.items()
+            }
+        return parse_state_dict_from_weights(
+            context.pipeline_config, context.weights, context.adapter
+        )
 
 
 def bind_decoder_scratch(
@@ -1470,10 +2273,13 @@ def _check_vision_registration(
     """Checks that a registration's image path is complete, or absent.
 
     Raises:
-        TypeError: If a ``VISION`` module lacks ``input_types()``, its
-            decoder doesn't consume image embeddings, or its batch processor
-            doesn't implement :class:`VisionBatchProcessor`; or if the
-            decoder consumes image embeddings with no ``VISION`` module.
+        TypeError: If a ``VISION`` module lacks ``input_types()``, sets a
+            ``vision_metadata``, ``vision_preprocess_spec`` or
+            ``vision_preprocess_video_spec`` that isn't a classmethod or a
+            staticmethod, its decoder doesn't consume image embeddings, or its
+            batch processor doesn't implement :class:`VisionBatchProcessor`;
+            or if the decoder consumes image embeddings with no ``VISION``
+            module.
     """
     if vision_cls is None:
         if consumes_vision(decoder_cls):
@@ -1486,6 +2292,21 @@ def _check_vision_registration(
         raise TypeError(
             f"the VISION module {vision_cls.__qualname__} needs input_types()"
         )
+    # The pipeline model calls each hook on the class, with no instance, so
+    # an instance method would fail only at export.
+    for hook in (
+        "vision_metadata",
+        "vision_preprocess_spec",
+        "vision_preprocess_video_spec",
+    ):
+        declared = inspect.getattr_static(vision_cls, hook, None)
+        if declared is not None and not isinstance(
+            declared, (classmethod, staticmethod)
+        ):
+            raise TypeError(
+                f"the VISION module {vision_cls.__qualname__}'s {hook} must"
+                " be a classmethod or a staticmethod"
+            )
     if not consumes_vision(decoder_cls):
         raise TypeError(
             f"{decoder_cls.__qualname__} doesn't consume image embeddings, "
@@ -1495,6 +2316,25 @@ def _check_vision_registration(
         raise TypeError(
             "a registration with a VISION module needs a batch processor "
             "that implements VisionBatchProcessor"
+        )
+
+
+def _check_block_diffusion_registration(
+    denoiser_cls: type[Module[..., Any]] | None,
+) -> None:
+    """Checks a registration's denoiser bounds its canvases sensibly.
+
+    Raises:
+        ValueError: If the ``BLOCK_DIFFUSION`` module sets a
+            ``max_canvas_batch`` below one.
+    """
+    if denoiser_cls is None:
+        return
+    cap = _max_canvas_batch(denoiser_cls)
+    if cap is not None and cap < 1:
+        raise ValueError(
+            f"the BLOCK_DIFFUSION module {denoiser_cls.__qualname__} sets "
+            f"max_canvas_batch={cap}; it must be at least 1"
         )
 
 
@@ -1516,11 +2356,11 @@ def module_pipeline_model(
     Raises:
         ValueError: If the registration names a framework-owned role, has no
             ``DECODER``.
-        NotImplementedError: If it registers a role other than ``DECODER``
-            and ``VISION``.
-        TypeError: If a registered class isn't a :class:`~max.nn.Module`, or
-            the registration's ``VISION`` module, decoder and batch processor
-            don't fit together.
+        NotImplementedError: If it registers a role other than ``DECODER``,
+            ``VISION`` and ``BLOCK_DIFFUSION``.
+        TypeError: If a registered class isn't a :class:`~max.nn.Module`,
+            or the registration's ``VISION`` module, decoder and batch
+            processor don't fit together.
     """
     registration = (config, modules, batching)
     if (cached := _PIPELINE_MODELS.get(registration)) is not None:
@@ -1543,6 +2383,7 @@ def module_pipeline_model(
     _check_vision_registration(
         decoder_cls, by_role.get(GraphRole.VISION), batching
     )
+    _check_block_diffusion_registration(by_role.get(GraphRole.BLOCK_DIFFUSION))
     name = f"{decoder_cls.__name__}PipelineModel"
     # Exporters read how tokens reach the expert dispatch off the pipeline
     # model class, to pick the matching expert-parallel backend.
@@ -1554,9 +2395,17 @@ def module_pipeline_model(
     exporter_attrs = (
         {} if layout is None else {"ep_dispatch_token_layout": layout}
     )
+    denoiser_cls = by_role.get(GraphRole.BLOCK_DIFFUSION)
+    bases: tuple[type, ...] = (ModuleV3DecoderPipelineModel,)
+    denoiser_attrs: dict[str, object] = {}
+    if denoiser_cls is not None:
+        bases = (BlockDiffusionPipelineModel,)
+        denoiser_attrs = {
+            "denoiser_cls": denoiser_cls,
+            "max_canvas_batch": _max_canvas_batch(denoiser_cls),
+        }
     # Only a decoder with state gets the release hooks, which serving
     # detects by their presence.
-    bases: tuple[type, ...] = (ModuleV3DecoderPipelineModel,)
     if hasattr(decoder_cls, "state_store"):
         bases = (RequestStateMixin, *bases)
     # Exporters build the stages of a pipelined model only.
@@ -1571,6 +2420,7 @@ def module_pipeline_model(
             "_registration": registration,
             "decoder_cls": decoder_cls,
             "vision_cls": by_role.get(GraphRole.VISION),
+            **denoiser_attrs,
             **exporter_attrs,
             "model_config_cls": config,
             "batch_processor_cls": batching or DecoderBatchProcessor,

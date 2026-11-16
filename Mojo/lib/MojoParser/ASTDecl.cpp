@@ -24,6 +24,7 @@
 #include "Mojo/LITDialect/LITUtils.h"
 #include "Mojo/MojoParser/DeclResolver.h"
 #include "Mojo/MojoParser/DocString.h"
+#include "Mojo/lib/MojoParser/ParserEvaluationContext.h"
 #include "Mojo/lib/MojoParser/Traits.h"
 #include "MojoUtils.h"
 #include "llvm/ADT/STLExtras.h"
@@ -62,7 +63,7 @@ ASTType ASTDecl::getToolingType() {
   if (auto *functionTypeDecl = dyn_cast<FunctionTypeASTDecl>(this))
     return functionTypeDecl->getSignature();
   if (auto *structDecl = dyn_cast<StructASTDecl>(this))
-    return StructASTDecl::computeSelfType(structDecl->getOp());
+    return structDecl->computeSelfType();
   if (auto *traitDecl = dyn_cast<TraitASTDecl>(this))
     return TraitASTDecl::computeSelfType(traitDecl->getOp());
   return {};
@@ -160,14 +161,6 @@ VariadicKind ASTDecl::getPogVariadicKind() const {
   assert(index < pogs.size() &&
          "POG variadic kind requested for non-argument or non-parameter");
   return pogs.getVariadicKind(index);
-}
-
-Type ASTDecl::getPogType() const {
-  auto [pogs, types] = getPogListAndTypes(*this);
-  size_t index = getPogIndex(*this, pogs);
-  assert(index < types.size() &&
-         "POG type requested for non-argument or non-parameter");
-  return types[index];
 }
 
 std::optional<TypedAttr> ASTDecl::getPogDefault() const {
@@ -538,6 +531,14 @@ WitnessASTDecl::WitnessASTDecl(SharedState &shared,
               indentation),
       storage(std::move(unresolvedDecls)), traitSymbol(traitSymbol) {}
 
+ConformanceWitnessASTDecl::ConformanceWitnessASTDecl(
+    SharedState &shared, ASTDecl &traitMember, StringAttr witnessName,
+    ConformanceASTDecl &conformanceDecl)
+    : ASTDecl(Kind::ConformanceMember, shared, conformanceDecl.getLoc(),
+              &conformanceDecl, LexerCursor(), LexerCursor(),
+              /*indentation=*/-1),
+      traitMember(traitMember), witnessName(witnessName) {}
+
 LogicalResult ASTDecl::resolveSignature(Lexer &lexer) {
   auto &resolver = shared.getDeclResolver();
   if (getIfOperation()) {
@@ -669,8 +670,9 @@ ASTDecl::getDeclFullSignature(ASTType contextualType) const {
     genDefaults.push_back(pog.getDefaultValue());
   }
 
-  return FnTypeGeneratorType::prependParams(fnSig, genDecls, genPogNames,
-                                            genDefaults);
+  return FnTypeGeneratorType::prependParams(
+      fnSig, genDecls, genPogNames, genDefaults,
+      genAttr.getMetadata().getBodyConstraints());
 }
 
 bool ASTDecl::isStaticMethodDecl() const {
@@ -865,26 +867,6 @@ void ASTDecl::takeDecls(ASTDecl &src) {
   counter = src.counter;
   assert(!knownAssumptions && "assumptions should be empty before overwriting");
   knownAssumptions = std::move(src.knownAssumptions);
-}
-
-/// Append the children decls of `src` into this scope (updating their
-/// `parentDecl`), without replacing existing names already in this scope.
-/// Used when promoting temporary pattern-binding scopes into a case scope.
-void ASTDecl::mergeDeclsFrom(ASTDecl &src) {
-  if (src.isErroneous())
-    setErroneous();
-  if (!src.declsInScope)
-    return;
-  if (!declsInScope)
-    declsInScope.reset(new DeclInScopeType());
-  for (auto &[name, children] : *src.declsInScope) {
-    TinyPtrVector<ASTDecl *> &entries = (*declsInScope)[name];
-    for (ASTDecl *child : children) {
-      child->parentDecl = this;
-      entries.push_back(child);
-    }
-  }
-  src.declsInScope.reset();
 }
 
 DenseMap<TraitSymbolAttr, std::pair<TraitSymbolAttr, SMLoc>> *
@@ -1101,8 +1083,8 @@ SymbolRefAttr ASTDecl::getSymbolRef() const {
   return getFullyResolvedSymbolRef(op);
 }
 
-/// Given an MLIR op for a struct declaration, return the self type.
-Type StructASTDecl::computeSelfType(StructDeclOp structOp) {
+Type StructASTDecl::computeSelfType() const {
+  StructDeclOp structOp = getOp();
   SmallVector<TypedAttr> parameters;
   for (auto decl : structOp.getParams()) {
     // We're using the parameter from the type declaration scope in the
@@ -1112,7 +1094,10 @@ Type StructASTDecl::computeSelfType(StructDeclOp structOp) {
 
   // Methods on structs (but not classes) take the struct implicitly by
   // pointer so they can use and mutate it.
-  return structOp.bindReference(parameters);
+  //
+  // Build the type directly instead of through `bindReference`, we don't want
+  // to evaluate the constraints on the self type.
+  return LIT::StructType::get(getFullyResolvedSymbolRef(structOp), parameters);
 }
 
 Type TraitASTDecl::computeSelfType(TraitDeclOp traitOp) {
