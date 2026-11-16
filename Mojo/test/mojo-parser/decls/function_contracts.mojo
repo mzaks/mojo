@@ -31,7 +31,7 @@ def one_clause(a: Int) -> Int requires a > 0:
 
 
 # CHECK-LABEL: lit.fn @"with_message
-# CHECK: kgen.requires({{.*}}) at({{.*}}) {message = "b must be positive"}
+# CHECK: kgen.requires({{.*}}) at({{.*}}) <message = "b must be positive">
 def with_message(b: Int) requires b > 0 else "b must be positive":
     pass
 
