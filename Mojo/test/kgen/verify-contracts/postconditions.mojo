@@ -110,3 +110,17 @@ def bad_index_through_reset_element(mut xs: List[Int], ys: List[Int]) -> Int:
 def bad_after_push_past_end(mut xs: List[Int], v: Int) -> Int:
     ok_push(xs, v)
     return xs[len(xs)]
+
+
+def bad_after_next_minus_two(xs: List[Int]) -> Int:
+    var i = ok_next(-2)  # only `i > -2`: `i` may be -1
+    if len(xs) > i:
+        return xs[i]
+    return 0
+
+
+def bad_after_next_unknown(xs: List[Int], a: Int) -> Int:
+    var i = ok_next(a)  # `a < 1000` is not known
+    if len(xs) > i:
+        return xs[i]  # `i > a` says nothing about `i >= 0`
+    return 0
