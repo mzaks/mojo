@@ -333,6 +333,12 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `extendleft`, `clear`, `reverse` and `rotate` state lengths. A bounded
   deque (`maxlen=`) evicts when full, so these clauses go through its
   `_maxlen`, which constructors state and mutators keep.
+- `match` and `if case` (`matches.mojo`): the cases are walked in order,
+  each from the paths the one before left for it, and the paths that leave
+  the match are joined, as the arms of an `if` are. What is known before a
+  match holds after it, and a value set in its cases is one of those
+  (`ok_set_in_cases`). The tests of a pattern are ordinary code to the
+  pass; what a pattern binds out of an enum's payload is not known.
 - `Optional`: `value()` and `take()` require a value to be held
   (`optionals.mojo`). The pass follows whether one is: constructors
   (`Optional(x)`, `Optional[T]()`, `None`, `init_with=`), `copy()`,
@@ -908,6 +914,7 @@ next script.
 | `structs.mojo`       | all `bad_*`        | all `ok_*`       |
 | `higher_order.mojo`  | all `bad_*`        | all `ok_*`       |
 | `optionals.mojo`     | all `bad_*`        | all `ok_*`       |
+| `matches.mojo`       | all `bad_*`        | all `ok_*`       |
 | `allocations.mojo`   | all `bad_*`        | all `ok_*`       |
 | `memory_clauses.mojo` | all `bad_*`       | all `ok_*`       |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |

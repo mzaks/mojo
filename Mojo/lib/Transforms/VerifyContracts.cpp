@@ -1840,6 +1840,14 @@ struct LoopFrame {
   std::set<Loc> reads;
 };
 
+/// An `hlcf.match` being walked: the paths that leave the case being walked
+/// for the next one (`hlcf.match.next`), and those that leave the match
+/// (`hlcf.match.complete`, with the values it gives the match's results).
+struct MatchFrame {
+  Operation *match;
+  SmallVector<State> nexts, completes;
+};
+
 /// A `lit.try` being walked: the paths that raise into its `except` region.
 struct TryFrame {
   StringRef label;
@@ -2457,6 +2465,7 @@ private:
   }
   SmallVector<LoopFrame *> loops;
   SmallVector<TryFrame *> tries;
+  SmallVector<MatchFrame *> matches;
 
   /// Case splitting: `answers` of the queries of `text`, upgraded to
   /// proven where every case proves them. A case is a combination of
@@ -5480,6 +5489,35 @@ private:
       state.alive = false;
       return;
     }
+    if (isa<HLCF::MatchNextOp, HLCF::MatchCompleteOp>(op)) {
+      // The nearest match with the op in one of its cases (in a match's
+      // `else` region the op is an enclosing match's).
+      MatchFrame *frame = nullptr;
+      for (MatchFrame *candidate : llvm::reverse(matches))
+        if (cast<HLCF::MatchOp>(candidate->match).containsInCaseRegion(op)) {
+          frame = candidate;
+          break;
+        }
+      if (!frame) {
+        notAnalyzed(op, state);
+        state.alive = false;
+        return;
+      }
+      if (isa<HLCF::MatchNextOp>(op)) {
+        frame->nexts.push_back(state);
+      } else {
+        state.yields.clear();
+        for (Value operand : op->getOperands())
+          state.yields.push_back(term(operand, state));
+        frame->completes.push_back(state);
+      }
+      state.alive = false;
+      return;
+    }
+    if (auto matchOp = dyn_cast<HLCF::MatchOp>(op)) {
+      walkMatch(matchOp, state);
+      return;
+    }
     if (isa<LIT::TryRaiseOp>(op)) {
       TryFrame *frame = findFrame(tries, labelOf(op));
       if (!frame) {
@@ -5538,6 +5576,48 @@ private:
     return false;
   }
 
+
+  /// `hlcf.match`: its case regions in order, each holding the tests and the
+  /// body of a case as ordinary ops. A path leaves a case for the next one
+  /// with `hlcf.match.next` (after the last case, for the `else` region) or
+  /// leaves the match with `hlcf.match.complete`; the `else` region ends in
+  /// a `hlcf.yield`. The state after the match is what those leaving paths
+  /// join to, and its results the values they give.
+  void walkMatch(HLCF::MatchOp matchOp, State &state) {
+    MatchFrame frame{matchOp, {}, {}};
+    matches.push_back(&frame);
+    State entering = state;
+    entering.yields.clear();
+    for (Region &region : matchOp.getCaseRegions()) {
+      if (!entering.alive)
+        break;
+      frame.nexts.clear();
+      walkBlock(region.front(), entering);
+      // A case's block ends in `hlcf.unreachable`: only the paths that
+      // asked for the next case reach it.
+      entering = merge(frame.nexts);
+    }
+    matches.pop_back();
+    SmallVector<State> exits = std::move(frame.completes);
+    if (entering.alive) {
+      entering.yields.clear();
+      walkBlock(matchOp.getElseRegion().front(), entering);
+      if (entering.alive)
+        exits.push_back(std::move(entering));
+    }
+    SmallVector<std::string> results;
+    State joined = merge(exits, &results);
+    if (!joined.alive) {
+      state.alive = false;
+      return;
+    }
+    if (results.size() == matchOp->getNumResults())
+      bindResults(matchOp, results);
+    else
+      setResultsUnknown(matchOp);
+    joined.yields = state.yields;
+    state = std::move(joined);
+  }
 
   /// `hlcf.if`, with `elif` arms: those are pairs of regions, a condition
   /// (ending in `hlcf.if.elifcond.yield`) evaluated where every earlier
