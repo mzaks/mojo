@@ -301,6 +301,10 @@ public:
   /// for the bodies of its methods (persistently allocated).
   llvm::DenseMap<mlir::Operation *, ArrayRef<ParsedConstraint>>
       structInvariants;
+  /// The `invariant` clauses (by location) a method's contract already
+  /// reported an error for: the struct's `__invariant__` predicate, made of
+  /// the same clauses, does not report it again.
+  llvm::DenseSet<const char *> invalidInvariantClauses;
 
   /// Emit `old(operand)` in a postcondition as a `kgen.old` at the emitter's
   /// insertion point (see `IREmitter::OldCalls`).

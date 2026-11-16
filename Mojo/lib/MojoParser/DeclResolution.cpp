@@ -2524,6 +2524,10 @@ populateInvariantPredicate(DeclResolver &resolver, DefASTDecl &fnDecl,
                            ArrayRef<ParsedConstraint> clauses) {
   SharedState &shared = resolver.shared;
   fnDecl.resolvedness = DeclResolvedness::body;
+  // A clause a method's contract found invalid was reported there.
+  for (const ParsedConstraint &clause : clauses)
+    if (resolver.invalidInvariantClauses.count(clause.loc.getPointer()))
+      return failure();
   FnOp fn = fnDecl.getOp();
   DebugInfo::DIBuilder::ScopeGuard diScopeGuard;
   if (shared.diBuilder)
@@ -2621,7 +2625,11 @@ static Block *emitContractCondition(DeclResolver &resolver, FnOp funcOp,
                  clause.loc);
   }
 
-  IREmitter clauseEmitter(*clauseScope, regionBuilder);
+  // In a function that can raise, a call that can raise is emitted, for
+  // `checkContractCalls` to report it as a call with an effect.
+  RaiseContext raiseContext(funcOp);
+  IREmitter clauseEmitter(*clauseScope, regionBuilder,
+                          funcOp.isThrows() ? &raiseContext : nullptr);
   clauseEmitter.oldCalls = olds;
   clauseEmitter.inContract = true;
   RValue cond =
@@ -3052,8 +3060,11 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
           emitContractCondition(*this, funcOp, decl, clause, requiresOp,
                                 operands, /*withResult=*/false, &reject, self);
       if (!condition ||
-          failed(checkContractCalls(shared, requiresOp, clause, keyword)))
+          failed(checkContractCalls(shared, requiresOp, clause, keyword))) {
+        if (contract.invariantOf)
+          invalidInvariantClauses.insert(clause.loc.getPointer());
         return failure();
+      }
       // An invariant holds on entry because every function that changes the
       // value ensures it: it is not checked again there at run time (where
       // a clause like `len(self) >= 0` would check itself inside
@@ -3101,10 +3112,13 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
         callLoc.getFileName(), clause.message, contract.invariantOf);
     if (!emitContractCondition(*this, funcOp, decl, clause, trial, operands,
                                /*withResult=*/true, &olds, self) ||
-        failed(
-            checkContractCalls(shared, trial, clause,
-                               contract.invariantOf ? "invariant" : "ensures")))
+        failed(checkContractCalls(shared, trial, clause,
+                                  contract.invariantOf ? "invariant"
+                                                       : "ensures"))) {
+      if (contract.invariantOf)
+        invalidInvariantClauses.insert(clause.loc.getPointer());
       return failure();
+    }
     bool runtimeCheck = olds.count == 0 && !hasQuantifier(trial);
     trial.erase();
     needsEntry |= olds.count != 0;
