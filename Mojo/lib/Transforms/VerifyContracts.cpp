@@ -12650,7 +12650,7 @@ private:
       if (auto r = dyn_cast<LIT::RefType>(type))
         type = r.getElementType();
       StringRef typeName(printed(type));
-      if (!typeName.contains("::@device_context::@DeviceBuffer<") &&
+      if (!typeName.contains("::@device_buffer::@DeviceBuffer<") &&
           !typeName.contains("::@device_context::@LegacyDeviceBuffer<"))
         continue;
       std::string value = valueOf(ref);

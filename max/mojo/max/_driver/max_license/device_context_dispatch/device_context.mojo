@@ -1248,7 +1248,8 @@ struct DeviceContext[target: CompilationTarget = default_accelerator()](
 
     def enqueue_create_buffer[
         dtype: DType
-    ](self, size: Int) raises -> DeviceBuffer[dtype]:
+    ](self, size: Int) raises -> DeviceBuffer[dtype]
+        ensures len(result) == size:
         """Enqueues a buffer creation using the `DeviceBuffer` constructor.
 
         For GPU devices, the space is allocated in the device's global memory.

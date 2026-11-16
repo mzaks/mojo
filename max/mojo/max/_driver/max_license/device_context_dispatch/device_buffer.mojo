@@ -398,7 +398,8 @@ struct DeviceBuffer[dtype: DType](
 
     def unsafe_ptr[
         mut: Bool, //, origin: Origin[mut=mut]
-    ](ref[origin] self) -> Pointer[Scalar[Self.dtype], origin]:
+    ](ref[origin] self) -> Pointer[Scalar[Self.dtype], origin]
+        ensures result._extent() == old(len(self)):
         """Returns the raw device pointer without transferring ownership.
 
         This method provides direct access to the underlying device pointer
