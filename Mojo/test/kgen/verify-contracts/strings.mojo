@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# `String`, `StringSlice` and string literals for `verify-contracts`; see
+# `String`, `StringSpan` and string literals for `verify-contracts`; see
 # README.md.
 
 
@@ -55,7 +55,7 @@ def ok_append() -> Int:
     return s[byte=4].byte_length()
 
 
-def ok_span_loop(s: StringSlice) -> Int:
+def ok_span_loop(s: StringSpan) -> Int:
     var t = 0
     var b = s.as_bytes()
     for i in range(s.byte_length()):
@@ -63,12 +63,12 @@ def ok_span_loop(s: StringSlice) -> Int:
     return t
 
 
-def ok_split_parts(s: StringSlice) -> Int:
+def ok_split_parts(s: StringSpan) -> Int:
     var parts = s.split(",")  # at least one part
     return parts[0].byte_length() + parts[len(parts) - 1].byte_length()
 
 
-def ok_codepoint_count(s: StringSlice) -> Int:
+def ok_codepoint_count(s: StringSpan) -> Int:
     var counts = List[Int](length=s.count_codepoints(), fill=0)
     return len(counts)
 
@@ -95,6 +95,6 @@ def bad_empty() -> Int:
     return s[byte=0].byte_length()
 
 
-def bad_split_second(s: StringSlice) -> Int:
+def bad_split_second(s: StringSpan) -> Int:
     var parts = s.split(",")
     return parts[1].byte_length()  # one part when there is no comma
