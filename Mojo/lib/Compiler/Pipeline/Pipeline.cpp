@@ -45,6 +45,11 @@ static void buildLowerLITPipeline(mlir::PassManager &pm,
                                   const CompilationOptions &options) {
   buildCheckLITPipeline(pm, options);
 
+  // Nothing from here on reads the contracts, and every inlining would copy
+  // them into the caller.
+  if (!options.keepContracts)
+    pm.addPass(createStripContracts());
+
   pm.addPass(createLowerLIT(
       {static_cast<llvm::dwarf::SourceLanguage>(options.debugInfoLanguage)}));
 #ifndef MODULAR_PRODUCTION

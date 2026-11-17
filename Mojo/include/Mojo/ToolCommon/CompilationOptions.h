@@ -172,6 +172,10 @@ public:
   void setSaveTemps(std::string prefix) { saveTempsPrefix = prefix; }
 
   unsigned optimizationLevel = 3;
+  /// Keep the contract ops (`kgen.requires`, `kgen.ensures`) through
+  /// elaboration, for an analysis of the elaborated module that reads them.
+  /// They are otherwise removed right after the check pipeline.
+  bool keepContracts = false;
   FpMode fpMode;
   DebugInfoLevel debugLevel = kNoDebug;
   std::optional<DebugAtLevel> debugAtLevel;

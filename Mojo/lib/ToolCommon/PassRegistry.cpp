@@ -40,6 +40,7 @@ void KGEN::registerDefaultKGENPasses(const std::string &cacheBaseExtra) {
   KGEN::registerArgPromotion();
   KGEN::registerBoundsCheckReport();
   KGEN::registerVerifyContracts();
+  KGEN::registerStripContracts();
   KGEN::registerCanonicalizer();
   KGEN::registerCheckLifetimes();
   KGEN::registerDecomposeFunctionArguments();

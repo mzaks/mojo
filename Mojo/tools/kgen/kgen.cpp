@@ -365,6 +365,8 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
     options.saveTempsPrefix = clOptions.tempsDir;
   options.verboseOutput = isEmitCmd(clOptions.cmd, kAsmVerboseKind);
   options.cacheBaseExtra = "kgen";
+  // bounds-check-report reads the contracts of the elaborated module.
+  options.keepContracts = clOptions.boundsCheckReport.has_value();
 
   OwningOpRef<ModuleOp> theModule;
   auto inputFileName = llvm::StringRef(clOptions.inputFilename);

@@ -704,6 +704,33 @@ def ApplyInliner : Pass<"apply-inliner", "ModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// StripContracts
+//===----------------------------------------------------------------------===//
+
+def StripContracts : Pass<"strip-contracts", "ModuleOp"> {
+  let summary = "remove contract ops";
+  let description = [{
+    This pass erases the `kgen.requires` and `kgen.ensures` ops of a module,
+    with what is nested in them, and the `kgen.contract.entry` markers left
+    without a use.
+
+    Contract ops have no runtime semantics: `verify-contracts` reads them
+    before elaboration, and the run-time checks of the clauses are separate
+    code. Left in the module, they are copied into every caller a function is
+    inlined into and optimized like code until lowering to LLVM erases them,
+    which costs more compile time than the functions' bodies do. The pass runs
+    right after the check pipeline, unless an analysis of the elaborated
+    module (`bounds-check-report`) asked for the contracts to be kept.
+  }];
+
+  let dependentDialects = ["KGENDialect"];
+
+  let statistics = [
+    Statistic<"numContracts", "num-contracts", "Number of contract ops removed">
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // EliminateDeadSymbols
 //===----------------------------------------------------------------------===//
 
