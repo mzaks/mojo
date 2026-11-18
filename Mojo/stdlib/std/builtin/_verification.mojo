@@ -20,7 +20,14 @@ LLVM, and the comptime interpreter skips them.
 from std.collections.string.string_span import _get_kgen_string
 from std.builtin.debug_assert import _assert_enabled, _debug_assert_msg
 from std.reflection import call_location
+from std.sys.defines import get_defined_bool
 from std.traits import IsTriviallyMovable
+
+
+comptime _ContractAssertMode = (
+    "safe" if get_defined_bool["CONTRACT_CHECKS", False]() else "none"
+)
+"""The assertion mode contract clauses are checked under."""
 
 
 @inline(.nodebug)
@@ -30,12 +37,19 @@ def _contract_checks_enabled() -> Bool:
 
     The parser emits each clause as a `debug_assert` under this condition, so
     a clause is evaluated only when it is checked: under the same assertion
-    mode as a `debug_assert` without an `assert_mode` (`-D ASSERT=all`).
+    mode as a `debug_assert` without an `assert_mode` (`-D ASSERT=all`), or,
+    experimentally, in every assertion mode but `none` with
+    `-D CONTRACT_CHECKS=true`.
 
     Returns:
         Whether contract clauses are checked.
     """
-    return _assert_enabled["none", False]()
+    # Decided at compile time: `_assert_enabled` is not inlined, so asking it
+    # at run time would cost every function with a clause a call.
+    comptime if _assert_enabled[_ContractAssertMode, False]():
+        return True
+    else:
+        return False
 
 
 @inline(.nodebug)
