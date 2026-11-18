@@ -1840,6 +1840,10 @@ struct Obligation {
   /// What the obligation says, when it is not a callee's clause ("that the
   /// divisor is not 0").
   std::string claim;
+  /// For a precondition of a direct call: the call, and the function called
+  /// (`drop-proven-checks` points the call at its copy without checks).
+  Operation *call = nullptr;
+  Operation *checkedCallee = nullptr;
 };
 
 /// A loop being walked: where its iterations continue and exit, and what
@@ -9401,6 +9405,9 @@ private:
           continue;
         Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
                       displayName(contract)};
+        ob.call = call.getOperation();
+        if (contract == callee && call.getDirectCallee())
+          ob.checkedCallee = callee.getOperation();
         if (cond) {
           ob.cond = *cond;
           noteCondition(ob.cond);
@@ -14578,6 +14585,81 @@ StringRef packageOf(Operation *op) {
   return name;
 }
 
+/// Whether `op`, in the body of `fn`, is a run-time check of one of `fn`'s
+/// preconditions: what the parser emits for a `requires` clause, or, in
+/// `List.__getitem__`, the call of `check_bounds`, which checks what its
+/// clause states.
+// TODO: The second is an assumption about one function. The standard
+// library should state which of its checks a clause stands for.
+static bool isPreconditionCheck(Operation &op, LIT::FnOp fn) {
+  if (isa<HLCF::IfOp>(op))
+    return op.hasAttr(kContractCheckAttrName);
+  auto call = dyn_cast<LIT::CallOp>(&op);
+  if (!call || !call->use_empty() ||
+      fn.getSourceName().value_or("") != "__getitem__")
+    return false;
+  SymbolRefAttr callee = call.getDirectCallee();
+  if (!callee || callee.getRootReference().getValue() != "std" ||
+      !callee.getLeafReference().getValue().starts_with("check_bounds["))
+    return false;
+  auto list = dyn_cast_or_null<LIT::StructDeclOp>(fn->getParentOp());
+  return list && list.getSymName() == "List";
+}
+
+/// The copy of `fn` without the run-time checks of its preconditions, for
+/// the calls that are proven to meet them; null if `fn` has no such check.
+static LIT::FnOp withoutChecks(LIT::FnOp fn,
+                               DenseMap<Operation *, Operation *> &copies) {
+  auto [it, inserted] = copies.try_emplace(fn.getOperation(), nullptr);
+  if (!inserted)
+    return cast_or_null<LIT::FnOp>(it->second);
+  if (fn.getFunctionBody().empty() || !fn.getSymNameAttr() ||
+      llvm::none_of(fn.getFunctionBody().front(),
+                    [&](Operation &op) { return isPreconditionCheck(op, fn); }))
+    return {};
+  auto copy = cast<LIT::FnOp>(fn->clone());
+  fn->getBlock()->getOperations().insertAfter(Block::iterator(fn), copy);
+  copy.setSymName((*fn.getSymName() + "$unchecked").str());
+  for (Operation &op :
+       llvm::make_early_inc_range(copy.getFunctionBody().front()))
+    if (isPreconditionCheck(op, fn))
+      op.erase();
+  copies[fn.getOperation()] = copy;
+  return copy;
+}
+
+/// Points `call`, every precondition of which is proven, at the copy of
+/// `callee` without their run-time checks. Returns whether it did.
+static bool callWithoutChecks(LIT::CallOp call, LIT::FnOp callee,
+                              DenseMap<Operation *, Operation *> &copies) {
+  SymbolRefAttr symbol = call.getDirectCallee();
+  if (!symbol)
+    return false;
+  // A call of a function the parser split names the wrapper, and `callee`
+  // is already the copy without checks.
+  LIT::FnOp copy =
+      callee.getSymName() &&
+              symbol.getLeafReference().getValue() != *callee.getSymName()
+          ? callee
+          : withoutChecks(callee, copies);
+  if (!copy)
+    return false;
+  MLIRContext *ctx = call->getContext();
+  SmallVector<FlatSymbolRefAttr> nested(symbol.getNestedReferences());
+  SymbolRefAttr fresh;
+  if (nested.empty()) {
+    fresh = FlatSymbolRefAttr::get(ctx, *copy.getSymName());
+  } else {
+    nested.back() = FlatSymbolRefAttr::get(ctx, *copy.getSymName());
+    fresh = SymbolRefAttr::get(symbol.getRootReference(), nested);
+  }
+  Attribute target = retargetCallee(call.getCallee(), symbol, fresh);
+  if (target == Attribute(call.getCallee()))
+    return false;
+  call->setAttr(call.getCalleeAttrName(), target);
+  return true;
+}
+
 struct VerifyContractsPass
     : impl::VerifyContractsBase<VerifyContractsPass> {
   using VerifyContractsBase::VerifyContractsBase;
@@ -15174,6 +15256,10 @@ struct VerifyContractsPass
       }
     };
     unsigned total = 0, proven = 0, forInstances = 0, loops = 0, invariants = 0;
+    // For `drop-proven-checks`: the direct calls of the verified functions,
+    // with the function called, or null once one of the call's preconditions
+    // is not proven generically.
+    llvm::MapVector<Operation *, Operation *> checkedCalls;
     for (auto [i, result] : llvm::enumerate(results)) {
       loops += result.loops;
       invariants += result.invariants;
@@ -15181,6 +15267,13 @@ struct VerifyContractsPass
       for (auto [k, ob, answer] :
            llvm::enumerate(result.obligations, result.answers)) {
         ++total;
+        if (ob.call) {
+          bool ok = answer == Answer::Proven && ob.checkedCallee &&
+                    ob.call->getParentOfType<LIT::FnOp>() == fns[i].fn;
+          auto it = checkedCalls.try_emplace(ob.call, ob.checkedCallee).first;
+          if (!ok)
+            it->second = nullptr;
+        }
         StringRef what = !ob.invariant.empty() ? "invariant"
                          : ob.postcondition    ? "postcondition"
                                                : "precondition";
@@ -15278,6 +15371,17 @@ struct VerifyContractsPass
               diag.attachNote(*at.via) << "with the parameters given here";
           }
       }
+    }
+    if (dropProvenChecks) {
+      unsigned dropped = 0;
+      DenseMap<Operation *, Operation *> uncheckedFns;
+      for (auto &[call, callee] : checkedCalls)
+        if (callee && callWithoutChecks(cast<LIT::CallOp>(call),
+                                        cast<LIT::FnOp>(callee), uncheckedFns))
+          ++dropped;
+      llvm::errs() << "verify-contracts: " << dropped << " of "
+                   << checkedCalls.size()
+                   << " calls with preconditions run without their checks\n";
     }
     llvm::errs() << "verify-contracts: " << proven << "/" << total
                  << " obligations proven (";

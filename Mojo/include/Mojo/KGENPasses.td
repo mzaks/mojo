@@ -113,6 +113,11 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
     Option<"dumpFn", "dump-fn", "std::string", /*default=*/"\"\"",
            "Print the IR of the function with this name as the pass reads "
            "it (for debugging the pass)">,
+    Option<"dropProvenChecks", "drop-proven-checks", "bool",
+           /*default=*/"false",
+           "Experimental: point every direct call all preconditions of which "
+           "are proven at a copy of the callee without their run-time "
+           "checks.">,
     Option<"cacheDir", "cache-dir", "std::string", /*default=*/"\"\"",
            "Directory to cache solver answers in, by a hash of each script "
            "(default: mojo/verify-contracts in the user's cache directory; "

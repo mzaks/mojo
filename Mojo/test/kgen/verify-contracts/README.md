@@ -895,6 +895,30 @@ what the caller knows, and the assumption in the copy lets it drop what the
 precondition implies there (with `requires len(a) == len(b)`, the bounds
 checks of `b[i]` in a loop over `a`, which then vectorizes).
 
+## Experimental: running proven calls without their checks
+
+`drop-proven-checks` points every direct call in a verified function whose
+callee's preconditions are all proven (generically, in every walk of the
+call) at the callee's copy without checks: the `$unchecked` copy of a split
+function, or, for `List.__getitem__`, a copy the pass makes without the call
+of `check_bounds`, which checks what its clause states. That second case is
+an assumption about one function, written into the pass.
+
+To build with it, set `MOJO_PROVE_CONTRACT_CHECKS` (to `verbose`, `nocache`,
+both, or nothing): the pass then runs inside the compilation pipeline, after
+the check pipeline, of `mojo build` and `kgen`:
+
+```bash
+MOJO_PROVE_CONTRACT_CHECKS=verbose mojo build -D CONTRACT_CHECKS=true main.mojo
+```
+
+Limits: a proof inside a function assumes the function's own preconditions,
+so dropping a check on its strength is only sound when those are checked or
+proven where the function is called (hence `CONTRACT_CHECKS`), and it trusts
+the postconditions of the standard library. The compiler's cache of
+elaborated modules does not know about the variable: use a fresh
+`MODULAR_CACHE_DIR` when switching it.
+
 ## The same answers on every machine
 
 Every query has a work limit (z3's `rlimit`), none a time limit, so what

@@ -16,6 +16,8 @@
 #ifndef KGEN_TRANSFORMUTILS_CONTRACTUTILS_H
 #define KGEN_TRANSFORMUTILS_CONTRACTUTILS_H
 
+#include "mlir/IR/BuiltinAttributes.h"
+
 namespace mlir {
 class Operation;
 } // namespace mlir
@@ -48,6 +50,12 @@ inline constexpr char kUncheckedSuffix[] = "$unchecked";
 /// snapshotted again. (Defined in the Transforms library, which depends on the
 /// dialects; TransformUtils cannot.)
 void snapshotContractOperands(mlir::Operation *root);
+
+/// The callee attribute of a call with the function it names, `from`,
+/// replaced by `to`; `callee` itself if it does not name `from`. (Defined in
+/// the Transforms library.)
+mlir::Attribute retargetCallee(mlir::Attribute callee, mlir::SymbolRefAttr from,
+                               mlir::SymbolRefAttr to);
 
 } // namespace M::KGEN
 

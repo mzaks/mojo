@@ -16,6 +16,7 @@
 #include "Mojo/KGENDialect/KGENOps.h"
 #include "Mojo/POPDialect/POPOps.h"
 #include "Mojo/TransformUtils/ContractUtils.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/Builders.h"
 
 using namespace mlir;
@@ -86,4 +87,17 @@ void M::KGEN::snapshotContractOperands(Operation *root) {
       operand.set(snapshot);
     }
   }
+}
+
+Attribute M::KGEN::retargetCallee(Attribute callee, SymbolRefAttr from,
+                                  SymbolRefAttr to) {
+  AttrTypeReplacer replacer;
+  replacer.addReplacement(
+      [&](SymbolRefAttr attr)
+          -> std::optional<std::pair<Attribute, WalkResult>> {
+        if (attr == from)
+          return std::make_pair(Attribute(to), WalkResult::skip());
+        return std::nullopt;
+      });
+  return replacer.replace(callee);
 }
