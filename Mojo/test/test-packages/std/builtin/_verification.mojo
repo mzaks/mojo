@@ -20,3 +20,11 @@ def _contract_checks_enabled() -> Bool:
 
 def _check_contract(cond: Bool, message: StringLiteral):
     pass
+
+
+def _check_contract_in_caller(cond: Bool, message: StringLiteral):
+    pass
+
+
+def _assume_contract(cond: Bool, message: StringLiteral):
+    pass

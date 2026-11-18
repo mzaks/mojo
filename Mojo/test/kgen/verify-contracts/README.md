@@ -865,6 +865,36 @@ obligations inside unsupported control flow are reported as not analyzed.
 `append` does not state the value it adds (a generic `T` has no `==` to state it
 with).
 
+## Run-time checks of preconditions, in the caller
+
+Outside the standard library the parser emits a run-time check for each
+`requires` clause that can run (no quantifier). The checks are on under
+`-D ASSERT=all`, and with `-D CONTRACT_CHECKS=true` in every assertion mode
+but `none`.
+
+A function with such a check is split in two (`splitContractChecks` in
+`DeclResolution.cpp`). The function itself keeps its clauses and their
+checks, and then only calls `<name>$unchecked`: a copy with the body, where
+each precondition is an assumption (`_assume_contract`) instead of a check.
+The function is `always_inline("nodebug")`, so each direct caller runs the
+checks itself, before elaboration, and a failure reports the call
+(`_check_contract_in_caller`), not the clause. Uses that are not direct calls
+(a function value, a witness) keep the checks in the function. The forwarding
+call is built like the one of a struct's wrapper for an inherited default
+method.
+
+Not split, with the check at the function's entry as before: initializers,
+functions with a named result, exported functions, implicit conversions,
+closures and trait methods.
+
+The verifier sees through the split: a call of the function is a call of
+its copy, and the copy is what is verified.
+
+Since the check is code of the caller, the optimizer can fold it against
+what the caller knows, and the assumption in the copy lets it drop what the
+precondition implies there (with `requires len(a) == len(b)`, the bounds
+checks of `b[i]` in a loop over `a`, which then vectorizes).
+
 ## The same answers on every machine
 
 Every query has a work limit (z3's `rlimit`), none a time limit, so what

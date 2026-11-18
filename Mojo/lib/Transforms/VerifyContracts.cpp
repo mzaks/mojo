@@ -44,6 +44,7 @@
 #include "Mojo/KGENDialect/KGENOps.h"
 #include "Mojo/LITDialect/LITOps.h"
 #include "Mojo/POPDialect/POPAttrs.h"
+#include "Mojo/TransformUtils/ContractUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseSet.h"
@@ -380,6 +381,20 @@ std::optional<CalleeName> calleeName(Attribute callee) {
   return name;
 }
 
+/// `fn`, or, if the parser split it for its checked preconditions (it then
+/// only runs the checks and calls its copy without them), that copy: the
+/// function with the body, and the same clauses.
+static LIT::FnOp behindWrapper(LIT::FnOp fn) {
+  if (!fn)
+    return fn;
+  auto copy = fn->getAttrOfType<FlatSymbolRefAttr>(kCheckedWrapperAttrName);
+  if (!copy)
+    return fn;
+  auto target = dyn_cast_or_null<LIT::FnOp>(
+      SymbolTable::lookupSymbolIn(fn->getParentOp(), copy.getAttr()));
+  return target ? target : fn;
+}
+
 /// The kernel a launch (`ctx.enqueue_function[kernel](...)`, whose callee
 /// is `call`) runs, and the symbol naming it with its parameters: the
 /// function among the call's parameters, behind the `rebind` and the thunk
@@ -403,8 +418,8 @@ launchedKernel(FuncSymbolGenerator call, ModuleOp module,
     auto symbol = FuncSymbolGenerator::dynCast(param);
     if (!symbol)
       return;
-    auto fn = dyn_cast_or_null<LIT::FnOp>(
-        symbols.lookupSymbolIn(module, symbol.getSymbol()));
+    auto fn = behindWrapper(dyn_cast_or_null<LIT::FnOp>(
+        symbols.lookupSymbolIn(module, symbol.getSymbol())));
     if (fn && !fn.getFunctionBody().empty() &&
         !symbol.getSymbol().getRootReference().getValue().starts_with("def[")) {
       found = {fn, symbol};
@@ -425,6 +440,10 @@ std::string displayName(LIT::FnOp fn) {
     name = source.getValue().str();
   else if (fn.getSymName())
     name = fn.getSymName()->str();
+  // The copy the parser makes of a function with checked preconditions
+  // (`splitContractChecks`) is that function, to a reader.
+  if (StringRef(name).ends_with(kUncheckedSuffix))
+    name.resize(name.size() - StringRef(kUncheckedSuffix).size());
   if (Operation *parent = fn->getParentOp())
     if (auto parentName = parent->getAttrOfType<StringAttr>(
             SymbolTable::getSymbolAttrName());
@@ -7631,7 +7650,8 @@ private:
       return {};
     // Symbols are absolute (`@std::@collections::...`): resolve them from the
     // module, since a `lit.fn` is a symbol table of its own.
-    return dyn_cast_or_null<LIT::FnOp>(symbols.lookupSymbolIn(module, callee));
+    return behindWrapper(
+        dyn_cast_or_null<LIT::FnOp>(symbols.lookupSymbolIn(module, callee)));
   }
 
   /// The call a struct's wrapper for an inherited trait default
@@ -8553,8 +8573,8 @@ private:
         // is `GEMVAlgorithm(0)`): `n`.
         if (ops.size() == 2 && !sort.isBool)
           if (auto symbol = FuncSymbolGenerator::dynCast(ops[0]))
-            if (auto init = dyn_cast_or_null<LIT::FnOp>(
-                    symbols.lookupSymbolIn(module, symbol.getSymbol()));
+            if (auto init = behindWrapper(dyn_cast_or_null<LIT::FnOp>(
+                    symbols.lookupSymbolIn(module, symbol.getSymbol())));
                 init && isFieldInit(init))
               return paramTerm(ops[1], sort, depth + 1);
         // `max_or_inf[dtype]()` and `min_or_neg_inf[dtype]()` of an integer
@@ -9086,8 +9106,8 @@ private:
       for (auto member : conformance.getBody().getOps<WitnessOp>())
         if (member.getSymName() == "__call__")
           if (auto value = FuncSymbolGenerator::dynCast(member.getValue()))
-            impl = dyn_cast_or_null<LIT::FnOp>(
-                symbols.lookupSymbolIn(module, value.getSymbol()));
+            impl = behindWrapper(dyn_cast_or_null<LIT::FnOp>(
+                symbols.lookupSymbolIn(module, value.getSymbol())));
     }
     if (!impl || impl.getFunctionBody().empty())
       return false;
@@ -14668,8 +14688,8 @@ struct VerifyContractsPass
         Operation *owner = op->getParentOfType<LIT::StructDeclOp>();
         if (auto call = dyn_cast<LIT::CallOp>(op))
           if (auto symbol = FuncSymbolGenerator::dynCast(call.getCallee()))
-            if (auto callee = dyn_cast_or_null<LIT::FnOp>(
-                    symbols.lookupSymbolIn(module, symbol.getSymbol()))) {
+            if (auto callee = behindWrapper(dyn_cast_or_null<LIT::FnOp>(
+                    symbols.lookupSymbolIn(module, symbol.getSymbol())))) {
               // A closure's own member, or a function with a body the
               // closure is handed to as a function to call (`map(n, f)`,
               // `xs^.deinit_with(f)`): the body is walked where it is
@@ -14700,8 +14720,10 @@ struct VerifyContractsPass
                       name->starts_with("__deinit__("));
     };
     getOperation().walk([&](LIT::FnOp fn) {
+      // A function split for its checks is verified as its copy with the
+      // body.
       if (selected(fn) && !isRequiredTraitMethod(fn) && !isDefaultWrapper(fn) &&
-          !calledOnly(fn))
+          !fn->hasAttr(kCheckedWrapperAttrName) && !calledOnly(fn))
         fns.push_back({fn, {}});
     });
     ModuleOp module = getOperation();
@@ -14721,8 +14743,8 @@ struct VerifyContractsPass
           auto value = FuncSymbolGenerator::dynCast(witness.getValue());
           if (!method || !value || method.getFunctionBody().empty())
             continue;
-          auto impl = dyn_cast_or_null<LIT::FnOp>(
-              symbols.lookupSymbolIn(module, value.getSymbol()));
+          auto impl = behindWrapper(dyn_cast_or_null<LIT::FnOp>(
+              symbols.lookupSymbolIn(module, value.getSymbol())));
           if (std::string owner = impl ? plainStructOf(impl) : "";
               !owner.empty()) {
             std::string key = implKey(conformance.getTraitSymbol(),
@@ -14854,8 +14876,8 @@ struct VerifyContractsPass
           if (!symbol ||
               !names.contains(symbol.getSymbol().getLeafReference().getValue()))
             return;
-          auto fn = dyn_cast_or_null<LIT::FnOp>(
-              symbols.lookupSymbolIn(module, symbol.getSymbol()));
+          auto fn = behindWrapper(dyn_cast_or_null<LIT::FnOp>(
+              symbols.lookupSymbolIn(module, symbol.getSymbol())));
           if (!fn || !wanted.count(fn))
             return;
           auto from = call->getParentOfType<LIT::FnOp>();

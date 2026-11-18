@@ -223,3 +223,25 @@ def all_nonneg(n: Int) requires all([i * i >= 0 for i in range(n)]):
 def shift_rest(mut a: Int)
     ensures all([a + i == old(a) + i for i in range(1, 3)]):
     pass
+
+
+# A function with a precondition that is checked at run time is split: it
+# keeps the clause and its check and calls a copy of itself that has the body
+# and no check. It is always inlined, so its callers run the check.
+# CHECK-LABEL: lit.fn @"split_in_two({{[^$]*}})"(
+# CHECK-SAME: always_inline_no_debug
+# CHECK: kgen.requires
+# CHECK: _check_contract_in_caller
+# CHECK: kgen.contract_check
+# CHECK-NOT: lit.var.decl "doubled"
+# CHECK: lit.call {{.*}}@"split_in_two({{.*}})$unchecked"
+# CHECK: lit.return
+# CHECK-LABEL: lit.fn @"split_in_two({{.*}})$unchecked"
+# CHECK: kgen.requires
+# CHECK-NOT: kgen.contract_check
+# CHECK: lit.var.decl "doubled"
+# CHECK: lit.end_fn
+def split_in_two(a: Int) -> Int requires a > 0:
+    var doubled = a + a
+    return doubled
+

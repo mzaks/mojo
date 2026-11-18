@@ -21,6 +21,7 @@ from std.collections.string.string_span import _get_kgen_string
 from std.builtin.debug_assert import _assert_enabled, _debug_assert_msg
 from std.reflection import call_location
 from std.sys.defines import get_defined_bool
+from std.sys.intrinsics import assume
 from std.traits import IsTriviallyMovable
 
 
@@ -69,6 +70,43 @@ def _check_contract(cond: Bool, message: StringLiteral):
     if cond:
         return
     _debug_assert_msg(message.ptr(), message.byte_length() + 1, call_location())
+
+
+@inline(.nodebug)
+def _check_contract_in_caller(cond: Bool, message: StringLiteral):
+    """Fails like `_check_contract`, reporting where the function was called.
+
+    The parser calls it for the check of a precondition in a function it
+    splits into the checks and a copy with the body: the function with the
+    checks is always inlined, so the location one level further out is the
+    call that did not meet the precondition.
+
+    Args:
+        cond: The clause's condition.
+        message: What to report when it does not hold.
+    """
+    if cond:
+        return
+    _debug_assert_msg(
+        message.ptr(), message.byte_length() + 1, call_location[inline_count=2]()
+    )
+
+
+@inline(.nodebug)
+def _assume_contract(cond: Bool, message: StringLiteral):
+    """Tells the optimizer that `cond` holds.
+
+    The parser calls it in place of `_check_contract_in_caller` in the copy
+    of a function it splits: the copy only runs once its caller has checked
+    the precondition, or is proven to meet it. Like the check, the call is
+    under `_contract_checks_enabled`: nothing is assumed when preconditions
+    are not checked.
+
+    Args:
+        cond: The clause's condition.
+        message: Unused; the signature is that of the check.
+    """
+    assume(cond)
 
 
 @inline(.nodebug)

@@ -37,8 +37,10 @@
 #include "Mojo/LITDialect/LITOps.h"
 #include "Mojo/POPDialect/POPOps.h"
 #include "Mojo/ToolCommon/CompilationOptions.h"
+#include "Mojo/TransformUtils/ContractUtils.h"
 #include "Support/Compiler/OperationUtils.h"
 #include "Support/Filesystem/Paths.h"
+#include "mlir/IR/IRMapping.h"
 
 #include "Mojo/HLCFDialect/HLCFOps.h"
 #include "Mojo/LITDialect/LITUtils.h"
@@ -2762,6 +2764,17 @@ static std::string clauseText(const ParsedConstraint &clause) {
   return out;
 }
 
+/// Whether `fn`, if it has run-time checks of preconditions, is split so its
+/// callers run them (`splitContractChecks`). Other kinds of functions are
+/// left alone for now: their checks stay at their entry.
+static bool checksPreconditionsInCallers(FnOp fn) {
+  return !fn->getParentOfType<FnOp>() && fn.getSymNameAttr() &&
+         !fn.getNamedResultAttr() && !fn.getDefaultFnRefAttr() &&
+         !fn.getSpecialFunctionInfo().isInitializer() &&
+         fn.getExportKind() == KGEN::ExportKind::NotExported &&
+         !isa<TraitDeclOp>(fn->getParentOp()) && !fn.isImplicitConversion();
+}
+
 /// Emits the run-time check of a contract clause at the emitter's insertion
 /// point:
 ///
@@ -2777,7 +2790,8 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
                              IREmitter &emitter, const ParsedConstraint &clause,
                              StringRef what, std::optional<CValue> result,
                              std::optional<CValue> self = {},
-                             StringRef subject = {}) {
+                             StringRef subject = {}, bool ofCall = false,
+                             bool assume = false) {
   SharedState &shared = resolver.shared;
   const ExprNode *expr = clause.propExpr;
   if (!emitter.builder || !expr || !shared.hasBuiltinModule())
@@ -2794,9 +2808,15 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
   ArrayRef<ASTDecl *> enabledFns = shared.getBuiltinFunction(
       scope, {"std", "builtin", "_verification"}, "_contract_checks_enabled",
       clause.loc);
+  // A precondition checked in the callers reports the call.
+  // In the copy of such a function, which has the body, the precondition is
+  // a fact (`assume`).
+  StringRef checkFn = assume ? "_assume_contract"
+                      : ofCall && checksPreconditionsInCallers(funcOp)
+                          ? "_check_contract_in_caller"
+                          : "_check_contract";
   ArrayRef<ASTDecl *> assertFns = shared.getBuiltinFunction(
-      scope, {"std", "builtin", "_verification"}, "_check_contract",
-      clause.loc);
+      scope, {"std", "builtin", "_verification"}, checkFn, clause.loc);
   if (enabledFns.empty() || assertFns.empty())
     return;
   Location loc = shared.translateLocation(clause.loc);
@@ -2848,7 +2868,7 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
                                   EC_TopLevelStmt);
             operands.add({cond, expr});
             operands.add({messageValue, expr});
-            OverloadSet call("_check_contract", assertFns,
+            OverloadSet call(checkFn, assertFns,
                              ParamBindings(checkScope, expr),
                              CallSyntax::kDirectCall);
             call.emitCall(std::move(operands), check);
@@ -2861,8 +2881,126 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
         HLCF::YieldOp::create(*emitter.builder, loc);
         return success();
       });
-  if (ifOp)
+  if (ifOp) {
+    // A precondition callers have to establish: where one is proven to, the
+    // check can go.
+    if (assume)
+      ifOp->setAttr(KGEN::kContractAssumeAttrName,
+                    UnitAttr::get(resolver.getContext()));
+    else if (ofCall)
+      ifOp->setAttr(KGEN::kContractCheckAttrName,
+                    UnitAttr::get(resolver.getContext()));
     emitter.builder->setInsertionPointAfter(ifOp);
+  }
+}
+
+/// Splits a function whose preconditions are checked at run time in two.
+/// The function keeps what its contracts emit at its entry, up to `prelude`
+/// (the clauses and their checks), and then only calls a copy of itself
+/// that has the body and no checks of preconditions, `<name>$unchecked`. It
+/// becomes `always_inline("nodebug")`, so each direct caller runs the checks
+/// itself, where they can be folded against what the caller knows, and where
+/// a caller proven to meet the preconditions can call the copy instead.
+///
+/// The forwarding call is built like the one of a struct's wrapper for an
+/// inherited default method (`populateDefaultedTraitFunction`).
+static void splitContractChecks(DefASTDecl &decl, Operation *prelude) {
+  FnOp fn = decl.getOp();
+  Block &body = *fn.getBody();
+  auto isCheck = [](Operation &op) {
+    return isa<HLCF::IfOp>(op) && op.hasAttr(KGEN::kContractCheckAttrName);
+  };
+  if (llvm::none_of(body, isCheck) || !checksPreconditionsInCallers(fn))
+    return;
+
+  // The copy starts as the whole function. The body it ends up with is not
+  // its own but the function's, moved: declarations of the parser point at
+  // those ops.
+  IRMapping mapping;
+  auto copy = cast<FnOp>(fn->clone(mapping));
+  fn->getBlock()->getOperations().insertAfter(Block::iterator(fn), copy);
+  copy.setSymName((*fn.getSymName() + KGEN::kUncheckedSuffix).str());
+  if (auto name = fn.getSourceName())
+    copy.setSourceName((*name + KGEN::kUncheckedSuffix).str());
+  Block &copyBody = *copy.getBody();
+  Operation *copyPrelude = mapping.lookup(prelude);
+  while (&copyBody.back() != copyPrelude)
+    copyBody.back().erase();
+  // The copy assumes the preconditions: its caller checked them, or is
+  // proven to meet them.
+  for (Operation &op : llvm::make_early_inc_range(copyBody))
+    if (isCheck(op))
+      op.erase();
+    else
+      op.removeAttr(KGEN::kContractAssumeAttrName);
+  Operation *firstMoved = &*std::next(Block::iterator(prelude));
+  copyBody.getOperations().splice(copyBody.end(), body.getOperations(),
+                                  Block::iterator(firstMoved), body.end());
+  // What the moved ops use of the function's arguments and of its contracts'
+  // ops, they now use of the copy's.
+  for (Operation &moved :
+       llvm::make_range(Block::iterator(firstMoved), copyBody.end()))
+    moved.walk([&](Operation *op) {
+      for (OpOperand &operand : op->getOpOperands()) {
+        Value value = operand.get();
+        Operation *def = value.getDefiningOp();
+        if (def ? def->getBlock() == &body
+                : cast<BlockArgument>(value).getOwner() == &body)
+          operand.set(mapping.lookup(value));
+      }
+    });
+
+  // The function: its contracts and their checks, then the call. What is
+  // not a check of a precondition (a struct's invariant, an assumption)
+  // stays in the copy.
+  for (Operation &op : llvm::make_early_inc_range(body))
+    if (isa<HLCF::IfOp>(op) && !isCheck(op))
+      op.erase();
+
+  SharedState &shared = decl.getShared();
+  RaiseContext raiseContext(fn);
+  IREmitter emitter(decl, EC_Trait, nullptr, &raiseContext);
+  emitter.builder = OpBuilder::atBlockEnd(&body);
+  auto &builder = *emitter.builder;
+
+  FnTypeGeneratorType signature = copy.getFullSignature();
+  // Every parameter is bound to itself: those of what the function is in (a
+  // struct), then its own.
+  SmallVector<TypedAttr> bindings;
+  for (Operation *op = fn->getParentOp();
+       op && isa<StructDeclOp, ExtensionDeclOp, TraitDeclOp>(op);
+       op = op->getParentOp())
+    for (ParamDeclAttr param : cast<DeclInterface>(op).getInputParams())
+      bindings.push_back(KGEN::ParamDeclRefAttr::get(param));
+  for (ParamDeclAttr param :
+       fn.getParams().drop_back(signature.getNumImplicitOriginDecls()))
+    bindings.push_back(KGEN::ParamDeclRefAttr::get(param));
+  FuncTypeGeneratorType specialized = signature.getSpecializedGenerator(
+      bindings, &shared.getEvaluationContext(), fn.getLoc());
+  if (!specialized) {
+    decl.setErroneous();
+    return;
+  }
+  TypedAttr callee =
+      copy.getBoundSymbolRef(shared.getEvaluationContext(), bindings);
+  SmallVector<Value> operands(fn.getArguments().begin(),
+                              fn.getArguments().end());
+  SmallVector<TypedAttr> implicitOrigins;
+  for (auto [value, convention] :
+       llvm::zip(operands, signature.getArgConventions()))
+    if (hasImplicitOrigin(convention))
+      implicitOrigins.push_back(
+          cast<LIT::RefType>(value.getType()).getOrigin());
+  auto type = cast<FuncType>(specialized.getBody());
+  auto call = LIT::CallOp::create(builder, fn.getLoc(), type.getResults(),
+                                  callee, implicitOrigins, operands);
+  emitter.emitCallControlFlow(*call, type, nullptr);
+  emitter.emitNormalReturn(fn.getLoc(), call->getResult(0));
+
+  fn->setAttr(KGEN::kCheckedWrapperAttrName,
+              FlatSymbolRefAttr::get(fn.getContext(), *copy.getSymName()));
+  fn.setInlineLevelAttr(
+      getInlineLevelAttr(fn.getContext(), KGEN::InlineLevel::AlwaysNoDebug));
 }
 
 /// `selfArg` of an invariant clause for a `self` that is the function's
@@ -3088,7 +3226,13 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
       }
       if (runtimeChecks && !hasQuantifier(requiresOp))
         emitRuntimeCheck(*this, funcOp, emitter, clause, "precondition",
-                         std::nullopt);
+                         std::nullopt, {}, {},
+                         /*ofCall=*/!contract.invariantOf);
+      if (runtimeChecks && !hasQuantifier(requiresOp) &&
+          !contract.invariantOf && checksPreconditionsInCallers(funcOp))
+        emitRuntimeCheck(*this, funcOp, emitter, clause, "precondition",
+                         std::nullopt, {}, {}, /*ofCall=*/true,
+                         /*assume=*/true);
       continue;
     }
 
@@ -3399,6 +3543,12 @@ LogicalResult DefASTDecl::resolveBody(Lexer &lexer) {
   if (failed(resolver.emitContracts(funcOp, *this, emitter,
                                     /*runtimeChecks=*/!contractOnly)))
     return failure();
+  // The last op of what the contracts emit at the function's entry (null if
+  // nothing): `splitContractChecks` keeps that part in the function.
+  Operation *contractPrelude =
+      emitter.builder->getInsertionPoint() == body.begin()
+          ? nullptr
+          : &*std::prev(emitter.builder->getInsertionPoint());
 
   // A required trait method has no return: its postconditions follow the
   // preconditions directly, as the contract every implementation provides.
@@ -3462,6 +3612,8 @@ LogicalResult DefASTDecl::resolveBody(Lexer &lexer) {
     return success();
   }
 
+  if (contractPrelude)
+    splitContractChecks(*this, contractPrelude);
   return success();
 }
 

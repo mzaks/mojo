@@ -22,6 +22,23 @@ class Operation;
 
 namespace M::KGEN {
 
+/// Marks the `hlcf.if` the parser emits for the run-time check of a
+/// precondition (`if _contract_checks_enabled(): _check_contract(...)`), so
+/// `verify-contracts` can leave it out for the calls it proves.
+inline constexpr char kContractCheckAttrName[] = "kgen.contract_check";
+
+/// Marks, until the parser has split the function, the `hlcf.if` it emits
+/// next to such a check to assume the precondition: it goes to the copy of
+/// the function that has the body.
+inline constexpr char kContractAssumeAttrName[] = "kgen.contract_assume";
+
+/// On a function the parser split for its checked preconditions: the symbol,
+/// next to it, of its copy without the checks, which it only calls.
+inline constexpr char kCheckedWrapperAttrName[] = "kgen.checked_wrapper";
+
+/// What the name of that copy adds to the function's.
+inline constexpr char kUncheckedSuffix[] = "$unchecked";
+
 /// Give every contract op (`kgen.requires`, `kgen.ensures`, `kgen.old`) under
 /// `root` that reads a stack slot through a pointer operand a snapshot of it
 /// instead: the value is loaded right before the op and stored into a fresh
