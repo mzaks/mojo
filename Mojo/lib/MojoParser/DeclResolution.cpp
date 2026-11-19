@@ -3207,8 +3207,33 @@ LogicalResult DeclResolver::emitContracts(FnOp funcOp, ASTDecl &decl,
       // value ensures it: it is not checked again there at run time (where
       // a clause like `len(self) >= 0` would check itself inside
       // `__len__`).
-      if (contract.invariantOf)
+      // Where the function changes the value, though, it checks the
+      // invariant on return, and the optimizer can only fold that check
+      // against the value's state on entry if it is told the invariant held
+      // there: an assumption, in the functions that have the check.
+      if (contract.invariantOf) {
+        ArgConvention convention =
+            contract.selfArg == kSelfIsResult
+                ? ArgConvention::ByRefResult
+                : funcSignature.getArgConventions()[contract.selfArg];
+        if (!runtimeChecks || hasQuantifier(requiresOp) ||
+            (convention != ArgConvention::Mut &&
+             convention != ArgConvention::MutRef))
+          continue;
+        std::optional<CValue> selfValue;
+        if (self) {
+          ArrayRef<ASTDecl *> argDecls =
+              decl.lookupInCurrentScope(funcSignature.getArgName(*self));
+          if (argDecls.size() != 1 || !argDecls[0]->getIfIRValue())
+            continue;
+          selfValue = argDecls[0]->getIfIRValue();
+        }
+        emitRuntimeCheck(*this, funcOp, emitter, clause, "invariant",
+                         std::nullopt, selfValue,
+                         contract.invariantOf.getValue(), /*ofCall=*/false,
+                         /*assume=*/true);
         continue;
+      }
       Value result = registerResult(*this, funcOp, decl);
       bool usesResult =
           result && llvm::any_of(result.getUsers(), [&](Operation *user) {
