@@ -1657,10 +1657,16 @@ struct List[T: AnyType, /](
     @stable(since="1.0")
     @__unsafe_nested_origins_read_only
     @inline(.always)
+    @__checked_preconditions
     def __getitem__(
         ref self, idx: Int, /
     ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T
-        requires _index_in_bounds(idx, len(self)):
+        requires _index_in_bounds(idx, len(self)) else (
+            "index ",
+            idx,
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets the list element at the given index.
 
         Subscripting calls this method: `lst[3]` invokes `lst.__getitem__(3)`.
@@ -1676,7 +1682,6 @@ struct List[T: AnyType, /](
         Returns:
             A reference to the element at the given index.
         """
-        check_bounds(idx, length=len(self))
         return self.unsafe_get(index(idx))
 
     @__unsafe_nested_origins_read_only
