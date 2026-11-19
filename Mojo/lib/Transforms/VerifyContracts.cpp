@@ -395,6 +395,55 @@ static LIT::FnOp behindWrapper(LIT::FnOp fn) {
   return target ? target : fn;
 }
 
+/// For each precondition of `fn` (its `kgen.requires` that are not
+/// invariants, in order), whether a build in which `checked` clauses are
+/// checked ("all", "bounds" or "none") checks it at run time: the parser
+/// emitted a check for it (`kContractCheckAttrName`, in the function that
+/// calls `fn` if it split it), and the assertion mode turns that check on.
+/// The check of an ordinary clause asks `_contract_checks_enabled`, on with
+/// all assertions; that of a function marked `@__checked_preconditions` asks
+/// `_bounds_contract_checks_enabled`, on unless assertions are off.
+static SmallVector<bool> checkedPreconditions(LIT::FnOp fn, StringRef checked) {
+  SmallVector<bool> result;
+  if (!fn || fn.getFunctionBody().empty())
+    return result;
+  // The checks of a split function are in the function that calls it.
+  LIT::FnOp holder = fn;
+  if (auto name = fn.getSymName(); name && name->ends_with(kUncheckedSuffix))
+    if (auto wrapper = dyn_cast_or_null<LIT::FnOp>(SymbolTable::lookupSymbolIn(
+            fn->getParentOp(), name->drop_back(strlen(kUncheckedSuffix))));
+        wrapper && behindWrapper(wrapper) == fn)
+      holder = wrapper;
+  for (Operation &op : holder.getFunctionBody().front()) {
+    if (auto req = dyn_cast<RequiresOp>(&op)) {
+      if (!req.getInvariant())
+        result.push_back(false);
+      continue;
+    }
+    if (result.empty() || !isa<HLCF::IfOp>(op) ||
+        !op.hasAttr(kContractCheckAttrName) || op.getNumOperands() == 0)
+      continue;
+    // The condition is `_..._checks_enabled().__mlir_bool__()`.
+    bool bounds = false, known = false;
+    Operation *def = op.getOperand(0).getDefiningOp();
+    for (unsigned depth = 0; def && depth < 3 && !known; ++depth) {
+      auto call = dyn_cast<LIT::CallOp>(def);
+      if (!call)
+        break;
+      if (SymbolRefAttr callee = call.getDirectCallee()) {
+        StringRef leaf = callee.getLeafReference().getValue();
+        bounds = leaf.starts_with("_bounds_contract_checks_enabled");
+        known = bounds || leaf.starts_with("_contract_checks_enabled");
+      }
+      def = call->getNumOperands() ? call->getOperand(0).getDefiningOp()
+                                   : nullptr;
+    }
+    if (known && (checked == "all" || (bounds && checked == "bounds")))
+      result.back() = true;
+  }
+  return result;
+}
+
 /// The kernel a launch (`ctx.enqueue_function[kernel](...)`, whose callee
 /// is `call`) runs, and the symbol naming it with its parameters: the
 /// function among the call's parameters, behind the `rebind` and the thunk
@@ -488,6 +537,11 @@ struct SolverConfig {
   bool exactRetry = false;
   /// The work limit of each query asking whether a product is in range.
   unsigned rangeRlimit = 300000;
+  /// Which contract clauses are checked at run time in the build the pass
+  /// runs in (`checked-clauses`): "" when it only reports (every clause is
+  /// then taken to hold where the language says it does), else "all",
+  /// "bounds" or "none".
+  std::string checkedClauses;
   /// The scripts already run, or running, in this run of the pass.
   std::shared_ptr<struct ScriptMemo> memo = {};
 };
@@ -1953,6 +2007,10 @@ public:
         dumpPrefix(std::move(dumpPrefix)), impls(impls), refines(refines),
         selfStruct(refines ? plainStructOf(fn) : "") {}
 
+  /// The functions whose postconditions the proofs of this one assume,
+  /// after calls of them.
+  llvm::SmallPtrSet<Operation *, 8> assumedCallees;
+
   /// Encodes the function; returns false if it has no body.
   bool encode() {
     Region &body = fn.getFunctionBody();
@@ -2026,10 +2084,21 @@ public:
         entryBases.push_back(a->base);
     // The function's own preconditions hold at its entry (when refining,
     // after they are proven there: on the path, not as global facts).
+    // In a build, only those the build checks at run time: what follows
+    // from a clause nothing checks must not remove a check.
     SmallVector<ClauseRange> ranges;
     rangeSink = &ranges;
+    SmallVector<bool> checked;
+    if (!solver.checkedClauses.empty())
+      checked = checkedPreconditions(fn, solver.checkedClauses);
+    unsigned precondition = 0;
     for (Operation &op : entry)
-      if (auto req = dyn_cast<RequiresOp>(&op))
+      if (auto req = dyn_cast<RequiresOp>(&op)) {
+        if (!req.getInvariant() && !solver.checkedClauses.empty()) {
+          unsigned index = precondition++;
+          if (index >= checked.size() || !checked[index])
+            continue;
+        }
         if (MaybeTerm cond = instantiate(req.getBody(), req.getArgs(), state,
                                          {}, {}, nullptr, /*assumed=*/true)) {
           if (refines)
@@ -2038,6 +2107,7 @@ public:
           else
             facts.push_back(*cond);
         }
+      }
     rangeSink = nullptr;
     // The function touches only the elements its preconditions name of
     // the memory tracked from entry (none, when they name no range).
@@ -9960,6 +10030,7 @@ private:
     SmallVector<EnsuresOp> clauses = postconditionClauses(callee);
     if (clauses.empty())
       return;
+    assumedCallees.insert(callee.getOperation());
     callResult = call->getNumResults() == 1 ? call->getResult(0) : Value();
     std::string holds = "true";
     for (EnsuresOp ensures : clauses)
@@ -14682,6 +14753,25 @@ struct VerifyContractsPass
       os << *ints;
       return;
     }
+    // `checked-clauses=build`: by the assertion mode of the build, the
+    // define `ASSERT` of the module (`safe` if it has none). With `warn` a
+    // failed check does not stop the program, so no clause counts as
+    // checked; with `none` there is no check to remove.
+    std::string checked = checkedClauses;
+    if (checked == "build") {
+      std::string mode;
+      if (auto env =
+              getOperation()->getAttrOfType<EnvAttr>(EnvAttr::getEnvAttrName()))
+        if (Attribute value = env.getValues().get("ASSERT")) {
+          llvm::raw_string_ostream os(mode);
+          value.print(os);
+        }
+      if (StringRef(mode).contains("none"))
+        return;
+      checked = StringRef(mode).contains("all")    ? "all"
+                : StringRef(mode).contains("warn") ? "none"
+                                                   : "bounds";
+    }
     std::string z3 = z3Path;
     if (z3.empty()) {
       if (auto found = llvm::sys::findProgramByName("z3"))
@@ -14702,6 +14792,7 @@ struct VerifyContractsPass
     if (intRetry)
       solver.nonlinearRlimit = nonlinearRlimit;
     solver.exactRetry = intRetry;
+    solver.checkedClauses = checked;
     solver.caseSplit = caseSplit;
     solver.invariantRetry = invariantRetry;
     solver.liveSolver = liveSolver;
@@ -15004,6 +15095,8 @@ struct VerifyContractsPass
       SmallVector<Obligation> obligations;
       SmallVector<Answer> answers;
       unsigned loops = 0, invariants = 0;
+      /// See `FunctionEncoder::assumedCallees`.
+      SmallVector<Operation *> assumedCallees;
     };
     // Encodes and solves one function (or instantiation) into `result`.
     auto verify = [&](FunctionEncoder &enc, Result &result,
@@ -15012,6 +15105,7 @@ struct VerifyContractsPass
         return;
       result.loops = enc.loopsAnalyzed;
       result.invariants = enc.invariantsFound;
+      llvm::append_range(result.assumedCallees, enc.assumedCallees);
       if (enc.obligations.empty())
         return;
       std::optional<SmallVector<Answer>> answers =
@@ -15255,6 +15349,64 @@ struct VerifyContractsPass
         return 0;
       }
     };
+    // In a build (`checked-clauses`), a proof only removes a check if all it
+    // may rest on is proven or checked at run time. Per function: every
+    // precondition of a call in it is proven, or checked by this build (a
+    // call that breaks one runs a callee nothing is known of); and every
+    // function whose postconditions it assumes is in the standard library,
+    // which is trusted, or is verified here with all its own postconditions
+    // proven by proofs that can be relied on in the same way. The largest
+    // set of functions with that property: mutual recursion does not
+    // exclude any.
+    std::vector<bool> reliable(results.size(), true);
+    if (!checked.empty()) {
+      DenseMap<Operation *, size_t> jobOf;
+      for (auto [i, job] : llvm::enumerate(fns))
+        if (!job.refines)
+          jobOf.try_emplace(job.fn.getOperation(), i);
+      DenseMap<Operation *, bool> allChecked;
+      auto checksAll = [&](Operation *callee) {
+        auto [it, inserted] = allChecked.try_emplace(callee, false);
+        if (inserted) {
+          SmallVector<bool> each =
+              checkedPreconditions(cast<LIT::FnOp>(callee), checked);
+          it->second =
+              !each.empty() && llvm::all_of(each, [](bool c) { return c; });
+        }
+        return it->second;
+      };
+      std::vector<bool> postconditionsProven(results.size(), true);
+      for (auto [i, result] : llvm::enumerate(results))
+        for (auto [ob, answer] :
+             llvm::zip(result.obligations, result.answers)) {
+          if (answer == Answer::Proven)
+            continue;
+          if (ob.postcondition)
+            postconditionsProven[i] = false;
+          else if (ob.claim.empty() && ob.implementation.empty() &&
+                   !(ob.checkedCallee && checksAll(ob.checkedCallee)))
+            reliable[i] = false;
+        }
+      for (bool changed = true; changed;) {
+        changed = false;
+        for (auto [i, result] : llvm::enumerate(results)) {
+          if (!reliable[i])
+            continue;
+          for (Operation *callee : result.assumedCallees) {
+            auto it = jobOf.find(callee);
+            bool trusted =
+                it == jobOf.end()
+                    ? packageOf(callee) == "std"
+                    : postconditionsProven[it->second] && reliable[it->second];
+            if (!trusted) {
+              reliable[i] = false;
+              changed = true;
+              break;
+            }
+          }
+        }
+      }
+    }
     unsigned total = 0, proven = 0, forInstances = 0, loops = 0, invariants = 0;
     // For `drop-proven-checks`: the direct calls of the verified functions,
     // with the function called, or null once one of the call's preconditions
@@ -15269,6 +15421,7 @@ struct VerifyContractsPass
         ++total;
         if (ob.call) {
           bool ok = answer == Answer::Proven && ob.checkedCallee &&
+                    reliable[i] &&
                     ob.call->getParentOfType<LIT::FnOp>() == fns[i].fn;
           auto it = checkedCalls.try_emplace(ob.call, ob.checkedCallee).first;
           if (!ok)

@@ -118,6 +118,14 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "Experimental: point every direct call all preconditions of which "
            "are proven at a copy of the callee without their run-time "
            "checks.">,
+    Option<"checkedClauses", "checked-clauses", "std::string",
+           /*default=*/"\"\"",
+           "For a build: which contract clauses the build checks at run "
+           "time, `all`, `bounds` (those of functions marked "
+           "`@__checked_preconditions`) or `none`, or `build` to go by the "
+           "module's `ASSERT` define. Proofs then rest only on clauses that "
+           "are checked or proven. Empty (the default) to "
+           "report on the contracts as written.">,
     Option<"quiet", "quiet", "bool", /*default=*/"false",
            "Report neither the obligations that are not proven nor the "
            "totals (for a build that only uses what is proven).">,

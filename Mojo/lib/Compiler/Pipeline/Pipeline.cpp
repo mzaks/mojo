@@ -53,6 +53,8 @@ static void buildLowerLITPipeline(mlir::PassManager &pm,
     VerifyContractsOptions verifyOptions;
     verifyOptions.dropProvenChecks = true;
     verifyOptions.quiet = true;
+    // Proofs rest only on clauses this build checks, or that are proven.
+    verifyOptions.checkedClauses = "build";
     pm.addPass(createVerifyContracts(verifyOptions));
   }
 

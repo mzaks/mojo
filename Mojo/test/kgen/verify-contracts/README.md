@@ -918,12 +918,30 @@ at all is up to `-D ASSERT`.
 mojo build --contract-prover=z3 main.mojo
 ```
 
-Limits: a proof inside a function assumes the function's own preconditions,
-so dropping a check on its strength is only sound when those are checked or
-proven where the function is called, which the pass does not look at yet:
-with the default assertion mode an ordinary `requires` is not checked, and a
-bounds check proven from it is still dropped. It also trusts the
-postconditions of the standard library.
+In a build a proof removes a check only if all it may rest on is checked at
+run time or proven (`checked-clauses`, which the build sets from the
+module's `ASSERT` define; the reports of `kgen --verify-contracts` keep
+taking every clause to hold where the language says it does):
+
+- A function's own preconditions are assumed in its body only where the
+  build checks them: every clause that can run under `-D ASSERT=all`, only
+  those of functions marked `@__checked_preconditions` by default, none
+  under `-D ASSERT=warn`, where a failed check does not stop the program.
+  So by default `def at(xs: List[Int], i: Int) requires i < len(xs)` keeps
+  the bounds check of its `xs[i]`.
+- No check is removed in a function that calls another with a precondition
+  that is neither proven at that call nor checked: nothing is known of what
+  the callee then does.
+- No check is removed in a function whose proofs assume the postconditions
+  of a function outside the standard library, unless that function is
+  verified in the same run with all its postconditions proven, by proofs
+  that hold up in the same way.
+
+Limits: the last two rules are per function, not per proof, so one such
+call costs the function all its removals. The postconditions and invariants
+of the standard library are trusted, not checked. A function from another
+package that is not verified in the run (`packages=`) is not trusted, even
+when the build checks its postconditions.
 
 ## The same answers on every machine
 
