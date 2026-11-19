@@ -21,6 +21,7 @@ from std.collections.string.string_span import _get_kgen_string
 from std.builtin.debug_assert import _assert_enabled, _debug_assert_msg
 from std.reflection import call_location
 from std.sys.defines import get_defined_bool
+from std.sys.info import is_gpu
 from std.sys.intrinsics import assume
 from std.traits import IsTriviallyMovable
 
@@ -48,6 +49,28 @@ def _contract_checks_enabled() -> Bool:
     # Decided at compile time: `_assert_enabled` is not inlined, so asking it
     # at run time would cost every function with a clause a call.
     comptime if _assert_enabled[_ContractAssertMode, False]():
+        return True
+    else:
+        return False
+
+
+def _bounds_contract_checks_enabled() -> Bool:
+    """Returns whether the preconditions of a function marked
+    `@__checked_preconditions` are checked at run time.
+
+    Such a precondition takes the place of a bounds check in the function, so
+    it is checked when `check_bounds` checks: by default on CPU, never with
+    `-D ASSERT=none`, and on GPU only with `-D ASSERT=all`.
+
+    Returns:
+        Whether those preconditions are checked.
+    """
+    comptime if is_gpu():
+        comptime if _assert_enabled["none", False]():
+            return True
+        else:
+            return False
+    elif _assert_enabled["safe", False]():
         return True
     else:
         return False

@@ -976,6 +976,11 @@ LogicalResult FnSigDecorators::applyOne(ExprNode *decorator) {
   } else if (spelling == "__unsafe_nested_origins_read_only") {
     applyArgumentless(spelling, callNode,
                       [&]() { tcSignature.isNestedOriginsReadOnly = true; });
+  } else if (spelling == "__checked_preconditions") {
+    applyArgumentless(spelling, callNode, [&]() {
+      funcOp->setAttr(KGEN::kCheckedPreconditionsAttrName,
+                      UnitAttr::get(funcOp.getContext()));
+    });
   } else if (spelling == "__allow_legacy_custom_self_type") {
     applyArgumentless(spelling, callNode,
                       [&]() { tcSignature.allowCustomSelfType = true; });
@@ -2796,18 +2801,24 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
   const ExprNode *expr = clause.propExpr;
   if (!emitter.builder || !expr || !shared.hasBuiltinModule())
     return;
-  // The standard library is not checked: the checks themselves use it (the
-  // assertion mode is a string, compared through pointers whose accessors
-  // have contracts), so a check inside it would need itself.
-  for (Operation *parent = funcOp->getParentOp(); parent;
+  // A function can ask for its preconditions to be checked like bounds
+  // checks, in the assertion mode those have.
+  bool likeBoundsCheck =
+      ofCall && funcOp->hasAttr(KGEN::kCheckedPreconditionsAttrName);
+  // The standard library is otherwise not checked: the checks themselves use
+  // it (the assertion mode is a string, compared through pointers whose
+  // accessors have contracts), so a check inside it would need itself.
+  for (Operation *parent = funcOp->getParentOp(); parent && !likeBoundsCheck;
        parent = parent->getParentOp())
     if (auto package = dyn_cast<LIT::PackageOp>(parent);
         package && package.getSymName() == "std")
       return;
   ASTDecl &scope = emitter.declScope;
-  ArrayRef<ASTDecl *> enabledFns = shared.getBuiltinFunction(
-      scope, {"std", "builtin", "_verification"}, "_contract_checks_enabled",
-      clause.loc);
+  StringRef enabledFn = likeBoundsCheck ? "_bounds_contract_checks_enabled"
+                                        : "_contract_checks_enabled";
+  // Copied: the next lookup can move what this one returns a view of.
+  SmallVector<ASTDecl *, 1> enabledFns(shared.getBuiltinFunction(
+      scope, {"std", "builtin", "_verification"}, enabledFn, clause.loc));
   // A precondition checked in the callers reports the call.
   // In the copy of such a function, which has the body, the precondition is
   // a fact (`assume`).
@@ -2821,8 +2832,8 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
     return;
   Location loc = shared.translateLocation(clause.loc);
 
-  OverloadSet enabledCall("_contract_checks_enabled", enabledFns,
-                          ParamBindings(scope, expr), CallSyntax::kDirectCall);
+  OverloadSet enabledCall(enabledFn, enabledFns, ParamBindings(scope, expr),
+                          CallSyntax::kDirectCall);
   CValue enabled = enabledCall.emitCall(
       CallOperands(CallSyntax::kDirectCall, expr, EC_BoolCondition), emitter);
   if (!enabled)

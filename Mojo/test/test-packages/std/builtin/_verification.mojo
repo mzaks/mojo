@@ -18,6 +18,10 @@ def _contract_checks_enabled() -> Bool:
     return False
 
 
+def _bounds_contract_checks_enabled() -> Bool:
+    return False
+
+
 def _check_contract(cond: Bool, message: StringLiteral):
     pass
 

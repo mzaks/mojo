@@ -34,6 +34,13 @@ inline constexpr char kContractCheckAttrName[] = "kgen.contract_check";
 /// the function that has the body.
 inline constexpr char kContractAssumeAttrName[] = "kgen.contract_assume";
 
+/// On a function marked `@__checked_preconditions`: its preconditions are
+/// checked at run time like bounds checks (on by default on CPU, off with
+/// `-D ASSERT=none`), also in the standard library, whose other clauses are
+/// not checked.
+inline constexpr char kCheckedPreconditionsAttrName[] =
+    "kgen.checked_preconditions";
+
 /// On a function the parser split for its checked preconditions: the symbol,
 /// next to it, of its copy without the checks, which it only calls.
 inline constexpr char kCheckedWrapperAttrName[] = "kgen.checked_wrapper";

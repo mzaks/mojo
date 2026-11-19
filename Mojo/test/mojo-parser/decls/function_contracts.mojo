@@ -245,3 +245,13 @@ def split_in_two(a: Int) -> Int requires a > 0:
     var doubled = a + a
     return doubled
 
+
+
+# A function marked `@__checked_preconditions` has its preconditions checked
+# in the assertion mode of bounds checks, not in that of contract clauses.
+# CHECK-LABEL: lit.fn @"checked_like_bounds
+# CHECK: _bounds_contract_checks_enabled
+# CHECK: _check_contract_in_caller
+@__checked_preconditions
+def checked_like_bounds(i: Int) requires i >= 0:
+    pass
