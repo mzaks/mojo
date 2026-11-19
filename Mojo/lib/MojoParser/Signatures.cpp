@@ -1514,8 +1514,12 @@ ParseResult ParsedConstraint::parseElseMessage(ParserBase &p,
     return p.emitError(p.getToken().getLoc(),
                        "expected a string literal message after 'else'");
 
+  // The parts of a contract clause's message are emitted with the function's
+  // body, like its condition, so they are kept as long.
   ExprNode *msgExpr;
-  if (p.parseExpression(msgExpr, stmtIndent))
+  if (keyword != "where"
+          ? p.parseExpression(msgExpr, p.shared.persistentAllocator, stmtIndent)
+          : p.parseExpression(msgExpr, stmtIndent))
     return failure();
 
   // Parentheses around the message let it wrap across lines, the way the
@@ -1523,9 +1527,24 @@ ParseResult ParsedConstraint::parseElseMessage(ParserBase &p,
   while (auto *paren = dyn_cast_if_present<ParenNode>(msgExpr))
     msgExpr = paren->subExpr;
 
-  // Only string literals, for the same reason as the parenthesized form: a
-  // non-literal expression would need comptime evaluation that the parser
-  // cannot perform.
+  // A contract clause is checked at run time, so its message can also be a
+  // tuple of parts to format when it fails.
+  if (keyword != "where")
+    if (auto *tuple = dyn_cast_if_present<TupleNode>(msgExpr);
+        tuple && !tuple->exprs.empty()) {
+      // Interned: the clause outlives the expression parser's own storage.
+      SmallVector<ExprNode *, 4> parts;
+      for (ExprNode *part : tuple->exprs)
+        if (part)
+          parts.push_back(part);
+      messageParts = p.shared.persistentAllocator.internElements(
+          ArrayRef<ExprNode *>(parts));
+      return success();
+    }
+
+  // Only string literals otherwise, for the same reason as the parenthesized
+  // form: a non-literal expression would need comptime evaluation that the
+  // parser cannot perform.
   auto *strLit = dyn_cast_if_present<StringLiteralNode>(msgExpr);
   if (!strLit)
     return p.emitError(msgExpr ? msgExpr->getLoc() : elseLoc,

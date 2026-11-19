@@ -32,3 +32,11 @@ def _check_contract_in_caller(cond: Bool, message: StringLiteral):
 
 def _assume_contract(cond: Bool, message: StringLiteral):
     pass
+
+
+def _fail_contract[*Ts: AnyType](*messages: *Ts):
+    pass
+
+
+def _fail_contract_in_caller[*Ts: AnyType](*messages: *Ts):
+    pass

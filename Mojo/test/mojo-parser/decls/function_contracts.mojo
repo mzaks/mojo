@@ -36,6 +36,20 @@ def with_message(b: Int) requires b > 0 else "b must be positive":
     pass
 
 
+# The message can also be a tuple of parts, which are evaluated and formatted
+# only where the clause is found not to hold at run time.
+# CHECK-LABEL: lit.fn @"with_formatted_message
+# CHECK: kgen.requires
+# CHECK: hlcf.if
+# CHECK: hlcf.if
+# CHECK: _fail_contract_in_caller
+def with_formatted_message(b: Int) requires b > 0 else (
+    "b must be positive, got ",
+    b,
+):
+    pass
+
+
 # A clause may use every argument, and a function may have several clauses:
 # one op per clause, each over all the function's arguments. A clause may
 # start a new line.

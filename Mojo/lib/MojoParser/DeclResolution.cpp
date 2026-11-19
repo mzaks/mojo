@@ -2826,8 +2826,14 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
                       : ofCall && checksPreconditionsInCallers(funcOp)
                           ? "_check_contract_in_caller"
                           : "_check_contract";
-  ArrayRef<ASTDecl *> assertFns = shared.getBuiltinFunction(
-      scope, {"std", "builtin", "_verification"}, checkFn, clause.loc);
+  // A clause with a formatted message tests its condition here and calls
+  // the function that formats and reports only where it does not hold.
+  bool formatted = !assume && !clause.messageParts.empty();
+  if (formatted)
+    checkFn = checkFn == "_check_contract" ? "_fail_contract"
+                                           : "_fail_contract_in_caller";
+  SmallVector<ASTDecl *, 1> assertFns(shared.getBuiltinFunction(
+      scope, {"std", "builtin", "_verification"}, checkFn, clause.loc));
   if (enabledFns.empty() || assertFns.empty())
     return;
   Location loc = shared.translateLocation(clause.loc);
@@ -2869,8 +2875,46 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
       *emitter.builder, loc, TypeRange{}, enabledI1,
       [&]() -> LogicalResult {
         IREmitter check(checkScope, *emitter.builder);
-        AnyValue cond = check.emitExpr(expr, EC_TopLevelStmt);
-        if (cond) {
+        AnyValue cond;
+        if (formatted) {
+          Value condI1;
+          if (CValue value = check.emitExprCValue(expr, EC_BoolCondition)) {
+            RValue condBool =
+                check.emitScalarBool({value, expr}, EC_BoolCondition);
+            condI1 =
+                check.emitSRValue({AnyValue(condBool), expr}, EC_BoolCondition);
+          }
+          if (condI1) {
+            auto failIf = HLCF::IfOp::create(
+                *check.builder, loc, TypeRange{}, condI1,
+                [&]() -> LogicalResult {
+                  HLCF::YieldOp::create(*check.builder, loc);
+                  return success();
+                },
+                [&]() -> LogicalResult {
+                  IREmitter fail(checkScope, *check.builder);
+                  CallOperands operands(CallSyntax::kDirectCall, expr,
+                                        EC_TopLevelStmt);
+                  bool ok = true;
+                  for (ExprNode *part : clause.messageParts) {
+                    AnyValue value = fail.emitExpr(part, EC_TopLevelStmt);
+                    ok &= bool(value);
+                    if (value)
+                      operands.add({value, part});
+                  }
+                  if (ok) {
+                    OverloadSet call(checkFn, assertFns,
+                                     ParamBindings(checkScope, expr),
+                                     CallSyntax::kDirectCall);
+                    call.emitCall(std::move(operands), fail);
+                  }
+                  HLCF::YieldOp::create(*fail.builder, loc);
+                  return success();
+                });
+            if (failIf)
+              check.builder->setInsertionPointAfter(failIf);
+          }
+        } else if ((cond = check.emitExpr(expr, EC_TopLevelStmt))) {
           ExprDest messageDest(EC_TopLevelStmt);
           CValue messageValue = StringLiteralNode::emitCtorCall(
               message, expr, messageDest, check);

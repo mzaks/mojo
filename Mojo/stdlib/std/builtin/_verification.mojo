@@ -18,7 +18,11 @@ LLVM, and the comptime interpreter skips them.
 """
 
 from std.collections.string.string_span import _get_kgen_string
-from std.builtin.debug_assert import _assert_enabled, _debug_assert_msg
+from std.builtin.debug_assert import (
+    _assert_enabled,
+    _debug_assert_fail_format,
+    _debug_assert_msg,
+)
 from std.reflection import call_location
 from std.sys.defines import get_defined_bool
 from std.sys.info import is_gpu
@@ -111,8 +115,42 @@ def _check_contract_in_caller(cond: Bool, message: StringLiteral):
     if cond:
         return
     _debug_assert_msg(
-        message.ptr(), message.byte_length() + 1, call_location[inline_count=2]()
+        message.ptr(),
+        message.byte_length() + 1,
+        call_location[inline_count=2](),
     )
+
+
+@inline(.nodebug)
+def _fail_contract[*Ts: Writable](*messages: *Ts):
+    """Fails like a `debug_assert` with the formatted `messages`.
+
+    The parser calls it where a `requires` or `ensures` clause with a
+    formatted message, `requires cond else ("index ", i, " is out of
+    bounds")`, does not hold: the parts are evaluated and formatted only
+    then.
+
+    Parameters:
+        Ts: The types of the parts.
+
+    Args:
+        messages: The parts of the message, written out in order.
+    """
+    _debug_assert_fail_format(call_location(), *messages)
+
+
+@inline(.nodebug)
+def _fail_contract_in_caller[*Ts: Writable](*messages: *Ts):
+    """Fails like `_fail_contract`, reporting where the function was called
+    (see `_check_contract_in_caller`).
+
+    Parameters:
+        Ts: The types of the parts.
+
+    Args:
+        messages: The parts of the message, written out in order.
+    """
+    _debug_assert_fail_format(call_location[inline_count=2](), *messages)
 
 
 @inline(.nodebug)

@@ -93,6 +93,12 @@ struct ParsedConstraint {
   /// `where (condition, "message")` or the `where condition else "message"`
   /// form. Null if no message was written.
   StringAttr message;
+  /// The parts of a message that is formatted when the clause fails at run
+  /// time, from `requires condition else ("index ", i, " is out of bounds")`:
+  /// string literals and values, written out in order like the messages of
+  /// `debug_assert`. Only a `requires` or `ensures` clause has them, and then
+  /// no `message`.
+  ArrayRef<ExprNode *> messageParts;
 
   /// Parse a `where` clause's condition and its optional message. `keyword`
   /// is the clause's own: `requires` and `ensures` clauses share the grammar,
