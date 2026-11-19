@@ -24,35 +24,27 @@ from std.builtin.debug_assert import (
     _debug_assert_msg,
 )
 from std.reflection import call_location
-from std.sys.defines import get_defined_bool
 from std.sys.info import is_gpu
 from std.sys.intrinsics import assume
 from std.traits import IsTriviallyMovable
 
 
-comptime _ContractAssertMode = (
-    "safe" if get_defined_bool["CONTRACT_CHECKS", False]() else "none"
-)
-"""The assertion mode contract clauses are checked under."""
-
-
-@inline(.nodebug)
 def _contract_checks_enabled() -> Bool:
     """Returns whether `requires` and `ensures` clauses are checked at run
     time.
 
     The parser emits each clause as a `debug_assert` under this condition, so
-    a clause is evaluated only when it is checked: under the same assertion
-    mode as a `debug_assert` without an `assert_mode` (`-D ASSERT=all`), or,
-    experimentally, in every assertion mode but `none` with
-    `-D CONTRACT_CHECKS=true`.
+    a clause is evaluated only when it is checked. Clauses follow the switch
+    of assertions and nothing else: they are checked in the assertion mode of
+    a `debug_assert` without an `assert_mode`, that is with `-D ASSERT=all`,
+    and never with `-D ASSERT=none`.
 
     Returns:
         Whether contract clauses are checked.
     """
     # Decided at compile time: `_assert_enabled` is not inlined, so asking it
     # at run time would cost every function with a clause a call.
-    comptime if _assert_enabled[_ContractAssertMode, False]():
+    comptime if _assert_enabled["none", False]():
         return True
     else:
         return False

@@ -868,9 +868,13 @@ with).
 ## Run-time checks of preconditions, in the caller
 
 Outside the standard library the parser emits a run-time check for each
-`requires` clause that can run (no quantifier). The checks are on under
-`-D ASSERT=all`, and with `-D CONTRACT_CHECKS=true` in every assertion mode
-but `none`.
+`requires` clause that can run (no quantifier). The checks follow the
+switch of assertions and nothing else: they are on under `-D ASSERT=all`,
+like a `debug_assert`, and gone under `-D ASSERT=none`. A function marked
+`@__checked_preconditions` has its preconditions checked like bounds checks
+instead (on by default on CPU), also in the standard library:
+`List.__getitem__` checks its index this way. A clause can format its
+message from values, `requires i < n else ("index ", i, " is out of bounds")`.
 
 A function with such a check is split in two (`splitContractChecks` in
 `DeclResolution.cpp`). The function itself keeps its clauses and their
