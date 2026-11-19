@@ -908,20 +908,22 @@ function, or, for `List.__getitem__`, a copy the pass makes without the call
 of `check_bounds`, which checks what its clause states. That second case is
 an assumption about one function, written into the pass.
 
-To build with it, set `MOJO_PROVE_CONTRACT_CHECKS` (to `verbose`, `nocache`,
-both, or nothing): the pass then runs inside the compilation pipeline, after
-the check pipeline, of `mojo build` and `kgen`:
+To build with it, pass `--contract-prover=z3` to `mojo build` (or `kgen`):
+the pass then runs inside the compilation pipeline, after the check
+pipeline, and reports nothing (`quiet`): what it does not prove keeps its
+check. The option only sets how much is proven; whether clauses are checked
+at all is up to `-D ASSERT`.
 
 ```bash
-MOJO_PROVE_CONTRACT_CHECKS=verbose mojo build -D CONTRACT_CHECKS=true main.mojo
+mojo build --contract-prover=z3 main.mojo
 ```
 
 Limits: a proof inside a function assumes the function's own preconditions,
 so dropping a check on its strength is only sound when those are checked or
-proven where the function is called (hence `CONTRACT_CHECKS`), and it trusts
-the postconditions of the standard library. The compiler's cache of
-elaborated modules does not know about the variable: use a fresh
-`MODULAR_CACHE_DIR` when switching it.
+proven where the function is called, which the pass does not look at yet:
+with the default assertion mode an ordinary `requires` is not checked, and a
+bounds check proven from it is still dropped. It also trusts the
+postconditions of the standard library.
 
 ## The same answers on every machine
 

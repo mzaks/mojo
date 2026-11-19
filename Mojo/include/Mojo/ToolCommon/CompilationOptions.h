@@ -122,6 +122,16 @@ public:
     kLangMojo = llvm::dwarf::DW_LANG_Mojo,
   };
 
+  /// What proves the run-time checks of contract clauses redundant, so they
+  /// can be left out. It does not decide whether clauses are checked: the
+  /// assertion mode does (`-D ASSERT`).
+  enum ContractProver {
+    /// Nothing beyond what the optimizer folds by itself.
+    kProverNone,
+    /// The `verify-contracts` pass, with the z3 solver.
+    kProverZ3,
+  };
+
   /// The compilation abstraction level to generate debug info for, used in
   /// tandem with DebugInfoLevel.
   enum DebugAtLevel {
@@ -176,6 +186,7 @@ public:
   /// elaboration, for an analysis of the elaborated module that reads them.
   /// They are otherwise removed right after the check pipeline.
   bool keepContracts = false;
+  ContractProver contractProver = kProverNone;
   FpMode fpMode;
   DebugInfoLevel debugLevel = kNoDebug;
   std::optional<DebugAtLevel> debugAtLevel;

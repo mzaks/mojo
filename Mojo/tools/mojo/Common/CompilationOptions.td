@@ -205,4 +205,16 @@ defm debug_info_language : CommandOption<["--", "-"], "debug-info-language",
   MarshallingInfoChoice<CompilationOpts<"debugInfoLanguage">, ["Mojo", "C"],
                         ["kLangMojo", "kLangC"]>;
 
+defm contract_prover : CommandOption<["--", "-"], "contract-prover",
+  ExperimentalCompilationOptionGroup, MetaVarName<"PROVER">,
+  HelpText<
+    "Sets what proves run-time checks of `requires` clauses redundant, so "
+    "the calls proven to meet them run without the checks. `none` (the "
+    "default) leaves that to the optimizer; `z3` verifies the contracts with "
+    "the z3 solver, which must be installed, and takes longer to compile. "
+    "The option does not turn the checks on or off: `-D ASSERT` does."
+  >>,
+  MarshallingInfoChoice<CompilationOpts<"contractProver">, ["none", "z3"],
+                        ["kProverNone", "kProverZ3"]>;
+
 #endif // KGEN_TOOLS_MOJO_COMMON_COMPILATIONOPTIONS_TD

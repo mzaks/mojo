@@ -15184,7 +15184,7 @@ struct VerifyContractsPass
       });
     pool.wait();
     for (InstanceJob &job : instanceJobs)
-      if (job.opaque) {
+      if (job.opaque && !quiet) {
         LIT::FnOp kernel = fns[job.job].fn;
         const Instance &at = instances[kernel.getOperation()][job.instance];
         auto diag = mlir::emitWarning(at.launch);
@@ -15336,6 +15336,8 @@ struct VerifyContractsPass
                 << (perInstance.size() == 1 ? "" : "s");
           continue;
         }
+        if (quiet)
+          continue;
         auto diag = mlir::emitWarning(ob.callLoc);
         switch (answer) {
         case Answer::Unproven:
@@ -15379,10 +15381,13 @@ struct VerifyContractsPass
         if (callee && callWithoutChecks(cast<LIT::CallOp>(call),
                                         cast<LIT::FnOp>(callee), uncheckedFns))
           ++dropped;
-      llvm::errs() << "verify-contracts: " << dropped << " of "
-                   << checkedCalls.size()
-                   << " calls with preconditions run without their checks\n";
+      if (!quiet)
+        llvm::errs() << "verify-contracts: " << dropped << " of "
+                     << checkedCalls.size()
+                     << " calls with preconditions run without their checks\n";
     }
+    if (quiet)
+      return;
     llvm::errs() << "verify-contracts: " << proven << "/" << total
                  << " obligations proven (";
     if (forInstances)

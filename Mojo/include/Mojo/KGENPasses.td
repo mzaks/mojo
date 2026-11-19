@@ -118,6 +118,9 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
            "Experimental: point every direct call all preconditions of which "
            "are proven at a copy of the callee without their run-time "
            "checks.">,
+    Option<"quiet", "quiet", "bool", /*default=*/"false",
+           "Report neither the obligations that are not proven nor the "
+           "totals (for a build that only uses what is proven).">,
     Option<"cacheDir", "cache-dir", "std::string", /*default=*/"\"\"",
            "Directory to cache solver answers in, by a hash of each script "
            "(default: mojo/verify-contracts in the user's cache directory; "

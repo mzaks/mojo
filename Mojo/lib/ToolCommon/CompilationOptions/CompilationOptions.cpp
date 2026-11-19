@@ -138,6 +138,9 @@ void CompilationOptions::print(raw_ostream &os) const {
 
   os << ", debugInfoLang: " << debugInfoLanguage;
 
+  if (contractProver != kProverNone)
+    os << ", contractProver: z3";
+
   if (numThreads != 0)
     os << ", numThreads: " << numThreads;
 

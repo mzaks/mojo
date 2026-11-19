@@ -45,16 +45,14 @@ static void buildLowerLITPipeline(mlir::PassManager &pm,
                                   const CompilationOptions &options) {
   buildCheckLITPipeline(pm, options);
 
-  // Experimental: with MOJO_PROVE_CONTRACT_CHECKS set, verify the contracts
-  // as part of the build, and run the calls proven to meet their
-  // preconditions without the run-time checks of those. The value may name
-  // `verbose` and `nocache` (no cache of solver answers).
-  if (const char *proveChecks = getenv("MOJO_PROVE_CONTRACT_CHECKS")) {
+  // With `--contract-prover=z3`, verify the contracts as part of the build,
+  // and run the calls proven to meet their preconditions without the
+  // run-time checks of those. Nothing is reported: what is not proven keeps
+  // its check.
+  if (options.contractProver == CompilationOptions::kProverZ3) {
     VerifyContractsOptions verifyOptions;
     verifyOptions.dropProvenChecks = true;
-    verifyOptions.verbose = StringRef(proveChecks).contains("verbose");
-    if (StringRef(proveChecks).contains("nocache"))
-      verifyOptions.cacheDir = "none";
+    verifyOptions.quiet = true;
     pm.addPass(createVerifyContracts(verifyOptions));
   }
 
