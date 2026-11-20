@@ -715,7 +715,14 @@ struct Array[T: AnyType, length: Int](
         return self._unchecked_get(idx)
 
     @inline(.always)
-    def __getitem__(ref self, idx: Some[Indexer]) -> ref[self] Self.T:
+    @__checked_preconditions
+    def __getitem__(ref self, idx: Some[Indexer]) -> ref[self] Self.T
+        requires _index_in_bounds(index(idx), len(self)) else (
+            "index ",
+            index(idx),
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets a reference to the element at the given index.
 
         Subscripting calls this method: `arr[3]` invokes `arr.__getitem__(3)`.
@@ -739,7 +746,6 @@ struct Array[T: AnyType, length: Int](
             This method provides array-style indexing access to elements in the
             Array. The index is bounds-checked at runtime.
         """
-        check_bounds(index(idx), length=len(self))
         return self._unchecked_get(idx)
 
     @inline(.always)
@@ -1046,7 +1052,14 @@ struct Array[T: AnyType, length: Int](
     # ===------------------------------------------------------------------===#
 
     @inline(.always)
-    def unsafe_get(ref self, idx: Some[Indexer]) -> ref[self] Self.T:
+    @__checked_preconditions("all")
+    def unsafe_get(ref self, idx: Some[Indexer]) -> ref[self] Self.T
+        requires _index_in_bounds(index(idx), len(self)) else (
+            "index ",
+            index(idx),
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets a reference to an element without bounds checking.
 
         Args:
@@ -1072,7 +1085,6 @@ struct Array[T: AnyType, length: Int](
             This is an unsafe method that skips bounds checking for performance.
             Users should prefer `__getitem__` instead for safety.
         """
-        check_bounds[cpu_default=False](index(idx), length=len(self))
         return self._unchecked_get(idx)
 
     @inline(.always)

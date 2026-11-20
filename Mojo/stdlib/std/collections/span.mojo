@@ -402,9 +402,16 @@ struct Span[
         return self._data[unsafe_offset=idx]
 
     @inline(.always)
+    @__checked_preconditions
     def __getitem__(
         self, idx: Some[Indexer]
-    ) -> ref[Self.origin, Self.address_space] Self.T:
+    ) -> ref[Self.origin, Self.address_space] Self.T
+        requires _index_in_bounds(index(idx), len(self)) else (
+            "index ",
+            index(idx),
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets the span element at the given index.
 
         Args:
@@ -413,7 +420,6 @@ struct Span[
         Returns:
             A reference to the element at the given index.
         """
-        check_bounds(index(idx), length=len(self))
         return self._data[unsafe_offset=idx]
 
     @inline(.always)
@@ -691,9 +697,16 @@ struct Span[
         return rebind[Self.Immutable](self)
 
     @inline(.always)
+    @__checked_preconditions("all")
     def unsafe_get(
         self, idx: Some[Indexer]
-    ) -> ref[Self.origin, Self.address_space] Self.T:
+    ) -> ref[Self.origin, Self.address_space] Self.T
+        requires _index_in_bounds(index(idx), len(self)) else (
+            "index ",
+            index(idx),
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Get a reference to the element at `index` without bounds checking.
 
         Args:
@@ -708,7 +721,6 @@ struct Span[
             in undefined behavior.
             - This function does not support wraparound for negative indices.
         """
-        check_bounds[cpu_default=False](index(idx), length=len(self))
         return self._data[unsafe_offset=idx]
 
     @always_inline("builtin")

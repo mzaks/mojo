@@ -1700,9 +1700,16 @@ struct List[T: AnyType, /](
 
     @__unsafe_nested_origins_read_only
     @inline(.always)
+    @__checked_preconditions
     def __getitem__(
         ref self, idx: Some[Indexer]
-    ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T:
+    ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T
+        requires _index_in_bounds(index(idx), len(self)) else (
+            "index ",
+            index(idx),
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets the list element at the given index.
 
         Subscripting calls this method: `lst[3]` invokes `lst.__getitem__(3)`.
@@ -1718,15 +1725,20 @@ struct List[T: AnyType, /](
         Returns:
             A reference to the element at the given index.
         """
-        check_bounds(index(idx), length=len(self))
         return self.unsafe_get(index(idx))
 
     @__unsafe_nested_origins_read_only
     @inline(.always)
+    @__checked_preconditions("all")
     def unsafe_get(
         ref self, idx: Int
     ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T
-        requires _index_in_bounds(idx, len(self)):
+        requires _index_in_bounds(idx, len(self)) else (
+            "index ",
+            idx,
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Get a reference to an element of self without checking index bounds.
 
         Args:
@@ -1745,13 +1757,18 @@ struct List[T: AnyType, /](
             Never use `my_list.unsafe_get(-1)` to get the last element of the
             list. Instead, do `my_list.unsafe_get(len(my_list) - 1)`.
         """
-        check_bounds[cpu_default=False](idx, length=len(self))
         return self.unsafe_ptr().unsafe_offset(idx)[]
 
     @inline(.always)
+    @__checked_preconditions("all")
     def unsafe_set(mut self, idx: Int, var value: Self.T)
         where conforms_to(Self.T, Deinitable & Movable)
-        requires _index_in_bounds(idx, len(self))
+        requires _index_in_bounds(idx, len(self)) else (
+            "index ",
+            idx,
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        )
         ensures len(self) == old(len(self)):
         """Write a value to a given location without checking index bounds.
 
@@ -1769,7 +1786,6 @@ struct List[T: AnyType, /](
             Never use `my_list.unsafe_set(-1, value)` to set the last element of
             the list. Instead, do `my_list.unsafe_set(len(my_list) - 1, value)`.
         """
-        check_bounds[cpu_default=False](idx, length=len(self))
         Span(self)._unchecked_get(idx) = value^
 
     def count(self, value: Self.T) -> Int where conforms_to(Self.T, Equatable):
