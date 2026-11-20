@@ -274,7 +274,14 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
     # --------------------------------------------------------------------- #
 
     @inline(.always)
-    def set(mut self, idx: Int) requires _index_in_bounds(idx, Self.size):
+    @__checked_preconditions
+    def set(mut self, idx: Int)
+        requires _index_in_bounds(idx, Self.size) else (
+            "index ",
+            idx,
+            " is out of bounds, valid range is 0 to ",
+            Self.size - 1,
+        ):
         """Sets the bit at the specified index `idx` to 1.
 
         If `idx` is greater than or equal to the current logical size,
@@ -284,12 +291,18 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
         Args:
             idx: The non-negative index of the bit to set (must be < `size`).
         """
-        check_bounds(idx, length=Self.size)
         var w = _word_index(idx)
         self._words.unsafe_get(w) |= Int64(_bit_mask(idx))
 
     @inline(.always)
-    def clear(mut self, idx: Int) requires _index_in_bounds(idx, Self.size):
+    @__checked_preconditions
+    def clear(mut self, idx: Int)
+        requires _index_in_bounds(idx, Self.size) else (
+            "index ",
+            idx,
+            " is out of bounds, valid range is 0 to ",
+            Self.size - 1,
+        ):
         """Clears the bit at the specified index `idx` (sets it to 0).
 
         Aborts if `idx` is negative or greater than or equal to the
@@ -298,12 +311,18 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
         Args:
             idx: The non-negative index of the bit to clear (must be < `size`).
         """
-        check_bounds(idx, length=Self.size)
         var w = _word_index(idx)
         self._words.unsafe_get(w) &= Int64(~_bit_mask(idx))
 
     @inline(.always)
-    def toggle(mut self, idx: Int) requires _index_in_bounds(idx, Self.size):
+    @__checked_preconditions
+    def toggle(mut self, idx: Int)
+        requires _index_in_bounds(idx, Self.size) else (
+            "index ",
+            idx,
+            " is out of bounds, valid range is 0 to ",
+            Self.size - 1,
+        ):
         """Toggles (inverts) the bit at the specified index `idx`.
 
         If the bit becomes 1 and `idx` is greater than or equal to the
@@ -313,12 +332,18 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
         Args:
             idx: The non-negative index of the bit to toggle (must be < `size`).
         """
-        check_bounds(idx, length=Self.size)
         var w = _word_index(idx)
         self._words.unsafe_get(w) ^= Int64(_bit_mask(idx))
 
     @inline(.always)
-    def test(self, idx: Int) -> Bool requires _index_in_bounds(idx, Self.size):
+    @__checked_preconditions
+    def test(self, idx: Int) -> Bool
+        requires _index_in_bounds(idx, Self.size) else (
+            "index ",
+            idx,
+            " is out of bounds, valid range is 0 to ",
+            Self.size - 1,
+        ):
         """Tests if the bit at the specified index `idx` is set (is 1).
 
         Aborts if `idx` is negative or greater than or equal to the
@@ -330,7 +355,6 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
         Returns:
             True if the bit at `idx` is set, False otherwise.
         """
-        check_bounds(idx, length=Self.size)
         var w = _word_index(idx)
         return (self._words.unsafe_get(w) & Int64(_bit_mask(idx))) != 0
 

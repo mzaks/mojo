@@ -992,9 +992,15 @@ struct List[T: AnyType, /](
     @__unsafe_nested_origins_read_only
     @inline(.always)
     @stable(since="1.2")
+    @__checked_preconditions
     def insert(mut self, i: Int, var value: Self.T, /)
         where conforms_to(Self.T, Movable)
-        requires _position_in_bounds(i, len(self))
+        requires _position_in_bounds(i, len(self)) else (
+            "index ",
+            i,
+            " is out of bounds, valid range is 0 to ",
+            len(self),
+        )
         ensures len(self) == old(len(self)) + 1:
         """Inserts a value to the list at the given index.
         `a.insert(len(a), value)` is equivalent to `a.append(value)`.
@@ -1011,8 +1017,6 @@ struct List[T: AnyType, /](
         print(list) # ['one', 'two', 'three']
         ```
         """
-        # Valid range is `[0, len(self)]` (`len(self)` appends).
-        check_bounds(i, length=len(self) + 1)
 
         var old_len = self._len
         self._grow_amortized(old_len + 1)
@@ -1191,9 +1195,15 @@ struct List[T: AnyType, /](
         return ret_val^
 
     @inline(.always)
+    @__checked_preconditions
     def pop(mut self, i: Int) -> Self.T
         where conforms_to(Self.T, Movable)
-        requires _index_in_bounds(i, len(self))
+        requires _index_in_bounds(i, len(self)) else (
+            "index ",
+            i,
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        )
         ensures (
             len(self) == old(len(self)) - 1
             and _same_elements(self._storage.unsafe_ptr(), old(self._storage.unsafe_ptr()), i)
@@ -1219,7 +1229,6 @@ struct List[T: AnyType, /](
         print(numbers)                            # ['1', '2', '4', '5']
         ```
         """
-        check_bounds(i, length=len(self))
         # UntrackedOrigin is needed to prevent exclusivity violations
         var data = self.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
         var ret_val = data.unsafe_offset(i).unsafe_take_pointee()
@@ -1634,10 +1643,16 @@ struct List[T: AnyType, /](
 
     @__unsafe_nested_origins_read_only
     @inline(.always)
+    @__checked_preconditions
     def __getitem__(
         ref self, idx: IntLiteral, /
     ) -> ref[Self._InteriorOrigin[origin_of(self)]] Self.T
-        requires Int(idx) < len(self):
+        requires Int(idx) < len(self) else (
+            "index ",
+            Int(idx),
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets the list element at the given index.
 
         Subscripting calls this method: `lst[3]` invokes `lst.__getitem__(3)`.
@@ -1651,7 +1666,6 @@ struct List[T: AnyType, /](
         comptime assert (
             IntLiteral[idx.value]() >= 0
         ), "negative indexing is not supported, use e.g. `x[len(x) - 1]`"
-        check_bounds(idx, length=len(self))
         return self.unsafe_get(index(idx))
 
     @stable(since="1.0")

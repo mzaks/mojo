@@ -522,10 +522,16 @@ struct Deque[ElementType: Movable](
 
     @__unsafe_nested_origins_read_only
     @inline(.always)
+    @__checked_preconditions
     def __getitem__(
         ref self, idx: IntLiteral
     ) -> ref[self._unchecked_get(idx)] Self.ElementType
-        requires Int(idx) < len(self):
+        requires Int(idx) < len(self) else (
+            "index ",
+            Int(idx),
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets the deque element at the given index.
 
         Args:
@@ -537,15 +543,20 @@ struct Deque[ElementType: Movable](
         comptime assert (
             IntLiteral[idx.value]() >= 0
         ), "negative indexing is not supported, use e.g. `x[len(x) - 1]`"
-        check_bounds(idx, length=len(self))
         return self._unchecked_get(idx)
 
     @__unsafe_nested_origins_read_only
     @inline(.always)
+    @__checked_preconditions
     def __getitem__(
         ref self, idx: Int
     ) -> ref[self._unchecked_get(idx)] Self.ElementType
-        requires _index_in_bounds(idx, len(self)):
+        requires _index_in_bounds(idx, len(self)) else (
+            "index ",
+            idx,
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets the deque element at the given index.
 
         Args:
@@ -554,7 +565,6 @@ struct Deque[ElementType: Movable](
         Returns:
             A reference to the element at the given index.
         """
-        check_bounds(idx, length=len(self))
         return self._unchecked_get(idx)
 
     @__unsafe_nested_origins_read_only

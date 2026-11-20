@@ -381,10 +381,16 @@ struct Span[
 
     @stable(since="1.0")
     @inline(.always)
+    @__checked_preconditions
     def __getitem__(
         self, idx: Int, /
     ) -> ref[Self.origin, Self.address_space] Self.T
-        requires _index_in_bounds(idx, len(self)):
+        requires _index_in_bounds(idx, len(self)) else (
+            "index ",
+            idx,
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets the span element at the given index.
 
         Args:
@@ -393,7 +399,6 @@ struct Span[
         Returns:
             A reference to the element at the given index.
         """
-        check_bounds(idx, length=len(self))
         return self._data[unsafe_offset=idx]
 
     @inline(.always)
@@ -412,10 +417,16 @@ struct Span[
         return self._data[unsafe_offset=idx]
 
     @inline(.always)
+    @__checked_preconditions
     def __getitem__(
         self, idx: IntLiteral
     ) -> ref[Self.origin, Self.address_space] Self.T
-        requires Int(idx) < len(self):
+        requires Int(idx) < len(self) else (
+            "index ",
+            Int(idx),
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets the span element at the given index.
 
         Args:
@@ -428,7 +439,6 @@ struct Span[
             "negative indexing is not supported, use e.g. `x[len(x) - 1]`"
             " instead"
         )
-        check_bounds(idx, length=len(self))
         return self._data[unsafe_offset=idx]
 
     @inline(.always)

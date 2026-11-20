@@ -679,8 +679,14 @@ struct Array[T: AnyType, length: Int](
 
     @stable(since="1.0")
     @inline(.always)
+    @__checked_preconditions
     def __getitem__(ref self, idx: Int, /) -> ref[self] Self.T
-        requires _index_in_bounds(idx, len(self)):
+        requires _index_in_bounds(idx, len(self)) else (
+            "index ",
+            idx,
+            " is out of bounds, valid range is 0 to ",
+            len(self) - 1,
+        ):
         """Gets a reference to the element at the given index.
 
         Subscripting calls this method: `arr[3]` invokes `arr.__getitem__(3)`.
@@ -706,7 +712,6 @@ struct Array[T: AnyType, length: Int](
             This method provides array-style indexing access to elements in the
             Array. The index is bounds-checked at runtime.
         """
-        check_bounds(idx, length=len(self))
         return self._unchecked_get(idx)
 
     @inline(.always)
