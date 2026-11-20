@@ -2774,10 +2774,9 @@ static std::string clauseText(const ParsedConstraint &clause) {
 /// left alone for now: their checks stay at their entry.
 static bool checksPreconditionsInCallers(FnOp fn) {
   return !fn->getParentOfType<FnOp>() && fn.getSymNameAttr() &&
-         !fn.getNamedResultAttr() && !fn.getDefaultFnRefAttr() &&
-         !fn.getSpecialFunctionInfo().isInitializer() &&
+         !fn.getDefaultFnRefAttr() &&
          fn.getExportKind() == KGEN::ExportKind::NotExported &&
-         !isa<TraitDeclOp>(fn->getParentOp()) && !fn.isImplicitConversion();
+         !isa<TraitDeclOp>(fn->getParentOp());
 }
 
 /// Emits the run-time check of a contract clause at the emitter's insertion
@@ -3050,7 +3049,24 @@ static void splitContractChecks(DefASTDecl &decl, Operation *prelude) {
   auto call = LIT::CallOp::create(builder, fn.getLoc(), type.getResults(),
                                   callee, implicitOrigins, operands);
   emitter.emitCallControlFlow(*call, type, nullptr);
-  emitter.emitNormalReturn(fn.getLoc(), call->getResult(0));
+  Value result = call->getResult(0);
+  // A named result in a register is a local, which postconditions read:
+  // the call's result goes there, and the return takes it from there.
+  if (StringAttr resultName = fn.getNamedResultAttr();
+      resultName && !signature.hasMemoryOnlyResult()) {
+    ArrayRef<ASTDecl *> results = decl.lookupInCurrentScope(resultName);
+    MLValue local;
+    if (results.size() == 1)
+      local = results[0]->getIfIRValue().getIfMLValue();
+    SyntheticNode node(decl.getLoc());
+    if (!local || !emitter.emitStoreToLValue({RValue(SRValue(result)), &node},
+                                             local, EC_ReturnValue)) {
+      decl.setErroneous();
+      return;
+    }
+    result = Value();
+  }
+  emitter.emitNormalReturn(fn.getLoc(), result);
 
   fn->setAttr(KGEN::kCheckedWrapperAttrName,
               FlatSymbolRefAttr::get(fn.getContext(), *copy.getSymName()));

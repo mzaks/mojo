@@ -269,3 +269,39 @@ def split_in_two(a: Int) -> Int requires a > 0:
 @__checked_preconditions
 def checked_like_bounds(i: Int) requires i >= 0:
     pass
+
+
+# So is a function with a named result, in a register or in memory.
+# CHECK-LABEL: lit.fn @"split_named_result({{[^$]*}})"
+# CHECK: _check_contract_in_caller
+# CHECK: lit.call {{.*}}@"split_named_result({{.*}})$unchecked"
+# CHECK-LABEL: lit.fn @"split_named_result({{.*}})$unchecked"
+def split_named_result(a: Int, out r: Int) requires a > 0:
+    r = a
+
+
+# CHECK-LABEL: lit.fn @"split_named_memory_result({{[^$]*}})"
+# CHECK: _check_contract_in_caller
+# CHECK: lit.call {{.*}}@"split_named_memory_result({{.*}})$unchecked"
+# CHECK-LABEL: lit.fn @"split_named_memory_result({{.*}})$unchecked"
+def split_named_memory_result(a: Int, out r: SplitByInit) requires a > 0:
+    r = SplitByInit(a)
+
+
+# And so are initializers, also those that convert implicitly.
+# CHECK-LABEL: lit.struct.decl @SplitByInit
+struct SplitByInit:
+    var value: Int
+
+    # CHECK: lit.fn @"__init__(::SIMD[DType.int, 1])"
+    # CHECK: _check_contract_in_caller
+    # CHECK: lit.call {{.*}}__init__({{.*}})$unchecked"
+    def __init__(out self, value: Int) requires value > 0:
+        self.value = value
+
+    # CHECK: lit.fn @"__init__(::Bool)"
+    # CHECK: _check_contract_in_caller
+    # CHECK: lit.call {{.*}}__init__({{.*}})$unchecked"
+    @implicit
+    def __init__(out self, flag: Bool) requires flag:
+        self.value = 1
