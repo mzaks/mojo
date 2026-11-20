@@ -271,6 +271,17 @@ def checked_like_bounds(i: Int) requires i >= 0:
     pass
 
 
+# With "all", they are checked in the mode of other clauses, also in a package
+# whose clauses are otherwise not checked.
+# CHECK-LABEL: lit.fn @"checked_with_all
+# CHECK-NOT: _bounds_contract_checks_enabled
+# CHECK: _contract_checks_enabled
+# CHECK: _check_contract_in_caller
+@__checked_preconditions("all")
+def checked_with_all(i: Int) requires i >= 0:
+    pass
+
+
 # So is a function with a named result, in a register or in memory.
 # CHECK-LABEL: lit.fn @"split_named_result({{[^$]*}})"
 # CHECK: _check_contract_in_caller

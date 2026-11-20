@@ -977,10 +977,19 @@ LogicalResult FnSigDecorators::applyOne(ExprNode *decorator) {
     applyArgumentless(spelling, callNode,
                       [&]() { tcSignature.isNestedOriginsReadOnly = true; });
   } else if (spelling == "__checked_preconditions") {
-    applyArgumentless(spelling, callNode, [&]() {
+    // `@__checked_preconditions` checks them in the mode of bounds checks,
+    // `@__checked_preconditions("all")` only with all assertions.
+    size_t numOperands = callNode ? callNode->operands.size() : 0;
+    if (numOperands == 0)
       funcOp->setAttr(KGEN::kCheckedPreconditionsAttrName,
                       UnitAttr::get(funcOp.getContext()));
-    });
+    else if (numOperands == 1 &&
+             callNode->operands[0].isPositionalStringLiteral("all"))
+      funcOp->setAttr(KGEN::kCheckedPreconditionsAttrName,
+                      StringAttr::get(funcOp.getContext(), "all"));
+    else
+      emitError(callNode->getLoc())
+          << "'@__checked_preconditions' takes no argument or \"all\"";
   } else if (spelling == "__allow_legacy_custom_self_type") {
     applyArgumentless(spelling, callNode,
                       [&]() { tcSignature.allowCustomSelfType = true; });
@@ -2800,14 +2809,17 @@ static void emitRuntimeCheck(DeclResolver &resolver, FnOp funcOp,
   const ExprNode *expr = clause.propExpr;
   if (!emitter.builder || !expr || !shared.hasBuiltinModule())
     return;
-  // A function can ask for its preconditions to be checked like bounds
-  // checks, in the assertion mode those have.
-  bool likeBoundsCheck =
-      ofCall && funcOp->hasAttr(KGEN::kCheckedPreconditionsAttrName);
+  // A function can ask for its preconditions to be checked
+  // (`@__checked_preconditions`): like bounds checks, in the assertion mode
+  // those have, or ("all") in that of other clauses.
+  Attribute marked = ofCall
+                         ? funcOp->getAttr(KGEN::kCheckedPreconditionsAttrName)
+                         : Attribute();
+  bool likeBoundsCheck = marked && isa<UnitAttr>(marked);
   // The standard library is otherwise not checked: the checks themselves use
   // it (the assertion mode is a string, compared through pointers whose
   // accessors have contracts), so a check inside it would need itself.
-  for (Operation *parent = funcOp->getParentOp(); parent && !likeBoundsCheck;
+  for (Operation *parent = funcOp->getParentOp(); parent && !marked;
        parent = parent->getParentOp())
     if (auto package = dyn_cast<LIT::PackageOp>(parent);
         package && package.getSymName() == "std")
