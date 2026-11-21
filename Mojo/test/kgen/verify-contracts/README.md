@@ -130,6 +130,16 @@ list.mojo:1610:18: note: precondition declared here
                  ^
 ```
 
+The second note gives the clause's operands, under the callee's names for
+them, in one case that breaks it: the values the solver found, which need
+not be the simplest ones. It is a case the encoding allows; where the
+verifier knows less than the code establishes (a loop it found no invariant
+for), the program may never reach it.
+
+```text
+straight_line.mojo:166:14: note: it does not hold with len(self) = 1, idx = -9223372036854775808
+```
+
 For each precondition it does not prove, the pass also asks whether the
 clause can hold there at all. If no case that reaches the call meets it,
 the warning says so instead: the call is wrong however it is reached, not
@@ -139,12 +149,13 @@ merely unproven.
 straight_line.mojo:260:14: warning: the precondition of 'List.__getitem__' cannot hold here
     return xs[7]  # the list has three elements
              ^
+straight_line.mojo:260:14: note: with len(self) = 3
 ```
 
 It is a warning and not an error because a test that an out-of-bounds index
 aborts makes such a call on purpose (`test_bitset.mojo` has four). Other
 obligations are reported the same way ("never true here: that the divisor
-is not 0"). The question gets at most 5M units of solver work.
+is not 0"). Each of the two questions gets at most 5M units of solver work.
 
 To compare a file against its expected results (every call in a `bad_*`
 function warned about, none in an `ok_*` one; in `traits.mojo`, also every

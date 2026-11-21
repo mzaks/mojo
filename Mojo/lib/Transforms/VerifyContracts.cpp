@@ -1919,15 +1919,22 @@ struct Obligation {
   /// says only that it follows from that, which a wrong guess of their
   /// results also satisfies); empty when that is `cond`.
   std::string holds;
+  /// The clause's operands as terms, by what the callee calls them (`idx`,
+  /// `len(self)`): what a counterexample gives the values of.
+  std::vector<std::pair<std::string, std::string>> operands;
   /// Found by the solver for an obligation that is not proven: nothing that
   /// reaches it meets it.
   bool neverHolds = false;
+  /// The operands' values in one case that breaks it (`idx = 0, len(self) =
+  /// 0`), if asked for and found.
+  std::string counterexample;
 };
 
 /// What `FunctionEncoder::instantiate` tells of a clause besides its
-/// condition (see `Obligation::holds`).
+/// condition (see `Obligation::holds` and `Obligation::operands`).
 struct ClauseDetail {
   std::string holds;
+  std::vector<std::pair<std::string, std::string>> operands;
 };
 
 /// A loop being walked: where its iterations continue and exit, and what
@@ -2174,32 +2181,85 @@ public:
     return text;
   }
 
-  /// Finds, for the obligations in `open`, which are not proven, whether
-  /// nothing that reaches one meets it (`neverHolds`). Each question gets at
-  /// most 5M units: what decides it is a constant or a simple bound, or
-  /// nothing does.
-  void explain(ArrayRef<Obligation *> open, StringRef name) {
+  /// What can be said of the obligations in `open`, which are not proven:
+  /// whether nothing that reaches one meets it (`neverHolds`) and, with
+  /// `examples`, the values of its operands in one case that breaks it
+  /// (`counterexample`). Each question gets at most 5M units: what decides
+  /// it is a constant or a simple bound, or nothing does.
+  void explain(ArrayRef<Obligation *> open, bool examples, StringRef name) {
     if (open.empty())
       return;
+    auto block = [&](const Obligation &ob, StringRef goal, StringRef after) {
+      return ("(echo \"@@\")\n(push 1)\n(assert " + ob.pc + ")\n(assert " +
+              goal + ")\n(set-option :rlimit " +
+              Twine(std::min<unsigned>(limitOf(ob), 5000000)) +
+              ")\n(check-sat)\n(set-option :rlimit 0)\n" + after + "(pop 1)\n")
+          .str();
+    };
     std::string text = header();
-    for (Obligation *ob : open)
-      text += ("(echo \"@@\")\n(push 1)\n(assert " + ob->pc + ")\n(assert " +
-               (ob->holds.empty() ? ob->cond : ob->holds) +
-               ")\n(set-option :rlimit " +
-               Twine(std::min<unsigned>(limitOf(*ob), 5000000)) +
-               ")\n(check-sat)\n(set-option :rlimit 0)\n(pop 1)\n")
-                  .str();
+    // Per obligation: whether a counterexample is asked for.
+    SmallVector<bool> asked;
+    for (Obligation *ob : open) {
+      text += block(*ob, ob->holds.empty() ? ob->cond : ob->holds, "");
+      asked.push_back(examples && !ob->operands.empty());
+      if (!asked.back())
+        continue;
+      std::string terms;
+      for (auto &[label, term] : ob->operands)
+        terms += " " + term;
+      text +=
+          block(*ob, "(not " + ob->cond + ")", "(get-value (" + terms + "))\n");
+    }
     std::optional<std::string> output =
         runForOutput(solver, text, name, liveSolver());
     if (!output)
       return;
     SmallVector<StringRef> segments;
     StringRef(*output).split(segments, "@@");
-    for (auto [i, ob] : llvm::enumerate(open)) {
-      if (i + 1 >= segments.size())
+    size_t next = 1;
+    for (auto [ob, example] : llvm::zip(open, asked)) {
+      if (next >= segments.size())
         return;
       ob->neverHolds =
-          segments[i + 1].trim().split('\n').first.trim() == "unsat";
+          segments[next++].trim().split('\n').first.trim() == "unsat";
+      if (!example)
+        continue;
+      if (next >= segments.size())
+        return;
+      auto [answer, model] = segments[next++].trim().split('\n');
+      if (answer.trim() != "sat")
+        continue;
+      std::optional<std::vector<SExpr>> parsed = parseSExprs(model);
+      if (!parsed || parsed->size() != 1 ||
+          parsed->front().list.size() != ob->operands.size())
+        continue;
+      std::string shown;
+      for (auto [operand, pair] :
+           llvm::zip(ob->operands, parsed->front().list)) {
+        if (pair.list.size() != 2 || !pair.list[1].isAtom()) {
+          shown.clear();
+          break;
+        }
+        StringRef value = pair.list[1].atom;
+        std::string number;
+        if (value == "true" || value == "false") {
+          number = value == "true" ? "True" : "False";
+        } else {
+          unsigned radix = value.consume_front("#x")   ? 16
+                           : value.consume_front("#b") ? 2
+                                                       : 0;
+          if (!radix || value.empty()) {
+            shown.clear();
+            break;
+          }
+          llvm::APInt bits(value.size() * (radix == 16 ? 4 : 1), value, radix);
+          SmallString<24> digits;
+          bits.toString(digits, 10, sortOfTerm(operand.second).isSigned);
+          number = std::string(digits);
+        }
+        shown += (shown.empty() ? "" : ", ") + operand.first + " = " + number;
+      }
+      ob->counterexample = std::move(shown);
     }
   }
 
@@ -9541,6 +9601,7 @@ private:
         Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
                       displayName(contract)};
         ob.holds = std::move(detail.holds);
+        ob.operands = std::move(detail.operands);
         ob.call = call.getOperation();
         if (contract == callee && call.getDirectCallee())
           ob.checkedCallee = callee.getOperation();
@@ -14507,8 +14568,46 @@ private:
     // when it is assumed and as premises when it is proven.
     bool premises =
         result && inner.pc != state.pc && sortOfTerm(*result).isBool;
-    if (sink && callee && premises && !assumed)
-      sink->holds = "(and " + inner.pc + " " + *result + ")";
+    if (sink && callee && result) {
+      if (premises && !assumed)
+        sink->holds = "(and " + inner.pc + " " + *result + ")";
+      // The operands the clause was given: a value by the callee's name for
+      // it, a collection by its length if the clause read it.
+      for (auto [i, blockArg] : llvm::enumerate(body.getArguments())) {
+        auto formal = dyn_cast<BlockArgument>(args[i]);
+        if (!formal || formal.getOwner() != &calleeEntry)
+          continue;
+        StringAttr name =
+            callee.getFuncTypeGenerator().getArgName(formal.getArgNumber());
+        if (!name || name.getValue().empty())
+          continue;
+        if (auto ref = refArgs.find(blockArg); ref != refArgs.end()) {
+          // The collection's value as the clause read it: one written, or
+          // the unknown `load` gave the place.
+          const Loc &loc = ref->second;
+          MaybeTerm handle = loadKnown(loc, inner, Sort{false, 64, false});
+          if (!handle && loc.path.empty()) {
+            if (auto it = epochValues.find({loc, inner.epoch});
+                inner.epoch && it != epochValues.end())
+              handle = it->second;
+            else if (auto it = entryValues.find(loc);
+                     !inner.epoch && it != entryValues.end())
+              handle = it->second;
+          }
+          if (!handle)
+            continue;
+          auto length = defined.find(Sort{false, 64, true}.str() + " (len " +
+                                     *handle + ")");
+          if (length != defined.end())
+            sink->operands.push_back(
+                {("len(" + name.getValue() + ")").str(), length->second});
+        } else if (auto value = values.find(blockArg);
+                   value != values.end() && isScalar(blockArg.getType()) &&
+                   !StringRef(printed(blockArg.getType())).contains("float")) {
+          sink->operands.push_back({name.getValue().str(), value->second});
+        }
+      }
+    }
     if (premises)
       result =
           define({true, 1, false}, "(" + std::string(assumed ? "and" : "=>") +
@@ -15291,7 +15390,7 @@ struct VerifyContractsPass
           refuted.push_back(&ob);
         result.answers.push_back(answer);
       }
-      enc.explain(refuted, name + ".explain");
+      enc.explain(refuted, /*examples=*/!quiet, name + ".explain");
       result.obligations = std::move(enc.obligations);
     };
     std::vector<Result> results(fns.size());
@@ -15599,6 +15698,10 @@ struct VerifyContractsPass
           diag.attachNote(ob.clauseLoc) << what << " declared here";
         else if (ob.clauseLoc != ob.callLoc)
           diag.attachNote(ob.clauseLoc) << "stated here";
+        if (!ob.counterexample.empty() && perInstance.empty())
+          diag.attachNote(ob.callLoc)
+              << (never ? "with " : "it does not hold with ")
+              << ob.counterexample;
         Operation *fn = fns[i].fn.getOperation();
         for (auto [instance, instanceAnswer] : perInstance)
           if (instanceAnswer != Answer::Proven) {
