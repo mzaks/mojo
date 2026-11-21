@@ -1030,6 +1030,23 @@ std::string query(ArrayRef<std::string> assumptions, StringRef goal,
   return text;
 }
 
+/// Runs z3 on `script` and returns what it printed, cached by the script
+/// like `runScript`'s answers; none when the run was stopped at the cap.
+std::optional<std::string> runForOutput(const SolverConfig &config,
+                                        StringRef script, StringRef dumpName,
+                                        SolverSession *session) {
+  std::string cachePath = cachePathOf(config, script);
+  if (std::optional<std::string> cached = readCache(cachePath))
+    return cached;
+  int rc = 0;
+  std::optional<std::string> output =
+      runSolver(config, script, dumpName, rc, session);
+  if (!output || rc == -1)
+    return std::nullopt;
+  writeCache(cachePath, *output);
+  return output;
+}
+
 //===----------------------------------------------------------------------===//
 // Integer retry
 //===----------------------------------------------------------------------===//
@@ -1898,6 +1915,19 @@ struct Obligation {
   /// (`drop-proven-checks` points the call at its copy without checks).
   Operation *call = nullptr;
   Operation *checkedCallee = nullptr;
+  /// When the clause holds, given what the calls inside it establish (`cond`
+  /// says only that it follows from that, which a wrong guess of their
+  /// results also satisfies); empty when that is `cond`.
+  std::string holds;
+  /// Found by the solver for an obligation that is not proven: nothing that
+  /// reaches it meets it.
+  bool neverHolds = false;
+};
+
+/// What `FunctionEncoder::instantiate` tells of a clause besides its
+/// condition (see `Obligation::holds`).
+struct ClauseDetail {
+  std::string holds;
 };
 
 /// A loop being walked: where its iterations continue and exit, and what
@@ -2144,6 +2174,35 @@ public:
     return text;
   }
 
+  /// Finds, for the obligations in `open`, which are not proven, whether
+  /// nothing that reaches one meets it (`neverHolds`). Each question gets at
+  /// most 5M units: what decides it is a constant or a simple bound, or
+  /// nothing does.
+  void explain(ArrayRef<Obligation *> open, StringRef name) {
+    if (open.empty())
+      return;
+    std::string text = header();
+    for (Obligation *ob : open)
+      text += ("(echo \"@@\")\n(push 1)\n(assert " + ob->pc + ")\n(assert " +
+               (ob->holds.empty() ? ob->cond : ob->holds) +
+               ")\n(set-option :rlimit " +
+               Twine(std::min<unsigned>(limitOf(*ob), 5000000)) +
+               ")\n(check-sat)\n(set-option :rlimit 0)\n(pop 1)\n")
+                  .str();
+    std::optional<std::string> output =
+        runForOutput(solver, text, name, liveSolver());
+    if (!output)
+      return;
+    SmallVector<StringRef> segments;
+    StringRef(*output).split(segments, "@@");
+    for (auto [i, ob] : llvm::enumerate(open)) {
+      if (i + 1 >= segments.size())
+        return;
+      ob->neverHolds =
+          segments[i + 1].trim().split('\n').first.trim() == "unsat";
+    }
+  }
+
   /// The query limit of every obligation.
   unsigned fullLimit() const {
     return queryRlimit ? queryRlimit : solver.rlimit;
@@ -2325,7 +2384,7 @@ public:
   bool deviceView = false;
 
   LIT::FnOp fn;
-  SmallVector<Obligation> obligations;
+  SmallVector<Obligation, 0> obligations;
   unsigned invariantsFound = 0, loopsAnalyzed = 0;
 
   /// The solver process this function's scripts share; null with
@@ -2387,6 +2446,9 @@ private:
   /// entry, those of the function's own preconditions (its hull); at a
   /// call, those of the callee's (the frame of the call).
   SmallVector<ClauseRange> *rangeSink = nullptr;
+  /// While a callee's precondition is instantiated at a call: where what a
+  /// report of it needs goes.
+  ClauseDetail *clauseSink = nullptr;
   /// The hull of the elements the function's preconditions name of memory
   /// tracked from entry (by `base`): the function touches no other.
   std::map<std::string, std::pair<std::string, std::string>> hulls;
@@ -9467,14 +9529,18 @@ private:
         if (!req)
           continue;
         params = contractFrame;
+        ClauseDetail detail;
+        clauseSink = &detail;
         MaybeTerm cond =
             instantiate(req.getBody(), req.getArgs(), state, call.getOperands(),
                         contract, nullptr, false);
+        clauseSink = nullptr;
         params = frame.parent;
         if (req.getInvariant())
           continue;
         Obligation ob{state.pc, "false", call.getLoc(), req.getLoc(),
                       displayName(contract)};
+        ob.holds = std::move(detail.holds);
         ob.call = call.getOperation();
         if (contract == callee && call.getDirectCallee())
           ob.checkedCallee = callee.getOperation();
@@ -14375,6 +14441,9 @@ private:
                         bool assumed) {
     Block &body = region.front();
     Block &calleeEntry = (callee ? callee : fn).getFunctionBody().front();
+    // This clause's own detail: not that of the clauses of calls inside it.
+    ClauseDetail *sink = clauseSink;
+    clauseSink = nullptr;
     DenseMap<Value, std::string> saved = values;
     DenseMap<Value, Value> savedActuals = actuals;
     State *savedOld = oldState;
@@ -14436,7 +14505,11 @@ private:
     // Calls inside the contract assumed their callees' postconditions into
     // the path condition of `inner`: they belong to the clause, as facts
     // when it is assumed and as premises when it is proven.
-    if (result && inner.pc != state.pc && sortOfTerm(*result).isBool)
+    bool premises =
+        result && inner.pc != state.pc && sortOfTerm(*result).isBool;
+    if (sink && callee && premises && !assumed)
+      sink->holds = "(and " + inner.pc + " " + *result + ")";
+    if (premises)
       result =
           define({true, 1, false}, "(" + std::string(assumed ? "and" : "=>") +
                                        " " + inner.pc + " " + *result + ")");
@@ -15092,7 +15165,7 @@ struct VerifyContractsPass
         expand({launch.kernel}, launch.launcher, launch.loc, std::nullopt, 0);
     }
     struct Result {
-      SmallVector<Obligation> obligations;
+      SmallVector<Obligation, 0> obligations;
       SmallVector<Answer> answers;
       unsigned loops = 0, invariants = 0;
       /// See `FunctionEncoder::assumedCallees`.
@@ -15206,6 +15279,7 @@ struct VerifyContractsPass
         cases();
       }
       unsigned next = 0;
+      SmallVector<Obligation *> refuted;
       for (Obligation &ob : enc.obligations) {
         Answer answer = Answer::NotAnalyzed;
         if (ob.analyzed) {
@@ -15213,8 +15287,11 @@ struct VerifyContractsPass
                                                      : Answer::Unknown;
           ++next;
         }
+        if (answer == Answer::Unproven)
+          refuted.push_back(&ob);
         result.answers.push_back(answer);
       }
+      enc.explain(refuted, name + ".explain");
       result.obligations = std::move(enc.obligations);
     };
     std::vector<Result> results(fns.size());
@@ -15489,12 +15566,22 @@ struct VerifyContractsPass
                 << (perInstance.size() == 1 ? "" : "s");
           continue;
         }
-        if (quiet)
+        // Not proven, and nothing that reaches it meets it: reported in a
+        // build too. A warning, not an error: a test that an out-of-bounds
+        // index aborts has such a call on purpose.
+        bool never =
+            answer == Answer::Unproven && ob.neverHolds && perInstance.empty();
+        if (quiet && !never)
           continue;
         auto diag = mlir::emitWarning(ob.callLoc);
         switch (answer) {
         case Answer::Unproven:
-          if (!claim.empty())
+          if (never && !claim.empty())
+            diag << "never true here: " << claim;
+          else if (never)
+            diag << "the " << what << " of '" << ob.callee
+                 << "' cannot hold here";
+          else if (!claim.empty())
             diag << "cannot prove " << claim;
           else
             diag << "cannot prove the " << what << " of '" << ob.callee << "'";

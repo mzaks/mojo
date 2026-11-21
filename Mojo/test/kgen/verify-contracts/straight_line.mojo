@@ -252,3 +252,13 @@ def bad_min_unsigned(xs: List[Int], n: UInt8) -> Int:
     if len(xs) == 251:
         return xs[Int(min(n, UInt8(251)))]  # 251 when `n` is larger
     return 0
+
+
+# --- must stay UNPROVEN, and are reported as "cannot hold here" ---
+def bad_constant_index() -> Int:
+    var xs: List[Int] = [1, 2, 3]
+    return xs[7]  # the list has three elements
+
+
+def bad_constant_argument(xs: List[Int]) -> Int:
+    return ok_get(xs, -1)  # no list has an element -1
