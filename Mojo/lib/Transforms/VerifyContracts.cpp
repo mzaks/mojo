@@ -9625,9 +9625,11 @@ private:
   /// With `type-invariants`: the invariant of the struct `st` for the value
   /// `ref` refers to, read by `at`; none if the struct states none, or if
   /// `at` is in one of its own methods, which may break it until they
-  /// return.
+  /// return. With `place`, for the value there instead of the one at the
+  /// place of `ref`.
   MaybeTerm typeInvariant(Value ref, Operation *at, State &state,
-                          LIT::StructType &st) {
+                          LIT::StructType &st,
+                          std::optional<Loc> place = std::nullopt) {
     auto type = dyn_cast<LIT::RefType>(ref.getType());
     st = type ? structTypeOf(type.getElementType()) : LIT::StructType();
     if (!st)
@@ -9655,7 +9657,7 @@ private:
     Block &entry = predicate.getFunctionBody().front();
     ArrayRef<ParamDeclAttr> decls = decl.getParams();
     ArrayRef<TypedAttr> bound = st.getParamValues();
-    std::optional<Loc> loc = placeOf(ref);
+    std::optional<Loc> loc = place ? place : placeOf(ref);
     if (!loc || entry.getNumArguments() != 1 || entry.empty() ||
         entry.back().getNumOperands() != 1 ||
         !isa<LIT::RefType>(entry.getArgument(0).getType()) ||
@@ -9671,10 +9673,35 @@ private:
     return predicateValue(predicate, frame, state);
   }
 
+  /// Whether all that is done with the reference `ref` is to read what it
+  /// refers to, or a field of that.
+  static bool onlyRead(Value ref, int depth = 0) {
+    for (OpOperand &use : ref.getUses()) {
+      Operation *user = use.getOwner();
+      if (isa<LIT::RefLoadOp>(user) ||
+          (isa<LIT::MemcpyOp>(user) && use.getOperandNumber() == 0))
+        continue;
+      if (depth < 6 &&
+          isa<RebindOp, LIT::RefImmutOp, LIT::RefUpcastOp, LIT::RefStructGEROp>(
+              user) &&
+          onlyRead(user->getResult(0), depth + 1))
+        continue;
+      return false;
+    }
+    return true;
+  }
+
+  /// The field references that read a snapshot of an element behind a
+  /// pointer (see `applyTypeInvariants`).
+  DenseSet<Value> elementSnapshots;
+
   /// With `type-invariants`, after `op`: a struct's invariant holds of a
   /// value whose field is taken and of one a call returns a reference to,
   /// and must hold again after a write to a field of one.
   void applyTypeInvariants(Operation *op, State &state) {
+    auto gep = dyn_cast<LIT::RefStructGEROp>(op);
+    if (gep && elementSnapshots.erase(gep->getResult(0)))
+      derivedPlaces.erase(gep->getResult(0));
     if (inContract || predicateDepth || !state.alive)
       return;
     auto assume = [&](Value ref) {
@@ -9683,8 +9710,33 @@ private:
         state.pc = define({true, 1, false},
                           "(and " + state.pc + " " + *holds + ")", "r");
     };
-    if (auto gep = dyn_cast<LIT::RefStructGEROp>(op))
-      return assume(gep->getOperand(0));
+    if (gep) {
+      Value base = gep->getOperand(0), taken = gep->getResult(0);
+      if (placeOf(base))
+        return assume(base);
+      // A field of a value that has no place here, as an element behind a
+      // pointer has (`p[i].value`; its memory has no values here): when the
+      // field is only read, it is read from a snapshot of the element, an
+      // unknown value of the struct that keeps the invariant. (The read is
+      // checked to be of an initialized element, and what is written there is a
+      // value of the struct or a field that is checked below.)
+      auto field = op->getAttrOfType<StringAttr>("field");
+      if (!field || !onlyRead(taken))
+        return;
+      Loc snapshot{taken, ""};
+      state.env[snapshot] = declare({false, 64, false}, "h");
+      LIT::StructType st;
+      MaybeTerm holds = typeInvariant(base, op, state, st, snapshot);
+      if (!holds) {
+        state.env.erase(snapshot);
+        return;
+      }
+      elementSnapshots.insert(taken);
+      derivedPlaces[taken] = Loc{taken, "/" + field.getValue().str()};
+      state.pc = define({true, 1, false},
+                        "(and " + state.pc + " " + *holds + ")", "r");
+      return;
+    }
     if (isa<LIT::CallOp>(op)) {
       for (Value result : op->getResults())
         assume(result);
@@ -9694,6 +9746,7 @@ private:
       return;
     // The structs the written field is in, innermost first.
     Value dest = op->getOperand(1);
+    bool innermost = true;
     while (Operation *def = dest.getDefiningOp()) {
       if (isa<RebindOp, LIT::RefImmutOp, LIT::RefUpcastOp>(def)) {
         dest = def->getOperand(0);
@@ -9703,7 +9756,34 @@ private:
         return;
       dest = def->getOperand(0);
       LIT::StructType st;
-      MaybeTerm holds = typeInvariant(dest, op, state, st);
+      MaybeTerm holds;
+      if (placeOf(dest)) {
+        holds = typeInvariant(dest, op, state, st);
+      } else {
+        // A field of a value that has no place here (an element behind a
+        // pointer): the invariant must hold
+        // of the written field with any values of the other fields, which
+        // are not known here.
+        auto field = def->getAttrOfType<StringAttr>("field");
+        if (!field || !innermost)
+          return;
+        State written = state;
+        Loc element{def->getResult(0), ""};
+        written.env[element] = declare({false, 64, false}, "h");
+        written.env[Loc{element.root, "/" + field.getValue().str()}] =
+            term(op->getOperand(0), state);
+        holds = typeInvariant(dest, op, written, st, element);
+        if (holds) {
+          Obligation ob{state.pc, *holds, op->getLoc(), op->getLoc(),
+                        st.getSymbol().getLeafReference().getValue().str()};
+          ob.claim = "that the invariant of '" + ob.callee +
+                     "' holds after this write";
+          noteCondition(ob.cond);
+          addObligation(ob);
+        }
+        return;
+      }
+      innermost = false;
       if (!holds)
         continue;
       Obligation ob{state.pc, *holds, op->getLoc(), op->getLoc(),

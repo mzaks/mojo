@@ -15,6 +15,8 @@
 # struct reads, wherever the value is kept, and is checked where such a
 # function writes a field of one; see README.md.
 
+from std.memory.alloc import unsafe_alloc
+
 
 # An `Int` that is not negative.
 struct Nat(ImplicitlyCopyable, Movable) invariant self.value >= 0:
@@ -59,6 +61,24 @@ def ok_write(mut p: Pair, a: Int):
         p.second.value = a
 
 
+def ok_behind_pointer(xs: List[Int]) -> Int:
+    var p = unsafe_alloc[Nat](1)
+    p.unsafe_write(Nat(1))
+    var i = p[].value  # an element behind a pointer
+    p.unsafe_free()
+    if i < len(xs):
+        return xs[i]
+    return 0
+
+
+def ok_write_behind_pointer(a: Int):
+    var p = unsafe_alloc[Nat](1)
+    p.unsafe_write(Nat(1))
+    if a >= 0:
+        p[].value = a
+    p.unsafe_free()
+
+
 # --- must be WARNED (at the write) ---
 def bad_write(mut p: Pair, a: Int):
     p.second.value = a  # nothing is known about `a`
@@ -67,6 +87,13 @@ def bad_write(mut p: Pair, a: Int):
 def bad_write_element(mut ns: List[Nat]):
     if len(ns) > 0:
         ns[0].value = -5
+
+
+def bad_write_behind_pointer(a: Int):
+    var p = unsafe_alloc[Nat](1)
+    p.unsafe_write(Nat(1))
+    p[].value = a
+    p.unsafe_free()
 
 
 def bad_write_local() -> Nat:
@@ -83,4 +110,7 @@ def main():
     ok_write(p, 2)
     bad_write(p, 2)
     bad_write_element(ns)
+    print(ok_behind_pointer(xs))
+    ok_write_behind_pointer(2)
+    bad_write_behind_pointer(2)
     print(bad_write_local().value)

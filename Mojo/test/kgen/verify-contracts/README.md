@@ -296,9 +296,14 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   methods may still break it until they return. Limits: only a write of a
   field is checked at the write; a field replaced whole (`r.lo = n`) or
   changed by a `mut` method called on it is checked where the function
-  returns if the struct is its argument, and not at all for a local; and
-  nothing is assumed of a value read through a raw pointer (`p[i].value`),
-  where the read itself must be of initialized memory (below).
+  returns if the struct is its argument, and not at all for a local.
+  Memory behind a raw pointer has no values in the pass, so a field read
+  there (`p[i].value`) is read from a snapshot of the element, an unknown
+  value that keeps the invariant: enough for `Nat`, but two reads are two
+  snapshots, so an invariant that relates two fields says nothing of
+  `p[i].hi - p[i].lo` (copy the element out first: `var r = p[i]`). A
+  field written there must keep the invariant whatever the other fields
+  are. The read itself must be of initialized memory (below).
   On the standard library's tests it proves nothing more and costs
   0 to 8% more solver time; `test_deque` gets nine more warnings, where
   it sets the deque's private fields.
