@@ -288,15 +288,23 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   `Int` in a wrapper. With it, a function that is not a method of the
   struct assumes the invariant of a value where it takes a field of it and
   where a call returns a reference to one (`ns[0]`). What makes that sound
-  is the other half: where such a function writes a field of a struct with
-  an invariant, the invariant (of each struct the field is in) must hold
-  again at once, or the write is reported ("cannot prove that the invariant
-  of 'Nat' holds after this write"). So an update in two steps that breaks
-  the invariant in between is reported at its first step; the struct's own
-  methods may still break it until they return. Limits: only a write of a
-  field is checked at the write; a field replaced whole (`r.lo = n`) or
-  changed by a `mut` method called on it is checked where the function
-  returns if the struct is its argument, and not at all for a local.
+  is the other half (`invariant_updates.mojo`): where such a function
+  writes into a struct with an invariant (a field of it, a field replaced
+  whole, a `mut` method called on a field), the value is open. The
+  invariant of an open value is not assumed, and must hold again before
+  anything can see the value: a call that is given it or what it is a
+  part of, or that may read the memory it is in (for a value a pointer
+  may refer to); a copy of it; a read through another reference that may
+  be to the same element; a branch or a loop in the block of the write;
+  the end of that block; a `return`. It is reported at the last write
+  before that ("cannot prove that the invariant of 'Bounds' holds after
+  this write"). So an update in several steps is checked once, after its
+  last step (`b.lo = 10; b.hi = 20`), and a value handed on between the
+  steps is reported (`bad_used_between`). A part of an open value is a
+  value of its own: `nb.lo` may be given to a call while `nb` is open.
+  The struct's own methods may break the invariant until they return, as
+  before. Limit: steps in different blocks (one before an `if`, one in
+  it) are not one update.
   An element behind a raw pointer is such a value too (memory behind
   pointers, below): `if p[].hi >= 0: p[].lo = 0` keeps `lo <= hi`, as does
   a method called on `p[]` under that guard, and a write between the
@@ -1088,6 +1096,7 @@ next script.
 | `allocations.mojo`   | all `bad_*`        | all `ok_*`       |
 | `memory_clauses.mojo` | all `bad_*`       | all `ok_*`       |
 | `type_invariants.mojo` | all `bad_*`      | all `ok_*` (with `type-invariants=true`) |
+| `invariant_updates.mojo` | all `bad_*`    | all `ok_*` (with `type-invariants=true`) |
 | `pointer_memory.mojo` | all `bad_*`       | all `ok_*`       |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |
 | `gemm_mma_cpasync.mojo` | (none)          | all `ok_*`       |
