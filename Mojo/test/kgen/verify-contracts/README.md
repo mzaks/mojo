@@ -307,10 +307,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   close it itself, `bad_arm_leaves_broken`), and through a loop that
   does not see it (`ok_across_loop`). A value an iteration of a loop
   opens must be closed where the iteration ends, since the next one
-  starts with it intact (`bad_iteration_leaves_broken`). An element
-  behind a pointer is closed where paths join that left the memory in
-  different versions. The struct's own methods may break the invariant
-  until they return, as before.
+  starts with it intact (`bad_iteration_leaves_broken`). The struct's
+  own methods may break the invariant until they return, as before.
   An element behind a raw pointer is such a value too (memory behind
   pointers, below): `if p[].hi >= 0: p[].lo = 0` keeps `lo <= hi`, as does
   a method called on `p[]` under that guard, and a write between the
@@ -327,7 +325,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   were read before keep their values unless their index is the written
   one (they are whole elements apart), and nothing else is known. Every
   other operation that may write memory a pointer can reach starts a
-  version in which nothing is known:
+  version in which nothing is known (where paths join, an element holds
+  what the path that was taken left there, `ok_join_written`):
   - a store or a copy to anything but a local variable whose address is
     never let out (it is given to no call that could keep it or turn it
     into a pointer: `var x; p = Pointer(to=x)` makes `x` one that a

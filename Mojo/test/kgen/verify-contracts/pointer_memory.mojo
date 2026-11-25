@@ -141,7 +141,69 @@ def ok_local_call(p: Pointer[Int, MutUntrackedOrigin], xs: List[Int]) -> Int
     return 0
 
 
+def ok_join_written(
+    p: Pointer[Int, MutUntrackedOrigin], xs: List[Int], c: Bool
+) -> Int
+    requires p._extent() >= 2:
+    if len(xs) > 5:
+        if c:
+            p[] = 3
+        else:
+            p[] = 4
+        return xs[p[]]  # what the arm that was taken wrote
+    return 0
+
+
+def ok_join_untouched(
+    p: Pointer[Int, MutUntrackedOrigin], xs: List[Int], c: Bool
+) -> Int
+    requires p._extent() >= 2:
+    if 0 <= p[] and p[] < len(xs):
+        if c:
+            p[unsafe_offset=1] = 7  # another element of the same pointer
+        return xs[p[]]
+    return 0
+
+
 # --- must stay UNPROVEN ---
+def bad_join_one_arm(
+    p: Pointer[Int, MutUntrackedOrigin], xs: List[Int], c: Bool, a: Int
+) -> Int
+    requires p._extent() >= 2:
+    if 0 <= p[] and p[] < len(xs):
+        if c:
+            p[] = a
+        return xs[p[]]
+    return 0
+
+
+def bad_join_other_pointer(
+    p: Pointer[Int, MutUntrackedOrigin],
+    q: Pointer[Int, MutUntrackedOrigin],
+    xs: List[Int],
+    c: Bool,
+) -> Int
+    requires p._extent() >= 2 and q._extent() >= 2:
+    if 0 <= p[] and p[] < len(xs):
+        if c:
+            q[] = 99999
+        return xs[p[]]
+    return 0
+
+
+def bad_join_call(
+    p: Pointer[Int, MutUntrackedOrigin], xs: List[Int], c: Bool
+) -> Int
+    requires p._extent() >= 2:
+    if 0 <= p[] and p[] < len(xs):
+        if c:
+            writes(p)
+        else:
+            p[] = 0
+        return xs[p[]]
+    return 0
+
+
 def bad_other_pointer(
     p: Pointer[Int, MutUntrackedOrigin],
     q: Pointer[Int, MutUntrackedOrigin],

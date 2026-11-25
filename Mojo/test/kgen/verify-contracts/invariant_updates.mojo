@@ -170,6 +170,15 @@ def ok_pointer_one_arm(p: Pointer[Bounds, MutUntrackedOrigin], c: Bool)
         p[].hi = 20
 
 
+def ok_pointer_both_arms(p: Pointer[Bounds, MutUntrackedOrigin], c: Bool)
+    requires p._extent() >= 1:
+    p[].lo = 10
+    if c:
+        p[].hi = 20
+    else:
+        p[].hi = 30
+
+
 # --- must be WARNED (at the last write before the value is seen) ---
 def bad_left_broken(mut b: Bounds):
     b.lo = 10  # `hi` may be less
@@ -302,6 +311,25 @@ def bad_pointer_arm(p: Pointer[Bounds, MutUntrackedOrigin], c: Bool)
     requires p._extent() >= 1:
     if c:
         p[].lo = 10
+
+
+def bad_pointer_one_arm_only(p: Pointer[Bounds, MutUntrackedOrigin], c: Bool)
+    requires p._extent() >= 1:
+    p[].lo = 10
+    if c:
+        p[].hi = 20  # not when `c` is false
+
+
+def bad_pointer_other_in_arm(
+    p: Pointer[Bounds, MutUntrackedOrigin],
+    q: Pointer[Bounds, MutUntrackedOrigin],
+    c: Bool,
+)
+    requires p._extent() >= 1 and q._extent() >= 1:
+    p[].lo = 10
+    if c:
+        q[].hi = 5  # may be the same element
+    p[].hi = 20
 
 
 def main():

@@ -3570,13 +3570,8 @@ private:
       return it->second;
     // An element behind a pointer: what its address holds in this version
     // of the memory.
-    if (cell != cells.end() && loc.path.empty()) {
-      auto [it, inserted] =
-          heapCells.try_emplace({state.heap, cell->second.key()}, "");
-      if (inserted)
-        it->second = declare(sort, "m");
-      return it->second;
-    }
+    if (cell != cells.end() && loc.path.empty())
+      return readCell(state.heap, cell->second.key(), sort);
     // An element's place: the element, as the collection holds it now.
     if (loc.path.empty())
       if (auto it = elements.find(loc.root); it != elements.end()) {
@@ -4118,6 +4113,53 @@ private:
     std::string key() const { return family + "|" + index; }
   };
   DenseMap<Value, Cell> cells;
+
+  /// The versions made where paths join: each path's condition and the
+  /// version it left.
+  std::map<unsigned, SmallVector<std::pair<std::string, unsigned>, 2>>
+      heapJoins;
+
+  /// Whether something is known of the element at `key` in `version`:
+  /// read or written there, or, in a version made by a join, on one of
+  /// its paths.
+  bool cellKnown(unsigned version, const std::string &key, int depth = 0) {
+    if (heapCells.count({version, key}))
+      return true;
+    auto join = heapJoins.find(version);
+    if (join == heapJoins.end() || depth > 8)
+      return false;
+    return llvm::any_of(join->second, [&](auto &path) {
+      return cellKnown(path.second, key, depth + 1);
+    });
+  }
+
+  /// What the element at `key` holds in `version`: what was read or
+  /// written there; in a version made by a join whose paths know of it,
+  /// what the path that was taken left there; else an unknown.
+  std::string readCell(unsigned version, const std::string &key, Sort sort) {
+    if (auto it = heapCells.find({version, key}); it != heapCells.end())
+      return it->second;
+    std::string value;
+    auto join = heapJoins.find(version);
+    if (join != heapJoins.end() && cellKnown(version, key)) {
+      SmallVector<std::string> vals;
+      for (auto &path : join->second)
+        vals.push_back(readCell(path.second, key, sort));
+      if (llvm::all_equal(vals)) {
+        value = vals.front();
+      } else {
+        std::string chosen = vals.back();
+        for (size_t i = vals.size() - 1; i-- > 0;)
+          chosen = "(ite " + join->second[i].first + " " + vals[i] + " " +
+                   chosen + ")";
+        value = define(sort, chosen);
+      }
+    } else {
+      value = declare(sort, "m");
+    }
+    heapCells[{version, key}] = value;
+    return value;
+  }
 
   /// From here the memory behind pointers holds nothing known.
   void freshHeap(State &state) {
@@ -6360,20 +6402,14 @@ private:
       return out;
     }
     // With `type-invariants`: a value open on some of the paths only is
-    // closed on those (each proves what it left), and so is an element
-    // behind a pointer where the paths left the memory in different
-    // versions, which the join knows nothing of. One open on every path
+    // closed on those (each proves what it left). One open on every path
     // stays open.
     if (typeInvariants) {
-      bool sameHeap = llvm::all_of(
-          live, [&](const State *s) { return s->heap == live.front()->heap; });
       for (const State *path : live) {
         State &s = const_cast<State &>(*path);
         if (s.open.empty())
           continue;
         closeOpenIf(s, [&](const OpenValue &open) {
-          if (open.heap && !sameHeap)
-            return true;
           std::string key = open.identity + '\x01' + open.path;
           return llvm::any_of(live, [&](const State *other) {
             return !other->open.count(key);
@@ -6383,11 +6419,20 @@ private:
     }
     for (const State *s : live)
       out.epoch = std::max(out.epoch, s->epoch);
-    // The memory behind pointers is known only where every path left it
-    // in the same version.
+    // The memory behind pointers: the version every path left it in, or
+    // a new one in which each element known on a path holds what its path
+    // left there (on a path that knows nothing of it, what that path
+    // would read).
     out.heap = live.front()->heap;
-    if (llvm::any_of(live, [&](const State *s) { return s->heap != out.heap; }))
+    if (llvm::any_of(live,
+                     [&](const State *s) { return s->heap != out.heap; })) {
+      // (Read when it is asked for, `readCell`: giving every known
+      // element its value at every join took 3 to 8% more time.)
       out.heap = ++heapVersions;
+      auto &paths = heapJoins[out.heap];
+      for (const State *s : live)
+        paths.push_back({s->pc, s->heap});
+    }
     // A value open on a path is open after the join.
     for (const State *s : live)
       for (auto &[key, value] : s->open)
