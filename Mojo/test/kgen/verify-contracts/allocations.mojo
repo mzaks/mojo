@@ -22,13 +22,27 @@ from std.memory import stack_allocation
 from std.memory.alloc import Layout, alloc, dealloc, unsafe_alloc
 
 
-def fill(p: Pointer[Int, MutUntrackedOrigin], n: Int)
-    requires p._extent() >= n:
+def fill(p: Pointer[Int, MutUntrackedOrigin], n: Int) requires p._extent() >= n:
     for i in range(n):
         p[unsafe_offset=i] = i
 
 
+struct Slot(ImplicitlyCopyable, Movable):
+    var count: Int
+
+    def __init__(out self, count: Int):
+        self.count = count
+
+
 # --- must be PROVEN ---
+def ok_field_after_write() -> Int:
+    var p = unsafe_alloc[Slot](1)
+    p.unsafe_write(Slot(4))
+    var t = p[].count
+    p.unsafe_free()
+    return t
+
+
 def ok_read_after_write() -> Int:
     var p = unsafe_alloc[Int](1)
     p[] = 4
@@ -231,6 +245,13 @@ def ok_stack() -> Int:
 
 
 # --- must stay UNPROVEN ---
+def bad_field_before_write() -> Int:
+    var p = unsafe_alloc[Slot](1)
+    var t = p[].count  # a field of an element that was never written
+    p.unsafe_free()
+    return t
+
+
 def bad_read_before_write() -> Int:
     var p = unsafe_alloc[Int](1)
     var t = p[]

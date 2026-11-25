@@ -4763,12 +4763,15 @@ private:
 
   /// The pointee `ref` refers to, through rebinding, immutable views and
   /// upcasts of it.
-  std::optional<Allocation> pointeeOf(Value ref) {
+  std::optional<Allocation> pointeeOf(Value ref, bool throughFields = false) {
     while (true) {
       if (auto it = pointeeRefs.find(ref); it != pointeeRefs.end())
         return it->second;
       Operation *def = ref.getDefiningOp();
-      if (!def || !isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp>(def))
+      // With `throughFields`, also the element a field of which `ref` is
+      // (`p[i].count`): what is read of it is read of the element.
+      if (!def || !(isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp>(def) ||
+                    (throughFields && isa<LIT::RefStructGEROp>(def))))
         return std::nullopt;
       ref = def->getOperand(0);
     }
@@ -7987,6 +7990,9 @@ private:
     if (isa<LIT::MemcpyOp>(op)) {
       Value from = op->getOperand(0), to = op->getOperand(1);
       auto ref = dyn_cast<LIT::RefType>(to.getType());
+      if (std::optional<Allocation> pointee = pointeeOf(from, true))
+        checkInitialized(op->getLoc(), "Pointer.__getitem__", *pointee,
+                         pointee->offset, 1, state);
       if (std::optional<Allocation> pointee = pointeeOf(to))
         markInitialized(*pointee, pointee->offset, true, state);
       std::optional<Loc> dst = placeOf(to);
@@ -8063,8 +8069,9 @@ private:
         op->getName().getStringRef() == "lit.load.consume") {
       Operation *loadOp = op;
       Value ref = loadOp->getOperand(0), result = loadOp->getResult(0);
-      // A read of `p[]`, `p[unsafe_offset=i]`: of an initialized element.
-      if (std::optional<Allocation> pointee = pointeeOf(ref))
+      // A read of `p[]`, `p[unsafe_offset=i]`, or of a field of one: of an
+      // initialized element.
+      if (std::optional<Allocation> pointee = pointeeOf(ref, true))
         checkInitialized(op->getLoc(), "Pointer.__getitem__", *pointee,
                          pointee->offset, 1, state);
       if (auto it = elements.find(ref); it != elements.end()) {

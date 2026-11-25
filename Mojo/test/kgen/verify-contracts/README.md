@@ -293,11 +293,13 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   again at once, or the write is reported ("cannot prove that the invariant
   of 'Nat' holds after this write"). So an update in two steps that breaks
   the invariant in between is reported at its first step; the struct's own
-  methods may still break it until they return. Limits: only writes of
-  fields are checked, not a field replaced whole (`p.first = other`) nor a
-  `mut` method called on one; a value a function returns (not a reference)
-  is not covered; and memory that was never written is taken to hold valid
-  values. On the standard library's tests it proves nothing more and costs
+  methods may still break it until they return. Limits: only a write of a
+  field is checked at the write; a field replaced whole (`r.lo = n`) or
+  changed by a `mut` method called on it is checked where the function
+  returns if the struct is its argument, and not at all for a local; and
+  nothing is assumed of a value read through a raw pointer (`p[i].value`),
+  where the read itself must be of initialized memory (below).
+  On the standard library's tests it proves nothing more and costs
   0 to 8% more solver time; `test_deque` gets nine more warnings, where
   it sets the deque's private fields.
 - Quantifiers (`all([... for i in range(lo, hi)])`) are proven for an
@@ -662,7 +664,8 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   itself), not by a write to an element
   (`ok_list_pointer`). These are the pass's own obligations ("that the element
   read is initialized", "that the memory the pointer points into has not been
-  freed"), not clauses: `p[]` cannot carry one (see above), and `__getitem__`
+  freed"), not clauses; a read of a field of an element (`p[].count`) reads
+  the element (`bad_field_before_write`): `p[]` cannot carry one (see above), and `__getitem__`
   serves writes too. Only what this function can see: a pointer it did not
   allocate or take from a list (an argument, a field) is taken to be allocated
   and initialized, and a function handed a local pointer by value is taken to
