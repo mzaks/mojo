@@ -191,7 +191,29 @@ struct Filler[n: Int]:
         return t
 
 
+# A value that is copied bit by bit.
+struct Cursor(ImplicitlyCopyable, Movable):
+    var at: Int
+
+    def __init__(out self, at: Int):
+        self.at = at
+
+
+struct Reader(Copyable, Movable):
+    var cursor: Cursor
+
+    def __init__(out self, cursor: Cursor):
+        self.cursor = cursor
+
+
 # --- must be PROVEN ---
+def ok_copied(c: Cursor, xs: List[Int]) -> Int:
+    if 0 <= c.at and c.at < len(xs):
+        var d = c  # the copy has the fields of `c`
+        return xs[d.at]
+    return 0
+
+
 def ok_field_store(mut r: Ring, i: Int) -> Int
     requires 0 <= i < r.size and r.data._extent() >= r.size:
     r.at = i  # `r.data` and `r.size` are what they were
@@ -400,6 +422,21 @@ def bad_read_in_loop(base: Int, n: Int) -> Int requires 0 <= base < 64:
 
 def bad_fill_and_flag(p: Pointer[Int, MutUntrackedOrigin]):
     _take_unless[](p, 5, False)  # nothing about `p`
+
+
+def bad_overwritten(a: Cursor, b: Cursor, xs: List[Int]) -> Int:
+    var c = a
+    if 0 <= c.at and c.at < len(xs):
+        c = b  # now the fields of `b`, of which nothing is known
+        return xs[c.at]
+    return 0
+
+
+def bad_field_replaced(mut r: Reader, c: Cursor, xs: List[Int]) -> Int:
+    if 0 <= r.cursor.at and r.cursor.at < len(xs):
+        r.cursor = c
+        return xs[r.cursor.at]
+    return 0
 
 
 def main():

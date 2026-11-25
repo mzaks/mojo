@@ -583,7 +583,10 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   fields, also at the head of a loop that writes only fields, and where two
   paths join. A field of a struct passed by value is that field of the
   value, so a callee's clause about `self.ptr` is about the caller's
-  `x.arr.ptr`. A constructor's `ensures` clause is about `self`, or about
+  `x.arr.ptr`. A whole value copied over another (`c = b`, `r.cursor
+  = c` of a struct that is copied bit by bit) gives the destination the
+  source's fields and drops what was known of its own (`ok_copied`,
+  `bad_overwritten`, `bad_field_replaced`). A constructor's `ensures` clause is about `self`, or about
   `result` for one that returns `Self`.
   `rebind[T](x)` is `x`; `Int(i)` of an `Intable` `i` is `i` where it is an
   `Int`, else one value per `i` (assumed a function of it); the pointer of an

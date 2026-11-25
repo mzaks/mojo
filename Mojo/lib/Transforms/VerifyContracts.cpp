@@ -2023,6 +2023,13 @@ std::string implKey(TraitSymbolAttr trait, StringRef method,
   return printed(trait) + "|" + method.str() + "|" + structSymbol.str();
 }
 
+/// The reference `op` writes a value through: a store's, or that of a copy
+/// of a whole value over another (`lit.memcpy`, how a trivially copyable
+/// struct is assigned). Null for any other operation.
+Value writtenRef(Operation *op) {
+  return isa<LIT::RefStoreOp, LIT::MemcpyOp>(op) ? op->getOperand(1) : Value();
+}
+
 /// The symbol of the struct `fn` is a method of, if it has no parameters.
 std::string plainStructOf(LIT::FnOp fn) {
   auto parent = fn->getParentOfType<LIT::StructDeclOp>();
@@ -5258,8 +5265,8 @@ private:
     root->walk([&](Operation *op) {
       if (touches)
         return;
-      if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
-        if (auto call = store->getOperand(1).getDefiningOp<LIT::CallOp>())
+      if (Value dest = writtenRef(op)) {
+        if (auto call = dest.getDefiningOp<LIT::CallOp>())
           if (std::optional<CalleeName> n = calleeName(call.getCallee());
               n && StringRef(n->path).starts_with(
                        "std::memory::pointer::Pointer::__getitem__"))
@@ -5348,8 +5355,7 @@ private:
           writes = true;
         return;
       }
-      if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
-        Value dest = store->getOperand(1);
+      if (Value dest = writtenRef(op)) {
         while (Operation *def = dest.getDefiningOp()) {
           if (auto call = dyn_cast<LIT::CallOp>(def)) {
             std::optional<CalleeName> n = calleeName(call.getCallee());
@@ -6246,8 +6252,8 @@ private:
       if (op->getParentOfType<RequiresOp>() ||
           op->getParentOfType<EnsuresOp>())
         return;
-      if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
-        written(store->getOperand(1));
+      if (Value dest = writtenRef(op)) {
+        written(dest);
       } else if (auto inner = dyn_cast<LIT::CallOp>(op)) {
         for (auto [index, operand] : llvm::enumerate(inner.getOperands()))
           if (auto ref = dyn_cast<LIT::RefType>(operand.getType());
@@ -6395,10 +6401,10 @@ private:
     llvm::SmallPtrSet<Operation *, 4> seen{root};
     while (!work.empty())
       work.pop_back_val()->walk([&](Operation *op) {
-        if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
-          auto ref = dyn_cast<LIT::RefType>(store->getOperand(1).getType());
+        if (Value dest = writtenRef(op)) {
+          auto ref = dyn_cast<LIT::RefType>(dest.getType());
           confined = ref && otherSpace(ref);
-          addRef(store->getOperand(1));
+          addRef(dest);
           confined = false;
         } else if (auto call = dyn_cast<LIT::CallOp>(op)) {
           if (LIT::FnOp member = closureMember(call);
@@ -6667,7 +6673,7 @@ private:
       if (isa<LIT::RefImmutOp>(user) ||
           user->getName().getStringRef() == "lit.ref.load")
         continue;
-      if (isa<LIT::RefStoreOp>(user)) {
+      if (isa<LIT::RefStoreOp, LIT::MemcpyOp>(user)) {
         if (use.getOperandNumber() == 1)
           return true;
         continue;
@@ -7011,8 +7017,8 @@ private:
       work.pop_back_val()->walk([&](Operation *op) {
         if (!only)
           return;
-        if (auto store = dyn_cast<LIT::RefStoreOp>(op)) {
-          only = !names(store->getOperand(1));
+        if (Value dest = writtenRef(op)) {
+          only = !names(dest);
         } else if (auto call = dyn_cast<LIT::CallOp>(op)) {
           if (LIT::FnOp member = closureMember(call);
               member && seen.insert(member.getOperation()).second)
@@ -7973,6 +7979,40 @@ private:
                     ref.getElementType());
       else
         havocAll(state);
+      return;
+    }
+    // A whole value copied over another (`n = other` and `r.lo = n` of a
+    // trivially copyable struct): the destination holds the source's
+    // value, with what is known of its fields, and no longer its own.
+    if (isa<LIT::MemcpyOp>(op)) {
+      Value from = op->getOperand(0), to = op->getOperand(1);
+      auto ref = dyn_cast<LIT::RefType>(to.getType());
+      if (std::optional<Allocation> pointee = pointeeOf(to))
+        markInitialized(*pointee, pointee->offset, true, state);
+      std::optional<Loc> dst = placeOf(to);
+      if (!dst) {
+        if (ref)
+          havocOrigin(printed(ref.getOrigin()), state, otherSpace(ref),
+                      ref.getElementType());
+        else
+          havocAll(state);
+        return;
+      }
+      Sort sort = ref ? sortOf(ref.getElementType()) : Sort{false, 64, false};
+      std::optional<Loc> src = placeOf(from);
+      if (!src || src->root == dst->root) {
+        store(*dst, state, declare(sort, "h"));
+        return;
+      }
+      std::string whole = load(*src, state, sort);
+      SmallVector<std::pair<std::string, std::string>> fields;
+      for (auto &[loc, value] : state.env)
+        if (loc.root == src->root &&
+            StringRef(loc.path).starts_with(src->path + "/"))
+          fields.push_back({loc.path.substr(src->path.size()), value});
+      store(*dst, state, whole);
+      for (auto &[field, value] : fields)
+        state.env[Loc{dst->root, dst->path + field}] = value;
       return;
     }
     // The field of an integer wrapper value is the value itself.
