@@ -14,7 +14,30 @@
 # literals and mutating methods; see README.md.
 
 
+struct Window(ImplicitlyCopyable, Movable):
+    var lo: Int
+    var hi: Int
+
+    def __init__(out self, lo: Int, hi: Int):
+        self.lo = lo
+        self.hi = hi
+
+
 # --- must be PROVEN ---
+def ok_element_field_kept(mut ws: List[Window], xs: List[Int]) -> Int:
+    if len(ws) > 0 and 0 <= ws[0].hi and ws[0].hi < len(xs):
+        ws[0].lo = 0  # the element's `hi` is what it was
+        return xs[ws[0].hi]
+    return 0
+
+
+def ok_element_field_read_back(mut ws: List[Window], xs: List[Int]) -> Int:
+    if len(ws) > 0 and len(xs) > 0:
+        ws[0].lo = 0
+        return xs[ws[0].lo]
+    return 0
+
+
 def ok_literal() -> Int:
     var xs: List[Int] = [1, 2, 3]
     return xs[2]
@@ -143,6 +166,23 @@ def ok_rows_built_in_loop() -> Int:
 
 
 # --- must stay UNPROVEN ---
+def bad_element_field_rewritten(
+    mut ws: List[Window], xs: List[Int], a: Int
+) -> Int:
+    if len(ws) > 0 and 0 <= ws[0].hi and ws[0].hi < len(xs):
+        ws[0].hi = a
+        return xs[ws[0].hi]
+    return 0
+
+
+def bad_element_replaced(mut ws: List[Window], xs: List[Int], w: Window) -> Int:
+    if len(ws) > 0 and len(xs) > 0:
+        ws[0].lo = 0
+        ws[0] = w
+        return xs[ws[0].lo]
+    return 0
+
+
 def bad_literal_past_end() -> Int:
     var xs: List[Int] = [1, 2, 3]
     return xs[3]

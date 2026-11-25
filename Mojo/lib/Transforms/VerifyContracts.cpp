@@ -3578,6 +3578,10 @@ private:
     for (auto &[prefix, old] : outer) {
       std::string fresh = declare({false, 64, false}, "h");
       updates[fresh] = {old, loc.path.substr(prefix.size())};
+      // The new value's written field is what was written: known of the
+      // value too, for where it is read from another place (an element
+      // of a list, read again through `xs[i]`).
+      fieldValues[{fresh, loc.path.substr(prefix.size())}] = value;
       state.env[Loc{loc.root, prefix}] = fresh;
     }
     state.env[loc] = std::move(value);
@@ -13670,6 +13674,16 @@ private:
     if (elementFunctions.insert(fn).second)
       prelude += "(declare-fun " + fn + " ((_ BitVec 64) (_ BitVec 64)) " +
                  sort.str() + ")\n";
+    // The element a write made this collection value with, read at the
+    // same index: that value itself, whose fields are then the written
+    // element's (a field is known of a value's term, not of its equals).
+    if (auto it = elementStores.find(list.str());
+        it != elementStores.end() && it->second.index == index) {
+      Sort stored = sortOfTerm(it->second.value);
+      if (stored.isBool == sort.isBool &&
+          (sort.isBool || stored.width == sort.width))
+        return it->second.value;
+    }
     return define(sort, ("(" + fn + " " + list + " " + index + ")").str());
   }
 

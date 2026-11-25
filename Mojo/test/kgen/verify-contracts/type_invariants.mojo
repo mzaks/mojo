@@ -61,6 +61,11 @@ def ok_write(mut p: Pair, a: Int):
         p.second.value = a
 
 
+def ok_write_element(mut ns: List[Nat], a: Int):
+    if len(ns) > 0 and a >= 0:
+        ns[0].value = a
+
+
 def ok_behind_pointer(xs: List[Int]) -> Int:
     var p = unsafe_alloc[Nat](1)
     p.unsafe_write(Nat(1))

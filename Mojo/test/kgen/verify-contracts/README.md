@@ -317,7 +317,11 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   (`LinkedList.append`). `_element_is(xs, i, v)` says element `i` is `v`:
   `List.append` and `LinkedList.append` state the element they add, so
   an appended row is known where it is read back (`xs[0][1]` after
-  `xs.append(row^)`: the row's length is `row`'s).
+  `xs.append(row^)`: the row's length is `row`'s). An element of a struct
+  type whose field is written (`ws[0].lo = 0`) keeps its other fields and
+  has the written one, where it is read again at the same index
+  (`ok_element_field_kept`, `ok_element_field_read_back`); at another
+  index term nothing is known of the fields.
 - Loop invariants also bound the lengths of lists a loop appends to. A
   loop over a `range` with constant bounds and step and at most 16
   iterations that changes a variable from outside it (`for i in range(2):
