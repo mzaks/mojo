@@ -2438,6 +2438,9 @@ public:
   unsigned queryRlimit = 0;
   /// Whether integer divisors that may be 0 are obligations.
   bool checkDivision = false;
+  /// Whether a struct's invariant holds of every value of it that a function
+  /// outside the struct reads, and is checked where one writes a field.
+  bool typeInvariants = false;
   /// Whether the compilation target's unknowns are declared.
   bool targetDeclared = false;
   /// Whether target predicates are read for a kernel at its launch.
@@ -5557,6 +5560,8 @@ private:
       if (!state.alive)
         return;
       walkOp(&op, state);
+      if (typeInvariants)
+        applyTypeInvariants(&op, state);
     }
   }
 
@@ -9533,7 +9538,18 @@ private:
     } else {
       values[arg] = term(operand, state);
     }
-    // Its parameter expressions are this call's.
+    MaybeTerm value = predicateValue(callee, frame, state);
+    if (!value)
+      return false;
+    values[call->getResult(0)] = *value;
+    return true;
+  }
+
+  /// What the body of the predicate `callee` computes, its argument bound
+  /// and its parameters read in `frame`.
+  MaybeTerm predicateValue(LIT::FnOp callee, ParamFrame &frame, State &state) {
+    Block &entry = callee.getFunctionBody().front();
+    // Its parameter expressions are this use's.
     callee->walk([&](ParamConstantOp cst) { values.erase(cst->getResult(0)); });
     size_t recorded = obligations.size();
     ParamFrame *saved = params;
@@ -9549,12 +9565,109 @@ private:
     params = saved;
     obligations.truncate(recorded);
     if (exits.size() != 1)
-      return false;
+      return std::nullopt;
     std::string value = term(entry.back().getOperand(0), exits[0]);
     if (!sortOfTerm(value).isBool)
-      return false;
-    values[call->getResult(0)] = value;
-    return true;
+      return std::nullopt;
+    return value;
+  }
+
+  /// The `__invariant__` predicate of each struct that has one.
+  DenseMap<Operation *, LIT::FnOp> invariantPredicates;
+
+  /// With `type-invariants`: the invariant of the struct `st` for the value
+  /// `ref` refers to, read by `at`; none if the struct states none, or if
+  /// `at` is in one of its own methods, which may break it until they
+  /// return.
+  MaybeTerm typeInvariant(Value ref, Operation *at, State &state,
+                          LIT::StructType &st) {
+    auto type = dyn_cast<LIT::RefType>(ref.getType());
+    st = type ? structTypeOf(type.getElementType()) : LIT::StructType();
+    if (!st)
+      return std::nullopt;
+    auto decl = dyn_cast_or_null<LIT::StructDeclOp>(
+        symbols.lookupSymbolIn(module, st.getSymbol()));
+    if (!decl)
+      return std::nullopt;
+    for (Operation *in : {at, fn.getOperation()})
+      for (Operation *parent = in; parent; parent = parent->getParentOp())
+        if (parent == decl.getOperation())
+          return std::nullopt;
+    auto [it, inserted] = invariantPredicates.try_emplace(decl.getOperation());
+    if (inserted)
+      for (auto method : decl.getBody()->getOps<LIT::FnOp>())
+        if (method.getSymName() &&
+            method.getSymName()->starts_with("__invariant__(") &&
+            !method.getFunctionBody().empty()) {
+          it->second = method;
+          break;
+        }
+    LIT::FnOp predicate = it->second;
+    if (!predicate)
+      return std::nullopt;
+    Block &entry = predicate.getFunctionBody().front();
+    ArrayRef<ParamDeclAttr> decls = decl.getParams();
+    ArrayRef<TypedAttr> bound = st.getParamValues();
+    std::optional<Loc> loc = placeOf(ref);
+    if (!loc || entry.getNumArguments() != 1 || entry.empty() ||
+        entry.back().getNumOperands() != 1 ||
+        !isa<LIT::RefType>(entry.getArgument(0).getType()) ||
+        decls.size() != bound.size())
+      return std::nullopt;
+    refArgs[entry.getArgument(0)] = *loc;
+    ParamFrame frame;
+    frame.parent = params;
+    frame.scope = printed(st);
+    frame.fn = predicate;
+    for (auto [param, value] : llvm::zip(decls, bound))
+      frame.values[param.getName()] = value;
+    return predicateValue(predicate, frame, state);
+  }
+
+  /// With `type-invariants`, after `op`: a struct's invariant holds of a
+  /// value whose field is taken and of one a call returns a reference to,
+  /// and must hold again after a write to a field of one.
+  void applyTypeInvariants(Operation *op, State &state) {
+    if (inContract || predicateDepth || !state.alive)
+      return;
+    auto assume = [&](Value ref) {
+      LIT::StructType st;
+      if (MaybeTerm holds = typeInvariant(ref, op, state, st))
+        state.pc = define({true, 1, false},
+                          "(and " + state.pc + " " + *holds + ")", "r");
+    };
+    if (auto gep = dyn_cast<LIT::RefStructGEROp>(op))
+      return assume(gep->getOperand(0));
+    if (isa<LIT::CallOp>(op)) {
+      for (Value result : op->getResults())
+        assume(result);
+      return;
+    }
+    if (!isa<LIT::RefStoreOp>(op))
+      return;
+    // The structs the written field is in, innermost first.
+    Value dest = op->getOperand(1);
+    while (Operation *def = dest.getDefiningOp()) {
+      if (isa<RebindOp, LIT::RefImmutOp, LIT::RefUpcastOp>(def)) {
+        dest = def->getOperand(0);
+        continue;
+      }
+      if (!isa<LIT::RefStructGEROp>(def))
+        return;
+      dest = def->getOperand(0);
+      LIT::StructType st;
+      MaybeTerm holds = typeInvariant(dest, op, state, st);
+      if (!holds)
+        continue;
+      Obligation ob{state.pc, *holds, op->getLoc(), op->getLoc(),
+                    st.getSymbol().getLeafReference().getValue().str()};
+      ob.claim =
+          "that the invariant of '" + ob.callee + "' holds after this write";
+      noteCondition(ob.cond);
+      addObligation(ob);
+      state.pc = define({true, 1, false},
+                        "(and " + state.pc + " " + *holds + ")", "r");
+    }
   }
 
   void evalCall(LIT::CallOp call, State &state) {
@@ -15411,6 +15524,7 @@ struct VerifyContractsPass
         FunctionEncoder enc(fns[i].fn, module, symbols, solver, name, impls,
                             fns[i].refines);
         enc.checkDivision = checkDivision;
+        enc.typeInvariants = typeInvariants;
         if (launched(i))
           enc.queryRlimit = genericRlimit;
         verify(enc, results[i], name);
@@ -15445,6 +15559,7 @@ struct VerifyContractsPass
         FunctionEncoder enc(fns[job.job].fn, module, symbols, solver, name,
                             impls);
         enc.checkDivision = checkDivision;
+        enc.typeInvariants = typeInvariants;
         enc.bindInstance(instances.find(fns[job.job].fn.getOperation())
                              ->second[job.instance]
                              .chain);

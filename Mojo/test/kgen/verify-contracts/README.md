@@ -71,7 +71,9 @@ runs every script in a z3 process of its own instead of one process per
 function kept alive between its scripts (below), `int-rlimit=` and
 `range-rlimit=` are the limits of the integer retry's queries (defaults
 1000000 and 300000), `check-division=true` reports integer divisions
-by a value that may be 0, `int-retry=false` turns off the integer retry
+by a value that may be 0, `type-invariants=true` takes a struct's invariant
+to hold for every value of the struct, wherever it is kept (below),
+`int-retry=false` turns off the integer retry
 (below), `nonlinear-rlimit=` the limit a query whose goal multiplies or
 divides two unknowns is first asked with (default 10000000; then over the
 integers, then with the full limit), `case-split=false` turns off case
@@ -279,6 +281,25 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   predicate's; and a function outside the struct that returns one of its
   values does not prove the invariant of its result (the struct's own
   methods do), so a caller does not assume it (`invariants.mojo`).
+- Invariants as facts of the type (`type-invariants=true`, off by default;
+  `type_invariants.mojo`): without it, the invariant is known only of
+  arguments and of what a constructor or a `mut` method returned, so a
+  `Nat` read from a `List[Nat]` or from a field of another struct is any
+  `Int` in a wrapper. With it, a function that is not a method of the
+  struct assumes the invariant of a value where it takes a field of it and
+  where a call returns a reference to one (`ns[0]`). What makes that sound
+  is the other half: where such a function writes a field of a struct with
+  an invariant, the invariant (of each struct the field is in) must hold
+  again at once, or the write is reported ("cannot prove that the invariant
+  of 'Nat' holds after this write"). So an update in two steps that breaks
+  the invariant in between is reported at its first step; the struct's own
+  methods may still break it until they return. Limits: only writes of
+  fields are checked, not a field replaced whole (`p.first = other`) nor a
+  `mut` method called on one; a value a function returns (not a reference)
+  is not covered; and memory that was never written is taken to hold valid
+  values. On the standard library's tests it proves nothing more and costs
+  0 to 8% more solver time; `test_deque` gets nine more warnings, where
+  it sets the deque's private fields.
 - Quantifiers (`all([... for i in range(lo, hi)])`) are proven for an
   arbitrary index and assumed as real quantifiers.
 - List elements: `xs[i]` reads `elem(xs, i)`; writing it keeps the length
@@ -1022,6 +1043,7 @@ next script.
 | `matches.mojo`       | all `bad_*`        | all `ok_*`       |
 | `allocations.mojo`   | all `bad_*`        | all `ok_*`       |
 | `memory_clauses.mojo` | all `bad_*`       | all `ok_*`       |
+| `type_invariants.mojo` | all `bad_*`      | all `ok_*` (with `type-invariants=true`) |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |
 | `gemm_mma_cpasync.mojo` | (none)          | all `ok_*`       |
 | `matmul_dispatch.mojo` | (none)           | (a corpus driver, nothing expected) |

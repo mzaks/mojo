@@ -90,6 +90,11 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
     Option<"checkDivision", "check-division", "bool", /*default=*/"false",
            "Report integer divisions by a value that may be 0 (`//`, `%`, "
            "`divmod`, `ceildiv` and the `uutils` helpers)">,
+    Option<"typeInvariants", "type-invariants", "bool", /*default=*/"false",
+           "Take a struct's invariant to hold for every value of it a "
+           "function outside the struct reads (a field of another struct, "
+           "an element a call returns a reference to), and check it where "
+           "such a function writes a field of one">,
     Option<"intRetry", "int-retry", "bool", /*default=*/"true",
            "Ask the queries answered `unknown` again over the integers "
            "(an exact translation; only proofs are taken)">,
