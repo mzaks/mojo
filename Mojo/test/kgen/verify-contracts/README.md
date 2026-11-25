@@ -295,16 +295,22 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   anything can see the value: a call that is given it or what it is a
   part of, or that may read the memory it is in (for a value a pointer
   may refer to); a copy of it; a read through another reference that may
-  be to the same element; a branch or a loop in the block of the write;
-  the end of that block; a `return`. It is reported at the last write
-  before that ("cannot prove that the invariant of 'Bounds' holds after
-  this write"). So an update in several steps is checked once, after its
+  be to the same element; leaving the function. It is reported at the
+  last write before that ("cannot prove that the invariant of 'Bounds'
+  holds after this write"). So an update in several steps is checked once, after its
   last step (`b.lo = 10; b.hi = 20`), and a value handed on between the
   steps is reported (`bad_used_between`). A part of an open value is a
   value of its own: `nb.lo` may be given to a call while `nb` is open.
-  The struct's own methods may break the invariant until they return, as
-  before. Limit: steps in different blocks (one before an `if`, one in
-  it) are not one update.
+  The steps may be in different branches: a value stays open through an
+  `if` and where its arms join if each arm leaves it open
+  (`ok_both_arms`; an arm that opens a value the other does not must
+  close it itself, `bad_arm_leaves_broken`), and through a loop that
+  does not see it (`ok_across_loop`). A value an iteration of a loop
+  opens must be closed where the iteration ends, since the next one
+  starts with it intact (`bad_iteration_leaves_broken`). An element
+  behind a pointer is closed where paths join that left the memory in
+  different versions. The struct's own methods may break the invariant
+  until they return, as before.
   An element behind a raw pointer is such a value too (memory behind
   pointers, below): `if p[].hi >= 0: p[].lo = 0` keeps `lo <= hi`, as does
   a method called on `p[]` under that guard, and a write between the

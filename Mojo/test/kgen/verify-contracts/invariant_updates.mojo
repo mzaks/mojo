@@ -13,8 +13,9 @@
 # Updates of a struct with an invariant by code outside it, with
 # `type-invariants=true`: a write into the value opens it, and its
 # invariant must hold again before anything can see the value (a call that
-# is given it or may read it, a copy, a branch, the end of the block), so
-# an update in several steps is checked once; see README.md.
+# is given it or may read it, a copy, leaving the function), so an update
+# in several steps is checked once, also where the steps are in different
+# branches; see README.md.
 
 
 struct Nat(ImplicitlyCopyable, Movable) invariant self.value >= 0:
@@ -125,6 +126,50 @@ def ok_part_used(mut nb: NatBounds) -> Int:
     return t
 
 
+def ok_both_arms(mut b: Bounds, c: Bool):
+    b.lo = 10
+    if c:
+        b.hi = 20
+    else:
+        b.hi = 30
+
+
+def ok_in_one_arm(mut b: Bounds, c: Bool):
+    if c:
+        b.lo = 10
+        b.hi = 20
+
+
+def ok_already_enough(mut b: Bounds, c: Bool):
+    if b.hi >= 10:
+        b.lo = 10
+        if c:
+            b.hi = 20
+
+
+def ok_across_loop(mut b: Bounds, n: Int) -> Int:
+    var t = 0
+    b.lo = 10
+    for i in range(n):
+        t = t + i
+    b.hi = 20
+    return t
+
+
+def ok_each_iteration(mut b: Bounds, n: Int):
+    if n < 1000:
+        for i in range(n):
+            b.lo = i
+            b.hi = i + 1
+
+
+def ok_pointer_one_arm(p: Pointer[Bounds, MutUntrackedOrigin], c: Bool)
+    requires p._extent() >= 1:
+    if c:
+        p[].lo = 10
+        p[].hi = 20
+
+
 # --- must be WARNED (at the last write before the value is seen) ---
 def bad_left_broken(mut b: Bounds):
     b.lo = 10  # `hi` may be less
@@ -222,6 +267,41 @@ def bad_seen_through_pointer() -> Int:
     var t = reads(p)  # reads `b` through the pointer
     b.hi = 20
     return t
+
+
+def bad_one_arm_only(mut b: Bounds, c: Bool):
+    b.lo = 10
+    if c:
+        b.hi = 20  # not when `c` is false
+
+
+def bad_arm_leaves_broken(mut b: Bounds, c: Bool):
+    if c:
+        b.lo = 10
+    else:
+        b.lo = 10
+        b.hi = 20
+
+
+def bad_iteration_leaves_broken(mut b: Bounds, n: Int):
+    for i in range(n):
+        b.lo = i
+    b.hi = n
+
+
+def bad_used_in_loop(mut b: Bounds, n: Int) -> Int:
+    var t = 0
+    b.lo = 10
+    for _ in range(n):
+        t = t + use(b)
+    b.hi = 20
+    return t
+
+
+def bad_pointer_arm(p: Pointer[Bounds, MutUntrackedOrigin], c: Bool)
+    requires p._extent() >= 1:
+    if c:
+        p[].lo = 10
 
 
 def main():

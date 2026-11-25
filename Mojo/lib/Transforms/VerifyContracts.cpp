@@ -1870,8 +1870,6 @@ struct OpenValue {
   Value root;
   std::string path;
   Operation *write = nullptr;
-  /// The block the write is in: the value is closed where that ends.
-  Block *block = nullptr;
   /// An element of a collection or behind a pointer (`identity`: which),
   /// which other references may be to as well.
   bool heap = false;
@@ -6361,6 +6359,28 @@ private:
       out.yields.clear();
       return out;
     }
+    // With `type-invariants`: a value open on some of the paths only is
+    // closed on those (each proves what it left), and so is an element
+    // behind a pointer where the paths left the memory in different
+    // versions, which the join knows nothing of. One open on every path
+    // stays open.
+    if (typeInvariants) {
+      bool sameHeap = llvm::all_of(
+          live, [&](const State *s) { return s->heap == live.front()->heap; });
+      for (const State *path : live) {
+        State &s = const_cast<State &>(*path);
+        if (s.open.empty())
+          continue;
+        closeOpenIf(s, [&](const OpenValue &open) {
+          if (open.heap && !sameHeap)
+            return true;
+          std::string key = open.identity + '\x01' + open.path;
+          return llvm::any_of(live, [&](const State *other) {
+            return !other->open.count(key);
+          });
+        });
+      }
+    }
     for (const State *s : live)
       out.epoch = std::max(out.epoch, s->epoch);
     // The memory behind pointers is known only where every path left it
@@ -8053,6 +8073,11 @@ private:
     State body = head;
     walkBlock(bodyBlock, body);
     loops.pop_back();
+    if (typeInvariants) {
+      closeOpenedInLoop(head.open, body);
+      for (State &next : frame.continues)
+        closeOpenedInLoop(head.open, next);
+    }
     if (body.alive) // Falling off the body starts the next iteration.
       frame.continues.push_back(body);
     ++loopsAnalyzed;
@@ -10705,10 +10730,12 @@ private:
 
   /// With `type-invariants`, before `op`: the open values it may see are
   /// closed. A value is seen by a call that is given a reference to it or
-  /// that may read memory where it is; by a copy of it, or a read of it
-  /// whole; and, in the block of its last write, by anything with code of
-  /// its own (a branch, a loop) and by the end of the block. A `return`
-  /// of the function closes them all.
+  /// that may read memory where it is, and by a copy of it or a read of it
+  /// whole. Leaving the function closes them all. A value stays open
+  /// through branches, where paths join if it is open on each of them
+  /// (`merge` closes the others), and through a loop that was entered
+  /// with it open; one that an iteration opens is closed where the
+  /// iteration ends (`closeOpenedInLoop`).
   void closeBefore(Operation *op, State &state) {
     if (inContract || predicateDepth)
       return;
@@ -10747,20 +10774,36 @@ private:
               whole ? sees(op->getOperand(0)) : std::nullopt)
         closeOpenIf(state,
                     [&](const OpenValue &open) { return maySee(*key, open); });
-    } else if (op->getNumRegions() &&
-               !isa<RequiresOp, EnsuresOp, LIT::FnOp>(op)) {
-      closeOpenIf(state, [&](const OpenValue &open) {
-        return open.block == op->getBlock();
-      });
     }
+    // Leaving the function: by a `return` or a raise, or at its end;
+    // and before its postconditions are proven there (an open argument's
+    // invariant is one of them, which is then not reported twice).
     StringRef name = op->getName().getStringRef();
-    if ((name == "hlcf.return" || name == "lit.error_return") &&
-        op->getParentOfType<LIT::FnOp>() == fn)
+    bool leaves = (name == "hlcf.return" || name == "lit.error_return" ||
+                   isa<EnsuresOp>(op)) &&
+                  op->getParentOfType<LIT::FnOp>() == fn;
+    if (leaves ||
+        (!op->getNextNode() && op->getBlock() == &fn.getFunctionBody().front()))
       closeOpenIf(state, [](const OpenValue &) { return true; });
-    else if (!op->getNextNode())
-      closeOpenIf(state, [&](const OpenValue &open) {
-        return open.block == op->getBlock();
-      });
+  }
+
+  /// Where an iteration of a loop ends (`end`, from a head where the
+  /// values in `atHead` were open): the values it opened are closed, since
+  /// the next iteration starts from a head at which they are not open.
+  void closeOpenedInLoop(const std::map<std::string, OpenValue> &atHead,
+                         State &end) {
+    if (!end.alive || end.open.empty())
+      return;
+    SmallVector<OpenValue> closing;
+    for (auto it = end.open.begin(); it != end.open.end();)
+      if (!atHead.count(it->first)) {
+        closing.push_back(it->second);
+        it = end.open.erase(it);
+      } else {
+        ++it;
+      }
+    for (const OpenValue &open : closing)
+      closeOpen(open, end);
   }
 
   /// A write through `ref` (at `write`) may break the invariant of each
@@ -10794,7 +10837,6 @@ private:
                                loc->root,
                                loc->path,
                                write,
-                               write->getBlock(),
                                key.heap,
                                key.identity,
                                key.heap || !privateLocal(loc->root)};
