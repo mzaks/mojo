@@ -84,6 +84,36 @@ def ok_write_behind_pointer(a: Int):
     p.unsafe_free()
 
 
+# `lo <= hi`
+struct Bounds(ImplicitlyCopyable, Movable) invariant self.lo <= self.hi:
+    var lo: Int
+    var hi: Int
+
+    def __init__(out self, lo: Int, hi: Int) requires lo <= hi:
+        self.lo = lo
+        self.hi = hi
+
+    def set_lo(mut self, lo: Int) requires lo <= self.hi:
+        self.lo = lo
+
+
+def ok_guarded_write(p: Pointer[Bounds, MutUntrackedOrigin])
+    requires p._extent() >= 1:
+    if p[].hi >= 0:
+        p[].lo = 0  # `hi` is what the guard read
+
+
+def ok_guarded_method(p: Pointer[Bounds, MutUntrackedOrigin])
+    requires p._extent() >= 1:
+    if p[].hi >= 0:
+        p[].set_lo(0)
+
+
+def ok_guarded_write_element(mut bs: List[Bounds]):
+    if len(bs) > 0 and bs[0].hi >= 0:
+        bs[0].lo = 0
+
+
 # --- must be WARNED (at the write) ---
 def bad_write(mut p: Pair, a: Int):
     p.second.value = a  # nothing is known about `a`
@@ -99,6 +129,21 @@ def bad_write_behind_pointer(a: Int):
     p.unsafe_write(Nat(1))
     p[].value = a
     p.unsafe_free()
+
+
+def bad_unguarded_write(p: Pointer[Bounds, MutUntrackedOrigin])
+    requires p._extent() >= 1:
+    p[].lo = 0  # `hi` may be negative
+
+
+def bad_write_between(
+    p: Pointer[Bounds, MutUntrackedOrigin],
+    q: Pointer[Bounds, MutUntrackedOrigin],
+)
+    requires p._extent() >= 1 and q._extent() >= 1:
+    if p[].hi >= 0:
+        q[].hi = -1  # may be the same element
+        p[].lo = 0
 
 
 def bad_write_local() -> Nat:

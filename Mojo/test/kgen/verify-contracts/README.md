@@ -297,16 +297,45 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   field is checked at the write; a field replaced whole (`r.lo = n`) or
   changed by a `mut` method called on it is checked where the function
   returns if the struct is its argument, and not at all for a local.
-  Memory behind a raw pointer has no values in the pass, so a field read
-  there (`p[i].value`) is read from a snapshot of the element, an unknown
-  value that keeps the invariant: enough for `Nat`, but two reads are two
-  snapshots, so an invariant that relates two fields says nothing of
-  `p[i].hi - p[i].lo` (copy the element out first: `var r = p[i]`). A
-  field written there must keep the invariant whatever the other fields
-  are. The read itself must be of initialized memory (below).
+  An element behind a raw pointer is such a value too (memory behind
+  pointers, below): `if p[].hi >= 0: p[].lo = 0` keeps `lo <= hi`, as does
+  a method called on `p[]` under that guard, and a write between the
+  guard and the write through a pointer that may be the same is reported.
   On the standard library's tests it proves nothing more and costs
   0 to 8% more solver time; `test_deque` gets nine more warnings, where
   it sets the deque's private fields.
+- Memory behind pointers (`pointer_memory.mojo`): the element `p[i]`
+  holds a value, so two reads with nothing written between agree
+  (`if 0 <= p[] < len(xs): xs[p[]]`), a written value is read back, and a
+  write of one field keeps the element's others. The memory has a version
+  on each path. A write through `p[i]` starts a version in which that
+  element holds what was written, the elements of the same pointer that
+  were read before keep their values unless their index is the written
+  one (they are whole elements apart), and nothing else is known. Every
+  other operation that may write memory a pointer can reach starts a
+  version in which nothing is known:
+  - a store or a copy to anything but a local variable whose address is
+    never let out (it is given to no call that could keep it or turn it
+    into a pointer: `var x; p = Pointer(to=x)` makes `x` one that a
+    pointer may read);
+  - a call that is given a reference it writes through, unless to such a
+    local; a call whose body, or one it calls, stores through a pointer or
+    does something not known to leave memory alone (an external call, an
+    intrinsic, an atomic); a call through a trait whose implementation is
+    not known; a closure;
+  - a loop that contains one of these, where it starts.
+  Two addresses are the same when their terms are: the pointer, the index
+  and the element type. Of two that differ nothing is assumed, neither
+  that they are apart nor that they overlap, so a write through `q[]`
+  forgets `p[]` (`bad_other_pointer`), whatever their types
+  (`bad_other_type`). What is taken on trust: the contract checks return
+  or abort (a function split for its checks is read as its body), and
+  `index(i)` of an `Indexer` writes nothing. Limits: a
+  pointer method that writes (`unsafe_write`, `store`) does not say what
+  it wrote; an element is not followed through a pointer moved by `p + k`
+  (another term than `p[unsafe_offset=k]`); invariants of loops say
+  nothing of such memory. Costs 1 to 7% of the verification of the
+  standard library's tests, whose results it does not change.
 - Quantifiers (`all([... for i in range(lo, hi)])`) are proven for an
   arbitrary index and assumed as real quantifiers.
 - List elements: `xs[i]` reads `elem(xs, i)`; writing it keeps the length
@@ -1059,6 +1088,7 @@ next script.
 | `allocations.mojo`   | all `bad_*`        | all `ok_*`       |
 | `memory_clauses.mojo` | all `bad_*`       | all `ok_*`       |
 | `type_invariants.mojo` | all `bad_*`      | all `ok_*` (with `type-invariants=true`) |
+| `pointer_memory.mojo` | all `bad_*`       | all `ok_*`       |
 | `gemv_split_k.mojo`  | (none)             | all `ok_*`       |
 | `gemm_mma_cpasync.mojo` | (none)          | all `ok_*`       |
 | `matmul_dispatch.mojo` | (none)           | (a corpus driver, nothing expected) |

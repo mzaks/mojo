@@ -1872,6 +1872,10 @@ struct State {
   /// entry if `epoch` is 0, and an unknown per place and epoch otherwise
   /// (after code whose writes are not tracked).
   unsigned epoch = 0;
+  /// The version of the memory behind pointers: what is read there at the
+  /// same address in the same version is the same value. Every operation
+  /// that may write such memory starts a version (see `freshHeap`).
+  unsigned heap = 0;
   /// False once the path has left (returned, broken out, continued, raised).
   bool alive = true;
   /// The version of each list's storage (by the list's place) that a
@@ -2028,6 +2032,141 @@ std::string implKey(TraitSymbolAttr trait, StringRef method,
 /// struct is assigned). Null for any other operation.
 Value writtenRef(Operation *op) {
   return isa<LIT::RefStoreOp, LIT::MemcpyOp>(op) ? op->getOperand(1) : Value();
+}
+
+/// Which functions may write memory that a caller reads through a pointer
+/// (see `FunctionEncoder::fnWritesHeap`), shared by the encoders of a run.
+struct HeapEffects {
+  std::mutex mutex;
+  DenseMap<Operation *, bool> writes;
+  /// Whether a function may let the address of its argument (by the
+  /// function and the argument's index) out: see `argumentEscapes`.
+  DenseMap<std::pair<Operation *, unsigned>, bool> escapes;
+  /// Whether a function may write what its argument refers to: see
+  /// `argumentWritten`.
+  DenseMap<std::pair<Operation *, unsigned>, bool> written;
+};
+
+/// Whether `op`, which is not a call, a store or a copy, is known to leave
+/// memory as it is. The operations are listed, so that one this does not
+/// know counts as a write.
+bool leavesMemory(Operation *op) {
+  StringRef name = op->getName().getStringRef();
+  if (name.starts_with("hlcf.") || name.starts_with("debuginfo.") ||
+      name.starts_with("index.") || name == "llvm.intr.trap")
+    return true;
+  if (name.consume_front("kgen.")) {
+    static const llvm::StringSet<> kgen(
+        {"assume", "codegen.reachable", "conformance", "copy_marker", "cost_of",
+         "deferred", "ensures", "forall", "is_run_in_comptime_interpreter",
+         "obligation", "old", "rebind", "requires", "source_loc", "witness"});
+    return kgen.contains(name) || name.starts_with("contract.") ||
+           name.starts_with("param.") || name.starts_with("struct.") ||
+           name.starts_with("variant.");
+  }
+  if (name.consume_front("lit.")) {
+    static const llvm::StringSet<> lit({"alias.decl",
+                                        "bind_params",
+                                        "break",
+                                        "continue",
+                                        "end_fn",
+                                        "enum.case",
+                                        "error_return",
+                                        "fn",
+                                        "load.consume",
+                                        "loop",
+                                        "loop.break.else",
+                                        "loop.continue",
+                                        "loop.yield",
+                                        "raise",
+                                        "ref.from_kgen_ptr",
+                                        "ref.from_pointer",
+                                        "ref.immut",
+                                        "ref.load",
+                                        "ref.pack.concat",
+                                        "ref.pack.create",
+                                        "ref.pack.extract",
+                                        "ref.struct.ger",
+                                        "ref.to_kgen_ptr",
+                                        "ref.to_pointer",
+                                        "ref.upcast",
+                                        "return",
+                                        "struct.decl",
+                                        "struct.extract",
+                                        "struct.field",
+                                        "struct.insert",
+                                        "try",
+                                        "try.raise",
+                                        "try.yield",
+                                        "var.decl",
+                                        "var.lifetime.end",
+                                        "var.lifetime.start"});
+    return lit.contains(name) || name.starts_with("ownership.");
+  }
+  if (name.consume_front("pop.")) {
+    static const llvm::StringSet<> pop({"abs",
+                                        "add",
+                                        "aligned_alloc",
+                                        "and",
+                                        "array.create",
+                                        "array.gep",
+                                        "array.get",
+                                        "array.repeat",
+                                        "array.replace",
+                                        "bitcast",
+                                        "cast",
+                                        "cast_from_builtin",
+                                        "cast_to_builtin",
+                                        "ceil",
+                                        "cmp",
+                                        "div",
+                                        "dtype.from_ui8",
+                                        "dtype.to_ui8",
+                                        "extern_ptr_symbol",
+                                        "floor",
+                                        "floordiv",
+                                        "fma",
+                                        "global_alloc",
+                                        "global_constant",
+                                        "load",
+                                        "max",
+                                        "min",
+                                        "mul",
+                                        "neg",
+                                        "noalias_pointer_cast",
+                                        "offset",
+                                        "or",
+                                        "pointer.bitcast",
+                                        "pointer_to_index",
+                                        "rem",
+                                        "round",
+                                        "select",
+                                        "shl",
+                                        "shr",
+                                        "simd.and",
+                                        "simd.extractelement",
+                                        "simd.insertelement",
+                                        "simd.or",
+                                        "simd.select",
+                                        "simd.shuffle",
+                                        "simd.splat",
+                                        "simd.xor",
+                                        "stack_alloc.lifetime.end",
+                                        "stack_alloc.lifetime.start",
+                                        "stack_allocation",
+                                        "string.address",
+                                        "string.size",
+                                        "sub",
+                                        "trunc",
+                                        "union.bitcast",
+                                        "union.unwrap",
+                                        "union.wrap",
+                                        "variant.bitcast",
+                                        "variant.discr_gep",
+                                        "xor"});
+    return pop.contains(name) || name.starts_with("simd.reduce_");
+  }
+  return false;
 }
 
 /// The symbol of the struct `fn` is a method of, if it has no parameters.
@@ -2448,6 +2587,9 @@ public:
   /// Whether a struct's invariant holds of every value of it that a function
   /// outside the struct reads, and is checked where one writes a field.
   bool typeInvariants = false;
+  /// Which functions may write memory behind pointers, shared by the
+  /// encoders of a run (see `fnWritesHeap`); null: kept by this one.
+  HeapEffects *heapEffects = nullptr;
   /// Whether the compilation target's unknowns are declared.
   bool targetDeclared = false;
   /// Whether target predicates are read for a kernel at its launch.
@@ -2612,6 +2754,10 @@ private:
     bool transparent = false;
     /// The function whose parameters these are, when it is known.
     LIT::FnOp fn;
+    /// Binds `values` when they are first asked for (`resolveParam`): for
+    /// a frame that is seldom read, since binding instantiates the
+    /// callee's symbol.
+    std::function<void(ParamFrame &)> fill;
   };
   ParamFrame *params = nullptr;
   /// While the function's own constraints are read: its parameters, which
@@ -3387,13 +3533,25 @@ private:
   }
 
   std::string load(const Loc &loc, State &state, Sort sort) {
-    for (LoopFrame *frame : loops) {
-      frame->loaded.insert(loc);
-      if (!storing)
-        frame->reads.insert(loc);
-    }
+    auto cell = cells.find(loc.root);
+    // (An element behind a pointer is no candidate for a loop's invariants.)
+    if (cell == cells.end())
+      for (LoopFrame *frame : loops) {
+        frame->loaded.insert(loc);
+        if (!storing)
+          frame->reads.insert(loc);
+      }
     if (auto it = state.env.find(loc); it != state.env.end())
       return it->second;
+    // An element behind a pointer: what its address holds in this version
+    // of the memory.
+    if (cell != cells.end() && loc.path.empty()) {
+      auto [it, inserted] =
+          heapCells.try_emplace({state.heap, cell->second.key()}, "");
+      if (inserted)
+        it->second = declare(sort, "m");
+      return it->second;
+    }
     // An element's place: the element, as the collection holds it now.
     if (loc.path.empty())
       if (auto it = elements.find(loc.root); it != elements.end()) {
@@ -3600,6 +3758,7 @@ private:
       auto [list, index] = it->second;
       storeElement(list, index, state.env[Loc{loc.root, ""}], state);
     }
+    commitCell(loc.root, state);
   }
 
   /// Everything reachable through `loc` becomes unknown.
@@ -3636,6 +3795,7 @@ private:
         auto [list, index] = it->second;
         storeElement(list, index, state.env[Loc{loc.root, ""}], state);
       }
+    commitCell(loc.root, state);
   }
 
   void havoc(const Loc &loc, State &state, Type type) {
@@ -3900,6 +4060,634 @@ private:
     ++state.epoch;
     state.env.clear();
     state.refs.clear();
+    freshHeap(state);
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Memory behind pointers
+  //===--------------------------------------------------------------------===//
+  //
+  // An element behind a pointer (`p[i]`) is a place: the reference
+  // `Pointer.__getitem__` returns is its root (`cells`), and its value is
+  // that of its address in the path's memory version (`State::heap`). A
+  // read there is an unknown per version and address, so two reads with no
+  // write between agree. A write through such a reference starts a version
+  // in which only the written element is known; every other operation that
+  // may write memory a pointer can reach starts one in which nothing is.
+  // Addresses are compared as terms (the pointer, the index and the
+  // element type): equal terms are one element, and of unequal ones nothing
+  // is taken to be known, so no assumption is made about which pointers
+  // alias or overlap.
+
+  /// The functions' effects when no run shares them (`heapEffects`).
+  HeapEffects ownHeapEffects;
+  /// The number of memory versions made.
+  unsigned heapVersions = 0;
+  /// What is read at an address (`cells`) in a version.
+  std::map<std::pair<unsigned, std::string>, std::string> heapCells;
+  /// The address of the element each `Pointer.__getitem__` reference
+  /// refers to, as walked last: the element type and the pointer (its
+  /// `family`, the elements one pointer leads to), and the index.
+  struct Cell {
+    std::string family, index;
+    std::string key() const { return family + "|" + index; }
+  };
+  DenseMap<Value, Cell> cells;
+
+  /// From here the memory behind pointers holds nothing known.
+  void freshHeap(State &state) {
+    state.heap = ++heapVersions;
+    for (auto it = state.env.begin(); it != state.env.end();)
+      it = cells.count(it->first.root) ? state.env.erase(it) : std::next(it);
+  }
+
+  /// The element behind a pointer `ref` refers to, or a field of it. Kept
+  /// apart from `placeOf`: only reads and plain stores go through it, and
+  /// a store there still makes unknown what the pointer may alias.
+  std::optional<Loc> cellPlaceOf(Value ref) {
+    std::string path;
+    while (true) {
+      if (cells.count(ref))
+        return Loc{ref, path};
+      Operation *def = ref.getDefiningOp();
+      if (!def)
+        return std::nullopt;
+      if (isa<LIT::RefImmutOp, RebindOp, LIT::RefUpcastOp>(def)) {
+        ref = def->getOperand(0);
+        continue;
+      }
+      if (!isa<LIT::RefStructGEROp>(def))
+        return std::nullopt;
+      auto field = def->getAttrOfType<StringAttr>("field");
+      path =
+          "/" +
+          (field ? field.getValue().str() : printed(def->getAttrDictionary())) +
+          path;
+      ref = def->getOperand(0);
+    }
+  }
+
+  /// The element at a cell written whole or in a field: a version in which
+  /// it holds the cell's new value, and nothing else is known.
+  void commitCell(Value root, State &state) {
+    auto it = cells.find(root);
+    auto value = state.env.find(Loc{root, ""});
+    if (it == cells.end())
+      return;
+    std::string written = value == state.env.end() ? "" : value->second;
+    unsigned before = state.heap;
+    const Cell &cell = it->second;
+    freshHeap(state);
+    if (written.empty())
+      return;
+    heapCells[{state.heap, cell.key()}] = written;
+    // The other elements of the same pointer that were read keep their
+    // values, unless their index is this one: elements of one type at one
+    // pointer are whole elements apart, so two of them are one or disjoint.
+    Sort sort = sortOfTerm(written);
+    std::string prefix = cell.family + "|";
+    SmallVector<std::pair<std::string, std::string>> kept;
+    for (auto other = heapCells.lower_bound({before, prefix});
+         other != heapCells.end() && other->first.first == before &&
+         StringRef(other->first.second).starts_with(prefix);
+         ++other) {
+      std::string index = other->first.second.substr(prefix.size());
+      Sort was = sortOfTerm(other->second);
+      if (index == cell.index || was.isBool != sort.isBool ||
+          was.width != sort.width || sortOfTerm(index).width != 64 ||
+          sortOfTerm(cell.index).width != 64)
+        continue;
+      kept.push_back(
+          {other->first.second,
+           define(sort, "(ite (= " + index + " " + cell.index + ") " + written +
+                            " " + other->second + ")")});
+    }
+    for (auto &[key, value] : kept)
+      heapCells[{state.heap, key}] = value;
+  }
+
+  /// After a call of `Pointer.__getitem__`: its result refers to the
+  /// element at the pointer and index it was given.
+  void registerCell(LIT::CallOp call, State &state) {
+    if (call->getNumResults() != 1)
+      return;
+    Value result = call->getResult(0);
+    cells.erase(result);
+    auto ref = dyn_cast<LIT::RefType>(result.getType());
+    std::optional<CalleeName> name = calleeName(call.getCallee());
+    ValueRange ops = call.getOperands();
+    if (!ref || !name ||
+        !StringRef(name->path)
+             .starts_with("std::memory::pointer::Pointer::__getitem__") ||
+        ops.empty() || ops.size() > 2 || isa<LIT::RefType>(ops[0].getType()))
+      return;
+    std::string pointer = term(ops[0], state);
+    std::string index = bvConst(0, 64);
+    if (ops.size() == 2) {
+      MaybeTerm k = indexOperand(ops[1], state);
+      if (!k)
+        return;
+      index = *k;
+    }
+    cells[result] = {printed(ref.getElementType()) + "|" + pointer, index};
+  }
+
+  /// Whether `user` is the first operation to use the local variable `ref`
+  /// declares, in the block that declares it: it initializes the variable
+  /// (once: no loop is between them), which nothing can refer to yet.
+  static bool firstUseOfLocal(Operation *user, Value ref) {
+    Operation *decl = ref.getDefiningOp();
+    if (!decl || !isa<LIT::VarDeclOp>(decl) ||
+        decl->getBlock() != user->getBlock())
+      return false;
+    unsigned steps = 0;
+    for (Operation *op = decl->getNextNode(); op && op != user;
+         op = op->getNextNode()) {
+      if (++steps > 64)
+        return false;
+      bool uses = false;
+      op->walk([&](Operation *nested) {
+        if (!nested->getName().getStringRef().starts_with("lit.var.lifetime."))
+          uses |= llvm::is_contained(nested->getOperands(), ref);
+      });
+      if (uses)
+        return false;
+    }
+    return true;
+  }
+
+  /// Whether the address of what the reference `ref` refers to may get
+  /// out of the code that uses it: into a pointer, into something that
+  /// keeps the reference, or out of the function. Reading and writing
+  /// through it does not let it out, nor does a call that gives back only
+  /// numbers and whose callee does not let its argument out. Anything
+  /// else is taken to.
+  bool
+  referenceEscapes(Value ref,
+                   SmallVectorImpl<std::pair<Operation *, unsigned>> &stack,
+                   bool &open, int depth = 0) {
+    if (depth > 12)
+      return true;
+    for (OpOperand &use : ref.getUses()) {
+      Operation *user = use.getOwner();
+      StringRef op = user->getName().getStringRef();
+      if (isa<LIT::RefLoadOp, LIT::MemcpyOp, RequiresOp, EnsuresOp>(user) ||
+          op == "lit.load.consume" || op.starts_with("lit.var.lifetime.") ||
+          op.starts_with("lit.ownership.") || op.starts_with("debuginfo.") ||
+          op == "kgen.contract.entry" ||
+          (isa<LIT::RefStoreOp>(user) && use.getOperandNumber() == 1))
+        continue;
+      if (isa<RebindOp, LIT::RefImmutOp, LIT::RefUpcastOp, LIT::RefStructGEROp>(
+              user)) {
+        if (referenceEscapes(user->getResult(0), stack, open, depth + 1))
+          return true;
+        continue;
+      }
+      auto call = dyn_cast<LIT::CallOp>(user);
+      if (!call || isa<GetWitnessAttr>(call.getCallee()))
+        return true;
+      // What the call gives back could hold the address.
+      for (Value result : call->getResults())
+        if (!isScalar(result.getType()) &&
+            printed(result.getType()) != "!kgen.none")
+          return true;
+      SymbolRefAttr symbol = call.getDirectCallee();
+      auto callee = symbol ? behindWrapper(dyn_cast_or_null<LIT::FnOp>(
+                                 symbols.lookupSymbolIn(module, symbol)))
+                           : LIT::FnOp();
+      if (!callee ||
+          argumentEscapes(callee, use.getOperandNumber(), stack, open))
+        return true;
+    }
+    return false;
+  }
+
+  /// Whether `callee` may let the address of its argument `index` out
+  /// (`referenceEscapes` of the argument in its body). As `fnWritesHeap`:
+  /// one being looked at is taken not to, and a result that rests on that
+  /// is kept only when the outermost one is done.
+  bool argumentEscapes(LIT::FnOp callee, unsigned index,
+                       SmallVectorImpl<std::pair<Operation *, unsigned>> &stack,
+                       bool &open) {
+    HeapEffects &effects = heapEffects ? *heapEffects : ownHeapEffects;
+    std::pair<Operation *, unsigned> key{callee.getOperation(), index};
+    {
+      std::lock_guard<std::mutex> lock(effects.mutex);
+      if (auto it = effects.escapes.find(key); it != effects.escapes.end())
+        return it->second;
+    }
+    if (llvm::is_contained(stack, key)) {
+      open = true;
+      return false;
+    }
+    if (callee.getFunctionBody().empty() ||
+        callee.getFunctionBody().front().getNumArguments() <= index ||
+        stack.size() > 24)
+      return true;
+    stack.push_back(key);
+    bool rests = false;
+    bool escapes = referenceEscapes(
+        callee.getFunctionBody().front().getArgument(index), stack, rests);
+    stack.pop_back();
+    open |= rests;
+    if (escapes || !rests || stack.empty()) {
+      std::lock_guard<std::mutex> lock(effects.mutex);
+      effects.escapes[key] = escapes;
+    }
+    return escapes;
+  }
+
+  /// Whether the code that uses the reference `ref` may write what it
+  /// refers to: a store or a copy to it or a field of it, a call that may
+  /// write it, or any use not known to leave it (moving out of it). Taking
+  /// its address writes nothing: a write through the pointer is a write of
+  /// memory behind a pointer, where it happens.
+  bool
+  referenceWritten(Value ref,
+                   SmallVectorImpl<std::pair<Operation *, unsigned>> &stack,
+                   bool &open, int depth = 0) {
+    if (depth > 12)
+      return true;
+    for (OpOperand &use : ref.getUses()) {
+      Operation *user = use.getOwner();
+      StringRef op = user->getName().getStringRef();
+      // (Nothing is written through an immutable view.)
+      if (isa<LIT::RefLoadOp, LIT::RefImmutOp, RequiresOp, EnsuresOp>(user) ||
+          op.starts_with("lit.var.lifetime.") ||
+          op.starts_with("lit.ownership.") || op.starts_with("debuginfo.") ||
+          op == "kgen.contract.entry" || op == "lit.ref.to_pointer" ||
+          op == "lit.ref.to_kgen_ptr" ||
+          (isa<LIT::MemcpyOp>(user) && use.getOperandNumber() == 0))
+        continue;
+      if (isa<RebindOp, LIT::RefUpcastOp, LIT::RefStructGEROp>(user)) {
+        if (referenceWritten(user->getResult(0), stack, open, depth + 1))
+          return true;
+        continue;
+      }
+      auto call = dyn_cast<LIT::CallOp>(user);
+      if (!call || isa<GetWitnessAttr>(call.getCallee()))
+        return true;
+      if (leavesMemory(call))
+        continue;
+      auto type = dyn_cast<LIT::RefType>(ref.getType());
+      if (type && type.isMutableKnown(false))
+        continue;
+      SymbolRefAttr symbol = call.getDirectCallee();
+      auto callee = symbol ? behindWrapper(dyn_cast_or_null<LIT::FnOp>(
+                                 symbols.lookupSymbolIn(module, symbol)))
+                           : LIT::FnOp();
+      if (!callee ||
+          argumentWritten(callee, use.getOperandNumber(), stack, open))
+        return true;
+    }
+    return false;
+  }
+
+  /// Whether `callee` may write what its argument `index` refers to
+  /// (`referenceWritten` of the argument in its body), kept as
+  /// `argumentEscapes` is.
+  bool argumentWritten(LIT::FnOp callee, unsigned index,
+                       SmallVectorImpl<std::pair<Operation *, unsigned>> &stack,
+                       bool &open) {
+    HeapEffects &effects = heapEffects ? *heapEffects : ownHeapEffects;
+    std::pair<Operation *, unsigned> key{callee.getOperation(), index};
+    {
+      std::lock_guard<std::mutex> lock(effects.mutex);
+      if (auto it = effects.written.find(key); it != effects.written.end())
+        return it->second;
+    }
+    if (llvm::is_contained(stack, key)) {
+      open = true;
+      return false;
+    }
+    if (callee.getFunctionBody().empty() ||
+        callee.getFunctionBody().front().getNumArguments() <= index ||
+        stack.size() > 24)
+      return true;
+    stack.push_back(key);
+    bool rests = false;
+    bool written = referenceWritten(
+        callee.getFunctionBody().front().getArgument(index), stack, rests);
+    stack.pop_back();
+    open |= rests;
+    if (written || !rests || stack.empty()) {
+      std::lock_guard<std::mutex> lock(effects.mutex);
+      effects.written[key] = written;
+    }
+    return written;
+  }
+
+  /// Whether a call of `callee` may write what its operand `index`, a
+  /// reference, refers to.
+  bool operandWritten(LIT::FnOp callee, Value operand, unsigned index) {
+    auto ref = dyn_cast<LIT::RefType>(operand.getType());
+    if (!ref || ref.isMutableKnown(false))
+      return false;
+    SmallVector<std::pair<Operation *, unsigned>, 8> stack;
+    bool open = false;
+    return !callee || argumentWritten(callee, index, stack, open);
+  }
+
+  /// A local variable no pointer can refer to: its address is never let
+  /// out (`referenceEscapes`).
+  DenseMap<Value, bool> privateLocals;
+  bool privateLocal(Value root) {
+    if (!root.getDefiningOp<LIT::VarDeclOp>())
+      return false;
+    if (auto it = privateLocals.find(root); it != privateLocals.end())
+      return it->second;
+    SmallVector<std::pair<Operation *, unsigned>, 8> stack;
+    bool open = false;
+    bool is = !referenceEscapes(root, stack, open);
+    privateLocals[root] = is;
+    return is;
+  }
+
+  /// Whether the reference `ref` is to a local variable of the function
+  /// its code is in, to one of that function's arguments, or to a field of
+  /// one: not to memory reached through a pointer or a call's result.
+  static bool localOrArgument(Value ref) {
+    for (int depth = 0; depth < 16; ++depth) {
+      if (auto arg = dyn_cast<BlockArgument>(ref))
+        return isa_and_nonnull<LIT::FnOp>(arg.getOwner()->getParentOp());
+      Operation *def = ref.getDefiningOp();
+      if (isa<LIT::VarDeclOp>(def))
+        return true;
+      if (!isa<RebindOp, LIT::RefImmutOp, LIT::RefUpcastOp,
+               LIT::RefStructGEROp>(def))
+        return false;
+      ref = def->getOperand(0);
+    }
+    return false;
+  }
+
+  /// Calls that leave memory as it is, although their bodies are not
+  /// followed: the contract checks, which return or abort, and `index(i)`,
+  /// the value of an `Indexer` (assumed of every implementation of
+  /// `__mlir_index__`, which the call's generic body does not name).
+  static bool leavesMemory(LIT::CallOp call) {
+    // (By the symbol's parts: printing the callee of every call looked at
+    // took a quarter more time than the verification without this.)
+    SymbolRefAttr symbol = call.getDirectCallee();
+    if (!symbol || symbol.getRootReference().getValue() != "std")
+      return false;
+    ArrayRef<FlatSymbolRefAttr> nested = symbol.getNestedReferences();
+    if (nested.size() < 3 || nested[0].getValue() != "builtin")
+      return false;
+    return nested[1].getValue() == "_verification" ||
+           (nested[1].getValue() == "int" && nested.size() == 3 &&
+            nested[2].getValue().starts_with("index["));
+  }
+
+  /// The implementation a call through a trait (`T.__len__` with `T` bound
+  /// to a struct type by the frames) is of, and in `frame` the struct's
+  /// parameters as the call's type gives them. Null when the type is not
+  /// a struct known here or does not state the method.
+  LIT::FnOp witnessImpl(GetWitnessAttr witness, ParamFrame &frame) {
+    ParamFrame *scope = nullptr;
+    auto typed = dyn_cast_or_null<TypeParamAttr>(
+        unwrapValue(resolveParam(witness.getTypeValue(), &scope)));
+    LIT::StructType st =
+        typed ? structTypeOf(typed.getTypeValue()) : LIT::StructType();
+    auto decl = st ? dyn_cast_or_null<LIT::StructDeclOp>(
+                         symbols.lookupSymbolIn(module, st.getSymbol()))
+                   : LIT::StructDeclOp();
+    if (!decl)
+      return {};
+    ArrayRef<ParamDeclAttr> decls = decl.getParams();
+    ArrayRef<TypedAttr> bound = st.getParamValues();
+    if (decls.size() != bound.size())
+      return {};
+    LIT::FnOp impl;
+    for (auto conformance : decl.getBody()->getOps<ConformanceOp>()) {
+      if (conformance.getTraitSymbol() != witness.getTraitSymbol())
+        continue;
+      for (auto member : conformance.getBody().getOps<WitnessOp>())
+        if (member.getSymName() == witness.getWitnessName())
+          if (auto value = FuncSymbolGenerator::dynCast(member.getValue()))
+            // (A function split for its checks: the copy with the body.
+            // The checks pass or abort.)
+            impl = behindWrapper(dyn_cast_or_null<LIT::FnOp>(
+                symbols.lookupSymbolIn(module, value.getSymbol())));
+    }
+    if (!impl)
+      return {};
+    frame.parent = scope;
+    frame.fn = impl;
+    frame.scope = printed(st);
+    for (auto [param, value] : llvm::zip(decls, bound))
+      frame.values[param.getName()] = value;
+    return impl;
+  }
+
+  /// The function `call` calls and, in `frame`, its parameters: a direct
+  /// callee, or the implementation a call through a trait resolves to
+  /// (`contextual`: by the frames). Null for any other callee.
+  LIT::FnOp calleeIn(LIT::CallOp call, ParamFrame &frame, bool &contextual) {
+    if (auto witness = dyn_cast<GetWitnessAttr>(call.getCallee())) {
+      contextual = true;
+      if (LIT::FnOp impl = selfImpl(witness)) {
+        frame.parent = params;
+        return impl;
+      }
+      return witnessImpl(witness, frame);
+    }
+    SymbolRefAttr symbol = call.getDirectCallee();
+    auto callee = symbol ? dyn_cast_or_null<LIT::FnOp>(
+                               symbols.lookupSymbolIn(module, symbol))
+                         : LIT::FnOp();
+    // Its parameters, as `paramFrame` binds them (without the frame's
+    // name, which only the encoding uses).
+    if (callee) {
+      frame.parent = params;
+      frame.fn = callee;
+      frame.fill = [call, callee](ParamFrame &frame) mutable {
+        auto generator = FuncSymbolGenerator::dynCast(call.getCallee());
+        if (!generator)
+          return;
+        SmallVector<ParamDeclAttr> decls;
+        if (auto parent = callee->getParentOfType<LIT::StructDeclOp>())
+          llvm::append_range(decls, parent.getParams());
+        else if (auto trait = callee->getParentOfType<LIT::TraitDeclOp>())
+          llvm::append_range(decls, trait.getParams());
+        ArrayRef<ParamDeclAttr> own = callee.getParams();
+        size_t implicit = call.getImplicitOrigins().size();
+        if (implicit <= own.size())
+          llvm::append_range(decls, own.drop_back(implicit));
+        ArrayRef<TypedAttr> values = boundParamValues(generator);
+        if (decls.size() == values.size())
+          for (auto [decl, value] : llvm::zip(decls, values))
+            frame.values[decl.getName()] = value;
+      };
+    }
+    // A function split for its checks: the copy with the body, which has
+    // its parameters. The checks pass or abort.
+    return behindWrapper(callee);
+  }
+
+  /// How many more operations `fnWritesHeap` looks at for the call being
+  /// decided: beyond that, the call writes.
+  unsigned heapBudget = 0;
+
+  /// Whether a call of `target` may write memory its caller can read
+  /// through a pointer: anything but its own locals and the arguments it
+  /// is given by reference (which the caller sees it is given). Unknown
+  /// code writes. Its calls through traits are resolved by the frames
+  /// (`params`), which makes the answer the call's and not the function's
+  /// (`contextual`: then it is not kept). `stack` holds the functions
+  /// being looked at; one of them called again is taken not to write (it
+  /// is found out where it is looked at), which `open` records, since a
+  /// result that rests on it is kept only once the outermost function is
+  /// done.
+  bool fnWritesHeap(LIT::FnOp target, SmallPtrSetImpl<Operation *> &stack,
+                    bool &open, bool &contextual) {
+    HeapEffects &effects = heapEffects ? *heapEffects : ownHeapEffects;
+    {
+      std::lock_guard<std::mutex> lock(effects.mutex);
+      if (auto it = effects.writes.find(target.getOperation());
+          it != effects.writes.end())
+        return it->second;
+    }
+    if (!stack.insert(target.getOperation()).second) {
+      open = true;
+      return false;
+    }
+    bool writes = target.getFunctionBody().empty();
+    bool rests = false, byFrames = false;
+    std::function<void(Operation *)> look = [&](Operation *op) {
+      if (writes || isa<RequiresOp, EnsuresOp>(op))
+        return;
+      if (!heapBudget) {
+        writes = byFrames = true; // Not decided: not kept.
+        return;
+      }
+      --heapBudget;
+      if (auto call = dyn_cast<LIT::CallOp>(op)) {
+        if (!leavesMemory(call)) {
+          ParamFrame frame;
+          LIT::FnOp callee = calleeIn(call, frame, byFrames);
+          // Given a reference to memory that is not a local or an argument
+          // of this function, which it may write.
+          for (auto [index, operand] : llvm::enumerate(call.getOperands()))
+            if (!localOrArgument(operand) &&
+                operandWritten(callee, operand, index))
+              callee = {};
+          if (callee) {
+            ParamFrame *saved = params;
+            params = &frame;
+            writes = fnWritesHeap(callee, stack, rests, byFrames);
+            params = saved;
+          } else {
+            writes = true;
+          }
+        }
+      } else if (Value dest = writtenRef(op)) {
+        writes = !localOrArgument(dest);
+      } else if (op != target.getOperation() && !::leavesMemory(op)) {
+        writes = true;
+      }
+      for (Region &region : op->getRegions())
+        for (Block &block : region)
+          for (Operation &nested : block)
+            look(&nested);
+    };
+    look(target.getOperation());
+    stack.erase(target.getOperation());
+    open |= rests;
+    contextual |= byFrames;
+    if (!byFrames && (writes || !rests || stack.empty())) {
+      std::lock_guard<std::mutex> lock(effects.mutex);
+      effects.writes[target.getOperation()] = writes;
+    }
+    return writes;
+  }
+
+  /// Whether `call`, in code that is walked, may write memory behind a
+  /// pointer: it is given a reference it may write through (which a
+  /// pointer may refer to as well), or its callee may write.
+  /// The answers for the calls looked at: those that do not depend on the
+  /// frame the call is walked in, and those of the function's own frame.
+  DenseMap<Operation *, bool> callsWriteHeap, ownCallsWriteHeap;
+  bool callWritesHeap(LIT::CallOp call) {
+    if (auto it = callsWriteHeap.find(call.getOperation());
+        it != callsWriteHeap.end())
+      return it->second;
+    bool own = params == rootParams;
+    if (own)
+      if (auto it = ownCallsWriteHeap.find(call.getOperation());
+          it != ownCallsWriteHeap.end())
+        return it->second;
+    bool contextual = false;
+    bool writes = decideCallWritesHeap(call, contextual);
+    if (!contextual)
+      callsWriteHeap[call.getOperation()] = writes;
+    else if (own)
+      ownCallsWriteHeap[call.getOperation()] = writes;
+    return writes;
+  }
+  bool decideCallWritesHeap(LIT::CallOp call, bool &contextual) {
+    if (leavesMemory(call))
+      return false;
+    ParamFrame frame;
+    LIT::FnOp target = calleeIn(call, frame, contextual);
+    if (!target)
+      return true;
+    // A reference the callee may write through, to what a pointer may
+    // refer to as well: not a local the call initializes (its result,
+    // which nothing refers to yet), nor one whose address is never let
+    // out.
+    for (auto [index, operand] : llvm::enumerate(call.getOperands()))
+      if (!firstUseOfLocal(call, operand) &&
+          operandWritten(target, operand, index)) {
+        std::optional<Loc> loc = placeOf(operand);
+        if (!loc || !privateLocal(loc->root))
+          return true;
+      }
+    SmallPtrSet<Operation *, 16> stack;
+    bool open = false;
+    heapBudget = 20000;
+    ParamFrame *saved = params;
+    params = &frame;
+    bool writes = fnWritesHeap(target, stack, open, contextual);
+    params = saved;
+    return writes;
+  }
+
+  /// Whether `op`, which is not a call, may write memory behind a pointer:
+  /// a store or a copy to anything but a local variable no pointer can
+  /// refer to, or an operation not known to leave memory as it is.
+  bool opWritesHeap(Operation *op) {
+    if (Value dest = writtenRef(op)) {
+      std::optional<Loc> loc = placeOf(dest);
+      return !firstUseOfLocal(op, dest) && (!loc || !privateLocal(loc->root));
+    }
+    return !::leavesMemory(op);
+  }
+
+  /// Whether the code of `root` may write memory behind a pointer.
+  bool codeWritesHeap(Operation *root) {
+    bool writes = false;
+    root->walk([&](Operation *op) {
+      if (writes || op == root)
+        return;
+      if (auto call = dyn_cast<LIT::CallOp>(op))
+        writes = callWritesHeap(call);
+      else
+        writes = opWritesHeap(op);
+    });
+    return writes;
+  }
+
+  /// After `op` was walked from a state in version `before`: a version
+  /// starts if it may have written memory behind a pointer and did not
+  /// start one itself (a write of a cell, a call).
+  void noteHeap(Operation *op, State &state, unsigned before) {
+    auto call = dyn_cast<LIT::CallOp>(op);
+    if (state.heap == before &&
+        (call ? callWritesHeap(call) : opWritesHeap(op)))
+      freshHeap(state);
+    if (call)
+      registerCell(call, state);
   }
 
   //===--------------------------------------------------------------------===//
@@ -3924,7 +4712,10 @@ private:
   /// The value a reference refers to, for a call argument passed by
   /// reference (e.g. `len(xs)`).
   std::string valueThrough(Value ref, State &state) {
-    if (std::optional<Loc> loc = placeOf(ref))
+    std::optional<Loc> loc = placeOf(ref);
+    if (!loc)
+      loc = cellPlaceOf(ref);
+    if (loc)
       return load(*loc, state,
                   cast<LIT::RefType>(ref.getType()).getElementType());
     return declare({false, 64, false}, "h");
@@ -5475,6 +6266,11 @@ private:
     }
     for (const State *s : live)
       out.epoch = std::max(out.epoch, s->epoch);
+    // The memory behind pointers is known only where every path left it
+    // in the same version.
+    out.heap = live.front()->heap;
+    if (llvm::any_of(live, [&](const State *s) { return s->heap != out.heap; }))
+      out.heap = ++heapVersions;
     std::set<Loc> places;
     for (const State *s : live)
       for (auto &[loc, _] : s->env)
@@ -5572,7 +6368,10 @@ private:
     for (Operation &op : block) {
       if (!state.alive)
         return;
+      unsigned heapBefore = state.heap;
       walkOp(&op, state);
+      if (state.alive)
+        noteHeap(&op, state, heapBefore);
       if (typeInvariants)
         applyTypeInvariants(&op, state);
     }
@@ -7139,6 +7938,10 @@ private:
       head.refs = std::move(keptRefs);
       keepAllocationState(loop, before, head);
     }
+    // An iteration starts with the memory behind pointers as the ones
+    // before it left it.
+    if (head.heap == before.heap && codeWritesHeap(loop))
+      freshHeap(head);
     if (written)
       assumeInvariantsAtHead(head, *written);
     State headAtEntry = head;
@@ -7975,17 +8778,26 @@ private:
         storeElement(list, index, term(value, state), state);
         return;
       }
-      if (std::optional<Loc> loc = placeOf(dest))
+      if (std::optional<Loc> loc = placeOf(dest)) {
         store(*loc, state, term(value, state), value);
-      else if (auto ref = dyn_cast<LIT::RefType>(dest.getType()))
+      } else if (auto ref = dyn_cast<LIT::RefType>(dest.getType())) {
         // A store through a reference into shared or global memory
         // (`smem_ptr[i] = v`) writes that memory only; one into a part of
         // a variable (an element of a list, through a span of it) keeps
         // the variable's length.
+        unsigned heap = state.heap;
         havocOrigin(printed(ref.getOrigin()), state, otherSpace(ref),
                     ref.getElementType());
-      else
+        // The element behind the pointer holds the value: of the memory
+        // behind pointers, this is the write (what else the pointer may
+        // refer to, the variables, is unknown by the line above).
+        if (std::optional<Loc> cell = cellPlaceOf(dest)) {
+          state.heap = heap;
+          store(*cell, state, term(value, state), value);
+        }
+      } else {
         havocAll(state);
+      }
       return;
     }
     // A whole value copied over another (`n = other` and `r.lo = n` of a
@@ -8000,16 +8812,25 @@ private:
       if (std::optional<Allocation> pointee = pointeeOf(to))
         markInitialized(*pointee, pointee->offset, true, state);
       std::optional<Loc> dst = placeOf(to);
+      bool cell = false;
       if (!dst) {
+        unsigned heap = state.heap;
         if (ref)
           havocOrigin(printed(ref.getOrigin()), state, otherSpace(ref),
                       ref.getElementType());
         else
           havocAll(state);
-        return;
+        // An element behind a pointer holds the value (as for a store).
+        dst = ref ? cellPlaceOf(to) : std::nullopt;
+        if (!dst)
+          return;
+        cell = true;
+        state.heap = heap;
       }
       Sort sort = ref ? sortOf(ref.getElementType()) : Sort{false, 64, false};
       std::optional<Loc> src = placeOf(from);
+      if (!src)
+        src = cellPlaceOf(from);
       if (!src || src->root == dst->root) {
         store(*dst, state, declare(sort, "h"));
         return;
@@ -8021,8 +8842,14 @@ private:
             StringRef(loc.path).starts_with(src->path + "/"))
           fields.push_back({loc.path.substr(src->path.size()), value});
       store(*dst, state, whole);
-      for (auto &[field, value] : fields)
-        state.env[Loc{dst->root, dst->path + field}] = value;
+      for (auto &[field, value] : fields) {
+        Loc at{dst->root, dst->path + field};
+        // (A cell keeps no values of its own: each is written to it.)
+        if (cell)
+          store(at, state, value);
+        else
+          state.env[at] = value;
+      }
       return;
     }
     // The field of an integer wrapper value is the value itself.
@@ -8085,6 +8912,8 @@ private:
         return;
       }
       std::optional<Loc> loc = placeOf(ref);
+      if (!loc)
+        loc = cellPlaceOf(ref);
       if (!loc) {
         // A reference a `comptime if` chose (`self.m if Self.swap else
         // self.n`): what the chosen place holds.
@@ -9586,6 +10415,8 @@ private:
       refArgs.erase(arg);
       if (std::optional<Loc> loc = placeOf(operand))
         refArgs[arg] = *loc;
+      else if (std::optional<Loc> cell = cellPlaceOf(operand))
+        refArgs[arg] = *cell;
     } else {
       values[arg] = term(operand, state);
     }
@@ -9629,11 +10460,9 @@ private:
   /// With `type-invariants`: the invariant of the struct `st` for the value
   /// `ref` refers to, read by `at`; none if the struct states none, or if
   /// `at` is in one of its own methods, which may break it until they
-  /// return. With `place`, for the value there instead of the one at the
-  /// place of `ref`.
+  /// return.
   MaybeTerm typeInvariant(Value ref, Operation *at, State &state,
-                          LIT::StructType &st,
-                          std::optional<Loc> place = std::nullopt) {
+                          LIT::StructType &st) {
     auto type = dyn_cast<LIT::RefType>(ref.getType());
     st = type ? structTypeOf(type.getElementType()) : LIT::StructType();
     if (!st)
@@ -9661,7 +10490,10 @@ private:
     Block &entry = predicate.getFunctionBody().front();
     ArrayRef<ParamDeclAttr> decls = decl.getParams();
     ArrayRef<TypedAttr> bound = st.getParamValues();
-    std::optional<Loc> loc = place ? place : placeOf(ref);
+    std::optional<Loc> loc = placeOf(ref);
+    // An element behind a pointer: its value in the memory as it is.
+    if (!loc)
+      loc = cellPlaceOf(ref);
     if (!loc || entry.getNumArguments() != 1 || entry.empty() ||
         entry.back().getNumOperands() != 1 ||
         !isa<LIT::RefType>(entry.getArgument(0).getType()) ||
@@ -9677,35 +10509,13 @@ private:
     return predicateValue(predicate, frame, state);
   }
 
-  /// Whether all that is done with the reference `ref` is to read what it
-  /// refers to, or a field of that.
-  static bool onlyRead(Value ref, int depth = 0) {
-    for (OpOperand &use : ref.getUses()) {
-      Operation *user = use.getOwner();
-      if (isa<LIT::RefLoadOp>(user) ||
-          (isa<LIT::MemcpyOp>(user) && use.getOperandNumber() == 0))
-        continue;
-      if (depth < 6 &&
-          isa<RebindOp, LIT::RefImmutOp, LIT::RefUpcastOp, LIT::RefStructGEROp>(
-              user) &&
-          onlyRead(user->getResult(0), depth + 1))
-        continue;
-      return false;
-    }
-    return true;
-  }
-
-  /// The field references that read a snapshot of an element behind a
-  /// pointer (see `applyTypeInvariants`).
-  DenseSet<Value> elementSnapshots;
-
   /// With `type-invariants`, after `op`: a struct's invariant holds of a
   /// value whose field is taken and of one a call returns a reference to,
-  /// and must hold again after a write to a field of one.
+  /// and must hold again after a write to a field of one. An element
+  /// behind a pointer is such a value too (its read is checked to be of
+  /// initialized memory, and what is written there is a value of the
+  /// struct or a field that is checked here).
   void applyTypeInvariants(Operation *op, State &state) {
-    auto gep = dyn_cast<LIT::RefStructGEROp>(op);
-    if (gep && elementSnapshots.erase(gep->getResult(0)))
-      derivedPlaces.erase(gep->getResult(0));
     if (inContract || predicateDepth || !state.alive)
       return;
     auto assume = [&](Value ref) {
@@ -9714,33 +10524,8 @@ private:
         state.pc = define({true, 1, false},
                           "(and " + state.pc + " " + *holds + ")", "r");
     };
-    if (gep) {
-      Value base = gep->getOperand(0), taken = gep->getResult(0);
-      if (placeOf(base))
-        return assume(base);
-      // A field of a value that has no place here, as an element behind a
-      // pointer has (`p[i].value`; its memory has no values here): when the
-      // field is only read, it is read from a snapshot of the element, an
-      // unknown value of the struct that keeps the invariant. (The read is
-      // checked to be of an initialized element, and what is written there is a
-      // value of the struct or a field that is checked below.)
-      auto field = op->getAttrOfType<StringAttr>("field");
-      if (!field || !onlyRead(taken))
-        return;
-      Loc snapshot{taken, ""};
-      state.env[snapshot] = declare({false, 64, false}, "h");
-      LIT::StructType st;
-      MaybeTerm holds = typeInvariant(base, op, state, st, snapshot);
-      if (!holds) {
-        state.env.erase(snapshot);
-        return;
-      }
-      elementSnapshots.insert(taken);
-      derivedPlaces[taken] = Loc{taken, "/" + field.getValue().str()};
-      state.pc = define({true, 1, false},
-                        "(and " + state.pc + " " + *holds + ")", "r");
-      return;
-    }
+    if (auto gep = dyn_cast<LIT::RefStructGEROp>(op))
+      return assume(gep->getOperand(0));
     if (isa<LIT::CallOp>(op)) {
       for (Value result : op->getResults())
         assume(result);
@@ -9750,7 +10535,6 @@ private:
       return;
     // The structs the written field is in, innermost first.
     Value dest = op->getOperand(1);
-    bool innermost = true;
     while (Operation *def = dest.getDefiningOp()) {
       if (isa<RebindOp, LIT::RefImmutOp, LIT::RefUpcastOp>(def)) {
         dest = def->getOperand(0);
@@ -9760,34 +10544,7 @@ private:
         return;
       dest = def->getOperand(0);
       LIT::StructType st;
-      MaybeTerm holds;
-      if (placeOf(dest)) {
-        holds = typeInvariant(dest, op, state, st);
-      } else {
-        // A field of a value that has no place here (an element behind a
-        // pointer): the invariant must hold
-        // of the written field with any values of the other fields, which
-        // are not known here.
-        auto field = def->getAttrOfType<StringAttr>("field");
-        if (!field || !innermost)
-          return;
-        State written = state;
-        Loc element{def->getResult(0), ""};
-        written.env[element] = declare({false, 64, false}, "h");
-        written.env[Loc{element.root, "/" + field.getValue().str()}] =
-            term(op->getOperand(0), state);
-        holds = typeInvariant(dest, op, written, st, element);
-        if (holds) {
-          Obligation ob{state.pc, *holds, op->getLoc(), op->getLoc(),
-                        st.getSymbol().getLeafReference().getValue().str()};
-          ob.claim = "that the invariant of '" + ob.callee +
-                     "' holds after this write";
-          noteCondition(ob.cond);
-          addObligation(ob);
-        }
-        return;
-      }
-      innermost = false;
+      MaybeTerm holds = typeInvariant(dest, op, state, st);
       if (!holds)
         continue;
       Obligation ob{state.pc, *holds, op->getLoc(), op->getLoc(),
@@ -9859,6 +10616,11 @@ private:
       }
       rangeSink = nullptr;
     }
+    // The call's preconditions read the memory behind pointers as it was;
+    // what is said of it from here (the postconditions) is of what the
+    // call left there.
+    if (callWritesHeap(call))
+      freshHeap(state);
     if (name && !inContract && !trusted) {
       checkLaunch(call, *name, state);
       checkDereference(call, *name, callee, state);
@@ -14220,6 +14982,11 @@ private:
       auto ref = dyn_cast<ParamDeclRefAttr>(attr);
       if (!ref)
         break;
+      if (frame->fill) {
+        auto fill = std::move(frame->fill);
+        frame->fill = nullptr;
+        fill(*frame);
+      }
       auto it = frame->values.find(ref.getName());
       if (it == frame->values.end()) {
         if (!frame->transparent)
@@ -14886,6 +15653,9 @@ private:
             SmallVectorImpl<Value> &boundRefs) {
     if (isa<LIT::RefType>(blockArg.getType())) {
       std::optional<Loc> loc = placeOf(actual);
+      // An element behind a pointer: the clause reads it.
+      if (!loc && actual)
+        loc = cellPlaceOf(actual);
       // A reference to a place that is not tracked (`self` of a struct in
       // shared memory): left unbound, so what the clause reads through it
       // is unknown, and the rest of the clause still counts.
@@ -15655,6 +16425,7 @@ struct VerifyContractsPass
     auto launched = [&](size_t i) {
       return !fns[i].refines && instances.count(fns[i].fn);
     };
+    HeapEffects heapEffects;
     llvm::DefaultThreadPool pool(llvm::hardware_concurrency());
     for (size_t i = 0; i < fns.size(); ++i) {
       if (launched(i) && !genericLaunched)
@@ -15666,6 +16437,7 @@ struct VerifyContractsPass
                             fns[i].refines);
         enc.checkDivision = checkDivision;
         enc.typeInvariants = typeInvariants;
+        enc.heapEffects = &heapEffects;
         if (launched(i))
           enc.queryRlimit = genericRlimit;
         verify(enc, results[i], name);
@@ -15701,6 +16473,7 @@ struct VerifyContractsPass
                             impls);
         enc.checkDivision = checkDivision;
         enc.typeInvariants = typeInvariants;
+        enc.heapEffects = &heapEffects;
         enc.bindInstance(instances.find(fns[job.job].fn.getOperation())
                              ->second[job.instance]
                              .chain);
