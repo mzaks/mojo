@@ -51,6 +51,7 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -15103,6 +15104,18 @@ private:
           values[result] = bvConst(*n, 64);
           return true;
         }
+    // `ord("a")` of a literal: its code point, a constant (the function's
+    // clause can only bound it).
+    if (path.starts_with("std::collections::string::string::ord[!kgen.string]("
+                         "::StringLiteral["))
+      if (auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+          symbol && boundParamValues(symbol).size() == 1 &&
+          sortOf(result.getType()).width == 64)
+        if (std::optional<uint32_t> code =
+                onlyCodepoint(resolveParam(boundParamValues(symbol)[0]))) {
+          values[result] = bvConst(*code, 64);
+          return true;
+        }
     // `index(x)` of an `Int` (passed by reference): `x`; of an
     // `IntLiteral`: its value, in its type.
     if (path.starts_with("std::builtin::int::index[") &&
@@ -15461,6 +15474,26 @@ private:
         m[1].getAsInteger(10, v))
       return std::nullopt;
     return v;
+  }
+
+  /// The code point of a `!kgen.string` parameter value that is one
+  /// well-formed UTF-8 character.
+  static std::optional<uint32_t> onlyCodepoint(TypedAttr attr) {
+    if (auto sugar = dyn_cast<SugarAttr>(attr))
+      attr = sugar.getCanonical();
+    auto str = dyn_cast<StringAttr>(attr);
+    if (!str || str.getValue().empty())
+      return std::nullopt;
+    StringRef text = str.getValue();
+    auto *begin = reinterpret_cast<const llvm::UTF8 *>(text.data());
+    const llvm::UTF8 *at = begin;
+    llvm::UTF32 code = 0;
+    if (llvm::convertUTF8Sequence(&at, begin + text.size(), &code,
+                                  llvm::strictConversion) !=
+            llvm::conversionOK ||
+        at != begin + text.size())
+      return std::nullopt;
+    return code;
   }
 
   /// The length in bytes of a `!kgen.string` parameter value.

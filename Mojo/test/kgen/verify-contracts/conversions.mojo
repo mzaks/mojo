@@ -69,8 +69,27 @@ def ok_widen(n: Int32, u: UInt32) -> Int:
     return Int(Int64(n)) + Int(UInt64(u)) + Int(Int64(u))
 
 
-def main():
+# `ord` of a literal is its code point; of any string, a code point.
+def ok_ascii() -> Byte:
+    return Byte(ord("H"))
+
+
+def bad_not_ascii() -> Byte:
+    return Byte(ord("€"))
+
+
+def ok_codepoint(s: StringSpan) raises -> UInt32:
+    return UInt32(ord(s))
+
+
+def bad_codepoint(s: StringSpan) raises -> UInt16:
+    return UInt16(ord(s))
+
+
+def main() raises:
     print(bad_bound(4, 8, 0), ok_bound(4, 8, 0))
     print(bad_narrow(1), ok_masked(1), ok_guarded(1))
     print(bad_to_unsigned(1), ok_to_unsigned(1), bad_to_signed(1))
     print(bad_widen(1), ok_widen(1, 1))
+    print(ok_ascii(), bad_not_ascii())
+    print(ok_codepoint("a"), bad_codepoint("a"))
