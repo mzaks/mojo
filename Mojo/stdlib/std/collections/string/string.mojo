@@ -2456,7 +2456,7 @@ struct String(
 # ===----------------------------------------------------------------------=== #
 
 
-def ord(s: StringSpan) raises -> Int:
+def ord(s: StringSpan) raises -> Int ensures 0 <= result and result <= 0x10FFFF:
     """Returns an integer that represents the codepoint of a single-character
     string.
 
@@ -2493,7 +2493,7 @@ def ord(s: StringSpan) raises -> Int:
     return Int(Codepoint.ord(s))
 
 
-def ord(s: StringLiteral[_]) -> Int:
+def ord(s: StringLiteral[_]) -> Int ensures 0 <= result and result <= 0x10FFFF:
     """Returns an integer that represents the codepoint of a single-character
     string.
 
