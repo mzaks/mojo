@@ -90,6 +90,11 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
     Option<"checkDivision", "check-division", "bool", /*default=*/"false",
            "Report integer divisions by a value that may be 0 (`//`, `%`, "
            "`divmod`, `ceildiv` and the `uutils` helpers)">,
+    Option<"checkConversions", "check-conversions", "std::string",
+           /*default=*/"\"\"",
+           "Report integer conversions that may change the value: "
+           "`narrowing` those to a narrower type (`Int32(n)` of an `Int`), "
+           "`all` also those that may change the sign (`UInt(n)`)">,
     Option<"typeInvariants", "type-invariants", "bool", /*default=*/"false",
            "Take a struct's invariant to hold for every value of it a "
            "function outside the struct reads (a field of another struct, "

@@ -2609,6 +2609,9 @@ public:
   unsigned queryRlimit = 0;
   /// Whether integer divisors that may be 0 are obligations.
   bool checkDivision = false;
+  /// `check-conversions`: 1 reports integer conversions to a narrower type
+  /// that may change the value, 2 also those that may change its sign.
+  unsigned checkConversions = 0;
   /// Whether a struct's invariant holds of every value of it that a function
   /// outside the struct reads, and is checked where one writes a field.
   bool typeInvariants = false;
@@ -9269,6 +9272,42 @@ private:
     return std::nullopt;
   }
 
+  /// With `check-conversions`, a conversion at `call` of the integer
+  /// `value` of sort `from` to an integer of sort `to` must keep the number:
+  /// integer `cast` truncates, and reads the bits by the new signedness.
+  void checkConversion(LIT::CallOp call, StringRef value, Sort from, Sort to,
+                       State &state) {
+    if (!checkConversions || inContract || predicateDepth || from.isBool ||
+        to.isBool)
+      return;
+    bool narrows = to.width < from.width;
+    // A signed value may be negative, an unsigned one may not fit the
+    // signed type of its width.
+    bool signChanges = from.isSigned != to.isSigned &&
+                       (from.isSigned || to.width == from.width);
+    if (!narrows && !(checkConversions > 1 && signChanges))
+      return;
+    std::string v = value.str();
+    std::string keeps;
+    if (narrows)
+      keeps = "(= ((_ " + std::string(to.isSigned ? "sign" : "zero") +
+              "_extend " + std::to_string(from.width - to.width) +
+              ") ((_ extract " + std::to_string(to.width - 1) + " 0) " + v +
+              ")) " + v + ")";
+    else
+      keeps = "(= ((_ extract " + std::to_string(from.width - 1) + " " +
+              std::to_string(from.width - 1) + ") " + v + ") #b0)";
+    Obligation ob{state.pc, "false", call.getLoc(), call.getLoc(),
+                  "conversion"};
+    ob.claim = "that this conversion to " +
+               std::string(to.isSigned ? "a signed" : "an unsigned") + " " +
+               std::to_string(to.width) + "-bit integer keeps the value";
+    ob.cond = define({true, 1, false}, keeps);
+    ob.operands.push_back({"the value", v});
+    noteCondition(ob.cond);
+    addObligation(ob);
+  }
+
   /// With `check-division`, a division at `call` by `divisor` must not
   /// divide by 0. Mojo's integer `//` and `%` return 0 then (undocumented;
   /// `SIMD` masks the result), which is almost always a bug.
@@ -12415,6 +12454,7 @@ private:
       std::optional<Sort> to = dtypeSort(printed(result.getType()));
       if (source && to && !target.isBool && target.width == 64 &&
           to->width == 64 && !actual.isBool && actual.width == source->width) {
+        checkConversion(call, value, *source, *to, state);
         values[result] =
             source->width == 64
                 ? value
@@ -15225,6 +15265,7 @@ private:
           to && from && sortOfTerm(operand(0)).width == from->width &&
           !sortOfTerm(operand(0)).isBool) {
         std::string v = operand(0);
+        checkConversion(call, v, *from, *to, state);
         std::string w;
         if (to->width > from->width)
           w = "((_ " + std::string(from->isSigned ? "sign" : "zero") +
@@ -16814,6 +16855,9 @@ struct VerifyContractsPass
         FunctionEncoder enc(fns[i].fn, module, symbols, solver, name, impls,
                             fns[i].refines);
         enc.checkDivision = checkDivision;
+        enc.checkConversions = checkConversions == "narrowing" ? 1
+                               : checkConversions == "all"     ? 2
+                                                               : 0;
         enc.typeInvariants = typeInvariants;
         enc.heapEffects = &heapEffects;
         if (launched(i))
@@ -16850,6 +16894,9 @@ struct VerifyContractsPass
         FunctionEncoder enc(fns[job.job].fn, module, symbols, solver, name,
                             impls);
         enc.checkDivision = checkDivision;
+        enc.checkConversions = checkConversions == "narrowing" ? 1
+                               : checkConversions == "all"     ? 2
+                                                               : 0;
         enc.typeInvariants = typeInvariants;
         enc.heapEffects = &heapEffects;
         enc.bindInstance(instances.find(fns[job.job].fn.getOperation())
@@ -17065,11 +17112,16 @@ struct VerifyContractsPass
             })) {
           ++proven;
           ++forInstances;
-          if (verbose)
-            mlir::emitRemark(ob.callLoc)
-                << what << " of '" << ob.callee << "' proven for the "
-                << perInstance.size() << " launched instantiation"
-                << (perInstance.size() == 1 ? "" : "s");
+          if (verbose) {
+            auto remark = mlir::emitRemark(ob.callLoc);
+            if (claim.empty())
+              remark << what << " of '" << ob.callee << "' proven";
+            else
+              remark << "proven " << claim;
+            remark << " for the " << perInstance.size()
+                   << " launched instantiation"
+                   << (perInstance.size() == 1 ? "" : "s");
+          }
           continue;
         }
         // Not proven, and nothing that reaches it meets it: reported in a

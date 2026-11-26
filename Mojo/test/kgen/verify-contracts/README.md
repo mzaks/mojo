@@ -71,7 +71,10 @@ runs every script in a z3 process of its own instead of one process per
 function kept alive between its scripts (below), `int-rlimit=` and
 `range-rlimit=` are the limits of the integer retry's queries (defaults
 1000000 and 300000), `check-division=true` reports integer divisions
-by a value that may be 0, `type-invariants=true` takes a struct's invariant
+by a value that may be 0, `check-conversions=narrowing` integer
+conversions to a narrower type that may change the value and
+`check-conversions=all` also those that may change the sign (below),
+`type-invariants=true` takes a struct's invariant
 to hold for every value of the struct, wherever it is kept (below),
 `int-retry=false` turns off the integer retry
 (below), `nonlinear-rlimit=` the limit a query whose goal multiplies or
@@ -421,6 +424,23 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   (what `SIMD` computes; undocumented). With `check-division=true` each
   `//`, `%`, `divmod`, `ceildiv` and `uutils` helper whose divisor is not
   a nonzero literal is an obligation ("that the divisor is not 0").
+
+- Integer conversions (`Int32(n)`, `UInt(n)`, `Int(u)`) are what integer
+  `cast` computes: the value is extended by the signedness of its type, or
+  truncated, and its bits are read by the new signedness. No contract says
+  that the number survives, so a product of two sizes converted to a
+  32-bit index wraps unnoticed. With `check-conversions=narrowing` each
+  conversion to a narrower type is an obligation ("that this conversion to
+  a signed 32-bit integer keeps the value"); with `check-conversions=all`
+  also each one that may change the sign (a signed value to an unsigned
+  type, an unsigned one to the signed type of its width). A widening that
+  holds every value is none. A conversion to a type that is a parameter
+  of the function (`Scalar[dtype](n)`) is not checked yet: it gets no
+  obligation. `conversions.mojo` has the cases. On the matmul dispatch corpus
+  the option adds 840 obligations to 1197 (`all`: 876), of which 374 are
+  proven (377), for 16% more CPU time (17%): the open ones are mostly
+  sizes passed to 32-bit interfaces (`Int32(m)` to BLAS, `UInt32(M)` in a
+  launch), which hold only for sizes no contract bounds.
 
 - `Array`: `len(a)` is the size parameter in `a`'s type (a number, or a
   parameter such as `n` in generic code), not negative (the struct
