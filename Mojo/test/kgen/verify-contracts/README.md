@@ -469,7 +469,7 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   launch), which hold only for sizes no contract bounds; 16 are to a type
   computed at compile time that is not evaluated (`FastUInt`) and
   reported as not checked. With `packages=linalg,layout` (2234
-  obligations, about 40% more CPU time than before the check per
+  obligations, about a quarter more CPU time than before the check per
   instantiation) the bound of the masked copy in `tile_io.mojo`
   (`Scalar[idx_type](rows * stride)` in `copy_bounded`) is reported for
   the instantiations the kernels call.

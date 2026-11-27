@@ -17217,11 +17217,35 @@ struct VerifyContractsPass
       // Each launch, through every chain of calls that gives its open
       // parameters; at most 32 instantiations per kernel.
       std::set<std::string> seen;
+      // A chain's key: its symbols as printed, each printed once (a chain
+      // is reached along many paths, and a symbol's text is long).
+      DenseMap<const void *, unsigned> symbolIds;
+      llvm::StringMap<unsigned> textIds;
+      auto chainKey = [&](ArrayRef<InstanceLink> chain) {
+        std::string key;
+        for (const InstanceLink &link : chain) {
+          Attribute symbol = link.symbol;
+          auto [it, inserted] =
+              symbolIds.try_emplace(symbol.getAsOpaquePointer(), 0);
+          if (inserted)
+            it->second = textIds.try_emplace(printed(symbol), textIds.size())
+                             .first->second;
+          key += std::to_string(it->second) + "|";
+        }
+        return key;
+      };
+      // Whether `fn` has its 32 instantiations: no chain adds one.
+      auto full = [&](Operation *fn) {
+        auto it = instances.find(fn);
+        return it != instances.end() && it->second.size() >= 32;
+      };
       std::function<void(SmallVector<InstanceLink>, LIT::FnOp, Location,
                          std::optional<Location>, int)>
           expand = [&](SmallVector<InstanceLink> chain, LIT::FnOp outer,
                        Location launch, std::optional<Location> via,
                        int depth) {
+            if (full(chain.front().fn))
+              return;
             auto it = outer ? callers.find(outer) : callers.end();
             if (depth < 3 && openChain(chain) && it != callers.end() &&
                 !it->second.empty()) {
@@ -17233,9 +17257,7 @@ struct VerifyContractsPass
               }
               return;
             }
-            std::string key;
-            for (const InstanceLink &link : chain)
-              key += printed(link.symbol) + "|";
+            std::string key = chainKey(chain);
             SmallVector<Instance> &list = instances[chain.front().fn];
             if (list.size() < 32 && seen.insert(key).second)
               list.push_back({std::move(chain), launch, via});
@@ -17297,9 +17319,9 @@ struct VerifyContractsPass
         }
         auto add = [&](SmallVector<InstanceLink> chain, Location at,
                        std::optional<Location> via, bool kernel) {
-          std::string key;
-          for (const InstanceLink &link : chain)
-            key += printed(link.symbol) + "|";
+          if (full(chain.front().fn))
+            return;
+          std::string key = chainKey(chain);
           SmallVector<Instance> &list = instances[chain.front().fn];
           if (list.size() < 32 && seen.insert(key).second)
             list.push_back({std::move(chain), at, via, kernel});
@@ -17309,6 +17331,8 @@ struct VerifyContractsPass
             expandCalled = [&](SmallVector<InstanceLink> chain, LIT::FnOp outer,
                                Location at, std::optional<Location> via,
                                int depth) {
+              if (full(chain.front().fn))
+                return;
               if (depth < 3 && outer && openChain(chain)) {
                 if (auto launchedAs = instances.find(outer);
                     launchedAs != instances.end() &&
