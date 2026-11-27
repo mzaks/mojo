@@ -2694,8 +2694,12 @@ public:
   /// `parametricConversion`) converts to in this instantiation, if its
   /// parameters give it. `assumed`: it is the 32-bit index type of a layout
   /// whose `_get_index_type` is not decided, which may give 64 bits.
-  std::optional<Sort> conversionTarget(Operation *op, bool &assumed) {
+  /// `generic`: the caller's own parameter gives the type, so this call is
+  /// no instantiation of the conversion.
+  std::optional<Sort> conversionTarget(Operation *op, bool &assumed,
+                                       bool &generic) {
     assumed = false;
+    generic = false;
     auto symbol =
         FuncSymbolGenerator::dynCast(cast<LIT::CallOp>(op).getCallee());
     if (!symbol || boundParamValues(symbol).empty())
@@ -2708,6 +2712,8 @@ public:
       assumed = true;
       return Sort{false, 32, true};
     }
+    // Still a parameter of the caller: the call gives no type.
+    generic = StringRef(dtype).contains("param.decl.ref");
     if (StringRef(dtype).contains("#kgen.param."))
       return std::nullopt;
     return dtypeSort(dtype);
@@ -2963,6 +2969,11 @@ private:
   DenseMap<Value, std::pair<Loc, std::string>> elements;
   std::set<std::string> elementFunctions;
   bool tensorDimDeclared = false;
+  /// `pidx(pack, k)`: `index` of element `k` of a variadic pack that is
+  /// a parameter of the function (its elements are not known one by one).
+  bool packIndexDeclared = false;
+  /// The results of `pack[k]` for such a pack: the pack and `k`.
+  DenseMap<Value, std::pair<std::string, std::string>> packElements;
   bool pointerExtentDeclared = false;
   /// The GPU id constants declared (see `evalGpuId`).
   std::set<std::string> gpuIds;
@@ -4678,14 +4689,114 @@ private:
             nested[2].getValue().starts_with("index["));
   }
 
+  /// Mode `k` of a concrete layout's shape (or of its strides), for the
+  /// type expression `LayoutType._shape_types[k]` (`TileTensor.dim[k]`
+  /// reads its extent through it) with `LayoutType` bound by the frames to a
+  /// `Layout` and `k` a constant: `ComptimeInt[n]`, `RuntimeInt[dtype]` or a
+  /// nested `Coord`, and in `scope` the frame its own parameters belong to.
+  /// Null for anything else.
+  TypedAttr shapeElement(TypedAttr attr, ParamFrame **scope) {
+    std::string k;
+    ParamListAttr shape = shapeModes(attr, scope, k);
+    static llvm::Regex constRe("^\\(_ bv([0-9]+) 64\\)$");
+    SmallVector<StringRef> m;
+    uint64_t index;
+    if (!shape || !constRe.match(k, &m) || m[1].getAsInteger(10, index) ||
+        index >= shape.getValues().size())
+      return {};
+    return shape.getValues()[index];
+  }
+
+  /// The modes of that layout's shape, and in `k` the index as a term.
+  ParamListAttr shapeModes(TypedAttr attr, ParamFrame **scope, std::string &k) {
+    for (int depth = 0; depth < 8; ++depth) {
+      attr = unwrapValue(attr);
+      auto type = dyn_cast<TypeParamAttr>(attr);
+      auto param = type ? dyn_cast<KGEN::ParamType>(type.getTypeValue())
+                        : KGEN::ParamType();
+      if (!param)
+        break;
+      attr = param.getParam();
+    }
+    auto get = dyn_cast<ParamListGetAttr>(attr);
+    auto witness =
+        get ? dyn_cast<GetWitnessAttr>(unwrapValue(get.getParamList()))
+            : GetWitnessAttr();
+    StringRef list = witness ? witness.getWitnessName().getValue() : "";
+    list.consume_front("_");
+    // The strides are the layout's second list, read the same way.
+    if (list != "_shape_types" && list != "_stride_types")
+      return {};
+    ParamFrame *frame = nullptr;
+    auto layout = dyn_cast<TypeParamAttr>(
+        unwrapValue(resolveParam(witness.getTypeValue(), &frame)));
+    auto st = layout ? structTypeOf(layout.getTypeValue()) : LIT::StructType();
+    if (!st || st.getParamValues().size() < 2 ||
+        printed(st.getSymbol()) != "@layout::@layout::@Layout")
+      return {};
+    auto shape = dyn_cast<ParamListAttr>(
+        st.getParamValues()[list == "_stride_types" ? 1 : 0]);
+    k = paramTerm(get.getIndex(), Sort{false, 64, true});
+    if (!shape || sortOfTerm(k).isBool || sortOfTerm(k).width != 64)
+      return {};
+    if (scope)
+      *scope = frame;
+    return shape;
+  }
+
+  /// `LayoutType._shape_types[k].value()` (or `.product()`) of a mode
+  /// that `shapeElement` gives as `ComptimeInt[n]`: `n`, as
+  /// `TileTensor.dim[k]` reads a static extent.
+  bool evalShapeMode(LIT::CallOp call) {
+    auto witness = dyn_cast<GetWitnessAttr>(call.getCallee());
+    if (!witness || call->getNumResults() != 1 ||
+        (witness.getWitnessName() != "value($0)" &&
+         witness.getWitnessName() != "product($0)"))
+      return false;
+    Sort sort = sortOf(call->getResult(0).getType());
+    ParamFrame *scope = nullptr;
+    std::string k;
+    ParamListAttr shape = shapeModes(witness.getTypeValue(), &scope, k);
+    if (!shape || shape.getValues().empty() || sort.isBool || sort.width != 64)
+      return false;
+    // For an index that is not a constant (a `comptime for`'s), the mode
+    // it selects: every mode has to be static then. An index outside the
+    // shape does not compile.
+    std::string value;
+    {
+      llvm::SaveAndRestore<ParamFrame *> saved(params, scope);
+      ArrayRef<TypedAttr> modes = shape.getValues();
+      for (size_t at = modes.size(); at-- > 0;) {
+        MaybeTerm n = comptimeIntTerm(unwrapValue(modes[at]));
+        std::string here = "(= " + k + " " + bvConst(at, 64) + ")";
+        std::optional<bool> is = decided(here);
+        if (is && !*is)
+          continue;
+        if (!n)
+          return false;
+        value = value.empty() || (is && *is)
+                    ? *n
+                    : "(ite " + here + " " + *n + " " + value + ")";
+        if (is && *is)
+          break;
+      }
+    }
+    if (value.empty())
+      return false;
+    values[call->getResult(0)] = define(sort, value);
+    return true;
+  }
+
   /// The implementation a call through a trait (`T.__len__` with `T` bound
   /// to a struct type by the frames) is of, and in `frame` the struct's
   /// parameters as the call's type gives them. Null when the type is not
   /// a struct known here or does not state the method.
   LIT::FnOp witnessImpl(GetWitnessAttr witness, ParamFrame &frame) {
     ParamFrame *scope = nullptr;
-    auto typed = dyn_cast_or_null<TypeParamAttr>(
-        unwrapValue(resolveParam(witness.getTypeValue(), &scope)));
+    TypedAttr type = shapeElement(witness.getTypeValue(), &scope);
+    if (!type)
+      type = resolveParam(witness.getTypeValue(), &scope);
+    auto typed = dyn_cast_or_null<TypeParamAttr>(unwrapValue(type));
     LIT::StructType st =
         typed ? structTypeOf(typed.getTypeValue()) : LIT::StructType();
     auto decl = st ? dyn_cast_or_null<LIT::StructDeclOp>(
@@ -9806,6 +9917,18 @@ private:
     // A layout's rank and flat rank (`t.rank`, the `rank` witness of its
     // layout type): one term per layout, for `num_elements()` and
     // `static_shape`.
+    // `is_tuple` of a mode of a concrete layout's shape: false for an
+    // integer mode.
+    if (auto witness = dyn_cast<GetWitnessAttr>(attr);
+        witness && sort.isBool && witness.getWitnessName() == "is_tuple")
+      if (TypedAttr element = shapeElement(witness.getTypeValue(), nullptr))
+        if (auto mode = dyn_cast<TypeParamAttr>(unwrapValue(element)))
+          if (auto st = structTypeOf(mode.getTypeValue())) {
+            std::string symbol = printed(st.getSymbol());
+            if (symbol == "@std::@utils::@coord::@ComptimeInt" ||
+                symbol == "@std::@utils::@coord::@RuntimeInt")
+              return "false";
+          }
     if (auto witness = dyn_cast<GetWitnessAttr>(attr);
         witness && !sort.isBool && sort.width == 64 &&
         (witness.getWitnessName() == "rank" ||
@@ -11248,6 +11371,8 @@ private:
     }
     if (name && !inContract)
       checkPointerCall(call, *name, contract, state);
+    if (evalShapeMode(call))
+      return;
     if (name && evalInvariantPredicate(call, *name, callee, frame, state))
       return;
     if (inlineHigherOrder(call, callee, frame, state))
@@ -12407,6 +12532,61 @@ private:
     return true;
   }
 
+  /// `index(pack[k])` of a parameter pack, as a term.
+  std::string packIndex(StringRef pack, StringRef k) {
+    if (!packIndexDeclared) {
+      prelude += "(declare-fun pidx ((_ BitVec 64) (_ BitVec 64)) "
+                 "(_ BitVec 64))\n";
+      packIndexDeclared = true;
+    }
+    return ("(pidx " + pack + " " + k + ")").str();
+  }
+
+  /// `t._indices_in_bounds(*items)` for a pack that is a parameter of the
+  /// function (the clause of `__setitem__`, assumed in its body): true for
+  /// a nested layout, else every `index(items[k])` in `[0, dim[k]())`, as
+  /// the predicate's loop says, for a `k` that is not known: quantified,
+  /// over `pidx` and `tdim`. A static extent is `tdim`'s value there.
+  MaybeTerm packIndicesInBounds(ArrayRef<TypedAttr> params, Value tensor,
+                                StringRef pack, State &state) {
+    if (params.size() < 9)
+      return std::nullopt;
+    Sort sort{false, 64, true};
+    std::string value = isa<LIT::RefType>(tensor.getType())
+                            ? valueThrough(tensor, state)
+                            : term(tensor, state);
+    if (sortOfTerm(value).width != 64 || sortOfTerm(value).isBool ||
+        sortOfTerm(pack).width != 64 || sortOfTerm(pack).isBool)
+      return std::nullopt;
+    // As the function's own `IndexTypes.length` is spelled: the same term.
+    std::string count = paramTerm(ParamListSizeAttr::get(params[8]), sort);
+    if (sortOfTerm(count).width != 64 || sortOfTerm(count).isBool)
+      return std::nullopt;
+    if (!tensorDimDeclared) {
+      prelude += "(declare-fun tdim ((_ BitVec 64) (_ BitVec 64)) "
+                 "(_ BitVec 64))\n";
+      tensorDimDeclared = true;
+    }
+    std::string layout = layoutText(resolveParam(params[3]));
+    for (auto [k, element] : llvm::enumerate(layoutList(layout, 0)))
+      if (std::optional<int64_t> n = comptimeIntValue(element)) {
+        std::string fact = "(= (tdim " + value + " " + bvConst(k, 64) + ") " +
+                           bvConst(*n, 64) + ")";
+        if (addedFacts.insert(fact).second)
+          facts.push_back(fact);
+      }
+    std::string key = layoutKey(params[3]);
+    std::string nested = "(not (= " + layoutWitness("flat_rank", key) + " " +
+                         layoutWitness("rank", key) + "))";
+    std::string element = packIndex(pack, "k");
+    return define({true, 1, false},
+                  "(or " + nested +
+                      " (forall ((k (_ BitVec 64))) (=> (and (bvsle " +
+                      bvConst(0, 64) + " k) (bvslt k " + count +
+                      ")) (and (bvsle " + bvConst(0, 64) + " " + element +
+                      ") (bvslt " + element + " (tdim " + value + " k))))))");
+  }
+
   /// Dimension `k` of the `TileTensor` `tensor`, whose type parameters are
   /// `params` (its layout is the fourth): the static size where the layout's
   /// shape says `ComptimeInt[n]`, otherwise `tdim(tensor, k)`, not negative.
@@ -12466,6 +12646,19 @@ private:
       it->second = declare(Sort{false, 64, true}, "p");
       prelude += "; " + it->second + ": " + name.str() + " of " +
                  StringRef(layout).take_front(300).str() + "\n";
+      // A concrete `Layout` whose shape has no nested mode: both are the
+      // number of its modes.
+      if (StringRef(layout).starts_with(
+              "|#kgen.type<!lit.struct<@layout::@layout::@Layout<")) {
+        SmallVector<StringRef> shape = layoutList(layout, 0);
+        if (!shape.empty() && llvm::all_of(shape, [](StringRef element) {
+              return element.starts_with(
+                         "@std::@utils::@coord::@ComptimeInt<") ||
+                     element.starts_with("@std::@utils::@coord::@RuntimeInt<");
+            }))
+          facts.push_back("(= " + it->second + " " + bvConst(shape.size(), 64) +
+                          ")");
+      }
     }
     return it->second;
   }
@@ -12981,8 +13174,16 @@ private:
       if (!isa<LIT::RefType>(pack.getType()))
         return false;
       auto refs = packRefs.find(valueThrough(pack, state));
-      if (refs == packRefs.end())
-        return false;
+      if (refs == packRefs.end()) {
+        // The function's own pack, passed on.
+        MaybeTerm all =
+            packIndicesInBounds(boundParamValues(symbol), call.getOperands()[0],
+                                valueThrough(pack, state), state);
+        if (!all)
+          return false;
+        values[result] = *all;
+        return true;
+      }
       std::string all = "true";
       for (auto [k, ref] : llvm::enumerate(refs->second)) {
         std::optional<Loc> place = placeOf(ref);
@@ -15335,6 +15536,35 @@ private:
           return true;
         }
       }
+    // `index(items[k])` of a pack that is a parameter: `pidx(items, k)`.
+    if (path.starts_with("std::builtin::int::index[") &&
+        call.getNumOperands() == 1 && sortOf(result.getType()).width == 64 &&
+        !sortOf(result.getType()).isBool) {
+      Value element = call.getOperands()[0];
+      while (auto rebind = element.getDefiningOp<RebindOp>())
+        element = rebind->getOperand(0);
+      if (auto it = packElements.find(element); it != packElements.end()) {
+        values[result] = define(Sort{false, 64, true},
+                                packIndex(it->second.first, it->second.second));
+        return true;
+      }
+    }
+    // `items[k]` of such a pack (the last parameter is `k`): noted for
+    // `index`; the element itself is unknown.
+    if (path.starts_with(
+            "std::builtin::variadics::VariadicPack::__getitem_param__[") &&
+        call.getNumOperands() == 1 &&
+        isa<LIT::RefType>(call.getOperands()[0].getType()))
+      if (auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+          symbol && !boundParamValues(symbol).empty()) {
+        std::string pack = valueThrough(call.getOperands()[0], state);
+        std::string k =
+            paramTerm(boundParamValues(symbol).back(), Sort{false, 64, true});
+        if (!packRefs.count(pack) && !sortOfTerm(pack).isBool &&
+            sortOfTerm(pack).width == 64 && !sortOfTerm(k).isBool &&
+            sortOfTerm(k).width == 64)
+          packElements[result] = {pack, k};
+      }
     // `Int(literal)`: the literal's value.
     if (path.starts_with("std::simd::SIMD::__init__[!pop.int_literal](") &&
         call.getNumOperands() == 1) {
@@ -17361,6 +17591,9 @@ struct VerifyContractsPass
     // What an instantiation says of its obligation (`Obligation::detail`,
     // and a counterexample).
     std::map<std::tuple<size_t, size_t, Key>, std::string> instanceDetails;
+    // Calls from a function that is itself generic in the conversion's
+    // type: not instantiations of it.
+    std::set<std::tuple<size_t, size_t, Key>> genericCallers;
     for (InstanceJob &job : instanceJobs) {
       if (job.opaque)
         continue;
@@ -17433,9 +17666,13 @@ struct VerifyContractsPass
             const Obligation &ob = result.obligations[k];
             if (!ob.conversion || !ob.variant.empty())
               continue;
-            bool assumed = false;
+            bool assumed = false, generic = false;
             std::optional<Sort> to =
-                enc.conversionTarget(ob.conversion, assumed);
+                enc.conversionTarget(ob.conversion, assumed, generic);
+            if (!to && generic) {
+              genericCallers.insert({i, j, resultKeys[k]});
+              continue;
+            }
             if (!to) {
               answers[resultKeys[k]] = Answer::NotAnalyzed;
               instanceDetails[{i, j, resultKeys[k]}] =
@@ -17657,6 +17894,8 @@ struct VerifyContractsPass
             Key first = resultKeys[k];
             std::get<2>(first) = 0;
             if (found == answers.end() && answers.count(first))
+              continue;
+            if (genericCallers.count({i, instance, resultKeys[k]}))
               continue;
             perInstance.push_back({instance, found == answers.end()
                                                  ? Answer::NotAnalyzed

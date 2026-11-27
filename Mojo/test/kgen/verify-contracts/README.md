@@ -449,19 +449,27 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   static layout of fewer than 2^31 elements, else 64-bit); where they do
   not, the conversion is checked for 32 bits and the note says so. A type
   is never read out of an expression that is still to be evaluated.
-  Limit: an instantiation's static sizes are mostly not known when it is
-  verified this way, so an index into a tensor of known size is reported
-  although it fits (`TileTensor.__setitem__`).
-  `conversions.mojo` has the cases. `ord` of a
-  literal is its code point (a constant); `ord` of any string is a code
-  point (its `ensures`: at most 0x10FFFF). On the matmul dispatch corpus
+  An instantiation verified this way knows what its layout says: the rank
+  of a concrete `Layout` (the number of its modes), each static mode's
+  size and stride (`ShapeTypes[k].value()`, also for a `k` that is not a
+  constant: one of the static sizes), and, from the bounds clause on the
+  function's own indices (`_indices_in_bounds(*indices)`), that each index
+  is within its dimension. So an index into a tensor of known size fits
+  its 32-bit index type (`dst[tid]`, `t.dim[0]()`). A call from a function
+  that is itself generic in the type is no instantiation: the callers of
+  that function are. Still reported: a tile's coordinates and shape (the
+  contract of `tile` bounds the tile, not the product with its size), and
+  what a layout only known at run time gives. `conversions.mojo` has the
+  cases; `tensors.mojo` with `packages=layout` the calls into `layout`.
+  `ord` of a literal is its code point (a constant); `ord` of any string is
+  a code point (its `ensures`: at most 0x10FFFF). On the matmul dispatch corpus
   with `narrowing` the option adds 869 obligations to 1197, of which 375
-  are proven, for about 7% more CPU time: the open ones are mostly sizes
+  are proven, for about 10% more CPU time: the open ones are mostly sizes
   passed to 32-bit interfaces (`Int32(m)` to BLAS, `UInt32(M)` in a
   launch), which hold only for sizes no contract bounds; 16 are to a type
   computed at compile time that is not evaluated (`FastUInt`) and
-  reported as not checked. With `packages=linalg,layout` (2218
-  obligations, about a third more CPU time than before the check per
+  reported as not checked. With `packages=linalg,layout` (2234
+  obligations, about 40% more CPU time than before the check per
   instantiation) the bound of the masked copy in `tile_io.mojo`
   (`Scalar[idx_type](rows * stride)` in `copy_bounded`) is reported for
   the instantiations the kernels call.
