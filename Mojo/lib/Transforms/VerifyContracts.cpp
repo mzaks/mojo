@@ -150,6 +150,13 @@ std::optional<Sort> dtypeSort(StringRef text) {
   SmallVector<StringRef> m;
   if (!re.match(text, &m))
     return std::nullopt;
+  // Not one inside an expression still to be evaluated, which only names
+  // it (`_get_index_type[Layout[...]](space)` names `index` in the
+  // layout's type, and gives `int32`). Printed inside a type, such an
+  // expression is `apply(...)`.
+  StringRef before = text.take_front(m[0].data() - text.data());
+  if (before.contains("#kgen.param.") || before.contains("apply("))
+    return std::nullopt;
   StringRef name = m[2];
   if (name == "index")
     return Sort{false, 64, true};
@@ -15270,11 +15277,19 @@ private:
                  ? printed(resolveParam(boundParamValues(symbol)[i]))
                  : name.params[i];
     };
+    // The source's type; where it is not known (a tensor's index type),
+    // the one its value is modelled with.
+    auto sourceSort = [&]() -> std::optional<Sort> {
+      if (std::optional<Sort> from = dtypeSort(resolved(2)))
+        return from;
+      if (call.getNumOperands() != 1 || sortOfTerm(operand(0)).isBool)
+        return std::nullopt;
+      return sortOfTerm(operand(0));
+    };
     if (path.starts_with("std::simd::SIMD::__init__[::DType](::SIMD[") &&
         call.getNumOperands() == 1 && name.params.size() == 3 &&
         isWidthOne(resolved(1)))
-      if (std::optional<Sort> to = dtypeSort(resolved(0)),
-          from = dtypeSort(resolved(2));
+      if (std::optional<Sort> to = dtypeSort(resolved(0)), from = sourceSort();
           to && from && sortOfTerm(operand(0)).width == from->width &&
           !sortOfTerm(operand(0)).isBool) {
         std::string v = operand(0);
