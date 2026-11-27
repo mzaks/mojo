@@ -377,6 +377,10 @@ static ArrayRef<TypedAttr> boundParamValues(FuncSymbolGenerator symbol) {
                                : symbol.getFuncSymbol().getParamValues();
 }
 
+/// In a printed dtype: the index type `layout` chooses for a tensor.
+static constexpr llvm::StringLiteral kLayoutIndexType =
+    "@layout::@tile_tensor::@\"_get_index_type[";
+
 /// The claim of a conversion whose types a parameter gives.
 static constexpr llvm::StringLiteral kParametricConversion =
     "that this conversion to an integer type given by a parameter keeps "
@@ -386,6 +390,69 @@ static constexpr llvm::StringLiteral kParametricConversion =
 static constexpr llvm::StringLiteral kUnevaluatedConversion =
     "that this conversion to an integer type computed at compile time "
     "keeps the value";
+
+/// What `_get_index_type[LayoutType](address_space)` of the `layout`
+/// package gives, from the printed call, where its arguments decide it:
+/// `int32` in shared and constant GPU memory, and for a layout whose shape
+/// and strides are all static and that spans fewer than 2^31 elements;
+/// `int64` otherwise. None where they do not (a parameter not yet given, a
+/// nested shape), or for any other text.
+static std::optional<Sort> layoutIndexType(StringRef text) {
+  static constexpr StringLiteral kCall =
+      "#kgen.param.expr<apply, #kgen.gen<#kgen.func.symbol<"
+      "@layout::@tile_tensor::@\"_get_index_type[";
+  if (!text.starts_with(kCall))
+    return std::nullopt;
+  Sort narrow{false, 32, true}, wide{false, 64, true};
+  // The address space, as its number (LLVM's): 3 is shared, 4 constant.
+  static llvm::Regex spaceRe(
+      "= \\{([0-9]+)\\}\\}> : "
+      "!lit.struct<@std::@memory::@address_space::@AddressSpace>> : "
+      "!lit.struct<@std::@builtin::@dtype::@DType>$");
+  std::optional<unsigned> space;
+  SmallVector<StringRef> m;
+  unsigned number;
+  if (spaceRe.match(text, &m) && !m[1].getAsInteger(10, number))
+    space = number;
+  if (space && (*space == 3 || *space == 4))
+    return narrow;
+  // The layout's shape and stride types: static sizes, or not.
+  size_t at = text.find("@layout::@layout::@Layout<");
+  if (at == StringRef::npos)
+    return std::nullopt;
+  StringRef rest = text.drop_front(at);
+  static llvm::Regex sizeRe("\\{:scalar<index> (-?[0-9]+)\\}>$");
+  bool known = true;
+  SmallVector<int64_t> sizes[2];
+  for (SmallVector<int64_t> &list : sizes) {
+    size_t open = rest.find('[');
+    if (open == StringRef::npos)
+      return std::nullopt;
+    rest = rest.drop_front(open + 1);
+    for (StringRef element : listElements(rest)) {
+      int64_t size;
+      if (element.starts_with("@std::@utils::@coord::@RuntimeInt<")) {
+        known = false;
+      } else if (element.starts_with("@std::@utils::@coord::@ComptimeInt<") &&
+                 sizeRe.match(element, &m) && !m[1].getAsInteger(10, size)) {
+        list.push_back(size);
+      } else {
+        return std::nullopt;
+      }
+    }
+  }
+  if (known) {
+    if (sizes[0].size() != sizes[1].size())
+      return std::nullopt;
+    llvm::APInt cosize(128, 1);
+    for (auto [shape, stride] : llvm::zip(sizes[0], sizes[1]))
+      cosize += llvm::APInt(128, shape - 1, /*isSigned=*/true) *
+                llvm::APInt(128, stride, /*isSigned=*/true);
+    if (cosize.sge(0) && cosize.slt(llvm::APInt(128, uint64_t(1) << 31)))
+      return narrow;
+  }
+  return space ? std::optional<Sort>(wide) : std::nullopt;
+}
 
 /// "a signed 32-bit integer".
 static std::string sortName(Sort sort) {
@@ -2634,6 +2701,13 @@ public:
     if (!symbol || boundParamValues(symbol).empty())
       return std::nullopt;
     std::string dtype = printed(resolveDeep(boundParamValues(symbol)[0]));
+    if (std::optional<Sort> index = layoutIndexType(dtype))
+      return index;
+    // The layout's index type, not decided: 32-bit unless shown otherwise.
+    if (StringRef(dtype).contains(kLayoutIndexType)) {
+      assumed = true;
+      return Sort{false, 32, true};
+    }
     if (StringRef(dtype).contains("#kgen.param."))
       return std::nullopt;
     return dtypeSort(dtype);
@@ -9404,6 +9478,13 @@ private:
                             StringRef dtype, State &state) {
     if (!checkConversions || inContract || predicateDepth || from.isBool)
       return;
+    if (dtype.contains(kLayoutIndexType) && !isParametricConversion(call)) {
+      checkConversion(call, value, from, Sort{false, 32, true}, state,
+                      "that this conversion keeps the value where the "
+                      "layout's index type is 32-bit (a layout of known "
+                      "size, or in shared memory)");
+      return;
+    }
     if (!isParametricConversion(call)) {
       // A type computed at compile time that is not evaluated here
       // (`FastUInt`): said, where a narrower type would lose something.
@@ -15389,6 +15470,8 @@ private:
     // expression still to be evaluated (`_get_index_type[Layout[...]](a)`
     // names `index` in the layout's type, and gives `int32`).
     auto conversionSort = [](StringRef dtype) -> std::optional<Sort> {
+      if (std::optional<Sort> index = layoutIndexType(dtype))
+        return index;
       if (dtype.contains("#kgen.param."))
         return std::nullopt;
       return dtypeSort(dtype);

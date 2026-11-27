@@ -443,7 +443,11 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   only where that is open the instantiation is verified for its
   conversions. The warning is in the function, with a note at each call
   it is not proven for; a function no call gives the type is reported as
-  not checked. A type
+  not checked. The index type of a `layout` tensor
+  (`_get_index_type[LayoutType](address_space)`) is evaluated where its
+  arguments decide it (32-bit in shared and constant memory and for a
+  static layout of fewer than 2^31 elements, else 64-bit); where they do
+  not, the conversion is checked for 32 bits and the note says so. A type
   is never read out of an expression that is still to be evaluated.
   Limit: an instantiation's static sizes are mostly not known when it is
   verified this way, so an index into a tensor of known size is reported
@@ -456,7 +460,11 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   passed to 32-bit interfaces (`Int32(m)` to BLAS, `UInt32(M)` in a
   launch), which hold only for sizes no contract bounds; 16 are to a type
   computed at compile time that is not evaluated (`FastUInt`) and
-  reported as not checked.
+  reported as not checked. With `packages=linalg,layout` (2218
+  obligations, about a third more CPU time than before the check per
+  instantiation) the bound of the masked copy in `tile_io.mojo`
+  (`Scalar[idx_type](rows * stride)` in `copy_bounded`) is reported for
+  the instantiations the kernels call.
 
 - `Array`: `len(a)` is the size parameter in `a`'s type (a number, or a
   parameter such as `n` in generic code), not negative (the struct
