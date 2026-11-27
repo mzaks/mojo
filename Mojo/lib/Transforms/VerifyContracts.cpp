@@ -45,6 +45,7 @@
 #include "Mojo/LITDialect/LITOps.h"
 #include "Mojo/POPDialect/POPAttrs.h"
 #include "Mojo/TransformUtils/ContractUtils.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseSet.h"
@@ -58,6 +59,7 @@
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/Regex.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/xxhash.h"
 
@@ -152,8 +154,8 @@ std::optional<Sort> dtypeSort(StringRef text) {
     return std::nullopt;
   // Not one inside an expression still to be evaluated, which only names
   // it (`_get_index_type[Layout[...]](space)` names `index` in the
-  // layout's type, and gives `int32`). Printed inside a type, such an
-  // expression is `apply(...)`.
+  // layout's type, and gives `int32`).
+  // (Printed inside a type, such an expression is `apply(...)`.)
   StringRef before = text.take_front(m[0].data() - text.data());
   if (before.contains("#kgen.param.") || before.contains("apply("))
     return std::nullopt;
@@ -373,6 +375,47 @@ struct CalleeName {
 static ArrayRef<TypedAttr> boundParamValues(FuncSymbolGenerator symbol) {
   return symbol.isFullyBound() ? symbol.getParamValues()
                                : symbol.getFuncSymbol().getParamValues();
+}
+
+/// The claim of a conversion whose types a parameter gives.
+static constexpr llvm::StringLiteral kParametricConversion =
+    "that this conversion to an integer type given by a parameter keeps "
+    "the value";
+
+/// The claim of a conversion to a type that is not evaluated.
+static constexpr llvm::StringLiteral kUnevaluatedConversion =
+    "that this conversion to an integer type computed at compile time "
+    "keeps the value";
+
+/// "a signed 32-bit integer".
+static std::string sortName(Sort sort) {
+  return std::string(sort.isSigned ? "a signed " : "an unsigned ") +
+         std::to_string(sort.width) + "-bit integer";
+}
+
+/// "si32".
+static std::string variantName(Sort sort) {
+  return (sort.isSigned ? "si" : "ui") + std::to_string(sort.width);
+}
+
+/// Whether `call` is an integer conversion (`Scalar[dtype](n)`) between
+/// types of which one is given by a parameter of the function it is in: what
+/// it may lose is known only where that parameter has a value.
+static bool isParametricConversion(LIT::CallOp call) {
+  auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+  if (!symbol || call.getNumOperands() != 1)
+    return false;
+  ArrayRef<FlatSymbolRefAttr> nested = symbol.getSymbol().getNestedReferences();
+  if (nested.size() < 2 ||
+      !nested.back().getValue().starts_with("__init__[::DType](::SIMD[") ||
+      nested[nested.size() - 2].getValue() != "SIMD")
+    return false;
+  ArrayRef<TypedAttr> bound = boundParamValues(symbol);
+  bool found = false;
+  for (size_t i : {size_t(0), size_t(2)})
+    if (i < bound.size())
+      Attribute(bound[i]).walk([&](ParamDeclRefAttr) { found = true; });
+  return found;
 }
 
 std::optional<CalleeName> calleeName(Attribute callee) {
@@ -1961,6 +2004,12 @@ struct Obligation {
   /// The operands' values in one case that breaks it (`idx = 0, len(self) =
   /// 0`), if asked for and found.
   std::string counterexample;
+  /// For a conversion to a type a parameter gives: the call; and, for the
+  /// obligations that follow the one reported, each saying that the value
+  /// fits one type it may be converted to, that type ("si32"). Those are
+  /// not reported: an instantiation is answered by the one of its type.
+  Operation *conversion = nullptr;
+  std::string variant;
 };
 
 /// What `FunctionEncoder::instantiate` tells of a clause besides its
@@ -2536,11 +2585,12 @@ public:
   /// gives is then an unknown, so what is proven holds for every value of
   /// it, and a parameter of one function cannot be read as a parameter of
   /// the same name of another.
-  void bindInstance(ArrayRef<InstanceLink> chain) {
+  void bindInstance(ArrayRef<InstanceLink> chain, bool kernel = true) {
     // A launched kernel runs on the GPU: its own target is one.
-    if (MaybeTerm gpu = targetPredicate("std::sys::info::is_gpu()",
-                                        Sort{true, 1, false}))
-      facts.push_back(*gpu);
+    if (kernel)
+      if (MaybeTerm gpu =
+              targetPredicate("std::sys::info::is_gpu()", Sort{true, 1, false}))
+        facts.push_back(*gpu);
     instanceFrames.clear();
     for (const InstanceLink &link : chain)
       instanceFrames.push_back(
@@ -2571,6 +2621,22 @@ public:
     }
     rootParams = instanceFrames.empty() ? nullptr : &instanceFrames.front();
     params = rootParams;
+  }
+
+  /// After `bindInstance`: the type the conversion `op` (see
+  /// `parametricConversion`) converts to in this instantiation, if its
+  /// parameters give it. `assumed`: it is the 32-bit index type of a layout
+  /// whose `_get_index_type` is not decided, which may give 64 bits.
+  std::optional<Sort> conversionTarget(Operation *op, bool &assumed) {
+    assumed = false;
+    auto symbol =
+        FuncSymbolGenerator::dynCast(cast<LIT::CallOp>(op).getCallee());
+    if (!symbol || boundParamValues(symbol).empty())
+      return std::nullopt;
+    std::string dtype = printed(resolveDeep(boundParamValues(symbol)[0]));
+    if (StringRef(dtype).contains("#kgen.param."))
+      return std::nullopt;
+    return dtypeSort(dtype);
   }
 
   /// After `bindInstance`: the name of an integer parameter of the kernel
@@ -9283,8 +9349,11 @@ private:
   /// With `check-conversions`, a conversion at `call` of the integer
   /// `value` of sort `from` to an integer of sort `to` must keep the number:
   /// integer `cast` truncates, and reads the bits by the new signedness.
+  /// With `claim`, that is what the obligation says; with `variant`, it is
+  /// one of those of `parametricConversion`.
   void checkConversion(LIT::CallOp call, StringRef value, Sort from, Sort to,
-                       State &state) {
+                       State &state, StringRef claim = "",
+                       StringRef variant = "") {
     if (!checkConversions || inContract || predicateDepth || from.isBool ||
         to.isBool)
       return;
@@ -9307,13 +9376,58 @@ private:
               std::to_string(from.width - 1) + ") " + v + ") #b0)";
     Obligation ob{state.pc, "false", call.getLoc(), call.getLoc(),
                   "conversion"};
-    ob.claim = "that this conversion to " +
-               std::string(to.isSigned ? "a signed" : "an unsigned") + " " +
-               std::to_string(to.width) + "-bit integer keeps the value";
+    ob.claim = claim.empty() ? "that this conversion to " + sortName(to) +
+                                   " keeps the value"
+                             : claim.str();
+    ob.conversion = variant.empty() ? nullptr : call.getOperation();
+    ob.variant = variant.str();
     ob.cond = define({true, 1, false}, keeps);
     ob.operands.push_back({"the value", v});
     noteCondition(ob.cond);
     addObligation(ob);
+  }
+
+  /// With `check-conversions`, a conversion at `call` of `value` (of sort
+  /// `from`) to a type that is not known here, as a parameter of the
+  /// function gives it: what it may lose depends on that parameter. One
+  /// obligation, open here, stands for it; it is followed by one for each
+  /// integer type the conversion could lose something to (`variant`),
+  /// proven or not for every value of the parameters. Each instantiation
+  /// the module has is answered by the one of its type
+  /// (`conversionTarget`).
+  ///
+  /// `dtype` is the type as far as it is known. `_get_index_type` of
+  /// `layout` gives `int32` or `int64`, by the layout's size and the
+  /// address space, which are not evaluated here: the value has to fit the
+  /// narrower one.
+  void parametricConversion(LIT::CallOp call, StringRef value, Sort from,
+                            StringRef dtype, State &state) {
+    if (!checkConversions || inContract || predicateDepth || from.isBool)
+      return;
+    if (!isParametricConversion(call)) {
+      // A type computed at compile time that is not evaluated here
+      // (`FastUInt`): said, where a narrower type would lose something.
+      // Not a dtype that is known and no integer (`Float32(n)`).
+      if ((checkConversions < 2 && from.width <= 8) ||
+          !(dtype.contains("#kgen.param.") || dtype.contains("apply(")))
+        return;
+      Obligation ob{state.pc, "false", call.getLoc(), call.getLoc(),
+                    "conversion"};
+      ob.claim = std::string(kUnevaluatedConversion);
+      ob.analyzed = false;
+      addObligation(ob);
+      return;
+    }
+    Obligation ob{state.pc, "false", call.getLoc(), call.getLoc(),
+                  "conversion"};
+    ob.claim = std::string(kParametricConversion);
+    ob.analyzed = false;
+    ob.conversion = call.getOperation();
+    addObligation(ob);
+    for (unsigned width : {8u, 16u, 32u, 64u})
+      for (bool isSigned : {true, false})
+        checkConversion(call, value, from, Sort{false, width, isSigned}, state,
+                        "", variantName({false, width, isSigned}));
   }
 
   /// With `check-division`, a division at `call` by `divisor` must not
@@ -15271,16 +15385,24 @@ private:
     // source's signedness, or truncated, as integer `cast` does.
     // The parameters resolved: in a callee's clause they may name its own
     // (`Int(offset)` for an `offset: Scalar` of any dtype).
+    // The dtype such a parameter names. Not one that occurs in an
+    // expression still to be evaluated (`_get_index_type[Layout[...]](a)`
+    // names `index` in the layout's type, and gives `int32`).
+    auto conversionSort = [](StringRef dtype) -> std::optional<Sort> {
+      if (dtype.contains("#kgen.param."))
+        return std::nullopt;
+      return dtypeSort(dtype);
+    };
     auto resolved = [&](size_t i) {
       auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
       return symbol && i < boundParamValues(symbol).size()
-                 ? printed(resolveParam(boundParamValues(symbol)[i]))
+                 ? printed(resolveDeep(boundParamValues(symbol)[i]))
                  : name.params[i];
     };
     // The source's type; where it is not known (a tensor's index type),
     // the one its value is modelled with.
     auto sourceSort = [&]() -> std::optional<Sort> {
-      if (std::optional<Sort> from = dtypeSort(resolved(2)))
+      if (std::optional<Sort> from = conversionSort(resolved(2)))
         return from;
       if (call.getNumOperands() != 1 || sortOfTerm(operand(0)).isBool)
         return std::nullopt;
@@ -15289,11 +15411,18 @@ private:
     if (path.starts_with("std::simd::SIMD::__init__[::DType](::SIMD[") &&
         call.getNumOperands() == 1 && name.params.size() == 3 &&
         isWidthOne(resolved(1)))
-      if (std::optional<Sort> to = dtypeSort(resolved(0)), from = sourceSort();
+      if (std::optional<Sort> to = conversionSort(resolved(0)),
+          from = sourceSort();
           to && from && sortOfTerm(operand(0)).width == from->width &&
           !sortOfTerm(operand(0)).isBool) {
         std::string v = operand(0);
         checkConversion(call, v, *from, *to, state);
+        // A type known only through an alias or the layout's choice of
+        // index type, which the result's own type does not show (it is
+        // modelled as 64-bit): checked, and its value left unknown.
+        if (Sort declared = sortOf(result.getType());
+            declared.isBool || declared.width != to->width)
+          return false;
         std::string w;
         if (to->width > from->width)
           w = "((_ " + std::string(from->isSigned ? "sign" : "zero") +
@@ -15306,6 +15435,14 @@ private:
         values[result] = define(*to, w);
         return true;
       }
+    // To a type that is not known here.
+    if (path.starts_with("std::simd::SIMD::__init__[::DType](::SIMD[") &&
+        call.getNumOperands() == 1 && name.params.size() == 3 &&
+        !conversionSort(resolved(0)))
+      if (std::optional<Sort> from = sourceSort();
+          from && !sortOfTerm(operand(0)).isBool &&
+          sortOfTerm(operand(0)).width == from->width)
+        parametricConversion(call, operand(0), *from, resolved(0), state);
     if (!path.starts_with("std::simd::SIMD::__") || name.params.size() < 2)
       return false;
     std::optional<Sort> sort = dtypeSort(name.params[0]);
@@ -15450,6 +15587,37 @@ private:
     while (auto upcast = dyn_cast<UpcastAttr>(attr))
       attr = upcast.getInputTypeValue();
     return attr;
+  }
+
+  /// `resolveParam` also inside an expression, and through aliases: a
+  /// dtype named by `comptime idx_type = dt`, or computed from parameters
+  /// (`_get_index_type[LayoutType](address_space)`), as far as the frames
+  /// give it.
+  TypedAttr resolveDeep(TypedAttr attr, unsigned depth = 0) {
+    if (depth > 8)
+      return attr;
+    using Replaced = std::optional<std::pair<Attribute, WalkResult>>;
+    mlir::AttrTypeReplacer replacer;
+    replacer.addReplacement([&](Attribute a) -> Replaced {
+      if (auto sugar = dyn_cast<SugarAttr>(a))
+        return std::make_pair(
+            Attribute(resolveDeep(sugar.getCanonical(), depth + 1)),
+            WalkResult::skip());
+      auto ref = dyn_cast<ParamDeclRefAttr>(a);
+      if (!ref)
+        return std::nullopt;
+      ParamFrame *scope = params;
+      TypedAttr value = resolveParam(ref, &scope);
+      if (value == ref)
+        return std::make_pair(a, WalkResult::skip());
+      // What a call binds names its caller's parameters.
+      llvm::SaveAndRestore<ParamFrame *> saved(params, scope);
+      return std::make_pair(Attribute(resolveDeep(value, depth + 1)),
+                            WalkResult::skip());
+    });
+    auto result =
+        dyn_cast_or_null<TypedAttr>(replacer.replace(Attribute(attr)));
+    return result ? result : attr;
   }
 
   /// Whether a type parameter's value is `Int`.
@@ -16605,8 +16773,16 @@ struct VerifyContractsPass
       Location launch;
       // The outermost call that gave parameters, when not the launch.
       std::optional<Location> via;
+      // Whether it runs in a launched kernel (on the GPU).
+      bool kernel = true;
     };
     DenseMap<Operation *, SmallVector<Instance>> instances;
+    // With `check-conversions`: the functions (not launched kernels) with a
+    // conversion to a type a parameter gives. They are verified for every
+    // value of their parameters; `instances` then has the instantiations
+    // the module calls (`launch` is that call), which only say what type
+    // each such conversion is to (`FunctionEncoder::parametricConversion`).
+    DenseSet<Operation *> genericFirst;
     {
       SymbolTableCollection symbols;
       DenseSet<Operation *> verified;
@@ -16753,6 +16929,104 @@ struct VerifyContractsPass
           };
       for (Launch &launch : launches)
         expand({launch.kernel}, launch.launcher, launch.loc, std::nullopt, 0);
+      // The instantiations of the functions of `genericFirst`: each call of
+      // one, with the calls of the calling function where the call passes
+      // that function's own parameters on (three levels out), ending in the
+      // instantiations of a launched kernel where the caller is one.
+      if (!checkConversions.empty()) {
+        SmallVector<LIT::FnOp> converting;
+        for (Job &job : fns) {
+          if (job.refines || instances.count(job.fn))
+            continue;
+          bool found = false;
+          job.fn->walk([&](LIT::CallOp call) {
+            found = found || isParametricConversion(call);
+          });
+          if (found && genericFirst.insert(job.fn).second)
+            converting.push_back(job.fn);
+        }
+        DenseMap<Operation *, SmallVector<Caller>> calledBy;
+        DenseSet<Operation *> level(genericFirst.begin(), genericFirst.end());
+        for (int depth = 0; depth < 4 && !level.empty(); ++depth) {
+          llvm::StringSet<> names;
+          // A function split for its checked preconditions is called
+          // through its wrapper, by the name without the suffix.
+          for (Operation *fn : level)
+            if (auto name = cast<LIT::FnOp>(fn).getSymName()) {
+              names.insert(*name);
+              if (name->ends_with(kUncheckedSuffix))
+                names.insert(name->drop_back(strlen(kUncheckedSuffix)));
+            }
+          DenseSet<Operation *> next;
+          module.walk([&](LIT::CallOp call) {
+            auto symbol = FuncSymbolGenerator::dynCast(call.getCallee());
+            if (!symbol ||
+                !names.contains(
+                    symbol.getSymbol().getLeafReference().getValue()))
+              return;
+            auto fn = behindWrapper(dyn_cast_or_null<LIT::FnOp>(
+                symbols.lookupSymbolIn(module, symbol.getSymbol())));
+            if (!fn || !level.count(fn))
+              return;
+            auto from = call->getParentOfType<LIT::FnOp>();
+            // The wrapper's own call of its copy gives no parameter.
+            if (from && behindWrapper(from) == fn)
+              return;
+            calledBy[fn].push_back(
+                {{symbol, fn, call.getImplicitOrigins().size()},
+                 from,
+                 call.getLoc()});
+            if (from && open(symbol) && !calledBy.count(from) &&
+                !instances.count(from))
+              next.insert(from);
+          });
+          level = std::move(next);
+        }
+        auto add = [&](SmallVector<InstanceLink> chain, Location at,
+                       std::optional<Location> via, bool kernel) {
+          std::string key;
+          for (const InstanceLink &link : chain)
+            key += printed(link.symbol) + "|";
+          SmallVector<Instance> &list = instances[chain.front().fn];
+          if (list.size() < 32 && seen.insert(key).second)
+            list.push_back({std::move(chain), at, via, kernel});
+        };
+        std::function<void(SmallVector<InstanceLink>, LIT::FnOp, Location,
+                           std::optional<Location>, int)>
+            expandCalled = [&](SmallVector<InstanceLink> chain, LIT::FnOp outer,
+                               Location at, std::optional<Location> via,
+                               int depth) {
+              if (depth < 3 && outer && openChain(chain)) {
+                if (auto launchedAs = instances.find(outer);
+                    launchedAs != instances.end() &&
+                    !genericFirst.count(outer)) {
+                  for (const Instance &instance :
+                       SmallVector<Instance>(launchedAs->second)) {
+                    SmallVector<InstanceLink> longer = chain;
+                    llvm::append_range(longer, instance.chain);
+                    add(std::move(longer), at, instance.launch, true);
+                  }
+                  return;
+                }
+                if (auto it = calledBy.find(outer);
+                    it != calledBy.end() && !it->second.empty()) {
+                  for (const Caller &caller : SmallVector<Caller>(it->second)) {
+                    SmallVector<InstanceLink> longer = chain;
+                    longer.push_back(caller.link);
+                    expandCalled(std::move(longer), caller.from, at, caller.loc,
+                                 depth + 1);
+                  }
+                  return;
+                }
+              }
+              add(std::move(chain), at, via, false);
+            };
+        for (LIT::FnOp fn : converting)
+          if (auto it = calledBy.find(fn); it != calledBy.end())
+            for (const Caller &caller : SmallVector<Caller>(it->second))
+              expandCalled({caller.link}, caller.from, caller.loc, std::nullopt,
+                           0);
+      }
     }
     struct Result {
       SmallVector<Obligation, 0> obligations;
@@ -16761,11 +17035,41 @@ struct VerifyContractsPass
       /// See `FunctionEncoder::assumedCallees`.
       SmallVector<Operation *> assumedCallees;
     };
-    // Encodes and solves one function (or instantiation) into `result`.
+    // An obligation's answer in each instantiation of its function: the
+    // obligation with the same call, clause and occurrence.
+    using Key = std::tuple<const void *, const void *, unsigned>;
+    auto keys = [](ArrayRef<Obligation> obligations) {
+      std::map<std::pair<const void *, const void *>, unsigned> seen;
+      SmallVector<Key> out;
+      for (const Obligation &ob : obligations) {
+        std::pair<const void *, const void *> at{
+            ob.callLoc.getAsOpaquePointer(), ob.clauseLoc.getAsOpaquePointer()};
+        // Not an occurrence of its own: see `Obligation::variant`.
+        if (!ob.variant.empty())
+          out.push_back({at.first, at.second, ~0u - unsigned(out.size())});
+        else
+          out.push_back({at.first, at.second, seen[at]++});
+      }
+      return out;
+    };
+    // Encodes and solves one function (or instantiation) into `result`;
+    // with `only`, of its obligations just those, and the ones that answer
+    // them (`Obligation::variant`): the others are not asked.
     auto verify = [&](FunctionEncoder &enc, Result &result,
-                      const std::string &name) {
+                      const std::string &name,
+                      const std::set<Key> *only = nullptr) {
       if (!enc.encode())
         return;
+      if (only) {
+        bool kept = false;
+        for (auto [key, ob] :
+             llvm::zip(keys(enc.obligations), enc.obligations)) {
+          if (ob.variant.empty())
+            kept = only->count(key);
+          if (!kept)
+            ob.analyzed = false;
+        }
+      }
       result.loops = enc.loopsAnalyzed;
       result.invariants = enc.invariantsFound;
       llvm::append_range(result.assumedCallees, enc.assumedCallees);
@@ -16890,7 +17194,8 @@ struct VerifyContractsPass
     // its parameters can be far slower (nonlinear in them) than one for the
     // values launched.
     auto launched = [&](size_t i) {
-      return !fns[i].refines && instances.count(fns[i].fn);
+      return !fns[i].refines && instances.count(fns[i].fn) &&
+             !genericFirst.count(fns[i].fn);
     };
     HeapEffects heapEffects;
     llvm::DefaultThreadPool pool(llvm::hardware_concurrency());
@@ -16925,7 +17230,7 @@ struct VerifyContractsPass
     std::vector<InstanceJob> instanceJobs;
     for (size_t i = 0; i < fns.size(); ++i) {
       auto it = fns[i].refines ? instances.end() : instances.find(fns[i].fn);
-      if (it == instances.end() ||
+      if (it == instances.end() || genericFirst.count(fns[i].fn) ||
           (genericLaunched && llvm::all_of(results[i].answers, [](Answer a) {
              return a == Answer::Proven;
            })))
@@ -16968,28 +17273,150 @@ struct VerifyContractsPass
         if (at.via)
           diag.attachNote(*at.via) << "with the parameters given here";
       }
-    // An obligation's answer in each instantiation of its function: the
-    // obligation with the same call, clause and occurrence.
-    using Key = std::tuple<const void *, const void *, unsigned>;
-    auto keys = [](const Result &result) {
-      std::map<std::pair<const void *, const void *>, unsigned> seen;
-      SmallVector<Key> out;
-      for (const Obligation &ob : result.obligations) {
-        std::pair<const void *, const void *> at{
-            ob.callLoc.getAsOpaquePointer(), ob.clauseLoc.getAsOpaquePointer()};
-        out.push_back({at.first, at.second, seen[at]++});
-      }
-      return out;
-    };
     std::map<size_t, SmallVector<std::pair<size_t, std::map<Key, Answer>>>>
         instanceAnswers;
+    // What an instantiation says of its obligation (`Obligation::detail`,
+    // and a counterexample).
+    std::map<std::tuple<size_t, size_t, Key>, std::string> instanceDetails;
     for (InstanceJob &job : instanceJobs) {
       if (job.opaque)
         continue;
       std::map<Key, Answer> answers;
-      for (auto [key, answer] : llvm::zip(keys(job.result), job.result.answers))
+      for (auto [key, answer] :
+           llvm::zip(keys(job.result.obligations), job.result.answers))
         answers[key] = answer;
       instanceAnswers[job.job].push_back({job.instance, std::move(answers)});
+    }
+    // A conversion to a type a parameter gives, in each instantiation the
+    // module calls. First by the obligation for its type there, among
+    // those that follow the function's own (none where nothing is lost):
+    // what is proven for every value of the parameters. Where that one is
+    // open, the instantiation is verified for these conversions: its
+    // parameters may decide them (an index into a layout of static size).
+    {
+      // In `result`, for the conversion whose own obligation is at `k`,
+      // to the type `to`: the answer, and a counterexample.
+      auto byType = [](const Result &result, size_t k, Sort to) {
+        std::pair<Answer, std::string> found{Answer::Proven, ""};
+        const Obligation &ob = result.obligations[k];
+        for (size_t m = k + 1;
+             m < result.obligations.size() &&
+             result.obligations[m].conversion == ob.conversion &&
+             !result.obligations[m].variant.empty();
+             ++m)
+          if (result.obligations[m].variant == variantName(to)) {
+            found = {m < result.answers.size() ? result.answers[m]
+                                               : Answer::Unknown,
+                     result.obligations[m].counterexample};
+            break;
+          }
+        return found;
+      };
+      auto describe = [](Sort to, bool assumed, StringRef example) {
+        std::string text = "to " + sortName(to);
+        if (assumed)
+          text += ", if the layout's index type is 32-bit";
+        if (!example.empty())
+          text += ": it does not hold with " + example.str();
+        return text;
+      };
+      struct Pending {
+        size_t job, instance;
+        // The conversions open in it, with their types there.
+        std::map<Key, std::pair<Sort, bool>> open;
+        Result result;
+      };
+      std::vector<Pending> pending;
+      for (size_t i = 0; i < fns.size(); ++i) {
+        auto found = fns[i].refines || !genericFirst.count(fns[i].fn)
+                         ? instances.end()
+                         : instances.find(fns[i].fn);
+        const Result &result = results[i];
+        if (found == instances.end() ||
+            llvm::none_of(result.obligations, [](const Obligation &ob) {
+              return ob.conversion && ob.variant.empty();
+            }))
+          continue;
+        SmallVector<Key> resultKeys = keys(result.obligations);
+        SymbolTableCollection symbols;
+        for (auto [j, instance] : llvm::enumerate(found->second)) {
+          FunctionEncoder enc(
+              fns[i].fn, module, symbols, solver,
+              "f" + std::to_string(i) + ".t" + std::to_string(j), impls);
+          enc.bindInstance(instance.chain, instance.kernel);
+          std::map<Key, Answer> answers;
+          Pending again{i, j, {}, {}};
+          for (size_t k = 0; k < result.obligations.size(); ++k) {
+            const Obligation &ob = result.obligations[k];
+            if (!ob.conversion || !ob.variant.empty())
+              continue;
+            bool assumed = false;
+            std::optional<Sort> to =
+                enc.conversionTarget(ob.conversion, assumed);
+            if (!to) {
+              answers[resultKeys[k]] = Answer::NotAnalyzed;
+              instanceDetails[{i, j, resultKeys[k]}] =
+                  "to a type that is not known";
+              continue;
+            }
+            auto [answer, example] = byType(result, k, *to);
+            answers[resultKeys[k]] = answer;
+            instanceDetails[{i, j, resultKeys[k]}] =
+                describe(*to, assumed, example);
+            if (answer != Answer::Proven)
+              again.open[resultKeys[k]] = {*to, assumed};
+          }
+          instanceAnswers[i].push_back({j, std::move(answers)});
+          if (!again.open.empty())
+            pending.push_back(std::move(again));
+        }
+      }
+      for (size_t n = 0; n < pending.size(); ++n)
+        pool.async([&, n] {
+          Pending &job = pending[n];
+          SymbolTableCollection symbols;
+          std::string name = "f" + std::to_string(job.job) + ".c" +
+                             std::to_string(job.instance);
+          FunctionEncoder enc(fns[job.job].fn, module, symbols, solver, name,
+                              impls);
+          enc.checkConversions = checkConversions == "all" ? 2 : 1;
+          enc.typeInvariants = typeInvariants;
+          enc.checkDivision = checkDivision;
+          enc.heapEffects = &heapEffects;
+          const Instance &instance =
+              instances.find(fns[job.job].fn.getOperation())
+                  ->second[job.instance];
+          enc.bindInstance(instance.chain, instance.kernel);
+          std::set<Key> only;
+          for (auto &entry : job.open)
+            only.insert(entry.first);
+          verify(enc, job.result, name, &only);
+        });
+      pool.wait();
+      for (Pending &job : pending) {
+        auto &list = instanceAnswers[job.job];
+        auto entry = llvm::find_if(
+            list, [&](auto &e) { return e.first == job.instance; });
+        SmallVector<Key> jobKeys = keys(job.result.obligations);
+        for (size_t k = 0; k < jobKeys.size() && entry != list.end(); ++k) {
+          auto open = job.open.find(jobKeys[k]);
+          const Obligation &ob = job.result.obligations[k];
+          if (open == job.open.end() || !ob.variant.empty())
+            continue;
+          auto [to, assumed] = open->second;
+          // The conversion's own obligation there, its type known; or as
+          // in the function, with those for each type.
+          std::pair<Answer, std::string> found =
+              ob.conversion ? byType(job.result, k, to)
+                            : std::pair<Answer, std::string>{
+                                  job.result.answers[k], ob.counterexample};
+          if (found.first == Answer::NotAnalyzed)
+            continue;
+          entry->second[jobKeys[k]] = found.first;
+          instanceDetails[{job.job, job.instance, jobKeys[k]}] =
+              describe(to, assumed, found.second);
+        }
+      }
     }
     // A kernel verified only for its instantiations: its obligations are
     // those of its instantiations, in order of first appearance, each
@@ -17001,14 +17428,15 @@ struct VerifyContractsPass
           continue;
         Result &result = results[job.job];
         std::set<Key> have;
-        for (const Key &key : keys(result))
+        for (const Key &key : keys(result.obligations))
           have.insert(key);
         if (result.obligations.empty()) {
           result.loops = job.result.loops;
           result.invariants = job.result.invariants;
         }
-        for (auto [key, ob, answer] : llvm::zip(
-                 keys(job.result), job.result.obligations, job.result.answers))
+        for (auto [key, ob, answer] :
+             llvm::zip(keys(job.result.obligations), job.result.obligations,
+                       job.result.answers))
           if (have.insert(key).second) {
             result.obligations.push_back(ob);
             result.answers.push_back(Answer::NotAnalyzed);
@@ -17085,7 +17513,8 @@ struct VerifyContractsPass
         }
       }
     }
-    unsigned total = 0, proven = 0, forInstances = 0, loops = 0, invariants = 0;
+    unsigned total = 0, proven = 0, forInstances = 0, forCalled = 0, loops = 0,
+             invariants = 0;
     // For `drop-proven-checks`: the direct calls of the verified functions,
     // with the function called, or null once one of the call's preconditions
     // is not proven generically.
@@ -17093,9 +17522,12 @@ struct VerifyContractsPass
     for (auto [i, result] : llvm::enumerate(results)) {
       loops += result.loops;
       invariants += result.invariants;
-      SmallVector<Key> resultKeys = keys(result);
+      SmallVector<Key> resultKeys = keys(result.obligations);
       for (auto [k, ob, answer] :
            llvm::enumerate(result.obligations, result.answers)) {
+        // Answers an instantiation: see `Obligation::variant`.
+        if (!ob.variant.empty())
+          continue;
         ++total;
         if (ob.call) {
           bool ok = answer == Answer::Proven && ob.checkedCallee &&
@@ -17159,7 +17591,8 @@ struct VerifyContractsPass
               return p.second == Answer::Proven;
             })) {
           ++proven;
-          ++forInstances;
+          bool called = genericFirst.count(fns[i].fn);
+          ++(called ? forCalled : forInstances);
           if (verbose) {
             auto remark = mlir::emitRemark(ob.callLoc);
             if (claim.empty())
@@ -17167,7 +17600,7 @@ struct VerifyContractsPass
             else
               remark << "proven " << claim;
             remark << " for the " << perInstance.size()
-                   << " launched instantiation"
+                   << (called ? " called" : " launched") << " instantiation"
                    << (perInstance.size() == 1 ? "" : "s");
           }
           continue;
@@ -17197,8 +17630,17 @@ struct VerifyContractsPass
                << "' was not decided within the solver limits";
           break;
         default:
-          diag << "the " << what << " of '" << ob.callee
-               << "' is not analyzed yet (this control flow is not supported)";
+          if (ob.claim == kUnevaluatedConversion)
+            diag << "not checked (the type is not evaluated here): " << claim;
+          else if (ob.claim == kParametricConversion)
+            diag << (perInstance.empty() ? "not checked (no call here gives "
+                                           "the parameter a value): "
+                                         : "cannot prove ")
+                 << claim;
+          else
+            diag << "the " << what << " of '" << ob.callee
+                 << "' is not analyzed yet (this control flow is not "
+                    "supported)";
           break;
         }
         if (ob.claim.empty())
@@ -17213,12 +17655,18 @@ struct VerifyContractsPass
         for (auto [instance, instanceAnswer] : perInstance)
           if (instanceAnswer != Answer::Proven) {
             const Instance &at = instances[fn][instance];
-            diag.attachNote(at.launch)
-                << (instanceAnswer == Answer::Unknown
-                        ? "not decided within the solver limits"
-                        : "not proven")
-                << " for the instantiation launched here"
-                << (genericLaunched ? " either" : "");
+            bool called = genericFirst.count(fn);
+            Diagnostic &note = diag.attachNote(at.launch);
+            note << (instanceAnswer == Answer::Unknown
+                         ? "not decided within the solver limits"
+                         : "not proven")
+                 << " for the instantiation "
+                 << (called ? "called" : "launched") << " here"
+                 << (genericLaunched && !called ? " either" : "");
+            if (auto detail =
+                    instanceDetails.find({i, instance, resultKeys[k]});
+                detail != instanceDetails.end())
+              note << " (" << detail->second << ")";
             if (at.via)
               diag.attachNote(*at.via) << "with the parameters given here";
           }
@@ -17242,6 +17690,8 @@ struct VerifyContractsPass
                  << " obligations proven (";
     if (forInstances)
       llvm::errs() << forInstances << " only for the launched instantiations; ";
+    if (forCalled)
+      llvm::errs() << forCalled << " only for the called instantiations; ";
     llvm::errs() << loops << " loops, " << invariants << " invariants)\n";
     if (stoppedScripts)
       llvm::errs() << "verify-contracts: " << stoppedScripts

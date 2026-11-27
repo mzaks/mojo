@@ -434,15 +434,29 @@ The output must be exactly the `bad_*` functions (and `Bad*` structs).
   a signed 32-bit integer keeps the value"); with `check-conversions=all`
   also each one that may change the sign (a signed value to an unsigned
   type, an unsigned one to the signed type of its width). A widening that
-  holds every value is none. A conversion to a type that is a parameter
-  of the function (`Scalar[dtype](n)`) is not checked yet: it gets no
-  obligation. `conversions.mojo` has the cases. `ord` of a
+  holds every value is none. A conversion to a type that a parameter of
+  the function gives (`Scalar[dtype](n)`, also through an alias:
+  `comptime idx_type = ...`) is checked for each instantiation the module
+  calls: the function has one obligation, open in itself, and each call
+  that fixes the type looks up the answer for that type (proven for every
+  value of the other parameters, or a type that holds every value), and
+  only where that is open the instantiation is verified for its
+  conversions. The warning is in the function, with a note at each call
+  it is not proven for; a function no call gives the type is reported as
+  not checked. A type
+  is never read out of an expression that is still to be evaluated.
+  Limit: an instantiation's static sizes are mostly not known when it is
+  verified this way, so an index into a tensor of known size is reported
+  although it fits (`TileTensor.__setitem__`).
+  `conversions.mojo` has the cases. `ord` of a
   literal is its code point (a constant); `ord` of any string is a code
   point (its `ensures`: at most 0x10FFFF). On the matmul dispatch corpus
-  the option adds 840 obligations to 1197 (`all`: 876), of which 374 are
-  proven (377), for 16% more CPU time (17%): the open ones are mostly
-  sizes passed to 32-bit interfaces (`Int32(m)` to BLAS, `UInt32(M)` in a
-  launch), which hold only for sizes no contract bounds.
+  with `narrowing` the option adds 869 obligations to 1197, of which 375
+  are proven, for about 7% more CPU time: the open ones are mostly sizes
+  passed to 32-bit interfaces (`Int32(m)` to BLAS, `UInt32(M)` in a
+  launch), which hold only for sizes no contract bounds; 16 are to a type
+  computed at compile time that is not evaluated (`FastUInt`) and
+  reported as not checked.
 
 - `Array`: `len(a)` is the size parameter in `a`'s type (a number, or a
   parameter such as `n` in generic code), not negative (the struct

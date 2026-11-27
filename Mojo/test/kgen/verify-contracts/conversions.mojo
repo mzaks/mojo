@@ -86,10 +86,62 @@ def bad_codepoint(s: StringSpan) raises -> UInt16:
     return UInt16(ord(s))
 
 
+# A conversion to a type that a parameter gives is checked for each
+# instantiation the file calls. Reported in the function, with a note at the
+# call: 32 bits do not hold a product of two sizes.
+def bad_generic_bound[dtype: DType](rows: Int, stride: Int) -> Scalar[dtype]
+    requires 0 <= rows and rows <= 100000
+    requires 0 <= stride and stride <= 100000:
+    return Scalar[dtype](rows * stride)
+
+
+# 64 bits do, and so do 32 for the rows of one tile.
+def ok_generic_bound[dtype: DType](rows: Int, stride: Int) -> Scalar[dtype]
+    requires 0 <= rows and rows <= 128
+    requires 0 <= stride and stride <= 100000:
+    return Scalar[dtype](rows * stride)
+
+
+# The parameter given by a caller's own: the instantiation is that of the
+# caller's call.
+def ok_passes_on[dtype: DType](rows: Int) -> Scalar[dtype]
+    requires 0 <= rows and rows <= 128:
+    return ok_generic_bound[dtype](rows, 8)
+
+
+# No call gives the parameter a value: not checked, and said so.
+def bad_never_called[dtype: DType](n: Int) -> Scalar[dtype]:
+    return Scalar[dtype](n)
+
+
+# The type named through an alias is the caller's all the same.
+def bad_through_alias[dtype: DType](n: Int) -> Scalar[dtype]:
+    comptime index_type = dtype
+    return Scalar[index_type](n)
+
+
+def pick_index_type() -> DType:
+    return DType.int32
+
+
+comptime PickedIndex = Scalar[pick_index_type()]
+
+
+# A type computed at compile time is not evaluated: not checked, and said so
+# (never read as a type its expression happens to name).
+def bad_unevaluated(n: Int) -> PickedIndex:
+    return PickedIndex(n)
+
+
 def main() raises:
     print(bad_bound(4, 8, 0), ok_bound(4, 8, 0))
     print(bad_narrow(1), ok_masked(1), ok_guarded(1))
     print(bad_to_unsigned(1), ok_to_unsigned(1), bad_to_signed(1))
     print(bad_widen(1), ok_widen(1, 1))
+    print(bad_generic_bound[DType.int32](4, 8))
+    print(bad_generic_bound[DType.int64](4, 8))
+    print(ok_generic_bound[DType.int32](4, 8))
+    print(ok_generic_bound[DType.int64](4, 8), ok_passes_on[DType.int32](4))
+    print(bad_through_alias[DType.int32](4), bad_unevaluated(4))
     print(ok_ascii(), bad_not_ascii())
     print(ok_codepoint("a"), bad_codepoint("a"))
