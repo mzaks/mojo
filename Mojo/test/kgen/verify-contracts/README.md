@@ -77,7 +77,11 @@ conversions to a narrower type that may change the value and
 `type-invariants=true` takes a struct's invariant
 to hold for every value of the struct, wherever it is kept (below),
 `int-retry=false` turns off the integer retry
-(below), `nonlinear-rlimit=` the limit a query whose goal multiplies or
+(below), `exact-retry=false` only its last step, the one with exact
+products (on by default: on the matmul dispatch corpus with
+`packages=linalg,layout` it is 44% of the solver time for 2 of 757
+proofs, and `gemm_mma_cpasync.mojo` and `pointers.mojo` need it),
+`nonlinear-rlimit=` the limit a query whose goal multiplies or
 divides two unknowns is first asked with (default 10000000; then over the
 integers, then with the full limit), `case-split=false` turns off case
 splitting (below), `invariant-retry=true` asks a loop-invariant candidate
@@ -109,13 +113,14 @@ still open is asked once more with exact products: the wrapping is what
 keeps the solver from `(i * 16 + w) * n + col < k * n`, which takes a
 bound on the row first. For each product of two unknowns, and each sum
 over one, it is first asked whether its exact value is in range under
-the query's assumptions (within 0.5 s each, at most 16 terms: those the
-goal depends on, and the products of plain terms, an extent's `k * n`);
-then the query is asked with the terms that are in range defined without
-`mod 2^w` (within 5 s), in each case of the finite-domain unknowns. That
-is the same query: where the assumptions hold, those terms have their
-exact values. Both steps have time limits, so a loaded machine can leave
-such a query open. `int-translate-file=F` writes the translation
+the query's assumptions (at most 16 terms: those the goal depends on,
+and the products of plain terms, an extent's `k * n`; a question that
+queries with the same assumptions share is asked once); then the query
+is asked with the terms that are in range defined without `mod 2^w`, in
+each case of the finite-domain unknowns. That is the same query: where
+the assumptions hold, those terms have their exact values. Both steps
+have work limits (`range-rlimit`, and 5000000 units), not time limits.
+`int-translate-file=F` writes the translation
 of the SMT-LIB file `F` to `F.int.smt2` and does nothing else (for
 testing).
 

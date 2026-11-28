@@ -16945,7 +16945,7 @@ struct VerifyContractsPass
     solver.rangeRlimit = rangeRlimit;
     if (intRetry)
       solver.nonlinearRlimit = nonlinearRlimit;
-    solver.exactRetry = intRetry;
+    solver.exactRetry = intRetry && exactRetry;
     solver.checkedClauses = checked;
     solver.caseSplit = caseSplit;
     solver.invariantRetry = invariantRetry;

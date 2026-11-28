@@ -103,6 +103,10 @@ def VerifyContracts : Pass<"verify-contracts", "ModuleOp"> {
     Option<"intRetry", "int-retry", "bool", /*default=*/"true",
            "Ask the queries answered `unknown` again over the integers "
            "(an exact translation; only proofs are taken)">,
+    Option<"exactRetry", "exact-retry", "bool", /*default=*/"true",
+           "With int-retry: ask a query with a product in its goal that is "
+           "still open once more with the products that are in range taken "
+           "exactly (the costliest step for what it proves)">,
     Option<"intTranslateFile", "int-translate-file", "std::string",
            /*default=*/"\"\"",
            "Testing: translate this SMT-LIB file as the integer retry does, "
