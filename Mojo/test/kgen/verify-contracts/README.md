@@ -129,6 +129,22 @@ to run, so with the cache a function whose encoding did not change costs
 no solver time. Changing a callee's contract changes its callers' scripts,
 so they are verified again.
 
+The answers are not always the same from run to run, though the scripts
+are: z3 (4.16.0) does not do the same work each time on a query of the
+integer retry (its nonlinear solver; `smt.arith.nl.nra=false` or
+`nlsat.reorder=false` makes the work the same, and loses the proofs), so
+one close to its limit is decided in one run and left open in another.
+Of the 2611 scripts of the matmul dispatch corpus
+(`packages=linalg,layout`), each run three times, 17 gave different
+answers, all of the integer retry (15 asking whether a product is in
+range, 2 of its first step) and none over bit-vectors. A proof is one in
+whichever run it is found, so nothing reported proven is wrong; but the
+number proven can differ by one or two between runs that start with an
+empty cache (the precondition of `gemv_kernel` at `gemv.mojo:4604` is
+proven in some), and an open warning can read "cannot prove" in one and
+"was not decided within the solver limits" in another. With the cache a
+machine keeps the answer it got first.
+
 An unproven precondition is a warning at the call, with a note at the clause:
 
 ```text
