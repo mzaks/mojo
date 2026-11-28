@@ -1866,6 +1866,9 @@ std::vector<bool> exactIntegers(const SolverConfig &config, StringRef script,
   std::string ranges = intHead + chained;
   std::vector<bool> translated(queries.size(), false);
   std::vector<std::vector<bool>> takes(queries.size());
+  // The range queries asked, and for each one wanted, in order, which.
+  llvm::StringMap<size_t> rangeSlots;
+  std::vector<size_t> slots;
   for (auto [q, block] : llvm::enumerate(queries)) {
     IntTranslator one = wrapped;
     if (!one.translate(block))
@@ -1879,13 +1882,19 @@ std::vector<bool> exactIntegers(const SolverConfig &config, StringRef script,
     takes[q] = relevant(block);
     // In range or not is quick to see over the integers, which can
     // otherwise run long without using up a limit.
+    // Asked once where queries share their assumptions (the calls of one
+    // block): a term out of range uses up its limit each time.
     for (auto [c, candidate] : llvm::enumerate(candidates))
-      if (takes[q][c])
-        ranges += text.substr(0, goal) +
-                  "(assert (not " +
-                  IntTranslator::inRange(candidate.second.width,
-                                         candidate.first + "!x") +
-                  "))" + text.substr(end);
+      if (takes[q][c]) {
+        std::string one = text.substr(0, goal) + "(assert (not " +
+                          IntTranslator::inRange(candidate.second.width,
+                                                 candidate.first + "!x") +
+                          "))" + text.substr(end);
+        auto [it, inserted] = rangeSlots.try_emplace(one, rangeSlots.size());
+        if (inserted)
+          ranges += one;
+        slots.push_back(it->second);
+      }
   }
   // Each with a small work limit of its own, not a time limit: what is in
   // range is seen with little work (at most 67k units on the MAX kernels),
@@ -1923,7 +1932,8 @@ std::vector<bool> exactIntegers(const SolverConfig &config, StringRef script,
                                   return !candidateNames.count(n) ||
                                          exact.exact.count(n);
                                 });
-      if (at < inRange->size() && (*inRange)[at] == Answer::Proven && inner)
+      if (at < slots.size() && slots[at] < inRange->size() &&
+          (*inRange)[slots[at]] == Answer::Proven && inner)
         exact.exact.insert(candidate.first);
       ++at;
     }
